@@ -111,14 +111,18 @@ pub fn unit_state_file(root: &Path, dir: &Path, unit: &UnitState) -> Vec<Violati
         Err(_) => vec![Violation::new(
             relative(root, &path),
             "unit-state-missing",
-            "STATE.md is gone; cm renders it from .cm/state.json on the next `cm advance` or `cm launch`",
+            format!("STATE.md is gone; re-render it with `cm init {}`", unit.unit),
         )],
         Ok(text) if text == rendered => Vec::new(),
         Ok(text) => vec![
             Violation::new(
                 relative(root, &path),
                 "unit-state-hand-edit",
-                "STATE.md differs from the render of .cm/state.json; change state with `cm advance`",
+                format!(
+                    "STATE.md differs from the render of .cm/state.json; reset it with `rm {} && cm init {}`, then change state with `cm advance`",
+                    relative(root, &path),
+                    unit.unit
+                ),
             )
             .at(first_difference(&text, &rendered)),
         ],

@@ -175,7 +175,7 @@ pub fn main() -> ExitCode {
             if cli.json {
                 println!(
                     "{}",
-                    serde_json::json!({ "command": command, "ok": false, "error": format!("{error:#}") })
+                    serde_json::json!({ "command": command, "ok": false, "violations": [], "error": format!("{error:#}") })
                 );
             } else {
                 eprintln!("cm {command}: {error:#}");

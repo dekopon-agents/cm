@@ -464,3 +464,79 @@ fn a_rewritten_journal_prefix_is_found_and_blocks_writes() {
     let refused = commands::journal(&host, &c.root, "next", None).unwrap();
     assert_eq!(rules(&refused), vec!["journal-rewritten"]);
 }
+
+#[test]
+fn a_removed_worktree_points_advance_at_repo() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let (repo, sha) = repo(c.root.parent().unwrap());
+    unit_with_step(&c, &host, "Go.\n");
+    let step = "01-first/alpha/BUILD";
+    assert!(
+        commands::launch(&host, &c.root, &parse_target(step, true).unwrap(), &repo)
+            .unwrap()
+            .ok()
+    );
+    let moved = c.root.parent().unwrap().join("moved");
+    fs::rename(&repo, &moved).unwrap();
+    let pr = Evidence {
+        pr: Some("https://github.com/o/r/pull/7".into()),
+        sha: Some(sha.clone()),
+        ..Evidence::default()
+    };
+    let refused = advance(&host, &c, step, "pr-open", pr.clone());
+    assert_eq!(rules(&refused), vec!["evidence-repo"]);
+    assert!(
+        refused.violations[0]
+            .message
+            .contains("is gone; pass --repo")
+    );
+    let outcome = commands::advance(
+        &host,
+        &c.root,
+        &target(step),
+        &"pr-open".parse().unwrap(),
+        &pr,
+        Some(&moved),
+    )
+    .unwrap();
+    assert!(outcome.ok(), "{:?}", outcome.violations);
+}
+
+#[test]
+fn hand_edit_messages_name_the_reset() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    unit_with_step(&c, &host, "Go.\n");
+    let state_md = c.root.join("01-first/alpha/STATE.md");
+    fs::write(&state_md, "edited\n").unwrap();
+    let mut journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    journal.push_str("extra\n");
+    fs::write(c.root.join("JOURNAL.md"), journal).unwrap();
+    let outcome = lint(&c.root).unwrap();
+    let messages: Vec<&str> = outcome
+        .violations
+        .iter()
+        .map(|v| v.message.as_str())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("`cp .cm/JOURNAL.md JOURNAL.md`")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("`rm 01-first/alpha/STATE.md && cm init 01-first/alpha`")),
+        "{messages:?}"
+    );
+    fs::remove_file(&state_md).unwrap();
+    fs::copy(c.root.join(".cm/JOURNAL.md"), c.root.join("JOURNAL.md")).unwrap();
+    assert!(
+        commands::init(&host, &c.root.join("01-first/alpha"))
+            .unwrap()
+            .ok()
+    );
+    assert_clean(&c.root);
+}

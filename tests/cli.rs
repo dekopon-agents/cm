@@ -93,6 +93,7 @@ fn usage_errors_exit_2_and_refusals_exit_1() {
     let outside = cm(root, &["--json", "journal", "x"]);
     assert_eq!(outside.status.code(), Some(1));
     assert_eq!(json(&outside)["ok"], false);
+    assert_eq!(json(&outside)["violations"], serde_json::json!([]));
     assert!(cm(root, &["init"]).status.success());
     let refused = cm(
         root,
