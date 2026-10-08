@@ -1,0 +1,171 @@
+name: Release
+
+# Every push to main releases. The version is Cargo.toml's X.Y.0 when no vX.Y.* tag exists, else the
+# next patch above the newest vX.Y.*; it is written into the build's manifest only, never committed.
+# A release created with GITHUB_TOKEN fires no workflow, so this run also pushes the tap formula.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  version:
+    name: compute the version
+    needs: ci
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(.github/scripts/next-version.sh Cargo.toml \
+            "$(git ls-remote --tags --refs "https://github.com/$GITHUB_REPOSITORY.git" | sed 's#.*refs/tags/##')")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "::notice::releasing v$version from $GITHUB_SHA"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: cm
+          key: ${{ hashFiles('rust-toolchain.toml') }}-${{ matrix.target }}
+      - name: Write the version into the build's manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          perl -0pi -e 's/^version = "[^"]*"/version = "$ENV{VERSION}"/m' Cargo.toml
+          perl -0pi -e 's/(\[\[package\]\]\nname = "cm"\nversion = )"[^"]*"/$1"$ENV{VERSION}"/' Cargo.lock
+          grep -q "^version = \"$VERSION\"" Cargo.toml
+      - run: cargo build --release --locked --target "$TARGET"
+      - name: Package and check the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="cm-$VERSION-$TARGET"
+          mkdir -p "staging/$archive"
+          cp "target/$TARGET/release/cm" README.md LICENSE-APACHE LICENSE-MIT "staging/$archive/"
+          tar -C staging -czf "$archive.tar.gz" "$archive"
+          shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256"
+          mkdir unpacked
+          tar -C unpacked -xzf "$archive.tar.gz"
+          test "$("unpacked/$archive/cm" --version)" = "cm $VERSION"
+          "unpacked/$archive/cm" init unpacked/campaign
+          "unpacked/$archive/cm" lint unpacked/campaign
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cm-${{ matrix.target }}
+          path: |
+            cm-*.tar.gz
+            cm-*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: publish v${{ needs.version.outputs.version }}
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: cm-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" dist/* --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "v$VERSION" --generate-notes
+
+  tap:
+    name: update the Homebrew tap
+    needs: [version, release]
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - id: tap-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.DEKOPON_RELEASE_APP_ID }}
+          private-key: ${{ secrets.DEKOPON_RELEASE_APP_KEY }}
+          owner: dekopon-agents
+          repositories: homebrew-tap
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: source
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dekopon-agents/homebrew-tap
+          token: ${{ steps.tap-token.outputs.token }}
+          path: tap
+      - name: Render and push Formula/cm.rb
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.tar.gz.sha256' --dir checksums
+          python3 source/.github/scripts/render-homebrew-formula.py \
+            --repository "$GITHUB_REPOSITORY" --tag "v$VERSION" \
+            --checksums checksums --output tap/Formula/cm.rb
+          cd tap
+          git add Formula/cm.rb
+          if git diff --cached --quiet; then
+            echo "::notice::Formula/cm.rb already matches v$VERSION."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: update cm to $VERSION"
+          git push origin HEAD:main

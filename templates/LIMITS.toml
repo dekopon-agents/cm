@@ -1,0 +1,23 @@
+# Read before every launch. The owner sets the dials; the coordinator applies a dial a measurement
+# decides and journals the owner's words that allow it.
+
+paused = false
+
+# The one money stop: a loop burning money, not ordinary spend.
+runaway_ceiling_usd = 1000
+
+driver_model = "openai-codex/gpt-6-sol"
+driver_effort = "medium"
+verifier_model = "openai-codex/gpt-6-sol"
+supervisor_model = "openai-codex/gpt-6-sol"
+supervisor_effort = "high"
+
+# cm launch refuses unless free disk on disk_volume, minus kache_headroom_gib, is over
+# min_free_disk_gib, and live heavy builds are under max_heavy_builds.
+disk_volume = "/"
+min_free_disk_gib = 25
+kache_headroom_gib = 3
+max_heavy_builds = 4
+
+pr_ci_expected_min = 5
+pr_ci_deadline_min = 8
