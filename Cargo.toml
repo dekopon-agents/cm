@@ -1,0 +1,30 @@
+[package]
+name = "cm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Campaign manager: the campaign lifecycle as one tool"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/dekopon-agents/cm"
+publish = false
+
+[[bin]]
+name = "cm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+jiff = "0.2"
+rustix = { version = "1", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
