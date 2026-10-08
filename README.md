@@ -38,6 +38,14 @@ error.
 `<NN-name>` is two digits, `-`, a name (`01-first`). Units and steps are names of letters, digits,
 `.`, `_` and `-`.
 
+Packet paths are checked on this machine. A path that lives elsewhere (a host path on a server, such
+as `/var/lib/<service>`) goes in a fenced block or without backticks; backticked, it fails
+`packet-path`.
+
+To undo a hand edit: `cp .cm/JOURNAL.md JOURNAL.md` resets the journal (re-add the lines with
+`cm journal`), and `rm <NN-name>/<unit>/STATE.md && cm init <NN-name>/<unit>` re-renders a unit's
+`STATE.md`.
+
 ### Template contracts
 
 | File | Lint requires |
@@ -118,6 +126,9 @@ never committed, so `Cargo.toml` always reads `X.Y.0`; bump the minor there to s
 The run builds `aarch64-apple-darwin`, `x86_64-unknown-linux-musl` and
 `aarch64-unknown-linux-musl`, attests the archives, creates the release and pushes
 `Formula/cm.rb` to `dekopon-agents/homebrew-tap`.
+
+Releases run one at a time. Merges that land while a release runs coalesce: GitHub keeps only the
+newest waiting run, so they ship together under the next tag, not one tag each.
 
 ## License
 

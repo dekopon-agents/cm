@@ -604,12 +604,23 @@ pub fn advance(
         ));
     }
     let needs_repo = given.sha.is_some() || given.tag.is_some();
+    let gone: Vec<String> = repos
+        .iter()
+        .filter(|repo| !repo.exists())
+        .map(|repo| repo.display().to_string())
+        .collect();
+    let repos: Vec<PathBuf> = repos.into_iter().filter(|repo| repo.exists()).collect();
     if needs_repo && repos.is_empty() {
-        violations.push(Violation::new(
-            &full,
-            "evidence-repo",
-            "no repository to resolve --sha or --tag in; pass --repo",
-        ));
+        let message = if gone.is_empty() {
+            "no repository to resolve --sha or --tag in; pass --repo <a checkout of the repo>"
+                .to_owned()
+        } else {
+            format!(
+                "the worktree {} is gone; pass --repo <a checkout of the repo>",
+                gone.join(", ")
+            )
+        };
+        violations.push(Violation::new(&full, "evidence-repo", message));
     } else {
         if let Some(sha) = &given.sha {
             let hex = sha.len() >= 7
@@ -624,7 +635,7 @@ pub fn advance(
                     &full,
                     "evidence-sha",
                     format!(
-                        "`{sha}` is not a commit in {}; fetch first if it was made elsewhere",
+                        "`{sha}` is not a commit in {}; fetch first if it was made elsewhere, or pass --repo",
                         repos
                             .iter()
                             .map(|repo| repo.display().to_string())
@@ -642,7 +653,7 @@ pub fn advance(
             violations.push(Violation::new(
                 &full,
                 "evidence-tag",
-                format!("tag `{tag}` does not resolve; `git fetch --tags` first if CI made it"),
+                format!("tag `{tag}` does not resolve; `git fetch --tags` first if CI made it, or pass --repo"),
             ));
         }
     }

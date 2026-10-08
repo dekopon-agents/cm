@@ -53,7 +53,7 @@ pub fn check(root: &Path, state: &CampaignState) -> Vec<Violation> {
                         JOURNAL,
                         "journal-hand-append",
                         format!(
-                            "{added} line(s) were added outside cm; only `cm journal`, `cm launch` and `cm advance` write here"
+                            "{added} line(s) were added outside cm; reset with `cp {JOURNAL_COPY} {JOURNAL}` and add them with `cm journal`"
                         ),
                     )
                     .at(first),
@@ -65,7 +65,7 @@ pub fn check(root: &Path, state: &CampaignState) -> Vec<Violation> {
                     Violation::new(
                         JOURNAL,
                         "journal-rewritten",
-                        format!("the recorded journal was changed from this line on; cm's copy is {JOURNAL_COPY}"),
+                        format!("the recorded journal was changed from this line on; reset with `cp {JOURNAL_COPY} {JOURNAL}`"),
                     )
                     .at(line),
                 );
