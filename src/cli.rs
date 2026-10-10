@@ -33,6 +33,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[command(about = "Inspect explicit PRs once and route next actions; never advances state")]
+    Attention {
+        #[arg(long, required = true)]
+        pr: Vec<String>,
+        #[arg(long)]
+        worker: String,
+        #[arg(long)]
+        coordinator: String,
+        #[arg(long, help = "Record changed observations in the campaign journal")]
+        record: bool,
+    },
     /// Write a campaign folder, or a unit folder (<NN-name>/<unit>) inside one, from the embedded templates. Never overwrites.
     Init {
         /// The folder to initialize.
@@ -106,6 +117,20 @@ fn read_body(path: &Path) -> Result<String> {
 fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
     let root = || store::root_or_cwd(cli.root.as_deref());
     match &cli.command {
+        Commands::Attention {
+            pr,
+            worker,
+            coordinator,
+            record,
+        } => crate::attention::run(
+            host,
+            &crate::attention::Gh,
+            &root()?,
+            pr,
+            worker,
+            coordinator,
+            *record,
+        ),
         Commands::Init { dir } => commands::init(host, dir),
         Commands::Journal { title, body_file } => {
             let body = body_file.as_deref().map(read_body).transpose()?;
@@ -142,6 +167,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
 
 fn name(command: &Commands) -> &'static str {
     match command {
+        Commands::Attention { .. } => "attention",
         Commands::Init { .. } => "init",
         Commands::Journal { .. } => "journal",
         Commands::Launch { .. } => "launch",
