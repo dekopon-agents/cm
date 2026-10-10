@@ -134,3 +134,49 @@ newest waiting run, so they ship together under the next tag, not one tag each.
 
 Licensed under either of Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)) or MIT
 license ([LICENSE-MIT](LICENSE-MIT)) at your option.
+
+## Attention at resume and handoff
+
+`cm attention` makes one read-only GitHub observation for explicit PRs and routes the next
+step to a named worker or coordinator. It works for prose-only campaign items; no unit
+initialization or lifecycle migration is required. Use an authenticated GitHub CLI with
+support for `gh pr checks --required --json` on PATH. GitHub.com PR URLs are required.
+
+```sh
+cm -C /path/to/campaign attention \
+  --pr https://github.com/example/project/pull/41 \
+  --worker implementation-worker --coordinator campaign-coordinator --record
+```
+
+Repeat `--pr` for up to 20 PRs with the same owners; invoke separately for other owners.
+The labels name responsible people or sessions, not GitHub assignees or notification
+recipients. The command sends no messages, runs no fixes, and never merges or advances
+campaign state. Coordinators run it at resume and worker handoff, then route routine
+work under existing authority. Genuine scope, funding and permission decisions still
+belong in OWNER-QUEUE.md.
+
+A failing required check routes to the worker. A changed head invalidates previous
+readiness and routes to the coordinator for review. Closed or merged PRs prompt
+reconciliation of obsolete work. Passing reported required checks only requests review
+of the exact head and authority: it is never merge approval. Missing, skipped, neutral,
+unknown or inaccessible check evidence is not green. A non-CLEAN GitHub merge status
+also requires verification, even if the reported checks passed: missing required checks
+and other merge blockers must be resolved. Drafts remain work for their worker.
+
+PR metadata is read before and after required checks; a changed observation is unknown
+and must be repeated. GitHub can change after any observation, so recheck the actual
+head and gates before a later write. The command reports GitHub's required-check view,
+not a replacement for repository policy or independent review.
+
+Without `--record`, only output is produced. With it, changed evidence or ownership is
+appended to JOURNAL.md through cm's lock and journal mirror, with the latest observation
+in `.cm/attention.json`. Repeating identical evidence adds nothing. These observations
+are separate from lifecycle transitions. `--json` includes owners, action, head, check
+links, the local observation timestamp, and GitHub's update/merge/close/check timestamps;
+a PR update time is not a CI completion or readiness time. Preserve action receipts with
+`cm journal` so later retros can connect observed blockers to actual actions. Neither
+elapsed observation intervals nor transition ages measure human effort.
+
+Unknown evidence exits 1 with actionable output; normal waiting, failed CI, or a review
+request exits 0 because inspection succeeded. Invalid usage is refused. Raw GitHub CLI
+stderr is not copied into campaign records; diagnose access using `gh` directly.
