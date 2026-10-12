@@ -103,7 +103,7 @@ fn init_campaign(host: &dyn Host, dir: &Path) -> Result<Outcome> {
             continue;
         }
         let text = fs::read_to_string(&path)?;
-        let found = templates::conform(name, &text);
+        let found = templates::conform(name, &text, templates::queue_open_in(dir));
         if !found.is_empty() {
             violations.extend(found);
             continue;

@@ -129,7 +129,16 @@ fn init_never_overwrites_and_adopts_what_lints_clean() {
     let host = Fake::at("2026-10-08T07:04:00Z");
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    let resume = cm::templates::RESUME.replace("Nothing has shipped yet.", "Our own words.");
+    let template = cm::templates::RESUME;
+    let fence = template.find("> ```").unwrap();
+    let end = template.find("\n\n# Resume").unwrap();
+    let resume = format!(
+        "{}> {}{}",
+        &template[..fence],
+        cm::templates::LOOP_WITHHELD,
+        &template[end..]
+    )
+    .replace("Nothing has shipped yet.", "Our own words.");
     fs::write(root.join("RESUME.md"), &resume).unwrap();
     fs::write(
         root.join("OWNER-QUEUE.md"),
@@ -442,6 +451,7 @@ fn lint_lists_every_violation_in_one_run() {
             "owner-queue-field",
             "packet-path",
             "resume-heading",
+            "resume-loop",
             "unit-state-hand-edit",
         ],
         "{:#?}",
