@@ -183,12 +183,13 @@ fn lint_unit(root: &Path, dir: &Path, home: Option<&Path>, packets: &mut usize) 
 
 pub fn root_files(root: &Path, state: Option<&CampaignState>) -> Vec<Violation> {
     let mut out = Vec::new();
+    let queue_open = templates::queue_open_in(root);
     for (name, _) in ROOT_FILES {
         if name == JOURNAL {
             continue;
         }
         match fs::read_to_string(root.join(name)) {
-            Ok(text) => out.extend(templates::conform(name, &text)),
+            Ok(text) => out.extend(templates::conform(name, &text, queue_open)),
             Err(_) => out.push(Violation::new(
                 name,
                 "missing-file",
