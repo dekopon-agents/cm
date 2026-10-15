@@ -7,11 +7,11 @@ use crate::journal;
 use crate::markdown::{code_spans, first_difference, named_path};
 use crate::outcome::{Outcome, Violation};
 use crate::render;
-use crate::state::{CampaignState, Phase, UnitState};
+use crate::state::{CampaignState, Phase, Track, UnitState};
 use crate::store::{
     self, JOURNAL, UNIT_STATE, find_root, is_name, is_subcampaign_name, relative, state_path,
 };
-use crate::templates::{self, ROOT_FILES};
+use crate::templates::{self, Banner, QUEUE_FILE, ROOT_FILES};
 
 pub fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
@@ -183,13 +183,14 @@ fn lint_unit(root: &Path, dir: &Path, home: Option<&Path>, packets: &mut usize) 
 
 pub fn root_files(root: &Path, state: Option<&CampaignState>) -> Vec<Violation> {
     let mut out = Vec::new();
-    let queue_open = templates::queue_open_in(root);
+    let closed = state.is_some_and(|state| state.closed.is_some());
+    let banner = Banner::of(root, closed);
     for (name, _) in ROOT_FILES {
         if name == JOURNAL {
             continue;
         }
         match fs::read_to_string(root.join(name)) {
-            Ok(text) => out.extend(templates::conform(name, &text, queue_open)),
+            Ok(text) => out.extend(templates::conform(name, &text, banner)),
             Err(_) => out.push(Violation::new(
                 name,
                 "missing-file",
@@ -197,12 +198,50 @@ pub fn root_files(root: &Path, state: Option<&CampaignState>) -> Vec<Violation> 
             )),
         }
     }
+    if closed {
+        out.extend(unsealed(root));
+    }
     match state {
         Some(state) => out.extend(journal::check(root, state)),
         None => {
             if let Ok(text) = fs::read_to_string(root.join(JOURNAL)) {
                 out.extend(templates::journal_title(&text));
             }
+        }
+    }
+    out
+}
+
+fn open_track(out: &mut Vec<Violation>, target: &str, track: &Track) {
+    if !matches!(track.state, Phase::Done | Phase::Blocked(_)) {
+        out.push(Violation::new(
+            target,
+            "closed-track",
+            format!(
+                "{target} is {}; a closed campaign holds only done or blocked tracks: `cm advance {target} done` or `blocked:<reason>`",
+                track.state
+            ),
+        ));
+    }
+}
+
+pub fn unsealed(root: &Path) -> Vec<Violation> {
+    let mut out = Vec::new();
+    if templates::queue_open_in(root) {
+        out.push(Violation::new(
+            QUEUE_FILE,
+            "closed-queue",
+            "OWNER-QUEUE.md has an open item; answer it or move it to the successor before the campaign closes",
+        ));
+    }
+    for dir in unit_dirs(root) {
+        let Ok(unit) = store::load_unit(&dir) else {
+            continue;
+        };
+        let target = relative(root, &dir);
+        open_track(&mut out, &target, &unit.track);
+        for (name, step) in &unit.steps {
+            open_track(&mut out, &format!("{target}/{name}"), &step.track);
         }
     }
     out

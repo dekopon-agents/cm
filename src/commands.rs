@@ -28,6 +28,16 @@ fn record(root: &Path, at: &str, title: &str, body: &str) -> Result<String> {
     Ok(journal::heading(at, title))
 }
 
+fn closed(root: &Path, campaign: &CampaignState) -> Option<Violation> {
+    campaign.closed.as_ref().map(|at| {
+        Violation::new(
+            relative(root, &state_path(root)),
+            "campaign-closed",
+            format!("the campaign closed at {at}; nothing is initialized, launched or moved here"),
+        )
+    })
+}
+
 fn write_unit(dir: &Path, unit: &UnitState) -> Result<()> {
     write_json(&state_path(dir), unit)?;
     write_atomic(&dir.join(UNIT_STATE), render::unit(unit).as_bytes())
@@ -67,6 +77,7 @@ fn init_campaign(host: &dyn Host, dir: &Path) -> Result<Outcome> {
             written: Vec::new(),
             adopted: Vec::new(),
             journal: None,
+            closed: None,
         }
     };
     let mut written = Vec::new();
@@ -103,7 +114,11 @@ fn init_campaign(host: &dyn Host, dir: &Path) -> Result<Outcome> {
             continue;
         }
         let text = fs::read_to_string(&path)?;
-        let found = templates::conform(name, &text, templates::queue_open_in(dir));
+        let found = templates::conform(
+            name,
+            &text,
+            templates::Banner::of(dir, state.closed.is_some()),
+        );
         if !found.is_empty() {
             violations.extend(found);
             continue;
@@ -158,7 +173,8 @@ fn init_campaign(host: &dyn Host, dir: &Path) -> Result<Outcome> {
 fn init_unit(host: &dyn Host, root: &Path, dir: &Path, unit_name: &str) -> Result<Outcome> {
     let _lock = lock(root)?;
     let campaign = store::load_campaign(root)?;
-    let guard = journal::check(root, &campaign);
+    let mut guard = journal::check(root, &campaign);
+    guard.extend(closed(root, &campaign));
     if !guard.is_empty() {
         return Ok(Outcome::refused(guard));
     }
@@ -196,6 +212,37 @@ fn init_unit(host: &dyn Host, root: &Path, dir: &Path, unit_name: &str) -> Resul
     if written.is_empty() && outcome.ok() {
         outcome.line(format!("nothing to do: unit {unit_name} is initialized"));
     }
+    Ok(outcome)
+}
+
+pub fn close(host: &dyn Host, root: &Path) -> Result<Outcome> {
+    let _lock = lock(root)?;
+    let mut campaign = store::load_campaign(root)?;
+    let mut violations = journal::check(root, &campaign);
+    violations.extend(closed(root, &campaign));
+    for dir in lint::unit_dirs(root) {
+        store::load_unit(&dir)?;
+    }
+    violations.extend(lint::unsealed(root));
+    if !violations.is_empty() {
+        return Ok(Outcome::refused(violations));
+    }
+    let at = stamp(host.now());
+    campaign.closed = Some(at.clone());
+    write_json(&state_path(root), &campaign)?;
+    let heading = record(
+        root,
+        &at,
+        "cm close",
+        "- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n",
+    )?;
+    let mut outcome = Outcome::default();
+    outcome.field("closed", at);
+    outcome.field("journal", heading.clone());
+    outcome.line(heading);
+    outcome.line(
+        "next: RESUME.md's banner drops its `/loop` and names the successor; `cm lint` holds it there",
+    );
     Ok(outcome)
 }
 
@@ -311,6 +358,7 @@ pub fn launch(host: &dyn Host, root: &Path, target: &Target, worktree: &Path) ->
     let _lock = lock(root)?;
     let campaign = store::load_campaign(root)?;
     let mut violations = journal::check(root, &campaign);
+    violations.extend(closed(root, &campaign));
     let mut report = Vec::new();
     let limits = match fs::read_to_string(root.join("LIMITS.toml")) {
         Err(_) => {
@@ -519,6 +567,7 @@ pub fn advance(
     let _lock = lock(root)?;
     let campaign = store::load_campaign(root)?;
     let mut violations = journal::check(root, &campaign);
+    violations.extend(closed(root, &campaign));
     let unit_dir = root.join(&target.unit);
     if !store::is_unit(&unit_dir) {
         violations.push(Violation::new(

@@ -288,6 +288,8 @@ pub struct CampaignState {
     pub adopted: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal: Option<JournalMark>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
