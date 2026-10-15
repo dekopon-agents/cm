@@ -50,6 +50,8 @@ enum Commands {
         #[arg(default_value = ".")]
         dir: PathBuf,
     },
+    /// Seal the campaign. Refuses while OWNER-QUEUE.md has an open item or any unit or step is short of done or blocked; afterwards unit init, launch and advance refuse and RESUME.md's banner holds no `/loop`.
+    Close,
     /// Append a stamped entry to JOURNAL.md.
     Journal {
         /// The entry's title, one line.
@@ -131,6 +133,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             coordinator,
             *record,
         ),
+        Commands::Close => commands::close(host, &root()?),
         Commands::Init { dir } => commands::init(host, dir),
         Commands::Journal { title, body_file } => {
             let body = body_file.as_deref().map(read_body).transpose()?;
@@ -168,6 +171,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
 fn name(command: &Commands) -> &'static str {
     match command {
         Commands::Attention { .. } => "attention",
+        Commands::Close => "close",
         Commands::Init { .. } => "init",
         Commands::Journal { .. } => "journal",
         Commands::Launch { .. } => "launch",

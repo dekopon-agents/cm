@@ -550,3 +550,86 @@ fn hand_edit_messages_name_the_reset() {
     );
     assert_clean(&c.root);
 }
+
+#[test]
+fn close_seals_the_campaign() {
+    let host = Fake::at("2026-10-15T18:00:00Z");
+    let c = campaign(&host);
+    let (repo, _) = repo(c.root.parent().unwrap());
+    unit_with_step(&c, &host, &format!("Work in `{}`.\n", repo.display()));
+    let step = "01-first/alpha/BUILD";
+    assert!(
+        commands::launch(&host, &c.root, &parse_target(step, true).unwrap(), &repo)
+            .unwrap()
+            .ok()
+    );
+    fs::write(
+        c.root.join("OWNER-QUEUE.md"),
+        "# Owner queue\n\n## Pick one\n\nRecommendation: yes\n\nAnswer:\n",
+    )
+    .unwrap();
+
+    let refused = commands::close(&host, &c.root).unwrap();
+    assert_eq!(
+        rules(&refused),
+        vec!["closed-queue", "closed-track", "closed-track"],
+        "{:#?}",
+        refused.violations
+    );
+    assert!(store::load_campaign(&c.root).unwrap().closed.is_none());
+
+    fs::write(c.root.join("OWNER-QUEUE.md"), "# Owner queue\n").unwrap();
+    assert!(advance(&host, &c, step, "blocked:superseded", Evidence::default()).ok());
+    assert!(
+        advance(
+            &host,
+            &c,
+            "01-first/alpha",
+            "blocked:superseded",
+            Evidence::default()
+        )
+        .ok()
+    );
+    let closed = commands::close(&host, &c.root).unwrap();
+    assert!(closed.ok(), "{:#?}", closed.violations);
+    assert_eq!(
+        store::load_campaign(&c.root).unwrap().closed.as_deref(),
+        Some("2026-10-15T18:00Z")
+    );
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    assert!(journal.contains("## 2026-10-15T18:00Z — cm close\n"));
+
+    assert_eq!(rules(&lint(&c.root).unwrap()), vec!["resume-loop"]);
+    let resume = fs::read_to_string(c.root.join("RESUME.md")).unwrap();
+    let start = resume.find("> ```").unwrap();
+    let end = resume.find("\n\n# Resume").unwrap();
+    fs::write(
+        c.root.join("RESUME.md"),
+        format!(
+            "{}> Closed; the successor governs.{}",
+            &resume[..start],
+            &resume[end..]
+        ),
+    )
+    .unwrap();
+    assert_clean(&c.root);
+
+    assert_eq!(
+        rules(&advance(&host, &c, step, "launched", Evidence::default())),
+        vec!["advance-refused", "campaign-closed"]
+    );
+    assert_eq!(
+        rules(&commands::init(&host, &c.root.join("01-first/beta")).unwrap()),
+        vec!["campaign-closed"]
+    );
+    assert_eq!(
+        rules(&commands::close(&host, &c.root).unwrap()),
+        vec!["campaign-closed"]
+    );
+    assert!(
+        commands::journal(&host, &c.root, "follow-up", None)
+            .unwrap()
+            .ok()
+    );
+    assert_clean(&c.root);
+}

@@ -22,7 +22,8 @@ error.
 | `cm journal "<title>" [--body-file F]` | Appends `## YYYY-MM-DDTHH:MMZ — <title>` and the body (`-` reads stdin). The only way `JOURNAL.md` grows. A body may not hold a `#` or `##` heading. |
 | `cm launch <NN-name>/<unit>/<step> --worktree PATH` | Runs the launch checks and reports every failure: `LIMITS.toml` not paused; free disk on `disk_volume` minus `kache_headroom_gib` over `min_free_disk_gib`; live heavy builds (top-level `cargo` processes) under `max_heavy_builds`; the worktree exists; the step folder has `kickoff.md`; every path its packet names exists. Then it marks the step (and a drafted unit) launched, journals the launch and prints the command. It spawns nothing. |
 | `cm advance <NN-name>/<unit>[/<step>] <state> [--sha S] [--pr URL] [--tag T] [--digest D] [--repo PATH]` | Moves one state along `drafted → launched → pr-open → merged → released → deployed → done`, or to `blocked:<reason>`. Refuses a skipped state and a state without its evidence, journals the move and re-renders `STATE.md`. |
-| `cm lint [DIR]` | Template conformance, cm-owned files against `.cm/state.json`, and the path check for every drafted or launched packet. |
+| `cm close` | Seals the campaign. Refuses, listing every gap, while `OWNER-QUEUE.md` has an open item or any unit or step is short of `done` or `blocked:<reason>`. Then it stamps `closed` in `.cm/state.json` and journals the close. From there unit `cm init`, `cm launch`, `cm advance` and a second `cm close` refuse with `campaign-closed`; `cm journal` stays open for follow-up observations. |
+| `cm lint [DIR]` | Template conformance, cm-owned files against `.cm/state.json`, and the path check for every drafted or launched packet. In a closed campaign, also an empty owner queue and every track done or blocked. |
 
 ## The folder
 
@@ -50,12 +51,12 @@ To undo a hand edit: `cp .cm/JOURNAL.md JOURNAL.md` resets the journal (re-add t
 
 | File | Lint requires |
 |---|---|
-| `RESUME.md` | Opens with a `>` banner. No `/loop` proposals until the owner queue is drained: while `OWNER-QUEUE.md` has an open item (a `##` heading), the banner carries the line `OWNER-QUEUE not drained: /loop withheld` and a fenced `/loop` is a violation; once the queue is empty or absent, the banner holds a fenced `/loop …` command and the withheld line is a violation. Headings `# Resume`, `## State today`, `## How to work`, `## Read, in this order`, in that order. |
+| `RESUME.md` | Opens with a `>` banner. No `/loop` proposals until the owner queue is drained: while `OWNER-QUEUE.md` has an open item (a `##` heading), the banner carries the line `OWNER-QUEUE not drained: /loop withheld` and a fenced `/loop` is a violation; once the queue is empty or absent, the banner holds a fenced `/loop …` command and the withheld line is a violation. After `cm close` the banner holds neither: nothing resumes a closed campaign. Headings `# Resume`, `## State today`, `## How to work`, `## Read, in this order`, in that order. |
 | `JOURNAL.md` | First heading `# Journal`; after the adopted baseline, every `##` heading is `## YYYY-MM-DDTHH:MMZ — <title>`; the file equals cm's copy (`.cm/JOURNAL.md`): a changed line is `journal-rewritten`, an added line is `journal-hand-append`. |
 | `LIMITS.toml` | `paused` (bool); `runaway_ceiling_usd`, `min_free_disk_gib`, `kache_headroom_gib`, `pr_ci_expected_min`, `pr_ci_deadline_min` (non-negative numbers); `max_heavy_builds` (non-negative integer); `driver_model`, `driver_effort`, `verifier_model`, `supervisor_model`, `supervisor_effort`, `disk_volume` (non-empty strings). Other keys are allowed. |
 | `OWNER-QUEUE.md` | First heading `# Owner queue`; each `##` item has a line starting `Recommendation:` and one starting `Answer:`. |
 | `<unit>/STATE.md` | Byte-equal to the render of the unit's `.cm/state.json`. |
-| Packets | In `kickoff.md`, `step-*.md` and `resume*.md` of a drafted or launched step, every absolute or `~/` path inside backticks exists. A span with whitespace, a glob or placeholder character (`* ? < > $ { } [ ] \|`), or a single component such as `/loop` is not a path; a trailing `:line` or `:start-end` is dropped. Fenced blocks are not read. |
+| Packets | In `kickoff.md`, `step-*.md` and `resume*.md` of a drafted or launched step, every absolute or `~/` path inside backticks exists. A span with whitespace, a glob or placeholder character (`* ? < > $ { } [ ] \|`), or a single component such as `/loop` or `//!` is not a path; a trailing `:line` or `:start-end` is dropped. Fenced blocks are not read. |
 
 ### State files
 
@@ -68,11 +69,12 @@ Campaign `.cm/state.json`:
   "initialized": "2026-10-08T07:04Z",
   "written": ["RESUME.md", "JOURNAL.md", "LIMITS.toml", "OWNER-QUEUE.md"],
   "adopted": [],
-  "journal": { "baseline_lines": 3 }
+  "journal": { "baseline_lines": 3 },
+  "closed": "2026-10-15T18:00Z"
 }
 ```
 
-`written` are files cm wrote, `adopted` are files that existed and linted clean at `cm init`.
+`closed` appears only after `cm close`. `written` are files cm wrote, `adopted` are files that existed and linted clean at `cm init`.
 `journal.baseline_lines` is where cm's stamped region starts; an adopted journal keeps its old
 headings.
 

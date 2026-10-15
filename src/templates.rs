@@ -28,9 +28,28 @@ pub const QUEUE_FILE: &str = "OWNER-QUEUE.md";
 
 pub const LOOP_WITHHELD: &str = "OWNER-QUEUE not drained: /loop withheld";
 
-pub fn conform(name: &str, text: &str, queue_open: bool) -> Vec<Violation> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Banner {
+    Loop,
+    Withheld,
+    Closed,
+}
+
+impl Banner {
+    pub fn of(root: &Path, closed: bool) -> Banner {
+        if closed {
+            Banner::Closed
+        } else if queue_open_in(root) {
+            Banner::Withheld
+        } else {
+            Banner::Loop
+        }
+    }
+}
+
+pub fn conform(name: &str, text: &str, banner: Banner) -> Vec<Violation> {
     match name {
-        "RESUME.md" => resume(text, queue_open),
+        "RESUME.md" => resume(text, banner),
         "JOURNAL.md" => journal_title(text),
         "LIMITS.toml" => limits::check(text).err().unwrap_or_default(),
         QUEUE_FILE => owner_queue(text),
@@ -46,7 +65,7 @@ pub fn queue_open_in(root: &Path) -> bool {
     fs::read_to_string(root.join(QUEUE_FILE)).is_ok_and(|queue| queue_open(&queue))
 }
 
-pub fn resume(text: &str, queue_open: bool) -> Vec<Violation> {
+pub fn resume(text: &str, expected: Banner) -> Vec<Violation> {
     let mut out = Vec::new();
     let lines: Vec<&str> = text.lines().collect();
     let first = lines.iter().position(|line| !line.trim().is_empty());
@@ -78,20 +97,27 @@ pub fn resume(text: &str, queue_open: bool) -> Vec<Violation> {
         });
         let withheld = banner.iter().any(|line| line.contains(LOOP_WITHHELD));
         let line = first.map_or(1, |start| start + 1);
-        let message = match (queue_open, has_loop, withheld) {
-            (true, true, _) => Some(format!(
+        let message = match (expected, has_loop, withheld) {
+            (Banner::Closed, true, _) => Some(
+                "the campaign is closed, so the banner holds no `/loop`: nothing resumes here; name the successor in prose instead".to_owned(),
+            ),
+            (Banner::Closed, false, true) => Some(format!(
+                "the campaign is closed, so the banner drops the line `{LOOP_WITHHELD}`"
+            )),
+            (Banner::Closed, false, false) => None,
+            (Banner::Withheld, true, _) => Some(format!(
                 "OWNER-QUEUE.md has an open item, so the banner proposes no `/loop` until the queue is drained; replace the fenced `/loop …` with the line `{LOOP_WITHHELD}`"
             )),
-            (true, false, false) => Some(format!(
+            (Banner::Withheld, false, false) => Some(format!(
                 "OWNER-QUEUE.md has an open item, so the banner carries the line `{LOOP_WITHHELD}` in place of the `/loop`"
             )),
-            (false, false, _) => Some(
+            (Banner::Loop, false, _) => Some(
                 "OWNER-QUEUE.md has no open item, so the banner holds a fenced `/loop …` command that resumes the campaign".to_owned(),
             ),
-            (false, true, true) => Some(format!(
+            (Banner::Loop, true, true) => Some(format!(
                 "OWNER-QUEUE.md has no open item, so the banner drops the line `{LOOP_WITHHELD}`"
             )),
-            (true, false, true) | (false, true, false) => None,
+            (Banner::Withheld, false, true) | (Banner::Loop, true, false) => None,
         };
         if let Some(message) = message {
             out.push(Violation::new("RESUME.md", "resume-loop", message).at(line));
@@ -194,17 +220,16 @@ mod tests {
     #[test]
     fn templates_conform() {
         for (name, text) in ROOT_FILES {
-            assert_eq!(
-                conform(name, text, queue_open(OWNER_QUEUE)),
-                Vec::new(),
-                "{name}"
-            );
+            assert_eq!(conform(name, text, Banner::Loop), Vec::new(), "{name}");
         }
     }
 
     #[test]
     fn resume_lists_every_gap() {
-        let violations = resume("# Resume\n\n## How to work\n\n## State today\n", false);
+        let violations = resume(
+            "# Resume\n\n## How to work\n\n## State today\n",
+            Banner::Loop,
+        );
         let rules: Vec<_> = violations.iter().map(|v| v.rule).collect();
         assert_eq!(
             rules,
@@ -226,8 +251,8 @@ mod tests {
         )
     }
 
-    fn loop_rules(text: &str, queue_open: bool) -> Vec<String> {
-        resume(text, queue_open)
+    fn loop_rules(text: &str, banner: Banner) -> Vec<String> {
+        resume(text, banner)
             .into_iter()
             .map(|violation| format!("{}: {}", violation.rule, violation.message))
             .collect()
@@ -241,12 +266,15 @@ mod tests {
 
     #[test]
     fn open_queue_with_withheld_line_passes() {
-        assert_eq!(loop_rules(&withheld_resume(), true), Vec::<String>::new());
+        assert_eq!(
+            loop_rules(&withheld_resume(), Banner::Withheld),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
     fn open_queue_with_loop_fails() {
-        let found = loop_rules(RESUME, true);
+        let found = loop_rules(RESUME, Banner::Withheld);
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].starts_with("resume-loop: OWNER-QUEUE.md has an open item"));
         assert!(found[0].contains("replace the fenced `/loop …`"));
@@ -254,15 +282,39 @@ mod tests {
 
     #[test]
     fn empty_queue_with_loop_passes() {
-        assert_eq!(loop_rules(RESUME, false), Vec::<String>::new());
+        assert_eq!(loop_rules(RESUME, Banner::Loop), Vec::<String>::new());
     }
 
     #[test]
     fn empty_queue_with_withheld_line_fails() {
-        let found = loop_rules(&withheld_resume(), false);
+        let found = loop_rules(&withheld_resume(), Banner::Loop);
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].starts_with("resume-loop: OWNER-QUEUE.md has no open item"));
         assert!(found[0].contains("fenced `/loop …` command"));
+    }
+
+    fn closed_resume() -> String {
+        let start = RESUME.find("> ```").unwrap();
+        let end = RESUME.find("\n\n# Resume").unwrap();
+        format!(
+            "{}> Closed; the successor's RESUME.md governs.{}",
+            &RESUME[..start],
+            &RESUME[end..]
+        )
+    }
+
+    #[test]
+    fn closed_banner_holds_neither_loop_nor_withheld_line() {
+        assert_eq!(
+            loop_rules(&closed_resume(), Banner::Closed),
+            Vec::<String>::new()
+        );
+        let found = loop_rules(RESUME, Banner::Closed);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].starts_with("resume-loop: the campaign is closed"));
+        let found = loop_rules(&withheld_resume(), Banner::Closed);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("drops the line"));
     }
 
     #[test]
