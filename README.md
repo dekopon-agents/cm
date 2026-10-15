@@ -56,7 +56,7 @@ To undo a hand edit: `cp .cm/JOURNAL.md JOURNAL.md` resets the journal (re-add t
 | `LIMITS.toml` | `paused` (bool); `runaway_ceiling_usd`, `min_free_disk_gib`, `kache_headroom_gib`, `pr_ci_expected_min`, `pr_ci_deadline_min` (non-negative numbers); `max_heavy_builds` (non-negative integer); `driver_model`, `driver_effort`, `verifier_model`, `supervisor_model`, `supervisor_effort`, `disk_volume` (non-empty strings). Other keys are allowed. |
 | `OWNER-QUEUE.md` | First heading `# Owner queue`; each `##` item has a line starting `Recommendation:` and one starting `Answer:`. |
 | `<unit>/STATE.md` | Byte-equal to the render of the unit's `.cm/state.json`. |
-| Packets | In `kickoff.md`, `step-*.md` and `resume*.md` of a drafted or launched step, every absolute or `~/` path inside backticks exists. A span with whitespace, a glob or placeholder character (`* ? < > $ { } [ ] \|`), or a single component such as `/loop` is not a path; a trailing `:line` or `:start-end` is dropped. Fenced blocks are not read. |
+| Packets | In `kickoff.md`, `step-*.md` and `resume*.md` of a drafted or launched step, every absolute or `~/` path inside backticks exists. A span with whitespace, a glob or placeholder character (`* ? < > $ { } [ ] \|`), or a single component such as `/loop` or `//!` is not a path; a trailing `:line` or `:start-end` is dropped. Fenced blocks are not read. |
 
 ### State files
 

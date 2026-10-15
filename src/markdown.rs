@@ -103,7 +103,7 @@ pub fn named_path(span: &str, home: Option<&std::path::Path>) -> Option<PathBuf>
         return home.map(|home| home.join(rest));
     }
     let rest = span.strip_prefix('/')?;
-    if !rest.trim_end_matches('/').contains('/') {
+    if rest.split('/').filter(|part| !part.is_empty()).count() < 2 {
         return None;
     }
     Some(PathBuf::from(span))
@@ -155,6 +155,8 @@ mod tests {
             Some(PathBuf::from("/a/b.rs"))
         );
         assert_eq!(named_path("/loop", None), None);
+        assert_eq!(named_path("//!", None), None);
+        assert_eq!(named_path("//", None), None);
         assert_eq!(named_path("/a/b c", None), None);
         assert_eq!(named_path("/a/<step>/x", None), None);
         assert_eq!(named_path("/a/turn-*.pid", None), None);
