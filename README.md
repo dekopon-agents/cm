@@ -9,6 +9,37 @@ Clock stamps come from `cm`, never from an argument.
 brew install dekopon-agents/tap/cm
 ```
 
+### From a release binary
+
+Each release publishes `cm-<target>.tar.gz` for `x86_64-unknown-linux-musl` (Linux x86_64),
+`aarch64-unknown-linux-musl` (Linux arm64) and `aarch64-apple-darwin` (macOS arm64), each with a
+`.sha256` beside it. `releases/latest/download/` always serves the newest release:
+
+```sh
+target=x86_64-unknown-linux-musl
+base=https://github.com/dekopon-agents/cm/releases/latest/download
+curl -fsSLO "$base/cm-$target.tar.gz"
+curl -fsSLO "$base/cm-$target.tar.gz.sha256"
+sha256sum -c "cm-$target.tar.gz.sha256"    # macOS: shasum -a 256 -c "cm-$target.tar.gz.sha256"
+mkdir -p cm-unpacked ~/.local/bin
+tar -xzf "cm-$target.tar.gz" -C cm-unpacked --strip-components=1
+install -m 755 cm-unpacked/cm ~/.local/bin/cm
+cm --version
+```
+
+`~/.local/bin` must be on `PATH`. To check the archive was built by this repository's release
+workflow, optionally run `gh attestation verify "cm-$target.tar.gz" --repo dekopon-agents/cm`.
+
+To pin a version, download the versioned name from its tag instead, for example
+`https://github.com/dekopon-agents/cm/releases/download/v0.2.0/cm-0.2.0-x86_64-unknown-linux-musl.tar.gz`
+and its `.sha256`; the steps are the same with `cm-0.2.0-$target` in place of `cm-$target`.
+
+### From source
+
+```sh
+cargo install --locked --git https://github.com/dekopon-agents/cm
+```
+
 ## Commands
 
 Every command takes `--json` (one JSON object on stdout with `ok` and `violations`) and `-C DIR`
@@ -126,8 +157,9 @@ Every push to `main` releases. The version is `Cargo.toml`'s `X.Y.0` when no `vX
 else the next patch above the newest `vX.Y.*`. It is written into the build's manifest only and
 never committed, so `Cargo.toml` always reads `X.Y.0`; bump the minor there to start a new line.
 The run builds `aarch64-apple-darwin`, `x86_64-unknown-linux-musl` and
-`aarch64-unknown-linux-musl`, attests the archives, creates the release and pushes
-`Formula/cm.rb` to `dekopon-agents/homebrew-tap`.
+`aarch64-unknown-linux-musl`, packages each as `cm-<version>-<target>.tar.gz` and an unversioned
+copy `cm-<target>.tar.gz` (each with a `.sha256`), attests the archives, creates the release and
+pushes `Formula/cm.rb`, rendered from the versioned checksums only, to `dekopon-agents/homebrew-tap`.
 
 Releases run one at a time. Merges that land while a release runs coalesce: GitHub keeps only the
 newest waiting run, so they ship together under the next tag, not one tag each.

@@ -86,6 +86,9 @@ jobs:
           cp "target/$TARGET/release/cm" README.md LICENSE-APACHE LICENSE-MIT "staging/$archive/"
           tar -C staging -czf "$archive.tar.gz" "$archive"
           shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256"
+          # The unversioned copy is what releases/latest/download/cm-$TARGET.tar.gz serves.
+          cp "$archive.tar.gz" "cm-$TARGET.tar.gz"
+          shasum -a 256 "cm-$TARGET.tar.gz" > "cm-$TARGET.tar.gz.sha256"
           mkdir unpacked
           tar -C unpacked -xzf "$archive.tar.gz"
           test "$("unpacked/$archive/cm" --version)" = "cm $VERSION"
@@ -155,7 +158,7 @@ jobs:
         run: |
           set -euo pipefail
           gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" \
-            --pattern '*.tar.gz.sha256' --dir checksums
+            --pattern "cm-$VERSION-*.tar.gz.sha256" --dir checksums
           python3 source/.github/scripts/render-homebrew-formula.py \
             --repository "$GITHUB_REPOSITORY" --tag "v$VERSION" \
             --checksums checksums --output tap/Formula/cm.rb
