@@ -1,12 +1,11 @@
 name: Release
 
-# Every push to main releases. The version is Cargo.toml's X.Y.0 when no vX.Y.* tag exists, else the
-# next patch above the newest vX.Y.*; it is written into the build's manifest only, never committed.
-# A release created with GITHUB_TOKEN fires no workflow, so this run also pushes the tap formula.
+# Pushing a cm-X.Y.Z tag releases it. The tag must match Cargo.toml's version and point at a commit
+# on main. A release created with GITHUB_TOKEN fires no workflow, so this run also pushes the tap formula.
 
 on:
   push:
-    branches: [main]
+    tags: ["cm-*"]
 
 permissions:
   contents: read
@@ -23,7 +22,7 @@ jobs:
     uses: ./.github/workflows/ci.yml
 
   version:
-    name: compute the version
+    name: check the tag
     needs: ci
     runs-on: ubuntu-24.04
     outputs:
@@ -32,14 +31,27 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - id: version
         shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          version=$(.github/scripts/next-version.sh Cargo.toml \
-            "$(git ls-remote --tags --refs "https://github.com/$GITHUB_REPOSITORY.git" | sed 's#.*refs/tags/##')")
+          if [[ ! $TAG =~ ^cm-([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::tag '$TAG' is not cm-<major>.<minor>.<patch>"
+            exit 1
+          fi
+          version=${BASH_REMATCH[1]}
+          declared=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [[ $declared != "$version" ]]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $declared"
+            exit 1
+          fi
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "::error::$TAG does not point at a commit on main"; exit 1; }
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "::notice::releasing v$version from $GITHUB_SHA"
+          echo "::notice::releasing $TAG from $GITHUB_SHA"
 
   build:
     name: build ${{ matrix.target }}
@@ -69,13 +81,6 @@ jobs:
         with:
           shared-key: cm
           key: ${{ hashFiles('rust-toolchain.toml') }}-${{ matrix.target }}
-      - name: Write the version into the build's manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-          perl -0pi -e 's/^version = "[^"]*"/version = "$ENV{VERSION}"/m' Cargo.toml
-          perl -0pi -e 's/(\[\[package\]\]\nname = "cm"\nversion = )"[^"]*"/$1"$ENV{VERSION}"/' Cargo.lock
-          grep -q "^version = \"$VERSION\"" Cargo.toml
       - run: cargo build --release --locked --target "$TARGET"
       - name: Package and check the binary
         shell: bash
@@ -86,6 +91,9 @@ jobs:
           cp "target/$TARGET/release/cm" README.md LICENSE-APACHE LICENSE-MIT "staging/$archive/"
           tar -C staging -czf "$archive.tar.gz" "$archive"
           shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256"
+          # The unversioned copy is what releases/latest/download/cm-$TARGET.tar.gz serves.
+          cp "$archive.tar.gz" "cm-$TARGET.tar.gz"
+          shasum -a 256 "cm-$TARGET.tar.gz" > "cm-$TARGET.tar.gz.sha256"
           mkdir unpacked
           tar -C unpacked -xzf "$archive.tar.gz"
           test "$("unpacked/$archive/cm" --version)" = "cm $VERSION"
@@ -101,7 +109,7 @@ jobs:
           retention-days: 14
 
   release:
-    name: publish v${{ needs.version.outputs.version }}
+    name: publish cm-${{ needs.version.outputs.version }}
     needs: [version, build]
     runs-on: ubuntu-24.04
     permissions:
@@ -122,8 +130,8 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v$VERSION" dist/* --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" --title "v$VERSION" --generate-notes
+          gh release create "cm-$VERSION" dist/* --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --title "cm-$VERSION" --generate-notes
 
   tap:
     name: update the Homebrew tap
@@ -154,15 +162,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" \
-            --pattern '*.tar.gz.sha256' --dir checksums
+          gh release download "cm-$VERSION" --repo "$GITHUB_REPOSITORY" \
+            --pattern "cm-$VERSION-*.tar.gz.sha256" --dir checksums
           python3 source/.github/scripts/render-homebrew-formula.py \
-            --repository "$GITHUB_REPOSITORY" --tag "v$VERSION" \
+            --repository "$GITHUB_REPOSITORY" --tag "cm-$VERSION" \
             --checksums checksums --output tap/Formula/cm.rb
           cd tap
           git add Formula/cm.rb
           if git diff --cached --quiet; then
-            echo "::notice::Formula/cm.rb already matches v$VERSION."
+            echo "::notice::Formula/cm.rb already matches cm-$VERSION."
             exit 0
           fi
           git config user.name "github-actions[bot]"
