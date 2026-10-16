@@ -41,9 +41,9 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=pathlib.Path)
     arguments = parser.parse_args()
 
-    if not re.fullmatch(r"v\d+\.\d+\.\d+", arguments.tag):
-        raise SystemExit(f"{arguments.tag} is not a v<major>.<minor>.<patch> tag")
-    version = arguments.tag[1:]
+    if not re.fullmatch(r"cm-\d+\.\d+\.\d+", arguments.tag):
+        raise SystemExit(f"{arguments.tag} is not a cm-<major>.<minor>.<patch> tag")
+    version = arguments.tag.removeprefix("cm-")
     pattern = re.compile(rf"^cm-{re.escape(version)}-(?P<target>.+)\.tar\.gz\.sha256$")
 
     by_os: dict[str, dict[str, tuple[str, str]]] = {}

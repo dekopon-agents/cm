@@ -31,8 +31,9 @@ cm --version
 workflow, optionally run `gh attestation verify "cm-$target.tar.gz" --repo dekopon-agents/cm`.
 
 To pin a version, download the versioned name from its tag instead, for example
-`https://github.com/dekopon-agents/cm/releases/download/v0.2.0/cm-0.2.0-x86_64-unknown-linux-musl.tar.gz`
-and its `.sha256`; the steps are the same with `cm-0.2.0-$target` in place of `cm-$target`.
+`https://github.com/dekopon-agents/cm/releases/download/cm-1.2.3/cm-1.2.3-x86_64-unknown-linux-musl.tar.gz`
+and its `.sha256`; the steps are the same with `cm-1.2.3-$target` in place of `cm-$target`.
+Releases up to 0.2.0 were tagged `v0.2.0` and published only the versioned names.
 
 ### From source
 
@@ -153,16 +154,19 @@ A commit or tag made elsewhere needs a `git fetch` first. Reading live artifacts
 
 ## Releases
 
-Every push to `main` releases. The version is `Cargo.toml`'s `X.Y.0` when no `vX.Y.*` tag exists,
-else the next patch above the newest `vX.Y.*`. It is written into the build's manifest only and
-never committed, so `Cargo.toml` always reads `X.Y.0`; bump the minor there to start a new line.
-The run builds `aarch64-apple-darwin`, `x86_64-unknown-linux-musl` and
-`aarch64-unknown-linux-musl`, packages each as `cm-<version>-<target>.tar.gz` and an unversioned
-copy `cm-<target>.tar.gz` (each with a `.sha256`), attests the archives, creates the release and
-pushes `Formula/cm.rb`, rendered from the versioned checksums only, to `dekopon-agents/homebrew-tap`.
+Pushing a `cm-X.Y.Z` tag releases `X.Y.Z`. To cut one, merge a PR that sets `version` in
+`Cargo.toml` (and `Cargo.lock`) to `X.Y.Z`, then tag that commit on `main`:
 
-Releases run one at a time. Merges that land while a release runs coalesce: GitHub keeps only the
-newest waiting run, so they ship together under the next tag, not one tag each.
+```sh
+git tag cm-X.Y.Z <sha-on-main> && git push origin cm-X.Y.Z
+```
+
+The run refuses a tag that is not `cm-<major>.<minor>.<patch>`, does not match `Cargo.toml`, or
+does not point at a commit on `main`. It builds `aarch64-apple-darwin`,
+`x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, packages each as
+`cm-<version>-<target>.tar.gz` and an unversioned copy `cm-<target>.tar.gz` (each with a
+`.sha256`), attests the archives, creates the release and pushes `Formula/cm.rb`, rendered from
+the versioned checksums only, to `dekopon-agents/homebrew-tap`. Merging to `main` runs CI only.
 
 ## License
 
