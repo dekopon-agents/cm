@@ -45,6 +45,7 @@ pub fn packet_paths(
     files: &[PathBuf],
     home: Option<&Path>,
 ) -> (usize, Vec<Violation>) {
+    let repo = root.ancestors().find(|dir| dir.join(".git").exists());
     let mut checked = 0;
     let mut out = Vec::new();
     for file in files {
@@ -57,11 +58,11 @@ pub fn packet_paths(
             continue;
         };
         for (line, span) in code_spans(&text) {
-            let Some(path) = named_path(span, home) else {
+            let Some(candidates) = packet_targets(span, home, repo) else {
                 continue;
             };
             checked += 1;
-            if !path.exists() {
+            if !candidates.iter().any(|path| path.exists()) {
                 out.push(
                     Violation::new(
                         relative(root, file),
@@ -74,6 +75,30 @@ pub fn packet_paths(
         }
     }
     (checked, out)
+}
+
+fn packet_targets(span: &str, home: Option<&Path>, repo: Option<&Path>) -> Option<Vec<PathBuf>> {
+    if let Some(path) = named_path(span, home) {
+        let mut targets = vec![path.clone()];
+        if let Some(repo) = repo.filter(|_| span.starts_with('/'))
+            && let Some(name) = repo.file_name()
+        {
+            let parts: Vec<_> = path.components().collect();
+            if let Some(at) = parts.iter().rposition(|part| part.as_os_str() == name) {
+                targets.push(
+                    parts[at + 1..]
+                        .iter()
+                        .fold(repo.to_path_buf(), |acc, part| acc.join(part)),
+                );
+            }
+        }
+        return Some(targets);
+    }
+    let repo = repo?;
+    let rooted = named_path(&format!("/{span}"), None)?;
+    let rel = rooted.strip_prefix("/").ok()?;
+    let first = rel.components().next()?.as_os_str().to_str()?;
+    (!first.starts_with('.') && repo.join(first).is_dir()).then(|| vec![repo.join(rel)])
 }
 
 fn subdirs(dir: &Path) -> Vec<PathBuf> {
@@ -290,4 +315,40 @@ pub fn lint(start: &Path) -> Result<Outcome> {
     };
     outcome.line(summary);
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_paths_resolve_against_the_repository() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("trail");
+        let root = repo.join("store/epochs/e");
+        let step = root.join("01-a/u/S1");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(&step).unwrap();
+        fs::write(step.join("brief.md"), "x").unwrap();
+        let packet = step.join("kickoff.md");
+        let check = |span: &str| {
+            fs::write(&packet, format!("see `{span}`\n")).unwrap();
+            let (checked, missing) = packet_paths(&root, std::slice::from_ref(&packet), None);
+            assert_eq!(checked, 1, "{span}");
+            missing.is_empty()
+        };
+        assert!(check("store/epochs/e/01-a/u/S1/brief.md"));
+        assert!(!check("store/epochs/e/01-a/u/S1/NOPE.md"));
+        assert!(check(
+            "/home/other/code/trail/store/epochs/e/01-a/u/S1/brief.md:3"
+        ));
+        assert!(check(&step.join("brief.md").to_string_lossy()));
+        assert!(!check("/home/other/code/trail/store/epochs/e/NOPE.md"));
+        assert!(!check("/home/other/elsewhere/x.md"));
+        fs::write(&packet, "`other/x.rs` `.git/x` `crate::a/b`\n").unwrap();
+        assert_eq!(
+            packet_paths(&root, std::slice::from_ref(&packet), None).0,
+            0
+        );
+    }
 }

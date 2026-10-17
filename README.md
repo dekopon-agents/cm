@@ -71,7 +71,10 @@ error.
 `<NN-name>` is two digits, `-`, a name (`01-first`). Units and steps are names of letters, digits,
 `.`, `_` and `-`.
 
-Packet paths are checked on this machine. A path that lives elsewhere (a host path on a server, such
+Packet paths are checked on this machine, resolved against the git repository holding the campaign:
+a relative path is checked when its first segment is a top-level directory of the repository, and an
+absolute path that does not exist is retried as the part after the repository's directory name
+(`/home/a/code/<repo>/store/x` → `<repo root>/store/x`). Prefer repo-relative paths. A path that lives elsewhere (a host path on a server, such
 as `/var/lib/<service>`) goes in a fenced block or without backticks; backticked, it fails
 `packet-path`.
 
