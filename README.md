@@ -165,7 +165,7 @@ The run refuses a tag that is not `cm-<major>.<minor>.<patch>`, does not match `
 does not point at a commit on `main`. It builds `aarch64-apple-darwin`,
 `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, packages each as
 `cm-<version>-<target>.tar.gz` and an unversioned copy `cm-<target>.tar.gz` (each with a
-`.sha256`), attests the archives, creates the release and pushes `Formula/cm.rb`, rendered from
+`.sha256`), attests the archives, creates the release (or uploads into one already made for the tag, e.g. from the GitHub release page) and pushes `Formula/cm.rb`, rendered from
 the versioned checksums only, to `dekopon-agents/homebrew-tap`. Merging to `main` runs CI only.
 
 ## License
