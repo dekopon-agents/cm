@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use anyhow::Result;
 
@@ -7,7 +8,7 @@ use crate::host::is_stamp;
 use crate::markdown::first_difference;
 use crate::outcome::Violation;
 use crate::state::CampaignState;
-use crate::store::{JOURNAL, JOURNAL_COPY, write_atomic};
+use crate::store::{JOURNAL, write_atomic};
 use crate::templates;
 
 pub fn heading(stamp: &str, title: &str) -> String {
@@ -20,12 +21,25 @@ pub fn is_stamped(line: &str) -> bool {
         .is_some_and(|(stamp, title)| is_stamp(stamp) && !title.trim().is_empty())
 }
 
+pub fn committed(root: &Path, name: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["show", &format!("HEAD:./{name}")])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 pub fn check(root: &Path, state: &CampaignState) -> Vec<Violation> {
     let Ok(text) = fs::read_to_string(root.join(JOURNAL)) else {
         return vec![Violation::new(
             JOURNAL,
             "journal-missing",
-            format!("JOURNAL.md is gone; cm's copy is {JOURNAL_COPY}"),
+            "JOURNAL.md is gone; restore it with `git checkout HEAD -- JOURNAL.md`",
         )];
     };
     let mut out = templates::journal_title(&text);
@@ -37,27 +51,26 @@ pub fn check(root: &Path, state: &CampaignState) -> Vec<Violation> {
         ));
         return out;
     };
-    match fs::read_to_string(root.join(JOURNAL_COPY)) {
-        Err(_) => out.push(Violation::new(
-            JOURNAL_COPY,
-            "journal-copy-missing",
-            "cm's copy of the journal is gone; nothing can tell a hand edit from cm's entries",
-        )),
-        Ok(recorded) => match text.strip_prefix(recorded.as_str()) {
-            Some("") => {}
+    if let Some(recorded) = committed(root, JOURNAL) {
+        match text.strip_prefix(recorded.as_str()) {
             Some(tail) => {
-                let first = recorded.lines().count() + 1;
-                let added = tail.lines().count().max(1);
-                out.push(
-                    Violation::new(
-                        JOURNAL,
-                        "journal-hand-append",
-                        format!(
-                            "{added} line(s) were added outside cm; reset with `cp {JOURNAL_COPY} {JOURNAL}` and add them with `cm journal`"
-                        ),
-                    )
-                    .at(first),
-                );
+                let first = recorded.lines().count() + usize::from(recorded.ends_with('\n'));
+                let added = tail
+                    .lines()
+                    .enumerate()
+                    .find(|(_, line)| !line.trim().is_empty());
+                if let Some((index, line)) = added
+                    && !is_stamped(line)
+                {
+                    out.push(
+                        Violation::new(
+                            JOURNAL,
+                            "journal-hand-append",
+                            "lines were added to the last committed entry; move them into a new entry with `cm journal`",
+                        )
+                        .at((first + index).max(1)),
+                    );
+                }
             }
             None => {
                 let line = first_difference(&text, &recorded);
@@ -65,12 +78,12 @@ pub fn check(root: &Path, state: &CampaignState) -> Vec<Violation> {
                     Violation::new(
                         JOURNAL,
                         "journal-rewritten",
-                        format!("the recorded journal was changed from this line on; reset with `cp {JOURNAL_COPY} {JOURNAL}`"),
+                        "the committed journal (git HEAD) was changed from this line on; restore it with `git checkout HEAD -- JOURNAL.md` and re-add uncommitted entries with `cm journal`",
                     )
                     .at(line),
                 );
             }
-        },
+        }
     }
     for (index, line) in text.lines().enumerate().skip(mark.baseline_lines) {
         if line.starts_with("## ") && !is_stamped(line) {
@@ -128,7 +141,6 @@ pub fn append(root: &Path, entry: &str) -> Result<()> {
         next.push('\n');
     }
     next.push_str(entry);
-    write_atomic(&root.join(JOURNAL_COPY), next.as_bytes())?;
     write_atomic(&root.join(JOURNAL), next.as_bytes())?;
     Ok(())
 }

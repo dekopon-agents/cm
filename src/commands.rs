@@ -9,14 +9,15 @@ use crate::journal;
 use crate::limits::{self, Limits};
 use crate::lint::{self, packet_files, packet_paths};
 use crate::outcome::{Outcome, Violation};
+use crate::plan::{self, Units};
 use crate::render;
 use crate::state::{
-    CampaignState, Evidence, Flag, JournalMark, Kind, Move, Phase, SCHEMA, Step, Track, UnitState,
-    evidence_for,
+    After, CampaignState, Evidence, Flag, JournalMark, Kind, Lane, Move, Phase, RELEASES, Release,
+    SCHEMA, Step, Track, UnitState, evidence_for,
 };
 use crate::store::{
-    self, JOURNAL, JOURNAL_COPY, Target, UNIT_STATE, absolute, create_new, find_root, lock,
-    parse_target, relative, state_path, write_atomic, write_json,
+    self, JOURNAL, Target, UNIT_STATE, absolute, create_new, find_root, lock, parse_target,
+    relative, state_path, write_atomic, write_json,
 };
 use crate::templates::{self, ROOT_FILES};
 
@@ -28,7 +29,7 @@ fn record(root: &Path, at: &str, title: &str, body: &str) -> Result<String> {
     Ok(journal::heading(at, title))
 }
 
-fn closed(root: &Path, campaign: &CampaignState) -> Option<Violation> {
+pub fn closed(root: &Path, campaign: &CampaignState) -> Option<Violation> {
     campaign.closed.as_ref().map(|at| {
         Violation::new(
             relative(root, &state_path(root)),
@@ -38,27 +39,56 @@ fn closed(root: &Path, campaign: &CampaignState) -> Option<Violation> {
     })
 }
 
-fn write_unit(dir: &Path, unit: &UnitState) -> Result<()> {
+pub fn write_unit(dir: &Path, unit: &UnitState) -> Result<()> {
     write_json(&state_path(dir), unit)?;
     write_atomic(&dir.join(UNIT_STATE), render::unit(unit).as_bytes())
 }
 
 pub fn init(host: &dyn Host, dir: &Path) -> Result<Outcome> {
+    declare(host, dir, None, &[])
+}
+
+pub fn declare(
+    host: &dyn Host,
+    dir: &Path,
+    lane: Option<Lane>,
+    after: &[String],
+) -> Result<Outcome> {
     let dir = absolute(dir);
+    let flags = lane.is_some() || !after.is_empty();
     if let Some(root) = dir.parent().and_then(find_root) {
         let rel = relative(&root, &dir);
-        return match parse_target(&rel, false) {
-            Ok(Target { unit, step: None }) => init_unit(host, &root, &dir, &unit),
+        return match (parse_target(&rel, false), lane) {
+            (Ok(Target { unit, step: None }), _) if !flags => init_unit(host, &root, &dir, &unit),
+            (
+                Ok(Target {
+                    unit,
+                    step: Some(step),
+                }),
+                Some(lane),
+            ) => init_step(host, &root, &unit, &step, lane, after),
+            (Ok(Target { step: Some(_), .. }), None) => Ok(Outcome::refused(vec![Violation::new(
+                rel,
+                "init-target",
+                "a step is declared with `cm init <NN-name>/<unit>/<step> --lane <lane> [--after …]`",
+            )])),
             _ => Ok(Outcome::refused(vec![Violation::new(
                 rel,
                 "init-target",
                 format!(
-                    "{} is inside the campaign at {}; `cm init` there takes a unit folder, <NN-name>/<unit>",
+                    "{} is inside the campaign at {}; `cm init` there takes a unit folder, <NN-name>/<unit>, or a step with --lane",
                     dir.display(),
                     root.display()
                 ),
             )])),
         };
+    }
+    if flags {
+        return Ok(Outcome::refused(vec![Violation::new(
+            dir.to_string_lossy(),
+            "init-target",
+            "--lane and --after declare a step inside a campaign; no campaign holds this folder",
+        )]));
     }
     init_campaign(host, &dir)
 }
@@ -95,7 +125,7 @@ fn init_campaign(host: &dyn Host, dir: &Path) -> Result<Outcome> {
                 violations.push(Violation::new(
                     JOURNAL,
                     "journal-missing",
-                    format!("JOURNAL.md is gone; restore it from {JOURNAL_COPY}"),
+                    "JOURNAL.md is gone; restore it with `git checkout HEAD -- JOURNAL.md`",
                 ));
             }
             continue;
@@ -103,7 +133,6 @@ fn init_campaign(host: &dyn Host, dir: &Path) -> Result<Outcome> {
         if create_new(&path, template.as_bytes())? {
             written.push(name.to_owned());
             if name == JOURNAL {
-                write_atomic(&dir.join(JOURNAL_COPY), template.as_bytes())?;
                 state.journal = Some(JournalMark {
                     baseline_lines: template.lines().count(),
                 });
@@ -125,7 +154,6 @@ fn init_campaign(host: &dyn Host, dir: &Path) -> Result<Outcome> {
         }
         adopted.push(name.to_owned());
         if name == JOURNAL {
-            write_atomic(&dir.join(JOURNAL_COPY), text.as_bytes())?;
             state.journal = Some(JournalMark {
                 baseline_lines: text.lines().count(),
             });
@@ -212,6 +240,140 @@ fn init_unit(host: &dyn Host, root: &Path, dir: &Path, unit_name: &str) -> Resul
     if written.is_empty() && outcome.ok() {
         outcome.line(format!("nothing to do: unit {unit_name} is initialized"));
     }
+    Ok(outcome)
+}
+
+fn release_checks(full: &str, unit: &UnitState, step_name: &str) -> Vec<Violation> {
+    let Some(release) = Release::of_target(full) else {
+        return vec![Violation::new(
+            full,
+            "release-version",
+            format!(
+                "a release step is {RELEASES}/<repo>/<major>.<minor>.<patch>; `{step_name}` is not a version"
+            ),
+        )];
+    };
+    let above: Vec<String> = unit
+        .steps
+        .keys()
+        .filter(|name| *name != step_name)
+        .filter_map(|name| name.parse().ok())
+        .filter(|version| *version >= release.version)
+        .map(|version: crate::state::Version| version.to_string())
+        .collect();
+    if above.is_empty() {
+        Vec::new()
+    } else {
+        vec![Violation::new(
+            full,
+            "release-version",
+            format!(
+                "{} is not above the release(s) {} already declared for {}",
+                release.version,
+                above.join(", "),
+                release.repo
+            ),
+        )]
+    }
+}
+
+fn init_step(
+    host: &dyn Host,
+    root: &Path,
+    unit_name: &str,
+    step_name: &str,
+    lane: Lane,
+    after: &[String],
+) -> Result<Outcome> {
+    let full = format!("{unit_name}/{step_name}");
+    let _lock = lock(root)?;
+    let campaign = store::load_campaign(root)?;
+    let mut violations = journal::check(root, &campaign);
+    violations.extend(closed(root, &campaign));
+    let units: Units = plan::load_units(root)?;
+    let mut parsed = Vec::new();
+    for text in after {
+        match After::parse(text, unit_name) {
+            Err(message) => violations.push(Violation::new(&full, "after-parse", message)),
+            Ok(after) if after.target() == full => violations.push(Violation::new(
+                &full,
+                "after-unknown",
+                format!("`{text}` names the step itself"),
+            )),
+            Ok(after) if plan::step(&units, &after.target()).is_none() => {
+                violations.push(Violation::new(
+                    &full,
+                    "after-unknown",
+                    format!(
+                        "`{text}` names {}, which is not declared; declare it first",
+                        after.target()
+                    ),
+                ))
+            }
+            Ok(after) => parsed.push(after),
+        }
+    }
+    let dir = root.join(unit_name);
+    let existing = units.get(unit_name).cloned();
+    if unit_name.starts_with(&format!("{RELEASES}/")) {
+        let empty = UnitState::new(unit_name, "");
+        violations.extend(release_checks(
+            &full,
+            existing.as_ref().unwrap_or(&empty),
+            step_name,
+        ));
+    }
+    if let Some(step) = existing.as_ref().and_then(|unit| unit.steps.get(step_name)) {
+        if step.lane == Some(lane) && step.after == parsed && violations.is_empty() {
+            let mut outcome = Outcome::default();
+            outcome.field("target", full.clone());
+            outcome.line(format!("nothing to do: {full} is declared"));
+            return Ok(outcome);
+        }
+        violations.push(Violation::new(
+            &full,
+            "step-declared",
+            format!(
+                "{full} is already declared ({}, lane {}); init never overwrites",
+                step.track.state,
+                step.lane.map_or("—", Lane::name)
+            ),
+        ));
+    }
+    if !violations.is_empty() {
+        return Ok(Outcome::refused(violations));
+    }
+    let at = stamp(host.now());
+    fs::create_dir_all(dir.join(store::CM_DIR))?;
+    fs::create_dir_all(dir.join(step_name))?;
+    let mut unit = existing.unwrap_or_else(|| UnitState::new(unit_name, &at));
+    unit.steps.insert(
+        step_name.to_owned(),
+        Step {
+            track: Track::new(&at),
+            worktree: String::new(),
+            launches: 0,
+            lane: Some(lane),
+            after: parsed.clone(),
+        },
+    );
+    write_unit(&dir, &unit)?;
+    let shown: Vec<String> = parsed.iter().map(After::to_string).collect();
+    let body = format!(
+        "- lane: {lane}\n- after: {}\n",
+        if shown.is_empty() {
+            "—".to_owned()
+        } else {
+            shown.join(", ")
+        }
+    );
+    let heading = record(root, &at, &format!("init step {full}"), &body)?;
+    let mut outcome = Outcome::default();
+    outcome.line(format!("declared {full} ({lane})"));
+    outcome.field("target", full);
+    outcome.field("lane", lane.name());
+    outcome.field("after", shown);
+    outcome.field("journal", heading);
     Ok(outcome)
 }
 
@@ -346,7 +508,12 @@ fn launch_checks(host: &dyn Host, limits: &Limits, report: &mut Vec<String>) -> 
     out
 }
 
-pub fn launch(host: &dyn Host, root: &Path, target: &Target, worktree: &Path) -> Result<Outcome> {
+pub fn launch(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    worktree: Option<&Path>,
+) -> Result<Outcome> {
     let Some(step_name) = target.step.as_deref() else {
         return Ok(Outcome::refused(vec![Violation::new(
             &target.unit,
@@ -359,6 +526,9 @@ pub fn launch(host: &dyn Host, root: &Path, target: &Target, worktree: &Path) ->
     let campaign = store::load_campaign(root)?;
     let mut violations = journal::check(root, &campaign);
     violations.extend(closed(root, &campaign));
+    let units = plan::load_units(root)?;
+    let declared = plan::step(&units, &full).and_then(|step| step.lane);
+    let local = declared.is_none_or(Lane::is_local);
     let mut report = Vec::new();
     let limits = match fs::read_to_string(root.join("LIMITS.toml")) {
         Err(_) => {
@@ -378,7 +548,15 @@ pub fn launch(host: &dyn Host, root: &Path, target: &Target, worktree: &Path) ->
         },
     };
     if let Some(limits) = &limits {
-        violations.extend(launch_checks(host, limits, &mut report));
+        if local {
+            violations.extend(launch_checks(host, limits, &mut report));
+        } else if limits.paused {
+            violations.push(Violation::new(
+                "LIMITS.toml",
+                "limits-paused",
+                "`paused = true`: nothing launches",
+            ));
+        }
     }
     let unit_dir = root.join(&target.unit);
     let mut unit = if store::is_unit(&unit_dir) {
@@ -396,9 +574,10 @@ pub fn launch(host: &dyn Host, root: &Path, target: &Target, worktree: &Path) ->
         .and_then(|unit| unit.steps.get(step_name))
         .cloned();
     if let Some(step) = &existing {
+        let fresh = step.track.state == Phase::Drafted;
         let relaunch = matches!(step.track.state, Phase::Blocked(_))
             && matches!(step.track.resting(), Phase::Drafted | Phase::Launched);
-        if !relaunch {
+        if !fresh && !relaunch {
             violations.push(Violation::new(
                 &full,
                 "launch-state",
@@ -407,6 +586,9 @@ pub fn launch(host: &dyn Host, root: &Path, target: &Target, worktree: &Path) ->
                     step.track.state
                 ),
             ));
+        }
+        if fresh {
+            violations.extend(plan::unmet(&full, &plan::gates(&units, step)));
         }
     }
     let step_dir = unit_dir.join(step_name);
@@ -422,8 +604,11 @@ pub fn launch(host: &dyn Host, root: &Path, target: &Target, worktree: &Path) ->
         .max()
         .map(|(_, file)| file);
     let kickoff = step_dir.join("kickoff.md");
-    let prompt: Option<PathBuf> = match (&existing, resume) {
-        (Some(_), Some(resume)) => Some(resume.clone()),
+    let relaunching = existing
+        .as_ref()
+        .is_some_and(|step| step.track.state != Phase::Drafted);
+    let prompt: Option<PathBuf> = match (relaunching, resume) {
+        (true, Some(resume)) => Some(resume.clone()),
         _ if kickoff.is_file() => Some(kickoff),
         _ => None,
     };
@@ -440,13 +625,19 @@ pub fn launch(host: &dyn Host, root: &Path, target: &Target, worktree: &Path) ->
         "packet: {} file(s), {checked} named path(s) checked",
         files.len()
     ));
-    let worktree = absolute(worktree);
-    if !worktree.join(".git").exists() {
-        violations.push(Violation::new(
+    let worktree = worktree.map(absolute);
+    match &worktree {
+        Some(worktree) if !worktree.join(".git").exists() => violations.push(Violation::new(
             worktree.to_string_lossy(),
             "worktree-missing",
             "the worktree does not exist; create it before the launch",
-        ));
+        )),
+        None if local => violations.push(Violation::new(
+            &full,
+            "worktree-missing",
+            "a local lane launches into a worktree; pass --worktree <path>",
+        )),
+        _ => {}
     }
     if !violations.is_empty() {
         let mut outcome = Outcome::refused(violations);
@@ -457,11 +648,16 @@ pub fn launch(host: &dyn Host, root: &Path, target: &Target, worktree: &Path) ->
         unreachable!("a launch with no violations has limits, a unit and a prompt");
     };
     let at = stamp(host.now());
-    let worktree_text = worktree.to_string_lossy().into_owned();
+    let worktree_text = worktree
+        .as_ref()
+        .map(|worktree| worktree.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let mut step = existing.unwrap_or_else(|| Step {
         track: Track::new(&at),
         worktree: worktree_text.clone(),
         launches: 0,
+        lane: None,
+        after: Vec::new(),
     });
     let from = step.track.state.clone();
     step.track.apply(Phase::Launched, &at, &Evidence::default());
@@ -489,29 +685,51 @@ pub fn launch(host: &dyn Host, root: &Path, target: &Target, worktree: &Path) ->
     write_unit(&unit_dir, unit)?;
     let leaf = target.unit.rsplit('/').next().unwrap_or(&target.unit);
     let step_text = step_dir.to_string_lossy();
-    let command = format!(
-        "pi() {{ command pi -ne \"$@\"; }}; export -f pi; pi-turn.sh {} {} {} {} {}",
-        shell_word(&step_text),
-        shell_word(&format!("{leaf}-{step_name}-sup")),
-        shell_word(&format!(
-            "{}:{}",
-            limits.supervisor_model, limits.supervisor_effort
-        )),
-        shell_word(&format!("{step_text}/sup-turn-{launches}.jsonl")),
-        shell_word(&prompt.file_name().unwrap_or_default().to_string_lossy()),
-    );
+    let command = local.then(|| {
+        format!(
+            "pi() {{ command pi -ne \"$@\"; }}; export -f pi; pi-turn.sh {} {} {} {} {}",
+            shell_word(&step_text),
+            shell_word(&format!("{leaf}-{step_name}-sup")),
+            shell_word(&format!(
+                "{}:{}",
+                limits.supervisor_model, limits.supervisor_effort
+            )),
+            shell_word(&format!("{step_text}/sup-turn-{launches}.jsonl")),
+            shell_word(&prompt.file_name().unwrap_or_default().to_string_lossy()),
+        )
+    });
     let mut body: String = report.iter().map(|line| format!("- {line}\n")).collect();
-    body.push_str(&format!(
-        "- worktree: `{worktree_text}`\n- launch {launches}: `{command}`\n"
-    ));
+    if let Some(lane) = declared {
+        body.push_str(&format!("- lane: {lane}\n"));
+    }
+    if !worktree_text.is_empty() {
+        body.push_str(&format!("- worktree: `{worktree_text}`\n"));
+    }
+    match &command {
+        Some(command) => body.push_str(&format!("- launch {launches}: `{command}`\n")),
+        None => body.push_str(&format!(
+            "- launch {launches}: `{}`\n",
+            relative(root, &prompt)
+        )),
+    }
     let heading = record(root, &at, &format!("launch {full}"), &body)?;
     let mut outcome = Outcome {
         lines: report,
         ..Outcome::default()
     };
-    outcome.line(command.clone());
+    if let Some(command) = &command {
+        outcome.line(command.clone());
+    } else {
+        outcome.line(format!(
+            "launched {full} in lane {}; its prompt is {}",
+            declared.map_or("—", Lane::name),
+            relative(root, &prompt)
+        ));
+    }
     outcome.field("target", full);
     outcome.field("launches", launches);
+    outcome.field("lane", declared.map(Lane::name));
+    outcome.field("prompt", relative(root, &prompt));
     outcome.field("launch", command);
     outcome.field("journal", heading);
     Ok(outcome)
@@ -650,6 +868,19 @@ pub fn advance(
             &full,
             "evidence-digest",
             format!("`{digest}` is not sha256:<64 lowercase hex>"),
+        ));
+    }
+    if let (Some(release), Some(tag)) = (Release::of_target(&full), &given.tag)
+        && !release.tag_names().contains(tag)
+    {
+        violations.push(Violation::new(
+            &full,
+            "release-tag",
+            format!(
+                "`{tag}` does not name version {}; the release step's tag is one of {}",
+                release.version,
+                release.tag_names().join(", ")
+            ),
         ));
     }
     let needs_repo = given.sha.is_some() || given.tag.is_some();
