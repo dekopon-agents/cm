@@ -92,6 +92,14 @@ fn unit_with_step(c: &Campaign, host: &Fake, kickoff: &str) {
     fs::write(c.root.join("01-first/alpha/BUILD/kickoff.md"), kickoff).unwrap();
 }
 
+fn commit_campaign(root: &Path) {
+    if !root.join(".git").exists() {
+        git(root, &["init", "-q"]);
+    }
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "ledger"]);
+}
+
 fn assert_clean(root: &Path) {
     let outcome = lint(root).unwrap();
     assert!(outcome.ok(), "{:#?}", outcome.violations);
@@ -222,7 +230,7 @@ fn launch_reports_every_failed_check_at_once() {
         &host,
         &c.root,
         &parse_target("01-first/alpha/BUILD", true).unwrap(),
-        &c.root.join("no-such-worktree"),
+        Some(&c.root.join("no-such-worktree")),
     )
     .unwrap();
     assert_eq!(
@@ -262,8 +270,13 @@ fn a_step_walks_from_launch_to_done() {
     let (repo, sha) = repo(c.root.parent().unwrap());
     unit_with_step(&c, &host, &format!("Work in `{}`.\n", repo.display()));
     let step = "01-first/alpha/BUILD";
-    let outcome =
-        commands::launch(&host, &c.root, &parse_target(step, true).unwrap(), &repo).unwrap();
+    let outcome = commands::launch(
+        &host,
+        &c.root,
+        &parse_target(step, true).unwrap(),
+        Some(&repo),
+    )
+    .unwrap();
     assert!(outcome.ok(), "{:?}", outcome.violations);
     let command = outcome.fields["launch"].as_str().unwrap();
     assert!(command.contains("pi-turn.sh "), "{command}");
@@ -321,9 +334,14 @@ fn advance_refuses_a_skip_and_missing_or_unexpected_evidence() {
     unit_with_step(&c, &host, "No paths.\n");
     let step = "01-first/alpha/BUILD";
     assert!(
-        commands::launch(&host, &c.root, &parse_target(step, true).unwrap(), &repo)
-            .unwrap()
-            .ok()
+        commands::launch(
+            &host,
+            &c.root,
+            &parse_target(step, true).unwrap(),
+            Some(&repo)
+        )
+        .unwrap()
+        .ok()
     );
     let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
 
@@ -394,17 +412,17 @@ fn a_blocked_step_relaunches_from_its_newest_resume() {
     let step = "01-first/alpha/BUILD";
     let launch_target = parse_target(step, true).unwrap();
     assert!(
-        commands::launch(&host, &c.root, &launch_target, &repo)
+        commands::launch(&host, &c.root, &launch_target, Some(&repo))
             .unwrap()
             .ok()
     );
-    let again = commands::launch(&host, &c.root, &launch_target, &repo).unwrap();
+    let again = commands::launch(&host, &c.root, &launch_target, Some(&repo)).unwrap();
     assert_eq!(rules(&again), vec!["launch-state"]);
     assert!(advance(&host, &c, step, "blocked:driver", Evidence::default()).ok());
     for name in ["resume-2.md", "resume-10.md"] {
         fs::write(c.root.join("01-first/alpha/BUILD").join(name), "Resume.\n").unwrap();
     }
-    let outcome = commands::launch(&host, &c.root, &launch_target, &repo).unwrap();
+    let outcome = commands::launch(&host, &c.root, &launch_target, Some(&repo)).unwrap();
     assert!(outcome.ok(), "{:?}", outcome.violations);
     let command = outcome.fields["launch"].as_str().unwrap();
     assert!(
@@ -419,6 +437,7 @@ fn lint_lists_every_violation_in_one_run() {
     let host = Fake::at("2026-10-08T07:00:00Z");
     let c = campaign(&host);
     unit_with_step(&c, &host, "Read `/definitely/not/here.md`.\n");
+    commit_campaign(&c.root);
     let state_md = c.root.join("01-first/alpha/STATE.md");
     let edited = fs::read_to_string(&state_md)
         .unwrap()
@@ -463,6 +482,7 @@ fn lint_lists_every_violation_in_one_run() {
 fn a_rewritten_journal_prefix_is_found_and_blocks_writes() {
     let host = Fake::at("2026-10-08T07:00:00Z");
     let c = campaign(&host);
+    commit_campaign(&c.root);
     let path = c.root.join("JOURNAL.md");
     let text = fs::read_to_string(&path)
         .unwrap()
@@ -483,9 +503,14 @@ fn a_removed_worktree_points_advance_at_repo() {
     unit_with_step(&c, &host, "Go.\n");
     let step = "01-first/alpha/BUILD";
     assert!(
-        commands::launch(&host, &c.root, &parse_target(step, true).unwrap(), &repo)
-            .unwrap()
-            .ok()
+        commands::launch(
+            &host,
+            &c.root,
+            &parse_target(step, true).unwrap(),
+            Some(&repo)
+        )
+        .unwrap()
+        .ok()
     );
     let moved = c.root.parent().unwrap().join("moved");
     fs::rename(&repo, &moved).unwrap();
@@ -518,6 +543,7 @@ fn hand_edit_messages_name_the_reset() {
     let host = Fake::at("2026-10-08T07:00:00Z");
     let c = campaign(&host);
     unit_with_step(&c, &host, "Go.\n");
+    commit_campaign(&c.root);
     let state_md = c.root.join("01-first/alpha/STATE.md");
     fs::write(&state_md, "edited\n").unwrap();
     let mut journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
@@ -532,7 +558,7 @@ fn hand_edit_messages_name_the_reset() {
     assert!(
         messages
             .iter()
-            .any(|m| m.contains("`cp .cm/JOURNAL.md JOURNAL.md`")),
+            .any(|m| m.contains("into a new entry with `cm journal`")),
         "{messages:?}"
     );
     assert!(
@@ -542,7 +568,7 @@ fn hand_edit_messages_name_the_reset() {
         "{messages:?}"
     );
     fs::remove_file(&state_md).unwrap();
-    fs::copy(c.root.join(".cm/JOURNAL.md"), c.root.join("JOURNAL.md")).unwrap();
+    git(&c.root, &["checkout", "HEAD", "--", "JOURNAL.md"]);
     assert!(
         commands::init(&host, &c.root.join("01-first/alpha"))
             .unwrap()
@@ -559,9 +585,14 @@ fn close_seals_the_campaign() {
     unit_with_step(&c, &host, &format!("Work in `{}`.\n", repo.display()));
     let step = "01-first/alpha/BUILD";
     assert!(
-        commands::launch(&host, &c.root, &parse_target(step, true).unwrap(), &repo)
-            .unwrap()
-            .ok()
+        commands::launch(
+            &host,
+            &c.root,
+            &parse_target(step, true).unwrap(),
+            Some(&repo)
+        )
+        .unwrap()
+        .ok()
     );
     fs::write(
         c.root.join("OWNER-QUEUE.md"),

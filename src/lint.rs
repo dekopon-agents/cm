@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::Result;
 
@@ -57,8 +58,9 @@ pub fn packet_paths(
             ));
             continue;
         };
+        let base = file.parent().unwrap_or(root);
         for (line, span) in code_spans(&text) {
-            let Some(candidates) = packet_targets(span, home, repo) else {
+            let Some(candidates) = packet_targets(span, home, repo, root, base) else {
                 continue;
             };
             checked += 1;
@@ -77,7 +79,13 @@ pub fn packet_paths(
     (checked, out)
 }
 
-fn packet_targets(span: &str, home: Option<&Path>, repo: Option<&Path>) -> Option<Vec<PathBuf>> {
+fn packet_targets(
+    span: &str,
+    home: Option<&Path>,
+    repo: Option<&Path>,
+    campaign: &Path,
+    base: &Path,
+) -> Option<Vec<PathBuf>> {
     if let Some(path) = named_path(span, home) {
         let mut targets = vec![path.clone()];
         if let Some(repo) = repo.filter(|_| span.starts_with('/'))
@@ -94,11 +102,24 @@ fn packet_targets(span: &str, home: Option<&Path>, repo: Option<&Path>) -> Optio
         }
         return Some(targets);
     }
-    let repo = repo?;
+    if span.starts_with("./") || span.starts_with("../") {
+        let path = named_path(&format!("/{span}"), None)?;
+        let rel = path.strip_prefix("/").ok()?;
+        return Some(vec![store::absolute(&base.join(rel))]);
+    }
     let rooted = named_path(&format!("/{span}"), None)?;
     let rel = rooted.strip_prefix("/").ok()?;
     let first = rel.components().next()?.as_os_str().to_str()?;
-    (!first.starts_with('.') && repo.join(first).is_dir()).then(|| vec![repo.join(rel)])
+    if first.starts_with('.') {
+        return None;
+    }
+    let targets: Vec<PathBuf> = repo
+        .into_iter()
+        .chain([campaign])
+        .filter(|dir| dir.join(first).is_dir())
+        .map(|dir| dir.join(rel))
+        .collect();
+    (!targets.is_empty()).then_some(targets)
 }
 
 fn subdirs(dir: &Path) -> Vec<PathBuf> {
@@ -154,7 +175,13 @@ pub fn unit_state_file(root: &Path, dir: &Path, unit: &UnitState) -> Vec<Violati
     }
 }
 
-fn lint_unit(root: &Path, dir: &Path, home: Option<&Path>, packets: &mut usize) -> Vec<Violation> {
+fn lint_unit(
+    root: &Path,
+    dir: &Path,
+    home: Option<&Path>,
+    sealed: bool,
+    packets: &mut usize,
+) -> Vec<Violation> {
     let state_rel = relative(root, &state_path(dir));
     let unit = match store::load_unit(dir) {
         Ok(unit) => unit,
@@ -186,6 +213,7 @@ fn lint_unit(root: &Path, dir: &Path, home: Option<&Path>, packets: &mut usize) 
             continue;
         }
         let live = match unit.steps.get(name) {
+            _ if sealed => false,
             None => true,
             Some(step) => matches!(step.track.resting(), Phase::Drafted | Phase::Launched),
         };
@@ -206,8 +234,34 @@ fn lint_unit(root: &Path, dir: &Path, home: Option<&Path>, packets: &mut usize) 
     out
 }
 
+pub fn tracked_runtime(root: &Path) -> Vec<Violation> {
+    let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--", ".cm/JOURNAL.md", ".cm/lock"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|path| {
+            Violation::new(
+                path,
+                "cm-tracked",
+                format!(
+                    "cm keeps no journal copy and `.cm/lock` is a runtime lock; untrack it with `git rm --cached {path}`"
+                ),
+            )
+        })
+        .collect()
+}
+
 pub fn root_files(root: &Path, state: Option<&CampaignState>) -> Vec<Violation> {
-    let mut out = Vec::new();
+    let mut out = tracked_runtime(root);
     let closed = state.is_some_and(|state| state.closed.is_some());
     let banner = Banner::of(root, closed);
     for (name, _) in ROOT_FILES {
@@ -295,9 +349,10 @@ pub fn lint(start: &Path) -> Result<Outcome> {
     };
     violations.extend(root_files(&root, state.as_ref()));
     let units = unit_dirs(&root);
+    let sealed = state.as_ref().is_some_and(|state| state.closed.is_some());
     let mut packets = 0;
     for dir in &units {
-        violations.extend(lint_unit(&root, dir, home.as_deref(), &mut packets));
+        violations.extend(lint_unit(&root, dir, home.as_deref(), sealed, &mut packets));
     }
     let mut outcome = Outcome::refused(violations);
     outcome.field("root", root.to_string_lossy().into_owned());
@@ -345,6 +400,11 @@ mod tests {
         assert!(check(&step.join("brief.md").to_string_lossy()));
         assert!(!check("/home/other/code/trail/store/epochs/e/NOPE.md"));
         assert!(!check("/home/other/elsewhere/x.md"));
+        assert!(check("../S1/brief.md"));
+        assert!(check("./brief.md:4"));
+        assert!(!check("../S1/NOPE.md"));
+        assert!(check("01-a/u/S1/brief.md"));
+        assert!(!check("01-a/u/NOPE.md"));
         fs::write(&packet, "`other/x.rs` `.git/x` `crate::a/b`\n").unwrap();
         assert_eq!(
             packet_paths(&root, std::slice::from_ref(&packet), None).0,

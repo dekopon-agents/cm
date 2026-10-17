@@ -11,7 +11,8 @@ use crate::state::{CampaignState, Kind, UnitState};
 pub const CM_DIR: &str = ".cm";
 pub const STATE_FILE: &str = "state.json";
 pub const JOURNAL: &str = "JOURNAL.md";
-pub const JOURNAL_COPY: &str = ".cm/JOURNAL.md";
+pub const LOCK: &str = "lock";
+pub const LEGACY_JOURNAL_COPY: &str = "JOURNAL.md";
 pub const UNIT_STATE: &str = "STATE.md";
 
 pub fn state_path(dir: &Path) -> PathBuf {
@@ -141,11 +142,15 @@ pub struct Lock {
 pub fn lock(root: &Path) -> Result<Lock> {
     let dir = root.join(CM_DIR);
     fs::create_dir_all(&dir)?;
+    create_new(
+        &dir.join(".gitignore"),
+        format!("{LOCK}\n{LEGACY_JOURNAL_COPY}\n").as_bytes(),
+    )?;
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(dir.join("lock"))?;
+        .open(dir.join(LOCK))?;
     rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
         .context("locking .cm/lock")?;
     Ok(Lock { _file: file })

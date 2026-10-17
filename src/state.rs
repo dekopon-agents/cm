@@ -34,7 +34,7 @@ impl Phase {
         ORDER.get(index + 1).cloned()
     }
 
-    fn rank(&self) -> Option<usize> {
+    pub fn rank(&self) -> Option<usize> {
         ORDER.iter().position(|phase| phase == self)
     }
 }
@@ -292,12 +292,268 @@ pub struct CampaignState {
     pub closed: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum Lane {
+    Pi,
+    Codex,
+    ClaudeCloud,
+    Fable,
+    Owner,
+}
+
+pub const LANES: [Lane; 5] = [
+    Lane::Pi,
+    Lane::Codex,
+    Lane::ClaudeCloud,
+    Lane::Fable,
+    Lane::Owner,
+];
+
+impl Lane {
+    pub fn name(self) -> &'static str {
+        match self {
+            Lane::Pi => "pi",
+            Lane::Codex => "codex",
+            Lane::ClaudeCloud => "claude-cloud",
+            Lane::Fable => "fable",
+            Lane::Owner => "owner",
+        }
+    }
+
+    pub fn is_local(self) -> bool {
+        self == Lane::Pi
+    }
+}
+
+impl fmt::Display for Lane {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for Lane {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        LANES
+            .into_iter()
+            .find(|lane| lane.name() == text)
+            .ok_or_else(|| {
+                let names: Vec<&str> = LANES.iter().map(|lane| lane.name()).collect();
+                format!("`{text}` is not a lane; lanes are {}", names.join(", "))
+            })
+    }
+}
+
+impl TryFrom<String> for Lane {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<Lane> for String {
+    fn from(lane: Lane) -> String {
+        lane.name().to_owned()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Version {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+}
+
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+impl std::str::FromStr for Version {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = text.split('.').collect();
+        let number = |part: &str| {
+            (!part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && (part == "0" || !part.starts_with('0')))
+            .then(|| part.parse::<u64>().ok())
+            .flatten()
+        };
+        match parts[..] {
+            [major, minor, patch] => match (number(major), number(minor), number(patch)) {
+                (Some(major), Some(minor), Some(patch)) => Ok(Version {
+                    major,
+                    minor,
+                    patch,
+                }),
+                _ => Err(format!("`{text}` is not a version <major>.<minor>.<patch>")),
+            },
+            _ => Err(format!("`{text}` is not a version <major>.<minor>.<patch>")),
+        }
+    }
+}
+
+pub const RELEASES: &str = "00-release";
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Release {
+    pub repo: String,
+    pub version: Version,
+}
+
+impl Release {
+    pub fn target(&self) -> String {
+        format!("{RELEASES}/{}/{}", self.repo, self.version)
+    }
+
+    pub fn of_target(target: &str) -> Option<Release> {
+        let mut parts = target.split('/');
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(RELEASES), Some(repo), Some(version), None) => Some(Release {
+                repo: repo.to_owned(),
+                version: version.parse().ok()?,
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn tag_names(&self) -> [String; 3] {
+        [
+            format!("v{}", self.version),
+            format!("{}-{}", self.repo, self.version),
+            self.version.to_string(),
+        ]
+    }
+
+    fn parse(text: &str) -> Result<Release, String> {
+        let shape = || format!("`{text}` is not <repo>@<major>.<minor>.<patch>");
+        let (repo, version) = text.split_once('@').ok_or_else(shape)?;
+        if !crate::store::is_name(repo) {
+            return Err(shape());
+        }
+        Ok(Release {
+            repo: repo.to_owned(),
+            version: version.parse().map_err(|_| shape())?,
+        })
+    }
+}
+
+impl fmt::Display for Release {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}", self.repo, self.version)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum After {
+    Merged(String),
+    PrOpen(String),
+    Tag(Release),
+    Deployed(Release),
+}
+
+impl After {
+    pub fn parse(text: &str, unit: &str) -> Result<After, String> {
+        let step = |rest: &str| -> Result<String, String> {
+            let full = if rest.contains('/') {
+                rest.to_owned()
+            } else {
+                format!("{unit}/{rest}")
+            };
+            crate::store::parse_target(&full, true)
+                .map(|target| format!("{}/{}", target.unit, target.step.unwrap_or_default()))
+                .map_err(|_| {
+                    format!(
+                        "`{text}` is not <step>, <NN-name>/<unit>/<step>, pr-open:<step>, tag:<repo>@<version> or deployed:<repo>@<version>"
+                    )
+                })
+        };
+        if let Some(rest) = text.strip_prefix("tag:") {
+            return Release::parse(rest).map(After::Tag);
+        }
+        if let Some(rest) = text.strip_prefix("deployed:") {
+            return Release::parse(rest).map(After::Deployed);
+        }
+        if let Some(rest) = text.strip_prefix("pr-open:") {
+            return step(rest).map(After::PrOpen);
+        }
+        step(text).map(After::Merged)
+    }
+
+    pub fn target(&self) -> String {
+        match self {
+            After::Merged(target) | After::PrOpen(target) => target.clone(),
+            After::Tag(release) | After::Deployed(release) => release.target(),
+        }
+    }
+
+    pub fn needs(&self) -> Phase {
+        match self {
+            After::Merged(_) => Phase::Merged,
+            After::PrOpen(_) => Phase::PrOpen,
+            After::Tag(_) => Phase::Released,
+            After::Deployed(_) => Phase::Deployed,
+        }
+    }
+
+    pub fn met_by(&self, track: &Track) -> bool {
+        match (track.state.rank(), self.needs().rank()) {
+            (Some(at), Some(needed)) => at >= needed,
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for After {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            After::Merged(target) => f.write_str(target),
+            After::PrOpen(target) => write!(f, "pr-open:{target}"),
+            After::Tag(release) => write!(f, "tag:{release}"),
+            After::Deployed(release) => write!(f, "deployed:{release}"),
+        }
+    }
+}
+
+impl TryFrom<String> for After {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if !value.starts_with("tag:") && !value.starts_with("deployed:") {
+            let rest = value.strip_prefix("pr-open:").unwrap_or(&value);
+            if rest.split('/').count() != 3 {
+                return Err(format!("`{value}` names no <NN-name>/<unit>/<step>"));
+            }
+        }
+        After::parse(&value, "")
+    }
+}
+
+impl From<After> for String {
+    fn from(after: After) -> String {
+        after.to_string()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
     #[serde(flatten)]
     pub track: Track,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub worktree: String,
+    #[serde(default)]
     pub launches: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<Lane>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<After>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,6 +628,46 @@ mod tests {
         assert!(blocked.check(&Phase::Released).is_err());
         blocked.apply(Phase::Merged, "t", &Evidence::default());
         assert_eq!(blocked.blocked_from, None);
+    }
+
+    #[test]
+    fn after_resolves_against_the_unit() {
+        let unit = "01-a/u";
+        let parse = |text: &str| After::parse(text, unit).map(|after| after.to_string());
+        assert_eq!(parse("S1").unwrap(), "01-a/u/S1");
+        assert_eq!(parse("02-b/v/S3").unwrap(), "02-b/v/S3");
+        assert_eq!(parse("pr-open:S1").unwrap(), "pr-open:01-a/u/S1");
+        assert_eq!(parse("tag:dekopon@0.49.0").unwrap(), "tag:dekopon@0.49.0");
+        assert_eq!(
+            After::parse("deployed:dekopon@0.49.0", unit)
+                .unwrap()
+                .target(),
+            "00-release/dekopon/0.49.0"
+        );
+        for bad in [
+            "tag:dekopon@v0.49.0",
+            "tag:@1.0.0",
+            "02-b/S3",
+            "a b",
+            "tag:x@1.0",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        let stored: After = serde_json::from_str("\"pr-open:01-a/u/S1\"").unwrap();
+        assert_eq!(stored, After::PrOpen("01-a/u/S1".into()));
+        assert!(serde_json::from_str::<After>("\"S1\"").is_err());
+    }
+
+    #[test]
+    fn versions_order_and_refuse_noise() {
+        let v = |text: &str| text.parse::<Version>();
+        assert!(v("0.10.0").unwrap() > v("0.9.9").unwrap());
+        for bad in ["v1.0.0", "1.0", "1.0.0-rc1", "01.0.0", ""] {
+            assert!(v(bad).is_err(), "{bad}");
+        }
+        let release = Release::of_target("00-release/cm/0.3.0").unwrap();
+        assert_eq!(release.tag_names(), ["v0.3.0", "cm-0.3.0", "0.3.0"]);
+        assert!(Release::of_target("01-a/cm/0.3.0").is_none());
     }
 
     #[test]

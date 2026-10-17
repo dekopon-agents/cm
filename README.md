@@ -2,8 +2,8 @@
 
 Campaign manager: the campaign lifecycle as one tool. A campaign is a folder of state files that a
 coordinator, supervisors and drivers read and write while a multi-step code effort runs. `cm` owns
-the mechanical parts of that folder: the journal, the launch checks, the state moves and the lint.
-Clock stamps come from `cm`, never from an argument.
+the mechanical parts of that folder: the journal, the step order, the launch checks, the state
+moves, the GitHub sync and the lint. Clock stamps come from `cm`, never from an argument.
 
 ```sh
 brew install dekopon-agents/tap/cm
@@ -51,35 +51,47 @@ error.
 | Command | Contract |
 |---|---|
 | `cm init [DIR]` | Writes `RESUME.md`, `JOURNAL.md`, `LIMITS.toml`, `OWNER-QUEUE.md` and `.cm/state.json` from templates embedded in the binary. Never overwrites: in an existing folder it writes only what is missing and adopts each existing file as the baseline once it lints clean. `cm init <NN-name>/<unit>` inside a campaign writes the unit's `.cm/state.json` and its rendered `STATE.md`. |
+| `cm init <NN-name>/<unit>/<step> --lane L [--after A]…` | Declares a step `drafted` in lane `pi`, `codex`, `claude-cloud`, `fable` or `owner`, creating the unit if needed. Each `--after` is one gate (see [Order](#order)); every step or release it names must already be declared, so the order has no cycles. A declaration is never changed: the same one again is a no-op, a different one is `step-declared`. |
+| `cm next [<NN-name>/<unit>/<step>] [--lane L]` | Lists the declared `drafted` steps whose every `--after` is met and whose folder has `kickoff.md` (`steps`), the rest with what each waits on (`waiting`), and the merged release steps that wait for their tag (`tags`). Nothing is next while `LIMITS.toml` is paused. Given a step, it refuses (exit 1) unless that step is next, naming every unmet gate. |
+| `cm sync` | Reads GitHub with read-only `gh api` calls and moves steps along: `pr-open` → `merged` when the PR merged (the merge commit is the evidence), a release step `merged` → `released` when its tag exists and contains the prep merge, any other step `merged` → `released` by the first release of its repository whose tag contains its merge, and `released` → `deployed` once its release step is `deployed`. One journal entry lists the moves; a sync that moves nothing journals nothing. It rewrites `CARD.md`, whose first line is `Last run: <stamp>`. A PR closed unmerged (`pr-closed`) or an observation `gh` could not make (`sync-unknown`) exits 1 after the rest is applied. |
+| `cm epoch planning\|working\|closed [--skill-revision R] [--plan-revision S]` | Moves `EPOCH.md`'s front matter one status along `OPEN → PLANNING → WORKING → CLOSED`, stamps `planning_started_at`, `working_started_at` or `closed_at` with the date, sets the pins it is given, and journals the move. It refuses a null pin: PLANNING needs `skill_revision`, WORKING and CLOSED also `approved_plan_revision`. `closed` follows `cm close`. |
 | `cm journal "<title>" [--body-file F]` | Appends `## YYYY-MM-DDTHH:MMZ — <title>` and the body (`-` reads stdin). The only way `JOURNAL.md` grows. A body may not hold a `#` or `##` heading. |
-| `cm launch <NN-name>/<unit>/<step> --worktree PATH` | Runs the launch checks and reports every failure: `LIMITS.toml` not paused; free disk on `disk_volume` minus `kache_headroom_gib` over `min_free_disk_gib`; live heavy builds (top-level `cargo` processes) under `max_heavy_builds`; the worktree exists; the step folder has `kickoff.md`; every path its packet names exists. Then it marks the step (and a drafted unit) launched, journals the launch and prints the command. It spawns nothing. |
+| `cm launch <NN-name>/<unit>/<step> [--worktree PATH]` | Runs the launch checks and reports every failure: `LIMITS.toml` not paused; a declared step's every `--after` met (`after-unmet`); for the local `pi` lane and undeclared steps, free disk on `disk_volume` minus `kache_headroom_gib` over `min_free_disk_gib`, live heavy builds (top-level `cargo` processes) under `max_heavy_builds` and the worktree, which they require; the step folder has `kickoff.md`; every path its packet names exists. Then it marks the step (and a drafted unit) launched, journals the launch and, for a local step, prints the command. It spawns nothing. |
 | `cm advance <NN-name>/<unit>[/<step>] <state> [--sha S] [--pr URL] [--tag T] [--digest D] [--repo PATH]` | Moves one state along `drafted → launched → pr-open → merged → released → deployed → done`, or to `blocked:<reason>`. Refuses a skipped state and a state without its evidence, journals the move and re-renders `STATE.md`. |
 | `cm close` | Seals the campaign. Refuses, listing every gap, while `OWNER-QUEUE.md` has an open item or any unit or step is short of `done` or `blocked:<reason>`. Then it stamps `closed` in `.cm/state.json` and journals the close. From there unit `cm init`, `cm launch`, `cm advance` and a second `cm close` refuse with `campaign-closed`; `cm journal` stays open for follow-up observations. |
-| `cm lint [DIR]` | Template conformance, cm-owned files against `.cm/state.json`, and the path check for every drafted or launched packet. In a closed campaign, also an empty owner queue and every track done or blocked. |
+| `cm lint [DIR]` | Template conformance, cm-owned files against `.cm/state.json`, the journal against git, `.cm/JOURNAL.md` and `.cm/lock` out of git (`cm-tracked`), and the path check for every drafted or launched packet. In a closed campaign, also an empty owner queue and every track done or blocked; its packets are no longer checked, since nothing launches there. |
 
 ## The folder
 
 ```
 <campaign>/
-  RESUME.md  JOURNAL.md  LIMITS.toml  OWNER-QUEUE.md
-  .cm/state.json  .cm/JOURNAL.md
+  RESUME.md  JOURNAL.md  LIMITS.toml  OWNER-QUEUE.md  CARD.md  [EPOCH.md]
+  .cm/state.json  .cm/.gitignore
   <NN-name>/<unit>/
     STATE.md  .cm/state.json
     <step>/kickoff.md  step-*.md  resume*.md
+  00-release/<repo>/
+    STATE.md  .cm/state.json
+    <major>.<minor>.<patch>/kickoff.md
 ```
+
+cm writes `.cm/.gitignore` with its first lock, keeping the runtime `.cm/lock` (and any old
+`.cm/JOURNAL.md`) out of git. A campaign from before 0.3 untracks both once:
+`git rm --cached .cm/JOURNAL.md .cm/lock`.
 
 `<NN-name>` is two digits, `-`, a name (`01-first`). Units and steps are names of letters, digits,
 `.`, `_` and `-`.
 
 Packet paths are checked on this machine, resolved against the git repository holding the campaign:
-a relative path is checked when its first segment is a top-level directory of the repository, and an
+a relative path is checked when its first segment is a top-level directory of the repository or of
+the campaign folder, `./` and `../` paths against the packet's own folder, and an
 absolute path that does not exist is retried as the part after the repository's directory name
 (`/home/a/code/<repo>/store/x` → `<repo root>/store/x`). Prefer repo-relative paths. A path that lives elsewhere (a host path on a server, such
 as `/var/lib/<service>`) goes in a fenced block or without backticks; backticked, it fails
 `packet-path`.
 
-To undo a hand edit: `cp .cm/JOURNAL.md JOURNAL.md` resets the journal (re-add the lines with
-`cm journal`), and `rm <NN-name>/<unit>/STATE.md && cm init <NN-name>/<unit>` re-renders a unit's
+To undo a hand edit: `git checkout HEAD -- JOURNAL.md` resets the journal (re-add uncommitted
+entries with `cm journal`), and `rm <NN-name>/<unit>/STATE.md && cm init <NN-name>/<unit>` re-renders a unit's
 `STATE.md`.
 
 ### Template contracts
@@ -87,7 +99,7 @@ To undo a hand edit: `cp .cm/JOURNAL.md JOURNAL.md` resets the journal (re-add t
 | File | Lint requires |
 |---|---|
 | `RESUME.md` | Opens with a `>` banner. No `/loop` proposals until the owner queue is drained: while `OWNER-QUEUE.md` has an open item (a `##` heading), the banner carries the line `OWNER-QUEUE not drained: /loop withheld` and a fenced `/loop` is a violation; once the queue is empty or absent, the banner holds a fenced `/loop …` command and the withheld line is a violation. After `cm close` the banner holds neither: nothing resumes a closed campaign. Headings `# Resume`, `## State today`, `## How to work`, `## Read, in this order`, in that order. |
-| `JOURNAL.md` | First heading `# Journal`; after the adopted baseline, every `##` heading is `## YYYY-MM-DDTHH:MMZ — <title>`; the file equals cm's copy (`.cm/JOURNAL.md`): a changed line is `journal-rewritten`, an added line is `journal-hand-append`. |
+| `JOURNAL.md` | First heading `# Journal`; after the adopted baseline, every `##` heading is `## YYYY-MM-DDTHH:MMZ — <title>`; the file extends `git show HEAD:JOURNAL.md` with stamped entries only: a changed committed line is `journal-rewritten`, text added to the last committed entry is `journal-hand-append`. Outside git, or before the journal's first commit, only the headings are checked. |
 | `LIMITS.toml` | `paused` (bool); `runaway_ceiling_usd`, `min_free_disk_gib`, `kache_headroom_gib`, `pr_ci_expected_min`, `pr_ci_deadline_min` (non-negative numbers); `max_heavy_builds` (non-negative integer); `driver_model`, `driver_effort`, `verifier_model`, `supervisor_model`, `supervisor_effort`, `disk_volume` (non-empty strings). Other keys are allowed. |
 | `OWNER-QUEUE.md` | First heading `# Owner queue`; each `##` item has a line starting `Recommendation:` and one starting `Answer:`. |
 | `<unit>/STATE.md` | Byte-equal to the render of the unit's `.cm/state.json`. |
@@ -128,7 +140,9 @@ Unit `.cm/state.json`:
       "since": "2026-10-08T08:10Z",
       "evidence": { "sha": "<40 hex>", "pr": "https://github.com/o/r/pull/7" },
       "worktree": "/abs/path",
-      "launches": 1
+      "launches": 1,
+      "lane": "pi",
+      "after": ["01-first/alpha/PLAN", "tag:dekopon@0.49.0"]
     }
   },
   "history": [
@@ -137,7 +151,8 @@ Unit `.cm/state.json`:
 }
 ```
 
-A blocked track also carries `blocked_from`. From `blocked:<reason>` a track resumes to the state it
+`lane` and `after` appear on declared steps (`cm init <step> --lane`); a declared step that has not
+launched has no `worktree` and `launches: 0`, and `STATE.md` adds an `Order` table. A blocked track also carries `blocked_from`. From `blocked:<reason>` a track resumes to the state it
 was blocked from, or moves to that state's successor; a step blocked before its PR relaunches with
 `cm launch`, which picks the newest `resume*.md`.
 
@@ -153,7 +168,33 @@ was blocked from, or moves to that state's successor; a step blocked before its 
 | `done` | | | |
 
 SHAs and tags resolve in `--repo`, else the step's worktree, else (for a unit) any step's worktree.
-A commit or tag made elsewhere needs a `git fetch` first. Reading live artifacts is phase 2.
+A commit or tag made elsewhere needs a `git fetch` first. A release step's `--tag` must name its own
+version (`release-tag`). `cm sync` reads the same evidence from GitHub instead.
+
+### Order
+
+A declared step is handed out by `cm next`, and launched by `cm launch`, only once every gate is
+met. `--after` takes:
+
+| Gate | Met when |
+|---|---|
+| `<step>` or `<NN-name>/<unit>/<step>` | that step is `merged` or later |
+| `pr-open:<step>` | that step is `pr-open` or later (a chain that builds on an open PR) |
+| `tag:<repo>@<version>` | the release step `00-release/<repo>/<version>` is `released` or later |
+| `deployed:<repo>@<version>` | that release step is `deployed` or later |
+
+A blocked step meets no gate. A bare step name is in the declaring step's unit.
+
+### Releases
+
+A release is a step `00-release/<repo>/<major>.<minor>.<patch>`: its packet is the prep PR, and
+its name is the only place a tag version comes from. Each declared version must be above every
+release already declared for that repository. Once the prep PR is `merged`, `cm next --json` lists it
+under `tags` with the version and the merge commit to tag. Its tag is `v<version>`,
+`<repo>-<version>` or `<version>`; `cm sync` records `released` when one of them exists and contains
+the prep merge, and moves the repository's merged steps that the tag contains along with it. The
+tick's smoke receipt is `cm advance 00-release/<repo>/<version> deployed --digest …`; the next sync
+carries `deployed` to the steps that release shipped.
 
 ## Releases
 
@@ -210,7 +251,7 @@ head and gates before a later write. The command reports GitHub's required-check
 not a replacement for repository policy or independent review.
 
 Without `--record`, only output is produced. With it, changed evidence or ownership is
-appended to JOURNAL.md through cm's lock and journal mirror, with the latest observation
+appended to JOURNAL.md through cm's lock, with the latest observation
 in `.cm/attention.json`. Repeating identical evidence adds nothing. These observations
 are separate from lifecycle transitions. `--json` includes owners, action, head, check
 links, the local observation timestamp, and GitHub's update/merge/close/check timestamps;

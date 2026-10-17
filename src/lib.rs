@@ -1,13 +1,17 @@
 pub mod attention;
 pub mod cli;
 pub mod commands;
+pub mod epoch;
+pub mod forge;
 pub mod host;
 pub mod journal;
 pub mod limits;
 pub mod lint;
 pub mod markdown;
 pub mod outcome;
+pub mod plan;
 pub mod render;
 pub mod state;
 pub mod store;
+pub mod sync;
 pub mod templates;

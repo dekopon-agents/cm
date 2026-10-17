@@ -6,10 +6,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::commands;
+use crate::epoch::{self, Status};
 use crate::host::{Host, System};
 use crate::lint;
 use crate::outcome::Outcome;
-use crate::state::{Evidence, Phase};
+use crate::state::{Evidence, Lane, Phase};
 use crate::store::{self, Target, parse_target};
 
 #[derive(Parser)]
@@ -44,11 +45,39 @@ enum Commands {
         #[arg(long, help = "Record changed observations in the campaign journal")]
         record: bool,
     },
-    /// Write a campaign folder, or a unit folder (<NN-name>/<unit>) inside one, from the embedded templates. Never overwrites.
+    /// Write a campaign folder, a unit folder (<NN-name>/<unit>) inside one, or declare a step (<NN-name>/<unit>/<step> --lane …) in a unit. Never overwrites.
     Init {
         /// The folder to initialize.
         #[arg(default_value = ".")]
         dir: PathBuf,
+        /// The step's lane: pi, codex, claude-cloud, fable or owner.
+        #[arg(long)]
+        lane: Option<Lane>,
+        /// What the step waits on: <step> or <NN-name>/<unit>/<step> (merged), pr-open:<step>, tag:<repo>@<version> or deployed:<repo>@<version>. Repeat for each.
+        #[arg(long, value_name = "AFTER")]
+        after: Vec<String>,
+    },
+    /// List the declared steps whose `--after` is met, or, given one, refuse it unless it is next.
+    Next {
+        /// <NN-name>/<unit>/<step>: check this step only.
+        #[arg(value_parser = step_target)]
+        target: Option<Target>,
+        /// Only steps in this lane.
+        #[arg(long)]
+        lane: Option<Lane>,
+    },
+    /// Read PR state and release tags from GitHub (read-only `gh`), move steps pr-open → merged → released (→ deployed after their release's receipt), and render CARD.md.
+    Sync,
+    /// Move EPOCH.md along OPEN → PLANNING → WORKING → CLOSED, stamping the date. Refuses a null pin.
+    Epoch {
+        /// planning, working or closed.
+        status: Status,
+        /// The skill revision to pin (`skill_revision`).
+        #[arg(long, value_name = "REV")]
+        skill_revision: Option<String>,
+        /// The approved plan revision to pin (`approved_plan_revision`).
+        #[arg(long, value_name = "SHA")]
+        plan_revision: Option<String>,
     },
     /// Seal the campaign. Refuses while OWNER-QUEUE.md has an open item or any unit or step is short of done or blocked; afterwards unit init, launch and advance refuse and RESUME.md's banner holds no `/loop`.
     Close,
@@ -65,9 +94,9 @@ enum Commands {
         /// <NN-name>/<unit>/<step>
         #[arg(value_parser = step_target)]
         target: Target,
-        /// The step's worktree, which must already exist.
+        /// The step's worktree, which must already exist; required for the local pi lane and undeclared steps.
         #[arg(long, value_name = "PATH")]
-        worktree: PathBuf,
+        worktree: Option<PathBuf>,
     },
     /// Move a unit or step to its next state with that state's evidence.
     Advance {
@@ -134,12 +163,27 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             *record,
         ),
         Commands::Close => commands::close(host, &root()?),
-        Commands::Init { dir } => commands::init(host, dir),
+        Commands::Init { dir, lane, after } => commands::declare(host, dir, *lane, after),
+        Commands::Next { target, lane } => crate::plan::next(&root()?, target.as_ref(), *lane),
+        Commands::Sync => crate::sync::sync(host, &crate::forge::Gh, &root()?),
+        Commands::Epoch {
+            status,
+            skill_revision,
+            plan_revision,
+        } => epoch::epoch(
+            host,
+            &root()?,
+            *status,
+            skill_revision.as_deref(),
+            plan_revision.as_deref(),
+        ),
         Commands::Journal { title, body_file } => {
             let body = body_file.as_deref().map(read_body).transpose()?;
             commands::journal(host, &root()?, title, body.as_deref())
         }
-        Commands::Launch { target, worktree } => commands::launch(host, &root()?, target, worktree),
+        Commands::Launch { target, worktree } => {
+            commands::launch(host, &root()?, target, worktree.as_deref())
+        }
         Commands::Advance {
             target,
             state,
@@ -173,6 +217,9 @@ fn name(command: &Commands) -> &'static str {
         Commands::Attention { .. } => "attention",
         Commands::Close => "close",
         Commands::Init { .. } => "init",
+        Commands::Next { .. } => "next",
+        Commands::Sync => "sync",
+        Commands::Epoch { .. } => "epoch",
         Commands::Journal { .. } => "journal",
         Commands::Launch { .. } => "launch",
         Commands::Advance { .. } => "advance",
