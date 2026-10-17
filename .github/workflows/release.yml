@@ -130,8 +130,13 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "cm-$VERSION" dist/* --repo "$GITHUB_REPOSITORY" \
-            --verify-tag --title "cm-$VERSION" --generate-notes
+          if gh release view "cm-$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::notice::cm-$VERSION already has a release; uploading the assets into it"
+            gh release upload "cm-$VERSION" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "cm-$VERSION" dist/* --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --title "cm-$VERSION" --generate-notes
+          fi
 
   tap:
     name: update the Homebrew tap
