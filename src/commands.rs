@@ -13,8 +13,8 @@ use crate::outcome::{Outcome, Violation};
 use crate::plan::{self, Units};
 use crate::render;
 use crate::state::{
-    After, CampaignState, DEFAULT_TAG, Evidence, Flag, JournalMark, Kind, Lane, Move, Phase,
-    RELEASES, Release, SCHEMA, Step, Track, UnitState, evidence_for,
+    After, CampaignState, DEFAULT_TAG, Evidence, FLAGS, Finish, Flag, JournalMark, Kind, Lane,
+    Move, Phase, RELEASES, Release, SCHEMA, Step, Track, UnitState, Work, evidence_for,
 };
 use crate::store::{
     self, JOURNAL, Target, UNIT_STATE, absolute, create_new, find_root, lock, parse_target,
@@ -51,6 +51,20 @@ pub struct Ships {
     pub tag: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct Declaration {
+    pub lane: Option<Lane>,
+    pub after: Vec<String>,
+    pub ships: Ships,
+    pub work: Work,
+}
+
+impl Declaration {
+    fn given(&self) -> bool {
+        self.lane.is_some() || !self.after.is_empty() || self.ships.given() || !self.work.is_code()
+    }
+}
+
 impl Ships {
     fn given(&self) -> bool {
         self.github.is_some() || self.tag.is_some()
@@ -58,21 +72,15 @@ impl Ships {
 }
 
 pub fn init(host: &dyn Host, dir: &Path) -> Result<Outcome> {
-    declare(host, dir, None, &[], &Ships::default())
+    declare(host, dir, &Declaration::default())
 }
 
-pub fn declare(
-    host: &dyn Host,
-    dir: &Path,
-    lane: Option<Lane>,
-    after: &[String],
-    ships: &Ships,
-) -> Result<Outcome> {
+pub fn declare(host: &dyn Host, dir: &Path, declaration: &Declaration) -> Result<Outcome> {
     let dir = absolute(dir);
-    let flags = lane.is_some() || !after.is_empty() || ships.given();
+    let flags = declaration.given();
     if let Some(root) = dir.parent().and_then(find_root) {
         let rel = relative(&root, &dir);
-        return match (parse_target(&rel, false), lane) {
+        return match (parse_target(&rel, false), declaration.lane) {
             (Ok(Target { unit, step: None }), _) if !flags => init_unit(host, &root, &dir, &unit),
             (
                 Ok(Target {
@@ -80,7 +88,7 @@ pub fn declare(
                     step: Some(step),
                 }),
                 Some(lane),
-            ) => init_step(host, &root, &unit, &step, lane, after, ships),
+            ) => init_step(host, &root, &unit, &step, lane, declaration),
             (Ok(Target { step: Some(_), .. }), None) => Ok(Outcome::refused(vec![Violation::new(
                 rel,
                 "init-target",
@@ -101,7 +109,7 @@ pub fn declare(
         return Ok(Outcome::refused(vec![Violation::new(
             dir.to_string_lossy(),
             "init-target",
-            "--lane, --after, --github and --tag declare a step inside a campaign; no campaign holds this folder",
+            "--lane, --after, --study, --github and --tag declare a step inside a campaign; no campaign holds this folder",
         )]));
     }
     init_campaign(host, &dir)
@@ -325,9 +333,10 @@ fn init_step(
     unit_name: &str,
     step_name: &str,
     lane: Lane,
-    after: &[String],
-    ships: &Ships,
+    declaration: &Declaration,
 ) -> Result<Outcome> {
+    let ships = &declaration.ships;
+    let work = declaration.work;
     let full = format!("{unit_name}/{step_name}");
     let _lock = lock(root)?;
     let campaign = store::load_campaign(root)?;
@@ -335,7 +344,7 @@ fn init_step(
     violations.extend(closed(root, &campaign));
     let units: Units = plan::load_units(root)?;
     let mut parsed = Vec::new();
-    for text in after {
+    for text in &declaration.after {
         match After::parse(text, unit_name) {
             Err(message) => violations.push(Violation::new(&full, "after-parse", message)),
             Ok(after) if after.target() == full => violations.push(Violation::new(
@@ -372,6 +381,13 @@ fn init_step(
                 Err(message) => violations.push(Violation::new(&full, "release-tag", message)),
             }
         }
+        if !work.is_code() {
+            violations.push(Violation::new(
+                &full,
+                "init-target",
+                "a release step ships a tag; --study marks a step that ships none",
+            ));
+        }
     } else if ships.given() {
         violations.push(Violation::new(
             &full,
@@ -387,6 +403,7 @@ fn init_step(
         if step.lane == Some(lane)
             && step.after == parsed
             && step.github == ships.github
+            && step.work == work
             && same_tag
             && violations.is_empty()
         {
@@ -400,6 +417,7 @@ fn init_step(
             && step.github.is_none()
             && step.lane == Some(lane)
             && step.after == parsed
+            && step.work == work
             && violations.is_empty()
         {
             return record_release(host, root, &mut unit, step_name, ships, tag);
@@ -431,6 +449,7 @@ fn init_step(
             after: parsed.clone(),
             github: ships.github.clone(),
             tag: tag.clone(),
+            work,
         },
     );
     write_unit(&dir, &unit)?;
@@ -449,11 +468,18 @@ fn init_step(
     if let Some(github) = &ships.github {
         body.push_str(&format!("- github: {github}\n"));
     }
+    if !work.is_code() {
+        body.push_str("- study: finishes with `cm advance <step> done --evidence <path>`\n");
+    }
     let heading = record(root, &at, &format!("init step {full}"), &body)?;
     let mut outcome = Outcome::default();
-    outcome.line(format!("declared {full} ({lane})"));
+    outcome.line(match work {
+        Work::Code => format!("declared {full} ({lane})"),
+        Work::Study => format!("declared {full} ({lane}, study)"),
+    });
     outcome.field("target", full);
     outcome.field("lane", lane.name());
+    outcome.field("study", !work.is_code());
     outcome.field("after", shown);
     outcome.field("tag", tag.as_ref().map(ToString::to_string));
     outcome.field("journal", heading);
@@ -743,6 +769,7 @@ pub fn launch(
         after: Vec::new(),
         github: None,
         tag: None,
+        work: Work::Code,
     });
     let from = step.track.state.clone();
     step.track.apply(Phase::Launched, &at, &Evidence::default());
@@ -855,6 +882,25 @@ fn is_digest(digest: &str) -> bool {
     })
 }
 
+fn evidence_file(root: &Path, file: &Path) -> Result<String, String> {
+    let path = absolute(file);
+    let (Ok(found), Ok(campaign)) = (path.canonicalize(), root.canonicalize()) else {
+        return Err(format!("`{}` does not exist", path.display()));
+    };
+    found
+        .strip_prefix(&campaign)
+        .ok()
+        .filter(|rel| !rel.as_os_str().is_empty())
+        .map(|rel| rel.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            format!(
+                "`{}` is not inside the campaign folder {}",
+                path.display(),
+                root.display()
+            )
+        })
+}
+
 pub fn advance(
     host: &dyn Host,
     root: &Path,
@@ -900,14 +946,36 @@ pub fn advance(
             }
         },
     };
-    if let Err(message) = track.check(to) {
-        violations.push(Violation::new(&full, "advance-refused", message));
+    let finish = declared.as_ref().map_or(Finish::Shipped, Step::finish);
+    let finishing_code = *to == Phase::Done && finish == Finish::Shipped && target.step.is_some();
+    let code_finish = || {
+        Violation::new(
+            &full,
+            "done-code-step",
+            format!(
+                "{full} is a code step: it finishes at deployed, or merged where it has no release; `done --evidence <path>` finishes an owner-lane step or one declared with --study"
+            ),
+        )
+    };
+    match track.check(to, finish) {
+        Err(_) if finishing_code && track.state != Phase::Done => violations.push(code_finish()),
+        Err(message) => violations.push(Violation::new(&full, "advance-refused", message)),
+        Ok(()) if finishing_code && given.file.is_some() => violations.push(code_finish()),
+        Ok(()) => {}
+    }
+    if *to == Phase::Done
+        && finish == Finish::Evidence
+        && *track.resting() == Phase::Drafted
+        && let Some(step) = &declared
+    {
+        let units = plan::load_units(root)?;
+        violations.extend(plan::unmet(&full, &plan::gates(&units, step)));
     }
     let resuming = matches!(track.state, Phase::Blocked(_)) && track.resting() == to;
     let (required, optional) = if resuming {
         (&[][..], &[][..])
     } else {
-        evidence_for(to)
+        evidence_for(to, finish)
     };
     for flag in required {
         if !flag.given(given) {
@@ -918,8 +986,12 @@ pub fn advance(
             ));
         }
     }
-    for flag in [Flag::Sha, Flag::Pr, Flag::Tag, Flag::Digest] {
-        if flag.given(given) && !required.contains(&flag) && !optional.contains(&flag) {
+    for flag in FLAGS {
+        if flag.given(given)
+            && !required.contains(&flag)
+            && !optional.contains(&flag)
+            && !(finishing_code && flag == Flag::File)
+        {
             violations.push(Violation::new(
                 &full,
                 "evidence-unexpected",
@@ -942,6 +1014,12 @@ pub fn advance(
             .collect(),
     };
     let mut evidence = given.clone();
+    if let Some(file) = &given.file {
+        match evidence_file(root, Path::new(file)) {
+            Ok(rel) => evidence.file = Some(rel),
+            Err(message) => violations.push(Violation::new(&full, "evidence-file", message)),
+        }
+    }
     if let Some(pr) = &given.pr
         && !is_pr_url(pr)
     {

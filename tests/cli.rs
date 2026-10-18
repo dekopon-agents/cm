@@ -129,3 +129,38 @@ fn init_resolves_a_relative_folder_against_dash_c() {
     assert!(b.join("01-x/u/.cm/state.json").is_file());
     assert!(!a.join("01-x").exists());
 }
+
+#[test]
+fn a_queue_item_without_context_is_reported_and_left_as_written() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    assert!(cm(root, &["init"]).status.success());
+    let queue =
+        "# Owner queue\n\n## Pick one\n\nWhich path?\n\nRecommendation: the first\n\nAnswer:\n";
+    fs::write(root.join("OWNER-QUEUE.md"), queue).unwrap();
+    let resume = fs::read_to_string(root.join("RESUME.md")).unwrap();
+    let start = resume.find("> ```").unwrap();
+    let end = resume.find("\n\n# Resume").unwrap();
+    let withheld = format!(
+        "{}> **OWNER-QUEUE not drained: /loop withheld**{}",
+        &resume[..start],
+        &resume[end..]
+    );
+    fs::write(root.join("RESUME.md"), withheld).unwrap();
+
+    let linted = cm(root, &["lint", "--json"]);
+    assert_eq!(linted.status.code(), Some(1));
+    let report = json(&linted);
+    let violations = report["violations"].as_array().unwrap();
+    assert_eq!(violations.len(), 1, "{report}");
+    assert_eq!(violations[0]["rule"], "owner-queue-field");
+    assert_eq!(
+        violations[0]["message"],
+        "item `Pick one` has no line starting `Context:`"
+    );
+    assert!(cm(root, &["init"]).status.success());
+    assert_eq!(
+        fs::read_to_string(root.join("OWNER-QUEUE.md")).unwrap(),
+        queue
+    );
+}

@@ -11,7 +11,7 @@ use crate::forge::GithubRepo;
 use crate::host::{Host, System};
 use crate::lint;
 use crate::outcome::Outcome;
-use crate::state::{Evidence, Lane, Phase};
+use crate::state::{Evidence, Lane, Phase, Work};
 use crate::store::{self, Target, parse_target};
 
 #[derive(Parser)]
@@ -51,9 +51,12 @@ enum Commands {
         /// The folder to initialize.
         #[arg(default_value = ".")]
         dir: PathBuf,
-        /// The step's lane: pi, codex, claude-cloud, fable or owner.
+        /// The step's lane: pi, codex, claude-cloud, fable, owner or coordinator.
         #[arg(long)]
         lane: Option<Lane>,
+        /// The step is a study: it ships no PR and finishes with `cm advance <step> done --evidence <path>`.
+        #[arg(long)]
+        study: bool,
         /// What the step waits on: <step> or <NN-name>/<unit>/<step> (merged), pr-open:<step>, tag:<line>@<version> or deployed:<line>@<version>. Repeat for each.
         #[arg(long, value_name = "AFTER")]
         after: Vec<String>,
@@ -110,7 +113,7 @@ enum Commands {
         /// <NN-name>/<unit> or <NN-name>/<unit>/<step>
         #[arg(value_parser = any_target)]
         target: Target,
-        /// pr-open, merged, released, deployed, done or blocked:<reason>.
+        /// pr-open, merged, released, deployed, done or blocked:<reason>. An owner-lane or study step moves to done, with --evidence, from drafted or launched.
         state: Phase,
         /// A commit: the PR head for pr-open, the merge commit for merged.
         #[arg(long)]
@@ -124,6 +127,9 @@ enum Commands {
         /// sha256:<hex> of the released or deployed artifact.
         #[arg(long)]
         digest: Option<String>,
+        /// A file in the campaign folder that shows an owner-lane or study step is done (done).
+        #[arg(long, value_name = "PATH")]
+        evidence: Option<PathBuf>,
         /// The repository --sha and --tag resolve in; defaults to the step worktrees.
         #[arg(long, value_name = "PATH")]
         repo: Option<PathBuf>,
@@ -141,6 +147,13 @@ fn step_target(text: &str) -> Result<Target, String> {
 
 fn any_target(text: &str) -> Result<Target, String> {
     parse_target(text, false)
+}
+
+fn under_root(cli: &Cli, path: &Path) -> PathBuf {
+    match &cli.root {
+        Some(root) if path.is_relative() => root.join(path),
+        _ => path.to_path_buf(),
+    }
 }
 
 fn read_body(path: &Path) -> Result<String> {
@@ -173,19 +186,21 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
         Commands::Init {
             dir,
             lane,
+            study,
             after,
             github,
             tag,
         } => {
-            let dir = match &cli.root {
-                Some(root) if dir.is_relative() => root.join(dir),
-                _ => dir.clone(),
+            let declaration = commands::Declaration {
+                lane: *lane,
+                after: after.clone(),
+                ships: commands::Ships {
+                    github: github.clone(),
+                    tag: tag.clone(),
+                },
+                work: if *study { Work::Study } else { Work::Code },
             };
-            let ships = commands::Ships {
-                github: github.clone(),
-                tag: tag.clone(),
-            };
-            commands::declare(host, &dir, *lane, after, &ships)
+            commands::declare(host, &under_root(cli, dir), &declaration)
         }
         Commands::Next { target, lane } => crate::plan::next(&root()?, target.as_ref(), *lane),
         Commands::Sync => crate::sync::sync(host, &crate::forge::Gh::default(), &root()?),
@@ -214,6 +229,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             pr,
             tag,
             digest,
+            evidence,
             repo,
         } => {
             let evidence = Evidence {
@@ -221,6 +237,9 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 pr: pr.clone(),
                 tag: tag.clone(),
                 digest: digest.clone(),
+                file: evidence
+                    .as_deref()
+                    .map(|file| under_root(cli, file).to_string_lossy().into_owned()),
             };
             commands::advance(host, &root()?, target, state, &evidence, repo.as_deref())
         }

@@ -6,14 +6,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cm::commands;
-use cm::commands::Ships;
+use cm::commands::{Declaration, Ships};
 use cm::epoch::{self, Status};
 use cm::forge::{CommitSha, Forge, ForgeError, Gh, GithubRepo, Pull, PullState, TagName};
 use cm::host::Host;
 use cm::lint::lint;
 use cm::outcome::Outcome;
 use cm::plan;
-use cm::state::{Evidence, Lane, Phase};
+use cm::state::{Evidence, Lane, Phase, Work};
 use cm::store::{self, parse_target};
 use cm::sync::sync;
 use jiff::Timestamp;
@@ -72,24 +72,37 @@ fn campaign(host: &Fake) -> Campaign {
     Campaign { _temp: temp, root }
 }
 
+fn declare_work(
+    host: &Fake,
+    c: &Campaign,
+    target: &str,
+    lane: Lane,
+    after: &[&str],
+    work: Work,
+) -> Outcome {
+    let declaration = Declaration {
+        lane: Some(lane),
+        after: after.iter().map(|text| (*text).to_owned()).collect(),
+        ships: Ships::default(),
+        work,
+    };
+    commands::declare(host, &c.root.join(target), &declaration).unwrap()
+}
+
 fn declare(host: &Fake, c: &Campaign, target: &str, lane: Lane, after: &[&str]) -> Outcome {
-    let after: Vec<String> = after.iter().map(|text| (*text).to_owned()).collect();
-    commands::declare(
-        host,
-        &c.root.join(target),
-        Some(lane),
-        &after,
-        &Ships::default(),
-    )
-    .unwrap()
+    declare_work(host, c, target, lane, after, Work::Code)
 }
 
 fn declare_release(host: &Fake, c: &Campaign, target: &str, github: &str, tag: &str) -> Outcome {
-    let ships = Ships {
-        github: Some(github.parse().unwrap()),
-        tag: Some(tag.to_owned()),
+    let declaration = Declaration {
+        lane: Some(Lane::Pi),
+        ships: Ships {
+            github: Some(github.parse().unwrap()),
+            tag: Some(tag.to_owned()),
+        },
+        ..Declaration::default()
     };
-    commands::declare(host, &c.root.join(target), Some(Lane::Pi), &[], &ships).unwrap()
+    commands::declare(host, &c.root.join(target), &declaration).unwrap()
 }
 
 fn kickoff(c: &Campaign, target: &str) {
@@ -714,18 +727,15 @@ fn a_release_moves_only_on_its_declared_tag_in_its_declared_repo() {
         vec!["release-tag"]
     );
     assert!(declare_release(&host, &c, guest, "xrl/vm-runner", "guest-v{version}").ok());
-    let ships = Ships {
-        github: Some("xrl/vm-runner".parse().unwrap()),
-        tag: None,
+    let declaration = Declaration {
+        lane: Some(Lane::Pi),
+        ships: Ships {
+            github: Some("xrl/vm-runner".parse().unwrap()),
+            tag: None,
+        },
+        ..Declaration::default()
     };
-    let feature = commands::declare(
-        &host,
-        &c.root.join("01-a/u/S1"),
-        Some(Lane::Pi),
-        &[],
-        &ships,
-    )
-    .unwrap();
+    let feature = commands::declare(&host, &c.root.join("01-a/u/S1"), &declaration).unwrap();
     assert_eq!(rules(&feature), vec!["init-target"]);
     kickoff(&c, guest);
     let prep = "https://github.com/xrl/vm-runner/pull/5";
@@ -1023,4 +1033,249 @@ fn a_release_declared_before_its_tag_was_recorded_takes_it_once() {
     let changed = declare_release(&host, &c, chart, "dekopon-agents/dekopon", "v{version}");
     assert_eq!(rules(&changed), vec!["step-declared"]);
     assert!(lint(&c.root).unwrap().ok());
+}
+
+fn finish(c: &Campaign, target: &str, file: Option<&Path>) -> Outcome {
+    commands::advance(
+        &at("2026-10-18T09:00:00Z"),
+        &c.root,
+        &parse_target(target, false).unwrap(),
+        &Phase::Done,
+        &Evidence {
+            file: file.map(|file| file.to_string_lossy().into_owned()),
+            ..Evidence::default()
+        },
+        None,
+    )
+    .unwrap()
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_study_done_with_evidence_frees_its_consumer() {
+    let host = at("2026-10-18T08:00:00Z");
+    let c = campaign(&host);
+    let study = declare_work(
+        &host,
+        &c,
+        "01-a/u/LOOK",
+        Lane::Coordinator,
+        &[],
+        Work::Study,
+    );
+    assert!(study.ok(), "{:?}", study.violations);
+    assert_eq!(study.fields["study"], true);
+    assert!(declare(&host, &c, "01-a/u/BUILD", Lane::Pi, &["LOOK"]).ok());
+    kickoff(&c, "01-a/u/LOOK");
+    kickoff(&c, "01-a/u/BUILD");
+    assert_eq!(ready(&c, None), ["01-a/u/LOOK"]);
+    let waiting = next_one(&c, "01-a/u/BUILD");
+    assert_eq!(rules(&waiting), vec!["after-unmet"]);
+    assert!(
+        waiting.violations[0]
+            .message
+            .contains("01-a/u/LOOK (needs done, is drafted)"),
+        "{:?}",
+        waiting.violations
+    );
+
+    assert_eq!(
+        rules(&finish(&c, "01-a/u/LOOK", None)),
+        vec!["evidence-missing"]
+    );
+    let missing = c.root.join("01-a/u/LOOK/findings.md");
+    assert_eq!(
+        rules(&finish(&c, "01-a/u/LOOK", Some(&missing))),
+        vec!["evidence-file"]
+    );
+    let outside = c.root.parent().unwrap().join("elsewhere.md");
+    fs::write(&outside, "x").unwrap();
+    assert_eq!(
+        rules(&finish(&c, "01-a/u/LOOK", Some(&outside))),
+        vec!["evidence-file"]
+    );
+    assert_eq!(state(&c, "01-a/u/LOOK"), Phase::Drafted);
+
+    fs::write(&missing, "Findings.\n").unwrap();
+    let gh = support::FakeGh::new("echo unexpected gh call >&2\nexit 1\n");
+    let cm = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("-C")
+            .arg(&c.root)
+            .args(args)
+            .env("PATH", gh.path())
+            .output()
+            .unwrap()
+    };
+    let done = cm(&[
+        "advance",
+        "01-a/u/LOOK",
+        "done",
+        "--evidence",
+        "01-a/u/LOOK/findings.md",
+    ]);
+    assert!(done.status.success(), "{done:?}");
+    assert_eq!(state(&c, "01-a/u/LOOK"), Phase::Done);
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    let track = &unit.steps["LOOK"].track;
+    assert_eq!(
+        track.evidence.file.as_deref(),
+        Some("01-a/u/LOOK/findings.md")
+    );
+    let moved = unit.history.last().unwrap();
+    assert_eq!((&moved.from, &moved.to), (&Phase::Drafted, &Phase::Done));
+    assert_eq!(moved.at, track.since);
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    assert!(
+        journal.contains("- evidence: file 01-a/u/LOOK/findings.md\n"),
+        "{journal}"
+    );
+
+    let rendered = fs::read_to_string(c.root.join("01-a/u/STATE.md")).unwrap();
+    assert!(
+        rendered.contains("| LOOK | coordinator, study | — |\n"),
+        "{rendered}"
+    );
+    assert_eq!(ready(&c, None), ["01-a/u/BUILD"]);
+    assert!(cm(&["sync"]).status.success());
+    let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+    assert!(
+        card.contains("## Next\n\n- `01-a/u/BUILD` (pi)\n"),
+        "{card}"
+    );
+    assert!(lint(&c.root).unwrap().ok());
+}
+
+#[test]
+fn done_refuses_a_code_step_and_an_owner_step_short_of_evidence_or_gates() {
+    let host = at("2026-10-18T08:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/CODE", Lane::Pi, &[]).ok());
+    assert!(declare(&host, &c, "01-a/u/ASK", Lane::Owner, &["CODE"]).ok());
+    let note = c.root.join("01-a/u/note.md");
+    fs::write(&note, "Answered.\n").unwrap();
+    kickoff(&c, "01-a/u/CODE");
+    open_pr(&host, &c, "01-a/u/CODE", "https://github.com/o/r/pull/1");
+    assert_eq!(
+        rules(&finish(&c, "01-a/u/CODE", Some(&note))),
+        vec!["done-code-step"]
+    );
+    assert_eq!(
+        rules(&finish(&c, "01-a/u/CODE", None)),
+        vec!["done-code-step"]
+    );
+    assert_eq!(state(&c, "01-a/u/CODE"), Phase::PrOpen);
+
+    assert_eq!(
+        rules(&finish(&c, "01-a/u/ASK", None)),
+        vec!["after-unmet", "evidence-missing"]
+    );
+    assert_eq!(
+        rules(&finish(&c, "01-a/u/ASK", Some(&note))),
+        vec!["after-unmet"]
+    );
+    let sha = git(&c.root.parent().unwrap().join("wt"), &["rev-parse", "HEAD"]);
+    let merged = advance(
+        &host,
+        &c,
+        "01-a/u/CODE",
+        "merged",
+        Evidence {
+            sha: Some(sha),
+            ..Evidence::default()
+        },
+    );
+    assert!(merged.ok(), "{:?}", merged.violations);
+    let asked = finish(&c, "01-a/u/ASK", Some(&note));
+    assert!(asked.ok(), "{:?}", asked.violations);
+    assert_eq!(
+        rules(&finish(&c, "01-a/u/ASK", Some(&note))),
+        vec!["advance-refused"]
+    );
+}
+
+#[test]
+fn a_coordinator_lane_launch_prints_no_spawn_line() {
+    let host = at("2026-10-18T08:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/PIN", Lane::Coordinator, &[]).ok());
+    kickoff(&c, "01-a/u/PIN");
+    assert_eq!(ready(&c, Some(Lane::Coordinator)), ["01-a/u/PIN"]);
+    let launched = commands::launch(
+        &host,
+        &c.root,
+        &parse_target("01-a/u/PIN", true).unwrap(),
+        None,
+    )
+    .unwrap();
+    assert!(launched.ok(), "{:?}", launched.violations);
+    assert_eq!(launched.fields["launch"], serde_json::Value::Null);
+    assert_eq!(launched.fields["lane"], "coordinator");
+    assert_eq!(
+        launched.lines.last().unwrap(),
+        "launched 01-a/u/PIN in lane coordinator; its prompt is 01-a/u/PIN/kickoff.md"
+    );
+    assert!(
+        launched
+            .lines
+            .iter()
+            .all(|line| !line.contains("pi-turn.sh"))
+    );
+    assert_eq!(state(&c, "01-a/u/PIN"), Phase::Launched);
+}
+
+#[test]
+fn a_campaign_from_cm_0_3_1_loads_unchanged_and_its_owner_step_finishes() {
+    let host = at("2026-10-18T08:00:00Z");
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/campaign-0.3.1");
+    let root = temp.path().join("campaign");
+    copy_tree(&fixture, &root);
+    let c = Campaign { _temp: temp, root };
+    let clean = lint(&c.root).unwrap();
+    assert!(clean.ok(), "{:#?}", clean.violations);
+    for unit in ["01-a/u", "00-release/cm"] {
+        let path = c.root.join(unit).join(".cm/state.json");
+        let stored = fs::read_to_string(&path).unwrap();
+        let loaded = store::load_unit(&c.root.join(unit)).unwrap();
+        assert_eq!(
+            serde_json::to_string_pretty(&loaded).unwrap().trim_end(),
+            stored.trim_end(),
+            "{unit}"
+        );
+    }
+    assert_eq!(
+        state(&c, "01-a/u/PLAN"),
+        Phase::Blocked("waiting-owner".into())
+    );
+    let release = store::load_unit(&c.root.join("00-release/cm")).unwrap();
+    assert_eq!(
+        release.steps["0.3.1"].tag.as_ref().map(ToString::to_string),
+        Some("cm-0.3.1".to_owned())
+    );
+    kickoff(&c, "01-a/u/BUILD");
+    assert_eq!(rules(&next_one(&c, "01-a/u/BUILD")), vec!["after-unmet"]);
+
+    let decision = c.root.join("01-a/u/PLAN/decision.md");
+    fs::write(&decision, "The owner chose the first.\n").unwrap();
+    let done = finish(&c, "01-a/u/PLAN", Some(&decision));
+    assert!(done.ok(), "{:?}", done.violations);
+    assert_eq!(done.fields["from"], "blocked:waiting-owner");
+    assert_eq!(ready(&c, None), ["01-a/u/BUILD"]);
+    assert!(declare(&host, &c, "01-a/u/LATER", Lane::Codex, &["SPIKE"]).ok());
+    let after = lint(&c.root).unwrap();
+    assert!(after.ok(), "{:#?}", after.violations);
 }

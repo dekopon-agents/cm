@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "kind": "unit",
+  "unit": "00-release/cm",
+  "state": "drafted",
+  "since": "2026-10-18T05:56Z",
+  "steps": {
+    "0.3.1": {
+      "state": "drafted",
+      "since": "2026-10-18T05:56Z",
+      "launches": 0,
+      "lane": "codex",
+      "github": "o/cm",
+      "tag": "cm-0.3.1"
+    }
+  },
+  "history": []
+}

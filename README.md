@@ -51,13 +51,13 @@ error.
 | Command | Contract |
 |---|---|
 | `cm init [DIR]` | Writes `RESUME.md`, `JOURNAL.md`, `LIMITS.toml`, `OWNER-QUEUE.md` and `.cm/state.json` from templates embedded in the binary. Never overwrites: in an existing folder it writes only what is missing and adopts each existing file as the baseline once it lints clean. `cm init <NN-name>/<unit>` inside a campaign writes the unit's `.cm/state.json` and its rendered `STATE.md`. |
-| `cm init <NN-name>/<unit>/<step> --lane L [--after A]… [--github OWNER/NAME] [--tag PATTERN]` | Declares a step `drafted` in lane `pi`, `codex`, `claude-cloud`, `fable` or `owner`, creating the unit if needed. Each `--after` is one gate (see [Order](#order)); every step or release it names must already be declared, so the order has no cycles. `--github` and `--tag` declare a release step's repository and tag (see [Releases](#releases)). A relative folder resolves against `-C` when it is given. A declaration is never changed: the same one again is a no-op, a different one is `step-declared`. |
+| `cm init <NN-name>/<unit>/<step> --lane L [--after A]… [--study] [--github OWNER/NAME] [--tag PATTERN]` | Declares a step `drafted` in lane `pi`, `codex`, `claude-cloud`, `fable`, `owner` or `coordinator` (a step the coordinator session runs itself), creating the unit if needed. `--study` marks a step that ships no PR: like an `owner`-lane step it finishes with `cm advance <step> done --evidence <path>` (see [Finishing](#finishing)). Each `--after` is one gate (see [Order](#order)); every step or release it names must already be declared, so the order has no cycles. `--github` and `--tag` declare a release step's repository and tag (see [Releases](#releases)). A relative folder resolves against `-C` when it is given. A declaration is never changed: the same one again is a no-op, a different one is `step-declared`. |
 | `cm next [<NN-name>/<unit>/<step>] [--lane L]` | Lists the declared `drafted` steps whose every `--after` is met and whose folder has `kickoff.md` (`steps`), the rest with what each waits on (`waiting`), and the merged release steps that wait for their tag (`tags`). Nothing is next while `LIMITS.toml` is paused. `tags` is in version order. Given a step, it refuses (exit 1) unless that step is next, naming every unmet gate, and lists a refused step under `waiting`, never `steps`. |
 | `cm sync` | Reads GitHub with read-only `gh api` calls, each killed after 60 seconds, without holding `.cm/lock`; then it takes the lock, reloads the state and applies the moves that still hold. It moves steps along: `pr-open` → `merged` when the PR merged (the merge commit is the evidence), a release step `merged` → `released` when its declared tag exists in its repository and contains the prep merge, any other step `merged` → `released` by the first release of its repository whose tag contains its merge, and `released` → `deployed` once a `deployed` release of the same line contains its merge. One journal entry lists the moves; a sync that moves nothing journals nothing. It rewrites `CARD.md`, whose first line is `Last run: <stamp>`. A PR closed unmerged (`pr-closed`) or an observation `gh` could not make (`sync-unknown`) exits 1 after the rest is applied. |
 | `cm epoch planning\|working\|closed [--skill-revision R] [--plan-revision S]` | Moves `EPOCH.md`'s front matter one status along `OPEN → PLANNING → WORKING → CLOSED`, stamps `planning_started_at`, `working_started_at` or `closed_at` with the date, sets the pins it is given, and journals the move. It refuses a null pin: PLANNING needs `skill_revision`, WORKING and CLOSED also `approved_plan_revision`. `closed` follows `cm close`. |
 | `cm journal "<title>" [--body-file F]` | Appends `## YYYY-MM-DDTHH:MMZ — <title>` and the body (`-` reads stdin). The only way `JOURNAL.md` grows. A body may not hold a `#` or `##` heading. |
-| `cm launch <NN-name>/<unit>/<step> [--worktree PATH]` | Runs the launch checks and reports every failure: `LIMITS.toml` not paused; a declared step's every `--after` met (`after-unmet`); for the local `pi` lane and undeclared steps, free disk on `disk_volume` minus `kache_headroom_gib` over `min_free_disk_gib`, live heavy builds (top-level `cargo` processes) under `max_heavy_builds` and the worktree, which they require; the step folder has `kickoff.md`; every path its packet names exists. Then it marks the step (and a drafted unit) launched, journals the launch and, for a local step, prints the command. It spawns nothing. |
-| `cm advance <NN-name>/<unit>[/<step>] <state> [--sha S] [--pr URL] [--tag T] [--digest D] [--repo PATH]` | Moves one state along `drafted → launched → pr-open → merged → released → deployed → done`, or to `blocked:<reason>`. Refuses a skipped state and a state without its evidence, journals the move and re-renders `STATE.md`. |
+| `cm launch <NN-name>/<unit>/<step> [--worktree PATH]` | Runs the launch checks and reports every failure: `LIMITS.toml` not paused; a declared step's every `--after` met (`after-unmet`); for the local `pi` lane and undeclared steps, free disk on `disk_volume` minus `kache_headroom_gib` over `min_free_disk_gib`, live heavy builds (top-level `cargo` processes) under `max_heavy_builds` and the worktree, which they require; the step folder has `kickoff.md`; every path its packet names exists. Then it marks the step (and a drafted unit) launched, journals the launch and, for a local step, prints the command; every other lane (`owner` and `coordinator` among them) prints only the step and its prompt. It spawns nothing. |
+| `cm advance <NN-name>/<unit>[/<step>] <state> [--sha S] [--pr URL] [--tag T] [--digest D] [--evidence PATH] [--repo PATH]` | Moves one state along `drafted → launched → pr-open → merged → released → deployed → done`, or to `blocked:<reason>`; an `owner`-lane or study step moves to `done` from `drafted` or `launched` with `--evidence` (see [Finishing](#finishing)). Refuses a skipped state and a state without its evidence, journals the move and re-renders `STATE.md`. |
 | `cm close` | Seals the campaign. Refuses, listing every gap, while `OWNER-QUEUE.md` has an open item or any unit or step is short of `done` or `blocked:<reason>`. Then it stamps `closed` in `.cm/state.json` and journals the close. From there unit `cm init`, `cm launch`, `cm advance` and a second `cm close` refuse with `campaign-closed`; `cm journal` stays open for follow-up observations. |
 | `cm lint [DIR]` | Template conformance, cm-owned files against `.cm/state.json`, the journal against git, `.cm/JOURNAL.md` and `.cm/lock` out of git (`cm-tracked`), and the path check for every drafted or launched packet. In a closed campaign, also an empty owner queue and every track done or blocked; its packets are no longer checked, since nothing launches there. |
 
@@ -101,7 +101,7 @@ entries with `cm journal`), and `rm <NN-name>/<unit>/STATE.md && cm init <NN-nam
 | `RESUME.md` | Opens with a `>` banner. No `/loop` proposals until the owner queue is drained: while `OWNER-QUEUE.md` has an open item (a `##` heading), the banner carries the line `OWNER-QUEUE not drained: /loop withheld` and a fenced `/loop` is a violation; once the queue is empty or absent, the banner holds a fenced `/loop …` command and the withheld line is a violation. After `cm close` the banner holds neither: nothing resumes a closed campaign. Headings `# Resume`, `## State today`, `## How to work`, `## Read, in this order`, in that order. |
 | `JOURNAL.md` | First heading `# Journal`; after the adopted baseline, every `##` heading is `## YYYY-MM-DDTHH:MMZ — <title>`; the file extends `git show HEAD:JOURNAL.md` with stamped entries only: a changed committed line is `journal-rewritten`, text added to the last committed entry is `journal-hand-append`. Outside git, or before the journal's first commit, only the headings are checked. |
 | `LIMITS.toml` | `paused` (bool); `runaway_ceiling_usd`, `min_free_disk_gib`, `kache_headroom_gib`, `pr_ci_expected_min`, `pr_ci_deadline_min` (non-negative numbers); `max_heavy_builds` (non-negative integer); `driver_model`, `driver_effort`, `verifier_model`, `supervisor_model`, `supervisor_effort`, `disk_volume` (non-empty strings). Other keys are allowed. |
-| `OWNER-QUEUE.md` | First heading `# Owner queue`; each `##` item has a line starting `Recommendation:` and one starting `Answer:`. |
+| `OWNER-QUEUE.md` | First heading `# Owner queue`; each `##` item has a line starting `Context:`, one starting `Recommendation:` and one starting `Answer:`. A queue written before cm 0.4 whose items lack `Context:` is reported, never rewritten. |
 | `<unit>/STATE.md` | Byte-equal to the render of the unit's `.cm/state.json`. |
 | Packets | In `kickoff.md`, `step-*.md` and `resume*.md` of a drafted or launched step, every absolute or `~/` path inside backticks exists. A span with whitespace, a glob or placeholder character (`* ? < > $ { } [ ] \|`), or a single component such as `/loop` or `//!` is not a path; a trailing `:line` or `:start-end` is dropped. Fenced blocks are not read. |
 
@@ -165,7 +165,7 @@ was blocked from, or moves to that state's successor; a step blocked before its 
 | `merged` | `--sha` | | resolves to a commit |
 | `released` | `--tag` | `--digest` | the tag resolves locally; a release step's is its declared tag |
 | `deployed` | `--digest` | | `sha256:<64 hex>` |
-| `done` | | | |
+| `done` | `--evidence` for an `owner`-lane or study step; nothing for a code step at `deployed` | | the path exists inside the campaign folder; it is recorded relative to it |
 
 SHAs and tags resolve in `--repo`, else the step's worktree, else (for a unit) any step's worktree.
 A commit or tag made elsewhere needs a `git fetch` first. A release step's `--tag` must be the tag it
@@ -184,7 +184,19 @@ met. `--after` takes:
 | `tag:<line>@<version>` | the release step `00-release/<line>/<version>` is `released` or later |
 | `deployed:<line>@<version>` | that release step is `deployed` or later |
 
+A step or `pr-open:` gate on an `owner`-lane or study step is met only when that step is `done`.
 A blocked step meets the gates of the state it was blocked from. A bare step name is in the declaring step's unit.
+
+### Finishing
+
+A code step finishes at `deployed`, or `merged` where it has no release; `cm advance <step> done`
+after `deployed` is unchanged. An `owner`-lane step, or one declared with `--study`, ships no PR:
+`cm advance <step> done --evidence <path>` moves it to `done` from `drafted` or `launched` (or
+blocked from either). The path must exist inside the campaign folder (`evidence-file`) and is
+recorded, relative to the campaign, in the move's evidence beside its stamp. From `drafted` the
+step's own `--after` must be met. `done` without `--evidence` on such a step is `evidence-missing`;
+`done --evidence` on a code step, or `done` on one short of `deployed`, is `done-code-step`. A
+release step cannot be a study.
 
 ### Releases
 

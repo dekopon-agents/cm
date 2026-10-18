@@ -117,7 +117,7 @@ impl<'a> Run<'a> {
         let Some(step) = unit.steps.get_mut(step_name) else {
             return;
         };
-        if step.track.check(&to).is_err() {
+        if step.track.check(&to, step.finish()).is_err() {
             return;
         }
         let from = step.track.state.clone();
