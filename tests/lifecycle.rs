@@ -262,6 +262,7 @@ fn advance(host: &Fake, c: &Campaign, what: &str, to: &str, evidence: Evidence) 
         &to.parse().unwrap(),
         &evidence,
         None,
+        None,
     )
     .unwrap()
 }
@@ -535,6 +536,7 @@ fn a_removed_worktree_points_advance_at_repo() {
         &target(step),
         &"pr-open".parse().unwrap(),
         &pr,
+        None,
         Some(&moved),
     )
     .unwrap();

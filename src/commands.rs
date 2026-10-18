@@ -4,6 +4,7 @@ use std::process::Command;
 
 use anyhow::Result;
 
+use crate::evidence::CampaignFile;
 use crate::forge::{GithubRepo, TagName};
 use crate::host::{Host, stamp};
 use crate::journal;
@@ -41,7 +42,11 @@ pub fn closed(root: &Path, campaign: &CampaignState) -> Option<Violation> {
 }
 
 pub fn write_unit(dir: &Path, unit: &UnitState) -> Result<()> {
-    write_json(&state_path(dir), unit)?;
+    let stamped = UnitState {
+        schema: SCHEMA,
+        ..unit.clone()
+    };
+    write_json(&state_path(dir), &stamped)?;
     write_atomic(&dir.join(UNIT_STATE), render::unit(unit).as_bytes())
 }
 
@@ -882,31 +887,13 @@ fn is_digest(digest: &str) -> bool {
     })
 }
 
-fn evidence_file(root: &Path, file: &Path) -> Result<String, String> {
-    let path = absolute(file);
-    let (Ok(found), Ok(campaign)) = (path.canonicalize(), root.canonicalize()) else {
-        return Err(format!("`{}` does not exist", path.display()));
-    };
-    found
-        .strip_prefix(&campaign)
-        .ok()
-        .filter(|rel| !rel.as_os_str().is_empty())
-        .map(|rel| rel.to_string_lossy().into_owned())
-        .ok_or_else(|| {
-            format!(
-                "`{}` is not inside the campaign folder {}",
-                path.display(),
-                root.display()
-            )
-        })
-}
-
 pub fn advance(
     host: &dyn Host,
     root: &Path,
     target: &Target,
     to: &Phase,
     given: &Evidence,
+    file: Option<&Path>,
     repo: Option<&Path>,
 ) -> Result<Outcome> {
     let full = match &target.step {
@@ -960,7 +947,7 @@ pub fn advance(
     match track.check(to, finish) {
         Err(_) if finishing_code && track.state != Phase::Done => violations.push(code_finish()),
         Err(message) => violations.push(Violation::new(&full, "advance-refused", message)),
-        Ok(()) if finishing_code && given.file.is_some() => violations.push(code_finish()),
+        Ok(()) if finishing_code && file.is_some() => violations.push(code_finish()),
         Ok(()) => {}
     }
     if *to == Phase::Done
@@ -978,7 +965,7 @@ pub fn advance(
         evidence_for(to, finish)
     };
     for flag in required {
-        if !flag.given(given) {
+        if !flag.given(given, file) {
             violations.push(Violation::new(
                 &full,
                 "evidence-missing",
@@ -987,7 +974,7 @@ pub fn advance(
         }
     }
     for flag in FLAGS {
-        if flag.given(given)
+        if flag.given(given, file)
             && !required.contains(&flag)
             && !optional.contains(&flag)
             && !(finishing_code && flag == Flag::File)
@@ -1014,10 +1001,13 @@ pub fn advance(
             .collect(),
     };
     let mut evidence = given.clone();
-    if let Some(file) = &given.file {
-        match evidence_file(root, Path::new(file)) {
-            Ok(rel) => evidence.file = Some(rel),
-            Err(message) => violations.push(Violation::new(&full, "evidence-file", message)),
+    evidence.file = None;
+    if let Some(file) = file {
+        match CampaignFile::resolve(root, file) {
+            Ok(found) => evidence.file = Some(found),
+            Err(error) => {
+                violations.push(Violation::new(&full, "evidence-file", error.to_string()))
+            }
         }
     }
     if let Some(pr) = &given.pr

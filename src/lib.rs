@@ -2,6 +2,7 @@ pub mod attention;
 pub mod cli;
 pub mod commands;
 pub mod epoch;
+pub mod evidence;
 pub mod forge;
 pub mod host;
 pub mod journal;

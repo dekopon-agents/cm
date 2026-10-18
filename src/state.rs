@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::evidence::CampaignFile;
 use crate::forge::{GithubRepo, TagName};
 
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -112,7 +114,7 @@ pub struct Evidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file: Option<String>,
+    pub file: Option<CampaignFile>,
 }
 
 impl Evidence {
@@ -126,11 +128,13 @@ impl Evidence {
             (&mut self.pr, &other.pr),
             (&mut self.tag, &other.tag),
             (&mut self.digest, &other.digest),
-            (&mut self.file, &other.file),
         ] {
             if theirs.is_some() {
                 mine.clone_from(theirs);
             }
+        }
+        if other.file.is_some() {
+            self.file.clone_from(&other.file);
         }
     }
 
@@ -140,10 +144,10 @@ impl Evidence {
             ("sha", &self.sha),
             ("tag", &self.tag),
             ("digest", &self.digest),
-            ("file", &self.file),
         ]
         .into_iter()
         .filter_map(|(name, value)| value.as_ref().map(|value| format!("{name} {value}")))
+        .chain(self.file.as_ref().map(|file| format!("file {file}")))
         .collect();
         if parts.is_empty() {
             "—".to_owned()
@@ -175,13 +179,13 @@ impl Flag {
         }
     }
 
-    pub fn given(self, evidence: &Evidence) -> bool {
+    pub fn given(self, evidence: &Evidence, file: Option<&Path>) -> bool {
         match self {
             Flag::Sha => evidence.sha.is_some(),
             Flag::Pr => evidence.pr.is_some(),
             Flag::Tag => evidence.tag.is_some(),
             Flag::Digest => evidence.digest.is_some(),
-            Flag::File => evidence.file.is_some(),
+            Flag::File => file.is_some(),
         }
     }
 }
@@ -237,21 +241,22 @@ impl Track {
         if self.state == Phase::Done {
             return Err("done is final".into());
         }
-        if *to == Phase::Done
-            && finish == Finish::Evidence
-            && matches!(self.resting(), Phase::Drafted | Phase::Launched)
-        {
-            return Ok(());
-        }
-        match to {
-            Phase::Blocked(_) => return Ok(()),
-            Phase::Drafted => return Err("drafted is where a track starts, never a move".into()),
-            Phase::Launched => {
+        match (to, finish) {
+            (Phase::Blocked(_), Finish::Shipped | Finish::Evidence)
+            | (Phase::Done, Finish::Evidence) => return Ok(()),
+            (Phase::Drafted, Finish::Shipped | Finish::Evidence) => {
+                return Err("drafted is where a track starts, never a move".into());
+            }
+            (Phase::Launched, Finish::Shipped | Finish::Evidence) => {
                 return Err(
                     "launched is entered only by `cm launch`, which runs the launch checks".into(),
                 );
             }
-            _ => {}
+            (
+                Phase::PrOpen | Phase::Merged | Phase::Released | Phase::Deployed,
+                Finish::Shipped | Finish::Evidence,
+            )
+            | (Phase::Done, Finish::Shipped) => {}
         }
         let resting = self.resting();
         if matches!(self.state, Phase::Blocked(_)) && to == resting {
@@ -720,6 +725,7 @@ mod tests {
         let check = |from: Phase| track(from).check(&Phase::Done, Finish::Evidence);
         assert!(check(Phase::Drafted).is_ok());
         assert!(check(Phase::Launched).is_ok());
+        assert!(check(Phase::Merged).is_ok());
         assert!(check(Phase::Done).is_err());
         let mut blocked = track(Phase::Launched);
         blocked.apply(Phase::Blocked("owner".into()), "t", &Evidence::default());

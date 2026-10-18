@@ -134,6 +134,7 @@ fn advance(host: &Fake, c: &Campaign, target: &str, to: &str, evidence: Evidence
         &to.parse().unwrap(),
         &evidence,
         None,
+        None,
     )
     .unwrap()
 }
@@ -1043,10 +1044,8 @@ fn finish(c: &Campaign, target: &str, file: Option<&Path>) -> Outcome {
         &c.root,
         &parse_target(target, false).unwrap(),
         &Phase::Done,
-        &Evidence {
-            file: file.map(|file| file.to_string_lossy().into_owned()),
-            ..Evidence::default()
-        },
+        &Evidence::default(),
+        file,
         None,
     )
     .unwrap()
@@ -1134,9 +1133,13 @@ fn a_study_done_with_evidence_frees_its_consumer() {
     let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
     let track = &unit.steps["LOOK"].track;
     assert_eq!(
-        track.evidence.file.as_deref(),
+        track.evidence.file.as_ref().map(|file| file.as_str()),
         Some("01-a/u/LOOK/findings.md")
     );
+    let stored: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(c.root.join("01-a/u/.cm/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(stored["schema"], 2);
     let moved = unit.history.last().unwrap();
     assert_eq!((&moved.from, &moved.to), (&Phase::Drafted, &Phase::Done));
     assert_eq!(moved.at, track.since);
@@ -1280,4 +1283,123 @@ fn a_campaign_from_cm_0_3_1_loads_unchanged_and_its_owner_step_finishes() {
     assert!(declare(&host, &c, "01-a/u/LATER", Lane::Codex, &["SPIKE"]).ok());
     let after = lint(&c.root).unwrap();
     assert!(after.ok(), "{:#?}", after.violations);
+}
+
+#[test]
+fn evidence_is_a_nonempty_regular_file_outside_cm_state() {
+    let host = at("2026-10-18T08:00:00Z");
+    let c = campaign(&host);
+    assert!(
+        declare_work(
+            &host,
+            &c,
+            "01-a/u/LOOK",
+            Lane::Coordinator,
+            &[],
+            Work::Study
+        )
+        .ok()
+    );
+    let notes = c.root.join("01-a/u/notes");
+    fs::create_dir_all(&notes).unwrap();
+    let empty = c.root.join("01-a/u/empty.md");
+    fs::write(&empty, "").unwrap();
+    for (file, reason) in [
+        (notes.clone(), "is not a regular file"),
+        (empty.clone(), "is empty"),
+        (c.root.join(".cm/state.json"), "which holds cm's own state"),
+        (
+            c.root.join("01-a/u/.cm/state.json"),
+            "which holds cm's own state",
+        ),
+    ] {
+        let refused = finish(&c, "01-a/u/LOOK", Some(&file));
+        assert_eq!(rules(&refused), vec!["evidence-file"], "{file:?}");
+        assert!(
+            refused.violations[0].message.contains(reason),
+            "{file:?}: {:?}",
+            refused.violations
+        );
+    }
+    assert_eq!(state(&c, "01-a/u/LOOK"), Phase::Drafted);
+}
+
+#[test]
+fn an_owner_step_walked_to_merged_still_finishes_with_evidence() {
+    let host = at("2026-10-18T08:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/ASK", Lane::Owner, &[]).ok());
+    assert!(declare(&host, &c, "01-a/u/BUILD", Lane::Pi, &["ASK"]).ok());
+    kickoff(&c, "01-a/u/ASK");
+    kickoff(&c, "01-a/u/BUILD");
+    open_pr(&host, &c, "01-a/u/ASK", "https://github.com/o/r/pull/1");
+    let sha = git(&c.root.parent().unwrap().join("wt"), &["rev-parse", "HEAD"]);
+    let merged = advance(
+        &host,
+        &c,
+        "01-a/u/ASK",
+        "merged",
+        Evidence {
+            sha: Some(sha),
+            ..Evidence::default()
+        },
+    );
+    assert!(merged.ok(), "{:?}", merged.violations);
+    let waiting = next_one(&c, "01-a/u/BUILD");
+    assert!(
+        waiting.violations[0]
+            .message
+            .contains("01-a/u/ASK (needs done, is merged)"),
+        "{:?}",
+        waiting.violations
+    );
+    let answer = c.root.join("01-a/u/ASK/answer.md");
+    fs::write(&answer, "Go.\n").unwrap();
+    let done = finish(&c, "01-a/u/ASK", Some(&answer));
+    assert!(done.ok(), "{:?}", done.violations);
+    assert_eq!(done.fields["from"], "merged");
+    assert_eq!(ready(&c, None), ["01-a/u/BUILD"]);
+}
+
+#[test]
+fn lint_rechecks_recorded_evidence() {
+    let host = at("2026-10-18T08:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/ASK", Lane::Owner, &[]).ok());
+    let answer = c.root.join("01-a/u/ASK/answer.md");
+    fs::write(&answer, "Go.\n").unwrap();
+    assert!(finish(&c, "01-a/u/ASK", Some(&answer)).ok());
+    assert!(lint(&c.root).unwrap().ok());
+    fs::write(&answer, "").unwrap();
+    let emptied = lint(&c.root).unwrap();
+    assert_eq!(rules(&emptied), vec!["evidence-file"]);
+    assert!(emptied.violations[0].message.contains("is empty"));
+    fs::remove_file(&answer).unwrap();
+    let removed = lint(&c.root).unwrap();
+    assert_eq!(rules(&removed), vec!["evidence-file"]);
+    assert_eq!(removed.violations[0].path, "01-a/u/ASK");
+    assert!(removed.violations[0].message.contains("does not exist"));
+}
+
+#[test]
+fn a_unit_from_a_newer_schema_is_refused() {
+    let host = at("2026-10-18T08:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/S1", Lane::Pi, &[]).ok());
+    let path = c.root.join("01-a/u/.cm/state.json");
+    let mut stored: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(stored["schema"], 2);
+    stored["schema"] = 3.into();
+    fs::write(&path, serde_json::to_string_pretty(&stored).unwrap()).unwrap();
+    let error = store::load_unit(&c.root.join("01-a/u")).unwrap_err();
+    let newer = error.downcast_ref::<store::NewerSchema>().unwrap();
+    assert_eq!(newer.found, 3);
+    let linted = lint(&c.root).unwrap();
+    assert_eq!(rules(&linted), vec!["state-parse"]);
+    assert!(
+        linted.violations[0]
+            .message
+            .contains("has schema 3, newer than the schema 2")
+    );
 }

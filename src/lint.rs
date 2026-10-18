@@ -206,6 +206,22 @@ fn lint_unit(
         ));
     }
     out.extend(unit_state_file(root, dir, &unit));
+    let tracks = std::iter::once((expected.clone(), &unit.track)).chain(
+        unit.steps
+            .iter()
+            .map(|(name, step)| (format!("{expected}/{name}"), &step.track)),
+    );
+    for (target, track) in tracks {
+        if let Some(file) = &track.evidence.file
+            && let Err(error) = file.check(root)
+        {
+            out.push(Violation::new(
+                target,
+                "evidence-file",
+                format!("its recorded evidence {file} no longer holds: {error}"),
+            ));
+        }
+    }
     for step_dir in subdirs(dir) {
         let name = name_of(&step_dir);
         let files = packet_files(&step_dir);

@@ -111,7 +111,7 @@ Campaign `.cm/state.json`:
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "kind": "campaign",
   "initialized": "2026-10-08T07:04Z",
   "written": ["RESUME.md", "JOURNAL.md", "LIMITS.toml", "OWNER-QUEUE.md"],
@@ -129,7 +129,7 @@ Unit `.cm/state.json`:
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "kind": "unit",
   "unit": "01-first/alpha",
   "state": "launched",
@@ -165,7 +165,7 @@ was blocked from, or moves to that state's successor; a step blocked before its 
 | `merged` | `--sha` | | resolves to a commit |
 | `released` | `--tag` | `--digest` | the tag resolves locally; a release step's is its declared tag |
 | `deployed` | `--digest` | | `sha256:<64 hex>` |
-| `done` | `--evidence` for an `owner`-lane or study step; nothing for a code step at `deployed` | | the path exists inside the campaign folder; it is recorded relative to it |
+| `done` | `--evidence` for an `owner`-lane or study step; nothing for a code step at `deployed` | | a non-empty regular file inside the campaign, outside `.cm/`; recorded relative to it |
 
 SHAs and tags resolve in `--repo`, else the step's worktree, else (for a unit) any step's worktree.
 A commit or tag made elsewhere needs a `git fetch` first. A release step's `--tag` must be the tag it
@@ -191,12 +191,18 @@ A blocked step meets the gates of the state it was blocked from. A bare step nam
 
 A code step finishes at `deployed`, or `merged` where it has no release; `cm advance <step> done`
 after `deployed` is unchanged. An `owner`-lane step, or one declared with `--study`, ships no PR:
-`cm advance <step> done --evidence <path>` moves it to `done` from `drafted` or `launched` (or
-blocked from either). The path must exist inside the campaign folder (`evidence-file`) and is
-recorded, relative to the campaign, in the move's evidence beside its stamp. From `drafted` the
-step's own `--after` must be met. `done` without `--evidence` on such a step is `evidence-missing`;
+`cm advance <step> done --evidence <path>` moves it to `done` from any state short of `done`
+(blocked steps from where they rest). The path must be a non-empty regular file inside the
+campaign folder and outside every `.cm/` folder (`evidence-file`); it is recorded, relative to the
+campaign, in the move's evidence beside its stamp, and `cm lint` re-checks it every run. From
+`drafted` the step's own `--after` must be met. `done` without `--evidence` on such a step is `evidence-missing`;
 `done --evidence` on a code step, or `done` on one short of `deployed`, is `done-code-step`. A
 release step cannot be a study.
+
+cm 0.4.0 writes every unit state, and a new campaign state, as schema 2 and refuses state from a newer
+schema than it knows; schema 1 state from 0.3.x loads unchanged. cm
+0.3.x checks no schema and drops the fields it does not know when it re-saves a unit, so a campaign
+that uses studies or `--evidence` needs cm 0.4.0 or later on every machine that touches it.
 
 ### Releases
 

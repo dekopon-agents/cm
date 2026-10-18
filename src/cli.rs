@@ -127,7 +127,7 @@ enum Commands {
         /// sha256:<hex> of the released or deployed artifact.
         #[arg(long)]
         digest: Option<String>,
-        /// A file in the campaign folder that shows an owner-lane or study step is done (done).
+        /// A non-empty file in the campaign folder, outside `.cm/`, that shows an owner-lane or study step is done (done).
         #[arg(long, value_name = "PATH")]
         evidence: Option<PathBuf>,
         /// The repository --sha and --tag resolve in; defaults to the step worktrees.
@@ -229,7 +229,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             pr,
             tag,
             digest,
-            evidence,
+            evidence: file,
             repo,
         } => {
             let evidence = Evidence {
@@ -237,11 +237,18 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 pr: pr.clone(),
                 tag: tag.clone(),
                 digest: digest.clone(),
-                file: evidence
-                    .as_deref()
-                    .map(|file| under_root(cli, file).to_string_lossy().into_owned()),
+                file: None,
             };
-            commands::advance(host, &root()?, target, state, &evidence, repo.as_deref())
+            let file = file.as_deref().map(|file| under_root(cli, file));
+            commands::advance(
+                host,
+                &root()?,
+                target,
+                state,
+                &evidence,
+                file.as_deref(),
+                repo.as_deref(),
+            )
         }
         Commands::Lint { dir } => {
             let start = match (dir, &cli.root) {
