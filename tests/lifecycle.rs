@@ -157,7 +157,10 @@ fn init_never_overwrites_and_adopts_what_lints_clean() {
     fs::write(root.join("JOURNAL.md"), journal).unwrap();
 
     let outcome = commands::init(&host, root).unwrap();
-    assert_eq!(rules(&outcome), vec!["owner-queue-field"]);
+    assert_eq!(
+        rules(&outcome),
+        vec!["owner-queue-field", "owner-queue-field"]
+    );
     assert_eq!(fs::read_to_string(root.join("RESUME.md")).unwrap(), resume);
     assert_eq!(
         fs::read_to_string(root.join("OWNER-QUEUE.md")).unwrap(),
@@ -169,7 +172,7 @@ fn init_never_overwrites_and_adopts_what_lints_clean() {
 
     fs::write(
         root.join("OWNER-QUEUE.md"),
-        "# Owner queue\n\n## Pick one\n\nRecommendation: the first\n\nAnswer:\n",
+        "# Owner queue\n\n## Pick one\n\nContext: two paths.\n\nRecommendation: the first\n\nAnswer:\n",
     )
     .unwrap();
     let outcome = commands::init(&host, root).unwrap();
@@ -258,6 +261,7 @@ fn advance(host: &Fake, c: &Campaign, what: &str, to: &str, evidence: Evidence) 
         &target(what),
         &to.parse().unwrap(),
         &evidence,
+        None,
         None,
     )
     .unwrap()
@@ -456,7 +460,7 @@ fn lint_lists_every_violation_in_one_run() {
     fs::write(c.root.join("LIMITS.toml"), limits).unwrap();
     fs::write(
         c.root.join("OWNER-QUEUE.md"),
-        "# Owner queue\n\n## Pick one\n\nRecommendation: yes\n",
+        "# Owner queue\n\n## Pick one\n\nContext: two paths.\n\nRecommendation: yes\n",
     )
     .unwrap();
 
@@ -532,6 +536,7 @@ fn a_removed_worktree_points_advance_at_repo() {
         &target(step),
         &"pr-open".parse().unwrap(),
         &pr,
+        None,
         Some(&moved),
     )
     .unwrap();
@@ -596,7 +601,7 @@ fn close_seals_the_campaign() {
     );
     fs::write(
         c.root.join("OWNER-QUEUE.md"),
-        "# Owner queue\n\n## Pick one\n\nRecommendation: yes\n\nAnswer:\n",
+        "# Owner queue\n\n## Pick one\n\nContext: two paths.\n\nRecommendation: yes\n\nAnswer:\n",
     )
     .unwrap();
 

@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "kind": "campaign",
+  "initialized": "2026-10-18T05:56Z",
+  "written": [
+    "RESUME.md",
+    "JOURNAL.md",
+    "LIMITS.toml",
+    "OWNER-QUEUE.md"
+  ],
+  "adopted": [],
+  "journal": {
+    "baseline_lines": 3
+  }
+}

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::plan::{Next, Units};
-use crate::state::{Lane, Phase, UnitState};
+use crate::state::{Lane, Phase, UnitState, Work};
 use crate::sync::Moved;
 
 fn cell(text: &str) -> String {
@@ -54,7 +54,12 @@ pub fn unit(state: &UnitState) -> String {
             out.push_str(&format!(
                 "| {} | {} | {} |\n",
                 cell(name),
-                step.lane.map_or("—", Lane::name),
+                match (step.lane, step.work) {
+                    (None, Work::Code) => "—".to_owned(),
+                    (None, Work::Study) => "study".to_owned(),
+                    (Some(lane), Work::Code) => lane.name().to_owned(),
+                    (Some(lane), Work::Study) => format!("{lane}, study"),
+                },
                 if after.is_empty() {
                     "—".to_owned()
                 } else {

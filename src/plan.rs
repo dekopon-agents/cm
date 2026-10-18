@@ -9,7 +9,7 @@ use crate::forge::{GithubRepo, TagName};
 use crate::limits;
 use crate::lint::unit_dirs;
 use crate::outcome::{Outcome, Violation};
-use crate::state::{After, Lane, Phase, Release, Step, Track, UnitState};
+use crate::state::{After, Finish, Lane, Phase, Release, Step, Track, UnitState};
 use crate::store::{self, Target, relative, state_path};
 
 pub type Units = BTreeMap<String, UnitState>;
@@ -33,13 +33,18 @@ pub fn step<'a>(units: &'a Units, target: &str) -> Option<&'a Step> {
 pub struct Gate {
     pub after: After,
     pub track: Option<Track>,
+    pub finish: Finish,
 }
 
 impl Gate {
+    pub fn needs(&self) -> Phase {
+        self.after.needs(self.finish)
+    }
+
     pub fn met(&self) -> bool {
         self.track
             .as_ref()
-            .is_some_and(|track| self.after.met_by(track))
+            .is_some_and(|track| self.after.met_by(track, self.finish))
     }
 
     pub fn describe(&self) -> String {
@@ -47,13 +52,13 @@ impl Gate {
             || "not declared".to_owned(),
             |track| track.state.to_string(),
         );
-        format!("{} (needs {}, is {state})", self.after, self.after.needs())
+        format!("{} (needs {}, is {state})", self.after, self.needs())
     }
 
     pub fn to_json(&self) -> Value {
         json!({
             "after": self.after.to_string(),
-            "needs": self.after.needs().to_string(),
+            "needs": self.needs().to_string(),
             "state": self.track.as_ref().map(|track| track.state.to_string()),
             "met": self.met(),
             "evidence": self.track.as_ref().map(|track| serde_json::to_value(&track.evidence).unwrap_or(Value::Null)),
@@ -64,9 +69,13 @@ impl Gate {
 pub fn gates(units: &Units, step: &Step) -> Vec<Gate> {
     step.after
         .iter()
-        .map(|after| Gate {
-            after: after.clone(),
-            track: self::step(units, &after.target()).map(|step| step.track.clone()),
+        .map(|after| {
+            let target = self::step(units, &after.target());
+            Gate {
+                after: after.clone(),
+                track: target.map(|step| step.track.clone()),
+                finish: target.map_or(Finish::Shipped, Step::finish),
+            }
         })
         .collect()
 }

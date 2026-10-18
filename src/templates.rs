@@ -26,6 +26,8 @@ pub const RESUME_HEADINGS: [&str; 4] = [
 
 pub const QUEUE_FILE: &str = "OWNER-QUEUE.md";
 
+pub const QUEUE_FIELDS: [&str; 3] = ["Context:", "Recommendation:", "Answer:"];
+
 pub const LOOP_WITHHELD: &str = "OWNER-QUEUE not drained: /loop withheld";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,7 +199,7 @@ pub fn owner_queue(text: &str) -> Vec<Violation> {
             .find(|line| **line > heading.line)
             .map_or(lines.len(), |line| line - 1);
         let body = &lines[heading.line..end.max(heading.line)];
-        for field in ["Recommendation:", "Answer:"] {
+        for field in QUEUE_FIELDS {
             if !body.iter().any(|line| line.trim_start().starts_with(field)) {
                 out.push(
                     Violation::new(
@@ -238,8 +240,7 @@ mod tests {
         );
     }
 
-    const OPEN_QUEUE: &str =
-        "# Owner queue\n\nIntro.\n\n## Pick one\n\nRecommendation: yes\n\nAnswer:\n";
+    const OPEN_QUEUE: &str = "# Owner queue\n\nIntro.\n\n## Pick one\n\nContext: why.\n\nRecommendation: yes\n\nAnswer:\n";
 
     fn withheld_resume() -> String {
         let start = RESUME.find("> ```").unwrap();
@@ -318,12 +319,37 @@ mod tests {
     }
 
     #[test]
-    fn owner_queue_items_need_both_fields() {
-        let text =
-            "# Owner queue\n\n## One\n\nRecommendation: yes\n\nAnswer:\n\n## Two\n\nAnswer: no\n";
-        let violations = owner_queue(text);
-        assert_eq!(violations.len(), 1, "{violations:?}");
-        assert_eq!(violations[0].line, Some(9));
-        assert!(violations[0].message.contains("Recommendation:"));
+    fn owner_queue_items_need_every_field() {
+        let text = "# Owner queue\n\n## One\n\nContext: a.\n\nRecommendation: yes\n\nAnswer:\n\n## Two\n\nContext: b.\n\nAnswer: no\n\n## Three\n\nRecommendation: no\n\nAnswer:\n";
+        let violations: Vec<(Option<usize>, String)> = owner_queue(text)
+            .into_iter()
+            .map(|violation| (violation.line, violation.message))
+            .collect();
+        assert_eq!(
+            violations,
+            [
+                (
+                    Some(11),
+                    "item `Two` has no line starting `Recommendation:`".to_owned()
+                ),
+                (
+                    Some(17),
+                    "item `Three` has no line starting `Context:`".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_queue_template_carries_the_drawdown_header() {
+        let header = OWNER_QUEUE.lines().nth(2).unwrap();
+        assert!(
+            header.contains("a line starting `Context:` (what the item is and why it is open, enough for a drawdown tutorial), the question, a line starting `Recommendation:` and a line starting `Answer:`")
+        );
+        assert!(
+            header.contains(
+                "[gated drawdown](../../../skills/campaign-trail/references/drawdown.md)"
+            )
+        );
     }
 }

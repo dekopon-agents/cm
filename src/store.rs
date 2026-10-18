@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::state::{CampaignState, Kind, UnitState};
+use crate::state::{CampaignState, Kind, SCHEMA, UnitState};
 
 pub const CM_DIR: &str = ".cm";
 pub const STATE_FILE: &str = "state.json";
@@ -92,8 +92,44 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_atomic(path, text.as_bytes())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewerSchema {
+    pub path: PathBuf,
+    pub found: u32,
+}
+
+impl std::fmt::Display for NewerSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} has schema {}, newer than the schema {SCHEMA} this cm {} reads; upgrade cm",
+            self.path.display(),
+            self.found,
+            env!("CARGO_PKG_VERSION")
+        )
+    }
+}
+
+impl std::error::Error for NewerSchema {}
+
+fn read_state<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        schema: u32,
+    }
+    let probe: Probe = read_json(path)?;
+    if probe.schema > SCHEMA {
+        return Err(NewerSchema {
+            path: path.to_path_buf(),
+            found: probe.schema,
+        }
+        .into());
+    }
+    read_json(path)
+}
+
 pub fn load_campaign(root: &Path) -> Result<CampaignState> {
-    let state: CampaignState = read_json(&state_path(root))?;
+    let state: CampaignState = read_state(&state_path(root))?;
     if state.kind != Kind::Campaign {
         bail!("{} is not a campaign state", state_path(root).display());
     }
@@ -101,7 +137,7 @@ pub fn load_campaign(root: &Path) -> Result<CampaignState> {
 }
 
 pub fn load_unit(dir: &Path) -> Result<UnitState> {
-    let state: UnitState = read_json(&state_path(dir))?;
+    let state: UnitState = read_state(&state_path(dir))?;
     if state.kind != Kind::Unit {
         bail!("{} is not a unit state", state_path(dir).display());
     }

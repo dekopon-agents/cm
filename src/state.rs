@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::evidence::CampaignFile;
 use crate::forge::{GithubRepo, TagName};
 
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -111,6 +113,8 @@ pub struct Evidence {
     pub tag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<CampaignFile>,
 }
 
 impl Evidence {
@@ -129,6 +133,9 @@ impl Evidence {
                 mine.clone_from(theirs);
             }
         }
+        if other.file.is_some() {
+            self.file.clone_from(&other.file);
+        }
     }
 
     pub fn summary(&self) -> String {
@@ -140,6 +147,7 @@ impl Evidence {
         ]
         .into_iter()
         .filter_map(|(name, value)| value.as_ref().map(|value| format!("{name} {value}")))
+        .chain(self.file.as_ref().map(|file| format!("file {file}")))
         .collect();
         if parts.is_empty() {
             "—".to_owned()
@@ -155,7 +163,10 @@ pub enum Flag {
     Pr,
     Tag,
     Digest,
+    File,
 }
+
+pub const FLAGS: [Flag; 5] = [Flag::Sha, Flag::Pr, Flag::Tag, Flag::Digest, Flag::File];
 
 impl Flag {
     pub fn name(self) -> &'static str {
@@ -164,27 +175,39 @@ impl Flag {
             Flag::Pr => "--pr",
             Flag::Tag => "--tag",
             Flag::Digest => "--digest",
+            Flag::File => "--evidence",
         }
     }
 
-    pub fn given(self, evidence: &Evidence) -> bool {
+    pub fn given(self, evidence: &Evidence, file: Option<&Path>) -> bool {
         match self {
             Flag::Sha => evidence.sha.is_some(),
             Flag::Pr => evidence.pr.is_some(),
             Flag::Tag => evidence.tag.is_some(),
             Flag::Digest => evidence.digest.is_some(),
+            Flag::File => file.is_some(),
         }
     }
 }
 
-pub fn evidence_for(phase: &Phase) -> (&'static [Flag], &'static [Flag]) {
-    match phase {
-        Phase::PrOpen => (&[Flag::Pr, Flag::Sha], &[]),
-        Phase::Merged => (&[Flag::Sha], &[]),
-        Phase::Released => (&[Flag::Tag], &[Flag::Digest]),
-        Phase::Deployed => (&[Flag::Digest], &[]),
-        _ => (&[], &[]),
+pub fn evidence_for(phase: &Phase, finish: Finish) -> (&'static [Flag], &'static [Flag]) {
+    match (phase, finish) {
+        (Phase::PrOpen, _) => (&[Flag::Pr, Flag::Sha], &[]),
+        (Phase::Merged, _) => (&[Flag::Sha], &[]),
+        (Phase::Released, _) => (&[Flag::Tag], &[Flag::Digest]),
+        (Phase::Deployed, _) => (&[Flag::Digest], &[]),
+        (Phase::Done, Finish::Evidence) => (&[Flag::File], &[]),
+        (
+            Phase::Drafted | Phase::Launched | Phase::Blocked(_) | Phase::Done,
+            Finish::Evidence | Finish::Shipped,
+        ) => (&[], &[]),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Finish {
+    Shipped,
+    Evidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,19 +237,26 @@ impl Track {
         }
     }
 
-    pub fn check(&self, to: &Phase) -> Result<(), String> {
+    pub fn check(&self, to: &Phase, finish: Finish) -> Result<(), String> {
         if self.state == Phase::Done {
             return Err("done is final".into());
         }
-        match to {
-            Phase::Blocked(_) => return Ok(()),
-            Phase::Drafted => return Err("drafted is where a track starts, never a move".into()),
-            Phase::Launched => {
+        match (to, finish) {
+            (Phase::Blocked(_), Finish::Shipped | Finish::Evidence)
+            | (Phase::Done, Finish::Evidence) => return Ok(()),
+            (Phase::Drafted, Finish::Shipped | Finish::Evidence) => {
+                return Err("drafted is where a track starts, never a move".into());
+            }
+            (Phase::Launched, Finish::Shipped | Finish::Evidence) => {
                 return Err(
                     "launched is entered only by `cm launch`, which runs the launch checks".into(),
                 );
             }
-            _ => {}
+            (
+                Phase::PrOpen | Phase::Merged | Phase::Released | Phase::Deployed,
+                Finish::Shipped | Finish::Evidence,
+            )
+            | (Phase::Done, Finish::Shipped) => {}
         }
         let resting = self.resting();
         if matches!(self.state, Phase::Blocked(_)) && to == resting {
@@ -302,14 +332,16 @@ pub enum Lane {
     ClaudeCloud,
     Fable,
     Owner,
+    Coordinator,
 }
 
-pub const LANES: [Lane; 5] = [
+pub const LANES: [Lane; 6] = [
     Lane::Pi,
     Lane::Codex,
     Lane::ClaudeCloud,
     Lane::Fable,
     Lane::Owner,
+    Lane::Coordinator,
 ];
 
 impl Lane {
@@ -320,13 +352,16 @@ impl Lane {
             Lane::ClaudeCloud => "claude-cloud",
             Lane::Fable => "fable",
             Lane::Owner => "owner",
+            Lane::Coordinator => "coordinator",
         }
     }
 
     pub fn is_local(self) -> bool {
         match self {
             Lane::Pi => true,
-            Lane::Codex | Lane::ClaudeCloud | Lane::Fable | Lane::Owner => false,
+            Lane::Codex | Lane::ClaudeCloud | Lane::Fable | Lane::Owner | Lane::Coordinator => {
+                false
+            }
         }
     }
 }
@@ -504,17 +539,18 @@ impl After {
         }
     }
 
-    pub fn needs(&self) -> Phase {
-        match self {
-            After::Merged(_) => Phase::Merged,
-            After::PrOpen(_) => Phase::PrOpen,
-            After::Tag(_) => Phase::Released,
-            After::Deployed(_) => Phase::Deployed,
+    pub fn needs(&self, finish: Finish) -> Phase {
+        match (self, finish) {
+            (After::Merged(_) | After::PrOpen(_), Finish::Evidence) => Phase::Done,
+            (After::Merged(_), Finish::Shipped) => Phase::Merged,
+            (After::PrOpen(_), Finish::Shipped) => Phase::PrOpen,
+            (After::Tag(_), Finish::Shipped | Finish::Evidence) => Phase::Released,
+            (After::Deployed(_), Finish::Shipped | Finish::Evidence) => Phase::Deployed,
         }
     }
 
-    pub fn met_by(&self, track: &Track) -> bool {
-        match (track.resting().rank(), self.needs().rank()) {
+    pub fn met_by(&self, track: &Track, finish: Finish) -> bool {
+        match (track.resting().rank(), self.needs(finish).rank()) {
             (Some(at), Some(needed)) => at >= needed,
             _ => false,
         }
@@ -568,9 +604,39 @@ pub struct Step {
     pub github: Option<GithubRepo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<TagName>,
+    #[serde(default, skip_serializing_if = "Work::is_code")]
+    pub work: Work,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Work {
+    #[default]
+    Code,
+    Study,
+}
+
+impl Work {
+    pub fn is_code(&self) -> bool {
+        match self {
+            Work::Code => true,
+            Work::Study => false,
+        }
+    }
 }
 
 impl Step {
+    pub fn finish(&self) -> Finish {
+        match (self.work, self.lane) {
+            (Work::Study, _) | (Work::Code, Some(Lane::Owner)) => Finish::Evidence,
+            (
+                Work::Code,
+                None
+                | Some(Lane::Pi | Lane::Codex | Lane::ClaudeCloud | Lane::Fable | Lane::Coordinator),
+            ) => Finish::Shipped,
+        }
+    }
+
     pub fn release_tag(&self, release: &Release) -> TagName {
         self.tag.clone().unwrap_or_else(|| {
             release
@@ -645,15 +711,29 @@ mod tests {
 
     #[test]
     fn refuses_a_skipped_state() {
-        let error = track(Phase::Launched).check(&Phase::Released).unwrap_err();
+        let check = |from: Phase, to: Phase| track(from).check(&to, Finish::Shipped);
+        let error = check(Phase::Launched, Phase::Released).unwrap_err();
         assert!(error.contains("skips pr-open, merged"), "{error}");
-        assert!(track(Phase::Launched).check(&Phase::PrOpen).is_ok());
-        assert!(
-            track(Phase::Done)
-                .check(&Phase::Blocked("x".into()))
-                .is_err()
-        );
-        assert!(track(Phase::PrOpen).check(&Phase::Launched).is_err());
+        assert!(check(Phase::Launched, Phase::PrOpen).is_ok());
+        assert!(check(Phase::Done, Phase::Blocked("x".into())).is_err());
+        assert!(check(Phase::PrOpen, Phase::Launched).is_err());
+        assert!(check(Phase::Launched, Phase::Done).is_err());
+    }
+
+    #[test]
+    fn an_evidence_finish_is_done_before_any_pr() {
+        let check = |from: Phase| track(from).check(&Phase::Done, Finish::Evidence);
+        assert!(check(Phase::Drafted).is_ok());
+        assert!(check(Phase::Launched).is_ok());
+        assert!(check(Phase::Merged).is_ok());
+        assert!(check(Phase::Done).is_err());
+        let mut blocked = track(Phase::Launched);
+        blocked.apply(Phase::Blocked("owner".into()), "t", &Evidence::default());
+        assert!(blocked.check(&Phase::Done, Finish::Evidence).is_ok());
+        let after = After::Merged("01-a/u/S1".into());
+        assert!(!after.met_by(&track(Phase::Merged), Finish::Evidence));
+        assert!(after.met_by(&track(Phase::Done), Finish::Evidence));
+        assert!(after.met_by(&track(Phase::Merged), Finish::Shipped));
     }
 
     #[test]
@@ -661,9 +741,9 @@ mod tests {
         let mut blocked = track(Phase::PrOpen);
         blocked.apply(Phase::Blocked("ci".into()), "t", &Evidence::default());
         assert_eq!(blocked.blocked_from, Some(Phase::PrOpen));
-        assert!(blocked.check(&Phase::PrOpen).is_ok());
-        assert!(blocked.check(&Phase::Merged).is_ok());
-        assert!(blocked.check(&Phase::Released).is_err());
+        assert!(blocked.check(&Phase::PrOpen, Finish::Shipped).is_ok());
+        assert!(blocked.check(&Phase::Merged, Finish::Shipped).is_ok());
+        assert!(blocked.check(&Phase::Released, Finish::Shipped).is_err());
         blocked.apply(Phase::Merged, "t", &Evidence::default());
         assert_eq!(blocked.blocked_from, None);
     }
@@ -720,8 +800,9 @@ mod tests {
     fn a_blocked_track_meets_gates_from_where_it_rests() {
         let mut blocked = track(Phase::Merged);
         blocked.apply(Phase::Blocked("ci".into()), "t", &Evidence::default());
-        assert!(After::Merged("01-a/u/S1".into()).met_by(&blocked));
-        assert!(!After::Merged("01-a/u/S1".into()).met_by(&track(Phase::Blocked("x".into()))));
+        let after = After::Merged("01-a/u/S1".into());
+        assert!(after.met_by(&blocked, Finish::Shipped));
+        assert!(!after.met_by(&track(Phase::Blocked("x".into())), Finish::Shipped));
     }
 
     #[test]
