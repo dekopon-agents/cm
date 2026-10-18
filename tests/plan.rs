@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cm::commands;
+use cm::commands::Ships;
 use cm::epoch::{self, Status};
-use cm::forge::{Forge, ForgeError, Pull, PullState};
+use cm::forge::{CommitSha, Forge, ForgeError, Gh, GithubRepo, Pull, PullState, TagName};
 use cm::host::Host;
 use cm::lint::lint;
 use cm::outcome::Outcome;
@@ -73,7 +74,22 @@ fn campaign(host: &Fake) -> Campaign {
 
 fn declare(host: &Fake, c: &Campaign, target: &str, lane: Lane, after: &[&str]) -> Outcome {
     let after: Vec<String> = after.iter().map(|text| (*text).to_owned()).collect();
-    commands::declare(host, &c.root.join(target), Some(lane), &after).unwrap()
+    commands::declare(
+        host,
+        &c.root.join(target),
+        Some(lane),
+        &after,
+        &Ships::default(),
+    )
+    .unwrap()
+}
+
+fn declare_release(host: &Fake, c: &Campaign, target: &str, github: &str, tag: &str) -> Outcome {
+    let ships = Ships {
+        github: Some(github.parse().unwrap()),
+        tag: Some(tag.to_owned()),
+    };
+    commands::declare(host, &c.root.join(target), Some(Lane::Pi), &[], &ships).unwrap()
 }
 
 fn kickoff(c: &Campaign, target: &str) {
@@ -316,22 +332,27 @@ impl Forge for FakeForge {
         self.pulls.get(url).cloned().ok_or(ForgeError::Json)
     }
 
-    fn tag_exists(&self, repo: &str, tag: &str) -> Result<bool, ForgeError> {
-        Ok(self.tags.contains_key(&(repo.to_owned(), tag.to_owned())))
+    fn tag_exists(&self, repo: &GithubRepo, tag: &TagName) -> Result<bool, ForgeError> {
+        Ok(self.tags.contains_key(&(repo.to_string(), tag.to_string())))
     }
 
-    fn tag_contains(&self, repo: &str, tag: &str, sha: &str) -> Result<bool, ForgeError> {
+    fn tag_contains(
+        &self,
+        repo: &GithubRepo,
+        tag: &TagName,
+        sha: &CommitSha,
+    ) -> Result<bool, ForgeError> {
         Ok(self
             .tags
-            .get(&(repo.to_owned(), tag.to_owned()))
-            .is_some_and(|shas| shas.contains(sha)))
+            .get(&(repo.to_string(), tag.to_string()))
+            .is_some_and(|shas| shas.contains(sha.as_str())))
     }
 }
 
 fn merged(sha: &str) -> Pull {
     Pull {
         state: PullState::Merged,
-        merge_commit: Some(sha.into()),
+        merge_commit: Some(CommitSha::new(sha)),
     }
 }
 
@@ -472,7 +493,16 @@ fn sync_moves_steps_from_github_state_and_renders_the_card() {
 fn a_release_tag_must_name_its_version() {
     let host = at("2026-10-17T08:00:00Z");
     let c = campaign(&host);
-    assert!(declare(&host, &c, "00-release/cm/0.3.0", Lane::Pi, &[]).ok());
+    assert!(
+        declare_release(
+            &host,
+            &c,
+            "00-release/cm/0.3.0",
+            "dekopon-agents/cm",
+            "cm-{version}"
+        )
+        .ok()
+    );
     kickoff(&c, "00-release/cm/0.3.0");
     open_pr(
         &host,
@@ -497,17 +527,20 @@ fn a_release_tag_must_name_its_version() {
     );
     git(&wt, &["tag", "cm-0.2.9"]);
     git(&wt, &["tag", "cm-0.3.0"]);
-    let wrong = advance(
-        &host,
-        &c,
-        "00-release/cm/0.3.0",
-        "released",
-        Evidence {
-            tag: Some("cm-0.2.9".into()),
-            ..Evidence::default()
-        },
-    );
-    assert_eq!(rules(&wrong), vec!["release-tag"]);
+    git(&wt, &["tag", "v0.3.0"]);
+    for wrong in ["cm-0.2.9", "v0.3.0"] {
+        let wrong = advance(
+            &host,
+            &c,
+            "00-release/cm/0.3.0",
+            "released",
+            Evidence {
+                tag: Some(wrong.into()),
+                ..Evidence::default()
+            },
+        );
+        assert_eq!(rules(&wrong), vec!["release-tag"]);
+    }
     let right = advance(
         &host,
         &c,
@@ -646,4 +679,348 @@ fn the_journal_is_checked_against_git_and_runtime_files_stay_out_of_it() {
     let appended = lint(&c.root).unwrap();
     assert_eq!(rules(&appended), vec!["journal-hand-append"]);
     assert_eq!(appended.violations[0].line, Some(text.lines().count()));
+}
+
+fn merge(host: &Fake, c: &Campaign, target: &str, pr: &str) -> String {
+    open_pr(host, c, target, pr);
+    let sha = git(&c.root.parent().unwrap().join("wt"), &["rev-parse", "HEAD"]);
+    let merged = advance(
+        host,
+        c,
+        target,
+        "merged",
+        Evidence {
+            sha: Some(sha.clone()),
+            ..Evidence::default()
+        },
+    );
+    assert!(merged.ok(), "{:?}", merged.violations);
+    sha
+}
+
+#[test]
+fn a_release_moves_only_on_its_declared_tag_in_its_declared_repo() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let guest = "00-release/guest/0.7.0";
+    assert_eq!(
+        rules(&declare_release(
+            &host,
+            &c,
+            guest,
+            "xrl/vm-runner",
+            "guest-v0.7.0"
+        )),
+        vec!["release-tag"]
+    );
+    assert!(declare_release(&host, &c, guest, "xrl/vm-runner", "guest-v{version}").ok());
+    let ships = Ships {
+        github: Some("xrl/vm-runner".parse().unwrap()),
+        tag: None,
+    };
+    let feature = commands::declare(
+        &host,
+        &c.root.join("01-a/u/S1"),
+        Some(Lane::Pi),
+        &[],
+        &ships,
+    )
+    .unwrap();
+    assert_eq!(rules(&feature), vec!["init-target"]);
+    kickoff(&c, guest);
+    let prep = "https://github.com/xrl/vm-runner/pull/5";
+    open_pr(&host, &c, guest, prep);
+    let mut forge = FakeForge::default();
+    forge.pulls.insert(prep.into(), merged("m1"));
+    forge.tags.insert(
+        ("xrl/vm-runner".into(), "v0.7.0".into()),
+        ["m1".to_owned()].into(),
+    );
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(
+        state(&c, guest),
+        Phase::Merged,
+        "the runner's v0.7.0 is not guest's tag"
+    );
+    let next = plan::next(&c.root, None, None).unwrap();
+    assert_eq!(
+        next.fields["tags"][0]["tags"],
+        serde_json::json!(["guest-v0.7.0"])
+    );
+    forge.tags.insert(
+        ("xrl/vm-runner".into(), "guest-v0.7.0".into()),
+        ["m1".to_owned()].into(),
+    );
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(state(&c, guest), Phase::Released);
+
+    let runner = "00-release/runner/0.4.0";
+    assert!(declare(&host, &c, runner, Lane::Pi, &[]).ok());
+    kickoff(&c, runner);
+    let worktree = c.root.parent().unwrap().join("wt");
+    assert!(
+        commands::launch(
+            &host,
+            &c.root,
+            &parse_target(runner, true).unwrap(),
+            Some(&worktree)
+        )
+        .unwrap()
+        .ok()
+    );
+    let elsewhere = advance(
+        &host,
+        &c,
+        runner,
+        "pr-open",
+        Evidence {
+            pr: Some("https://github.com/xrl/vm-runner/pull/6".into()),
+            sha: Some(git(&worktree, &["rev-parse", "HEAD"])),
+            ..Evidence::default()
+        },
+    );
+    assert_eq!(rules(&elsewhere), vec!["release-repo"]);
+}
+
+#[test]
+fn a_member_is_deployed_by_any_deployed_release_of_its_line_that_contains_it() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    for target in ["01-a/u/S1", "00-release/cm/0.3.0", "00-release/cm/0.3.1"] {
+        assert!(declare(&host, &c, target, Lane::Pi, &[]).ok());
+        kickoff(&c, target);
+    }
+    let prs = [
+        ("01-a/u/S1", "https://github.com/o/cm/pull/1", "s1"),
+        (
+            "00-release/cm/0.3.0",
+            "https://github.com/o/cm/pull/2",
+            "p0",
+        ),
+        (
+            "00-release/cm/0.3.1",
+            "https://github.com/o/cm/pull/3",
+            "p1",
+        ),
+    ];
+    let mut forge = FakeForge::default();
+    for (target, pr, sha) in prs {
+        open_pr(&host, &c, target, pr);
+        forge.pulls.insert(pr.into(), merged(sha));
+    }
+    forge.tags.insert(
+        ("o/cm".into(), "v0.3.0".into()),
+        ["s1".to_owned(), "p0".to_owned()].into(),
+    );
+    forge.tags.insert(
+        ("o/cm".into(), "v0.3.1".into()),
+        ["s1".to_owned(), "p0".to_owned(), "p1".to_owned()].into(),
+    );
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(state(&c, "01-a/u/S1"), Phase::Released);
+    let digest = format!("sha256:{}", "d".repeat(64));
+    let deployed = advance(
+        &host,
+        &c,
+        "00-release/cm/0.3.1",
+        "deployed",
+        Evidence {
+            digest: Some(digest.clone()),
+            ..Evidence::default()
+        },
+    );
+    assert!(deployed.ok(), "{:?}", deployed.violations);
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(state(&c, "01-a/u/S1"), Phase::Deployed);
+    assert!(advance(&host, &c, "01-a/u/S1", "done", Evidence::default()).ok());
+}
+
+#[test]
+fn a_met_gate_stays_met_while_its_dependency_is_blocked() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/S1", Lane::Pi, &[]).ok());
+    assert!(declare(&host, &c, "01-a/u/S2", Lane::Pi, &["pr-open:S1"]).ok());
+    kickoff(&c, "01-a/u/S1");
+    kickoff(&c, "01-a/u/S2");
+    open_pr(&host, &c, "01-a/u/S1", "https://github.com/o/r/pull/1");
+    assert!(advance(&host, &c, "01-a/u/S1", "blocked:ci", Evidence::default()).ok());
+    let next = next_one(&c, "01-a/u/S2");
+    assert!(next.ok(), "{:?}", next.violations);
+}
+
+#[test]
+fn next_lists_tags_in_version_order() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    for (target, pr) in [
+        ("00-release/cm/0.9.0", "https://github.com/o/cm/pull/1"),
+        ("00-release/cm/0.10.0", "https://github.com/o/cm/pull/2"),
+    ] {
+        assert!(declare(&host, &c, target, Lane::Pi, &[]).ok());
+        kickoff(&c, target);
+        merge(&host, &c, target, pr);
+    }
+    let next = plan::next(&c.root, None, None).unwrap();
+    let versions: Vec<&str> = next.fields["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tag| tag["version"].as_str().unwrap())
+        .collect();
+    assert_eq!(versions, ["0.9.0", "0.10.0"]);
+}
+
+#[test]
+fn a_refused_step_is_listed_as_waiting_and_never_as_next() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/S1", Lane::Pi, &[]).ok());
+    assert!(declare(&host, &c, "01-a/u/S2", Lane::Pi, &["S1"]).ok());
+    kickoff(&c, "01-a/u/S2");
+    let refused = next_one(&c, "01-a/u/S2");
+    assert_eq!(rules(&refused), vec!["after-unmet"]);
+    assert_eq!(refused.fields["steps"], serde_json::json!([]));
+    assert_eq!(refused.fields["waiting"][0]["target"], "01-a/u/S2");
+    assert!(
+        refused.fields["waiting"][0]["waits_on"][0]
+            .as_str()
+            .unwrap()
+            .contains("01-a/u/S1")
+    );
+    kickoff(&c, "01-a/u/S1");
+    let ready = next_one(&c, "01-a/u/S1");
+    assert!(ready.ok());
+    assert_eq!(ready.fields["steps"][0]["target"], "01-a/u/S1");
+}
+
+#[test]
+fn a_paused_campaign_lists_nothing_next_on_the_card() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/S1", Lane::Pi, &[]).ok());
+    kickoff(&c, "01-a/u/S1");
+    let limits = fs::read_to_string(c.root.join("LIMITS.toml"))
+        .unwrap()
+        .replace("paused = false", "paused = true");
+    fs::write(c.root.join("LIMITS.toml"), limits).unwrap();
+    sync(&host, &FakeForge::default(), &c.root).unwrap();
+    let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+    assert!(
+        card.contains("## Next\n\nNothing is launchable.\n"),
+        "{card}"
+    );
+    assert!(card.contains("- `01-a/u/S1` waits on"), "{card}");
+}
+
+#[cfg(unix)]
+mod support;
+
+#[test]
+#[cfg(unix)]
+fn sync_reads_github_without_holding_the_lock() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/S1", Lane::Pi, &[]).ok());
+    kickoff(&c, "01-a/u/S1");
+    let pr = "https://github.com/o/r/pull/1";
+    open_pr(&host, &c, "01-a/u/S1", pr);
+    let gh = support::FakeGh::new(
+        r#"touch "$FAKE_GH/started"
+while [ ! -f "$FAKE_GH/release" ]; do sleep 0.05; done
+echo '{"state":"closed","merged":true,"merge_commit_sha":"abc123"}'
+"#,
+    );
+    let cm = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cm"));
+        command
+            .arg("-C")
+            .arg(&c.root)
+            .args(args)
+            .env("PATH", gh.path())
+            .stdout(Stdio::null());
+        command
+    };
+    let mut syncing = cm(&["sync"]).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !gh.fixture().join("started").exists() {
+        assert!(Instant::now() < deadline, "gh never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut journal = cm(&["journal", "while gh is out"]).spawn().unwrap();
+    let journaled = loop {
+        if let Some(status) = journal.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() > deadline {
+            journal.kill().unwrap();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    fs::write(gh.fixture().join("release"), "").unwrap();
+    assert!(syncing.wait().unwrap().success());
+    assert!(
+        journaled.is_some_and(|status| status.success()),
+        "cm journal waited on sync's lock while gh ran"
+    );
+    assert_eq!(state(&c, "01-a/u/S1"), Phase::Merged);
+    let text = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    assert!(text.contains("while gh is out"));
+    assert!(text.contains("cm sync: 1 move(s) from GitHub"));
+}
+
+#[test]
+#[cfg(unix)]
+fn a_stalled_gh_is_killed_at_its_timeout() {
+    use std::time::{Duration, Instant};
+
+    let gh = support::FakeGh::new("exec sleep 30\n");
+    let forge = Gh {
+        program: gh.program(),
+        timeout: Duration::from_millis(300),
+    };
+    let start = Instant::now();
+    let read = forge.pull("https://github.com/o/r/pull/1");
+    assert_eq!(read, Err(ForgeError::Timeout(Duration::from_millis(300))));
+    assert!(start.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn a_release_declared_before_its_tag_was_recorded_takes_it_once() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let chart = "00-release/dekopon-chart/1.2.0";
+    assert!(declare(&host, &c, chart, Lane::Pi, &[]).ok());
+    let path = c.root.join("00-release/dekopon-chart/.cm/state.json");
+    let mut stored: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    stored["steps"]["1.2.0"]
+        .as_object_mut()
+        .unwrap()
+        .remove("tag");
+    fs::write(&path, serde_json::to_string_pretty(&stored).unwrap()).unwrap();
+    let recorded = declare_release(
+        &host,
+        &c,
+        chart,
+        "dekopon-agents/dekopon",
+        "dekopon-chart-{version}",
+    );
+    assert!(recorded.ok(), "{:?}", recorded.violations);
+    assert_eq!(recorded.fields["tag"], "dekopon-chart-1.2.0");
+    let again = declare_release(
+        &host,
+        &c,
+        chart,
+        "dekopon-agents/dekopon",
+        "dekopon-chart-{version}",
+    );
+    assert!(again.ok() && again.lines[0].starts_with("nothing to do"));
+    let changed = declare_release(&host, &c, chart, "dekopon-agents/dekopon", "v{version}");
+    assert_eq!(rules(&changed), vec!["step-declared"]);
+    assert!(lint(&c.root).unwrap().ok());
 }

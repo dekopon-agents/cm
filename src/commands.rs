@@ -4,6 +4,7 @@ use std::process::Command;
 
 use anyhow::Result;
 
+use crate::forge::{GithubRepo, TagName};
 use crate::host::{Host, stamp};
 use crate::journal;
 use crate::limits::{self, Limits};
@@ -12,8 +13,8 @@ use crate::outcome::{Outcome, Violation};
 use crate::plan::{self, Units};
 use crate::render;
 use crate::state::{
-    After, CampaignState, Evidence, Flag, JournalMark, Kind, Lane, Move, Phase, RELEASES, Release,
-    SCHEMA, Step, Track, UnitState, evidence_for,
+    After, CampaignState, DEFAULT_TAG, Evidence, Flag, JournalMark, Kind, Lane, Move, Phase,
+    RELEASES, Release, SCHEMA, Step, Track, UnitState, evidence_for,
 };
 use crate::store::{
     self, JOURNAL, Target, UNIT_STATE, absolute, create_new, find_root, lock, parse_target,
@@ -44,8 +45,20 @@ pub fn write_unit(dir: &Path, unit: &UnitState) -> Result<()> {
     write_atomic(&dir.join(UNIT_STATE), render::unit(unit).as_bytes())
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct Ships {
+    pub github: Option<GithubRepo>,
+    pub tag: Option<String>,
+}
+
+impl Ships {
+    fn given(&self) -> bool {
+        self.github.is_some() || self.tag.is_some()
+    }
+}
+
 pub fn init(host: &dyn Host, dir: &Path) -> Result<Outcome> {
-    declare(host, dir, None, &[])
+    declare(host, dir, None, &[], &Ships::default())
 }
 
 pub fn declare(
@@ -53,9 +66,10 @@ pub fn declare(
     dir: &Path,
     lane: Option<Lane>,
     after: &[String],
+    ships: &Ships,
 ) -> Result<Outcome> {
     let dir = absolute(dir);
-    let flags = lane.is_some() || !after.is_empty();
+    let flags = lane.is_some() || !after.is_empty() || ships.given();
     if let Some(root) = dir.parent().and_then(find_root) {
         let rel = relative(&root, &dir);
         return match (parse_target(&rel, false), lane) {
@@ -66,7 +80,7 @@ pub fn declare(
                     step: Some(step),
                 }),
                 Some(lane),
-            ) => init_step(host, &root, &unit, &step, lane, after),
+            ) => init_step(host, &root, &unit, &step, lane, after, ships),
             (Ok(Target { step: Some(_), .. }), None) => Ok(Outcome::refused(vec![Violation::new(
                 rel,
                 "init-target",
@@ -87,7 +101,7 @@ pub fn declare(
         return Ok(Outcome::refused(vec![Violation::new(
             dir.to_string_lossy(),
             "init-target",
-            "--lane and --after declare a step inside a campaign; no campaign holds this folder",
+            "--lane, --after, --github and --tag declare a step inside a campaign; no campaign holds this folder",
         )]));
     }
     init_campaign(host, &dir)
@@ -271,10 +285,38 @@ fn release_checks(full: &str, unit: &UnitState, step_name: &str) -> Vec<Violatio
                 "{} is not above the release(s) {} already declared for {}",
                 release.version,
                 above.join(", "),
-                release.repo
+                release.line
             ),
         )]
     }
+}
+
+fn record_release(
+    host: &dyn Host,
+    root: &Path,
+    unit: &mut UnitState,
+    step_name: &str,
+    ships: &Ships,
+    tag: &TagName,
+) -> Result<Outcome> {
+    let at = stamp(host.now());
+    let full = format!("{}/{step_name}", unit.unit);
+    if let Some(step) = unit.steps.get_mut(step_name) {
+        step.tag = Some(tag.clone());
+        step.github.clone_from(&ships.github);
+    }
+    write_unit(&root.join(&unit.unit), unit)?;
+    let mut body = format!("- tag: {tag}\n");
+    if let Some(github) = &ships.github {
+        body.push_str(&format!("- github: {github}\n"));
+    }
+    let heading = record(root, &at, &format!("record release {full}"), &body)?;
+    let mut outcome = Outcome::default();
+    outcome.line(format!("recorded {full}'s tag {tag}"));
+    outcome.field("target", full);
+    outcome.field("tag", tag.to_string());
+    outcome.field("journal", heading);
+    Ok(outcome)
 }
 
 fn init_step(
@@ -284,6 +326,7 @@ fn init_step(
     step_name: &str,
     lane: Lane,
     after: &[String],
+    ships: &Ships,
 ) -> Result<Outcome> {
     let full = format!("{unit_name}/{step_name}");
     let _lock = lock(root)?;
@@ -315,6 +358,7 @@ fn init_step(
     }
     let dir = root.join(unit_name);
     let existing = units.get(unit_name).cloned();
+    let mut tag = None;
     if unit_name.starts_with(&format!("{RELEASES}/")) {
         let empty = UnitState::new(unit_name, "");
         violations.extend(release_checks(
@@ -322,13 +366,43 @@ fn init_step(
             existing.as_ref().unwrap_or(&empty),
             step_name,
         ));
+        if let Some(release) = Release::of_target(&full) {
+            match release.tag(ships.tag.as_deref().unwrap_or(DEFAULT_TAG)) {
+                Ok(name) => tag = Some(name),
+                Err(message) => violations.push(Violation::new(&full, "release-tag", message)),
+            }
+        }
+    } else if ships.given() {
+        violations.push(Violation::new(
+            &full,
+            "init-target",
+            format!("--github and --tag declare a release step, {RELEASES}/<line>/<version>"),
+        ));
     }
     if let Some(step) = existing.as_ref().and_then(|unit| unit.steps.get(step_name)) {
-        if step.lane == Some(lane) && step.after == parsed && violations.is_empty() {
+        let same_tag = match (Release::of_target(&full), &tag) {
+            (Some(release), Some(tag)) => step.release_tag(&release) == *tag,
+            _ => step.tag.is_none(),
+        };
+        if step.lane == Some(lane)
+            && step.after == parsed
+            && step.github == ships.github
+            && same_tag
+            && violations.is_empty()
+        {
             let mut outcome = Outcome::default();
             outcome.field("target", full.clone());
             outcome.line(format!("nothing to do: {full} is declared"));
             return Ok(outcome);
+        }
+        if let (Some(mut unit), Some(tag)) = (existing.clone(), &tag)
+            && step.tag.is_none()
+            && step.github.is_none()
+            && step.lane == Some(lane)
+            && step.after == parsed
+            && violations.is_empty()
+        {
+            return record_release(host, root, &mut unit, step_name, ships, tag);
         }
         violations.push(Violation::new(
             &full,
@@ -355,11 +429,13 @@ fn init_step(
             launches: 0,
             lane: Some(lane),
             after: parsed.clone(),
+            github: ships.github.clone(),
+            tag: tag.clone(),
         },
     );
     write_unit(&dir, &unit)?;
     let shown: Vec<String> = parsed.iter().map(After::to_string).collect();
-    let body = format!(
+    let mut body = format!(
         "- lane: {lane}\n- after: {}\n",
         if shown.is_empty() {
             "—".to_owned()
@@ -367,12 +443,19 @@ fn init_step(
             shown.join(", ")
         }
     );
+    if let Some(tag) = &tag {
+        body.push_str(&format!("- tag: {tag}\n"));
+    }
+    if let Some(github) = &ships.github {
+        body.push_str(&format!("- github: {github}\n"));
+    }
     let heading = record(root, &at, &format!("init step {full}"), &body)?;
     let mut outcome = Outcome::default();
     outcome.line(format!("declared {full} ({lane})"));
     outcome.field("target", full);
     outcome.field("lane", lane.name());
     outcome.field("after", shown);
+    outcome.field("tag", tag.as_ref().map(ToString::to_string));
     outcome.field("journal", heading);
     Ok(outcome)
 }
@@ -658,6 +741,8 @@ pub fn launch(
         launches: 0,
         lane: None,
         after: Vec::new(),
+        github: None,
+        tag: None,
     });
     let from = step.track.state.clone();
     step.track.apply(Phase::Launched, &at, &Evidence::default());
@@ -796,6 +881,11 @@ pub fn advance(
         return Ok(Outcome::refused(violations));
     }
     let mut unit = store::load_unit(&unit_dir)?;
+    let declared = target
+        .step
+        .as_ref()
+        .and_then(|step| unit.steps.get(step))
+        .cloned();
     let track = match &target.step {
         None => unit.track.clone(),
         Some(step) => match unit.steps.get(step) {
@@ -870,18 +960,31 @@ pub fn advance(
             format!("`{digest}` is not sha256:<64 lowercase hex>"),
         ));
     }
-    if let (Some(release), Some(tag)) = (Release::of_target(&full), &given.tag)
-        && !release.tag_names().contains(tag)
-    {
-        violations.push(Violation::new(
-            &full,
-            "release-tag",
-            format!(
-                "`{tag}` does not name version {}; the release step's tag is one of {}",
-                release.version,
-                release.tag_names().join(", ")
-            ),
-        ));
+    if let (Some(release), Some(step)) = (Release::of_target(&full), &declared) {
+        let wanted = step.release_tag(&release);
+        if let Some(tag) = &given.tag
+            && *tag != wanted.as_str()
+        {
+            violations.push(Violation::new(
+                &full,
+                "release-tag",
+                format!(
+                    "`{tag}` is not {release}'s tag; the release step's tag is {wanted}, declared at `cm init`"
+                ),
+            ));
+        }
+        if let Some(repo) = given.pr.as_deref().and_then(GithubRepo::of_pr)
+            && !step.ships_from(&release, &repo)
+        {
+            violations.push(Violation::new(
+                &full,
+                "release-repo",
+                format!(
+                    "the prep PR is in {repo}, but {release} ships from {}",
+                    step.release_repo(&release)
+                ),
+            ));
+        }
     }
     let needs_repo = given.sha.is_some() || given.tag.is_some();
     let gone: Vec<String> = repos

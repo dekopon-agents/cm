@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde_json::{Value, json};
 
+use crate::forge::{GithubRepo, TagName};
 use crate::limits;
 use crate::lint::unit_dirs;
 use crate::outcome::{Outcome, Violation};
@@ -127,6 +128,12 @@ impl Candidate<'_> {
             "after": self.gates.iter().map(Gate::to_json).collect::<Vec<_>>(),
         })
     }
+
+    fn waiting_json(&self, root: &Path) -> Value {
+        let mut value = self.to_json(root);
+        value["waits_on"] = json!(self.waits_on());
+        value
+    }
 }
 
 fn candidates<'a>(root: &Path, units: &'a Units) -> Vec<Candidate<'a>> {
@@ -151,12 +158,13 @@ fn candidates<'a>(root: &Path, units: &'a Units) -> Vec<Candidate<'a>> {
 pub struct Tag {
     pub target: String,
     pub release: Release,
-    pub repo: Option<String>,
+    pub tag: TagName,
+    pub repo: Option<GithubRepo>,
     pub sha: Option<String>,
 }
 
 pub fn untagged(units: &Units) -> Vec<Tag> {
-    units
+    let mut out: Vec<Tag> = units
         .iter()
         .flat_map(|(unit, state)| {
             state
@@ -166,22 +174,32 @@ pub fn untagged(units: &Units) -> Vec<Tag> {
         })
         .filter(|(_, step)| step.track.state == Phase::Merged)
         .filter_map(|(target, step)| {
+            let release = Release::of_target(&target)?;
+            let repo = step
+                .track
+                .evidence
+                .pr
+                .as_deref()
+                .and_then(GithubRepo::of_pr);
+            if repo
+                .as_ref()
+                .is_some_and(|repo| !step.ships_from(&release, repo))
+            {
+                return None;
+            }
             Some(Tag {
-                release: Release::of_target(&target)?,
-                repo: step.track.evidence.pr.as_deref().and_then(repo_of_pr),
+                tag: step.release_tag(&release),
+                release,
+                repo,
                 sha: step.track.evidence.sha.clone(),
                 target,
             })
         })
-        .collect()
-}
-
-pub fn repo_of_pr(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("https://github.com/")?;
-    let mut parts = rest.split('/');
-    let owner = parts.next()?;
-    let repo = parts.next()?;
-    (parts.next() == Some("pull")).then(|| format!("{owner}/{repo}"))
+        .collect();
+    out.sort_by(|a, b| {
+        (a.release.version, &a.release.line).cmp(&(b.release.version, &b.release.line))
+    });
+    out
 }
 
 pub fn paused(root: &Path) -> Result<bool, Vec<Violation>> {
@@ -206,7 +224,7 @@ pub fn summary(root: &Path, units: &Units) -> Next {
     let mut ready = Vec::new();
     let mut waiting = Vec::new();
     for candidate in candidates(root, units) {
-        if candidate.ready() {
+        if !paused && candidate.ready() {
             ready.push((candidate.target.clone(), candidate.lane()));
         } else {
             waiting.push((candidate.target.clone(), candidate.waits_on()));
@@ -291,8 +309,12 @@ pub fn next(root: &Path, target: Option<&Target>, lane: Option<Lane>) -> Result<
                 "{full} ({}) is next",
                 candidate.lane().map_or("—", Lane::name)
             ));
+            outcome.field("steps", vec![candidate.to_json(root)]);
+            outcome.field("waiting", Vec::<Value>::new());
+        } else {
+            outcome.field("steps", Vec::<Value>::new());
+            outcome.field("waiting", vec![candidate.waiting_json(root)]);
         }
-        outcome.field("steps", vec![candidate.to_json(root)]);
         return Ok(outcome);
     }
     let in_lane = |candidate: &&Candidate| lane.is_none_or(|lane| candidate.lane() == Some(lane));
@@ -326,8 +348,10 @@ pub fn next(root: &Path, target: Option<&Target>, lane: Option<Lane>) -> Result<
     for tag in &tags {
         outcome.line(format!(
             "tag {} {} at {}",
-            tag.repo.as_deref().unwrap_or(&tag.release.repo),
-            tag.release.version,
+            tag.repo
+                .as_ref()
+                .map_or_else(|| tag.release.line.clone(), ToString::to_string),
+            tag.tag,
             tag.sha.as_deref().unwrap_or("—")
         ));
     }
@@ -345,11 +369,7 @@ pub fn next(root: &Path, target: Option<&Target>, lane: Option<Lane>) -> Result<
         "waiting",
         waiting
             .iter()
-            .map(|candidate| {
-                let mut value = candidate.to_json(root);
-                value["waits_on"] = json!(candidate.waits_on());
-                value
-            })
+            .map(|candidate| candidate.waiting_json(root))
             .collect::<Vec<_>>(),
     );
     outcome.field(
@@ -358,9 +378,9 @@ pub fn next(root: &Path, target: Option<&Target>, lane: Option<Lane>) -> Result<
             .map(|tag| {
                 json!({
                     "target": tag.target,
-                    "repo": tag.repo,
+                    "repo": tag.repo.as_ref().map(ToString::to_string),
                     "version": tag.release.version.to_string(),
-                    "tags": tag.release.tag_names(),
+                    "tags": [tag.tag.to_string()],
                     "sha": tag.sha,
                 })
             })
