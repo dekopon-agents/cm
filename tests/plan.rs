@@ -106,7 +106,9 @@ fn declare_release(host: &Fake, c: &Campaign, target: &str, github: &str, tag: &
 }
 
 fn kickoff(c: &Campaign, target: &str) {
-    fs::write(c.root.join(target).join("kickoff.md"), "Go.\n").unwrap();
+    let dir = c.root.join(target);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("kickoff.md"), "Go.\n").unwrap();
 }
 
 fn ready(c: &Campaign, lane: Option<Lane>) -> Vec<String> {
