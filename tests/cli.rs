@@ -104,3 +104,28 @@ fn usage_errors_exit_2_and_refusals_exit_1() {
     let lint_outside = cm(temp.path().parent().unwrap(), &["lint", "--json", "/"]);
     assert_eq!(lint_outside.status.code(), Some(1));
 }
+
+#[test]
+fn init_resolves_a_relative_folder_against_dash_c() {
+    let temp = tempfile::tempdir().unwrap();
+    let a = temp.path().join("a");
+    let b = temp.path().join("b");
+    fs::create_dir_all(&a).unwrap();
+    assert!(cm(&a, &["init"]).status.success());
+    assert!(cm(temp.path(), &["-C", "b", "init"]).status.success());
+    let declared = cm(
+        &a,
+        &[
+            "--json",
+            "-C",
+            b.to_str().unwrap(),
+            "init",
+            "01-x/u/S1",
+            "--lane",
+            "pi",
+        ],
+    );
+    assert!(declared.status.success(), "{}", json(&declared));
+    assert!(b.join("01-x/u/.cm/state.json").is_file());
+    assert!(!a.join("01-x").exists());
+}

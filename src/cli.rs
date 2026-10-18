@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 
 use crate::commands;
 use crate::epoch::{self, Status};
+use crate::forge::GithubRepo;
 use crate::host::{Host, System};
 use crate::lint;
 use crate::outcome::Outcome;
@@ -53,9 +54,15 @@ enum Commands {
         /// The step's lane: pi, codex, claude-cloud, fable or owner.
         #[arg(long)]
         lane: Option<Lane>,
-        /// What the step waits on: <step> or <NN-name>/<unit>/<step> (merged), pr-open:<step>, tag:<repo>@<version> or deployed:<repo>@<version>. Repeat for each.
+        /// What the step waits on: <step> or <NN-name>/<unit>/<step> (merged), pr-open:<step>, tag:<line>@<version> or deployed:<line>@<version>. Repeat for each.
         #[arg(long, value_name = "AFTER")]
         after: Vec<String>,
+        /// A release step's repository, <owner>/<name>; its prep PR must be there. Defaults to any owner's repository named for the release line.
+        #[arg(long, value_name = "OWNER/NAME")]
+        github: Option<GithubRepo>,
+        /// A release step's tag pattern, holding `{version}` once; cm records the one tag it names. Defaults to `v{version}`.
+        #[arg(long, value_name = "PATTERN")]
+        tag: Option<String>,
     },
     /// List the declared steps whose `--after` is met, or, given one, refuse it unless it is next.
     Next {
@@ -163,9 +170,25 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             *record,
         ),
         Commands::Close => commands::close(host, &root()?),
-        Commands::Init { dir, lane, after } => commands::declare(host, dir, *lane, after),
+        Commands::Init {
+            dir,
+            lane,
+            after,
+            github,
+            tag,
+        } => {
+            let dir = match &cli.root {
+                Some(root) if dir.is_relative() => root.join(dir),
+                _ => dir.clone(),
+            };
+            let ships = commands::Ships {
+                github: github.clone(),
+                tag: tag.clone(),
+            };
+            commands::declare(host, &dir, *lane, after, &ships)
+        }
         Commands::Next { target, lane } => crate::plan::next(&root()?, target.as_ref(), *lane),
-        Commands::Sync => crate::sync::sync(host, &crate::forge::Gh, &root()?),
+        Commands::Sync => crate::sync::sync(host, &crate::forge::Gh::default(), &root()?),
         Commands::Epoch {
             status,
             skill_revision,

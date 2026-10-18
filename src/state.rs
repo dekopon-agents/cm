@@ -3,6 +3,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::forge::{GithubRepo, TagName};
+
 pub const SCHEMA: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,7 +324,10 @@ impl Lane {
     }
 
     pub fn is_local(self) -> bool {
-        self == Lane::Pi
+        match self {
+            Lane::Pi => true,
+            Lane::Codex | Lane::ClaudeCloud | Lane::Fable | Lane::Owner => false,
+        }
     }
 }
 
@@ -400,45 +405,50 @@ impl std::str::FromStr for Version {
 }
 
 pub const RELEASES: &str = "00-release";
+pub const DEFAULT_TAG: &str = "v{version}";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Release {
-    pub repo: String,
+    pub line: String,
     pub version: Version,
 }
 
 impl Release {
     pub fn target(&self) -> String {
-        format!("{RELEASES}/{}/{}", self.repo, self.version)
+        format!("{RELEASES}/{}/{}", self.line, self.version)
     }
 
     pub fn of_target(target: &str) -> Option<Release> {
         let mut parts = target.split('/');
         match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (Some(RELEASES), Some(repo), Some(version), None) => Some(Release {
-                repo: repo.to_owned(),
+            (Some(RELEASES), Some(line), Some(version), None) => Some(Release {
+                line: line.to_owned(),
                 version: version.parse().ok()?,
             }),
             _ => None,
         }
     }
 
-    pub fn tag_names(&self) -> [String; 3] {
-        [
-            format!("v{}", self.version),
-            format!("{}-{}", self.repo, self.version),
-            self.version.to_string(),
-        ]
+    pub fn tag(&self, pattern: &str) -> Result<TagName, String> {
+        if pattern.matches("{version}").count() != 1 {
+            return Err(format!(
+                "`{pattern}` holds `{{version}}` once, e.g. `{DEFAULT_TAG}` or `{}-{{version}}`",
+                self.line
+            ));
+        }
+        pattern
+            .replace("{version}", &self.version.to_string())
+            .parse()
     }
 
     fn parse(text: &str) -> Result<Release, String> {
         let shape = || format!("`{text}` is not <repo>@<major>.<minor>.<patch>");
-        let (repo, version) = text.split_once('@').ok_or_else(shape)?;
-        if !crate::store::is_name(repo) {
+        let (line, version) = text.split_once('@').ok_or_else(shape)?;
+        if !crate::store::is_name(line) {
             return Err(shape());
         }
         Ok(Release {
-            repo: repo.to_owned(),
+            line: line.to_owned(),
             version: version.parse().map_err(|_| shape())?,
         })
     }
@@ -446,7 +456,7 @@ impl Release {
 
 impl fmt::Display for Release {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}@{}", self.repo, self.version)
+        write!(f, "{}@{}", self.line, self.version)
     }
 }
 
@@ -504,7 +514,7 @@ impl After {
     }
 
     pub fn met_by(&self, track: &Track) -> bool {
-        match (track.state.rank(), self.needs().rank()) {
+        match (track.resting().rank(), self.needs().rank()) {
             (Some(at), Some(needed)) => at >= needed,
             _ => false,
         }
@@ -554,6 +564,34 @@ pub struct Step {
     pub lane: Option<Lane>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub after: Vec<After>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<GithubRepo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<TagName>,
+}
+
+impl Step {
+    pub fn release_tag(&self, release: &Release) -> TagName {
+        self.tag.clone().unwrap_or_else(|| {
+            release
+                .tag(DEFAULT_TAG)
+                .expect("a version always forms the default tag")
+        })
+    }
+
+    pub fn ships_from(&self, release: &Release, repo: &GithubRepo) -> bool {
+        match &self.github {
+            Some(github) => github == repo,
+            None => repo.name() == release.line,
+        }
+    }
+
+    pub fn release_repo(&self, release: &Release) -> String {
+        match &self.github {
+            Some(github) => github.to_string(),
+            None => format!("<owner>/{}", release.line),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -666,8 +704,24 @@ mod tests {
             assert!(v(bad).is_err(), "{bad}");
         }
         let release = Release::of_target("00-release/cm/0.3.0").unwrap();
-        assert_eq!(release.tag_names(), ["v0.3.0", "cm-0.3.0", "0.3.0"]);
+        assert_eq!(release.tag(DEFAULT_TAG).unwrap().as_str(), "v0.3.0");
+        assert_eq!(release.tag("cm-{version}").unwrap().as_str(), "cm-0.3.0");
+        assert!(release.tag("cm-0.3.0").is_err());
         assert!(Release::of_target("01-a/cm/0.3.0").is_none());
+    }
+
+    #[test]
+    fn only_the_pi_lane_is_local() {
+        let local: Vec<Lane> = LANES.into_iter().filter(|lane| lane.is_local()).collect();
+        assert_eq!(local, [Lane::Pi]);
+    }
+
+    #[test]
+    fn a_blocked_track_meets_gates_from_where_it_rests() {
+        let mut blocked = track(Phase::Merged);
+        blocked.apply(Phase::Blocked("ci".into()), "t", &Evidence::default());
+        assert!(After::Merged("01-a/u/S1".into()).met_by(&blocked));
+        assert!(!After::Merged("01-a/u/S1".into()).met_by(&track(Phase::Blocked("x".into()))));
     }
 
     #[test]

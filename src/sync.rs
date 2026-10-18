@@ -5,13 +5,13 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::commands::{closed, write_unit};
-use crate::forge::{Forge, ForgeError, Pull, PullState};
+use crate::forge::{CommitSha, Forge, ForgeError, GithubRepo, Pull, PullState, TagName};
 use crate::host::{Host, stamp};
 use crate::journal;
 use crate::outcome::{Outcome, Violation};
-use crate::plan::{self, Units, repo_of_pr};
+use crate::plan::{self, Units};
 use crate::render;
-use crate::state::{Evidence, Move, Phase, Release};
+use crate::state::{Evidence, Move, Phase, Release, Step};
 use crate::store::{self, lock, write_atomic};
 
 pub const CARD: &str = "CARD.md";
@@ -23,19 +23,73 @@ pub struct Moved {
     pub evidence: Evidence,
 }
 
+type Read<T> = Result<T, ForgeError>;
+
+#[derive(Default)]
+struct Reads {
+    pulls: BTreeMap<String, Read<Pull>>,
+    tags: BTreeMap<(GithubRepo, TagName), Read<bool>>,
+    contains: BTreeMap<(GithubRepo, TagName, CommitSha), Read<bool>>,
+}
+
+fn cached<K: Ord, T: Clone>(
+    cache: &mut BTreeMap<K, Read<T>>,
+    key: K,
+    forge: Option<&dyn Forge>,
+    read: impl FnOnce(&dyn Forge) -> Read<T>,
+) -> Option<Read<T>> {
+    if let Some(hit) = cache.get(&key) {
+        return Some(hit.clone());
+    }
+    let result = read(forge?);
+    cache.insert(key, result.clone());
+    Some(result)
+}
+
+struct Shipped {
+    release: Release,
+    repo: GithubRepo,
+    tag: TagName,
+    digest: Option<String>,
+}
+
 struct Run<'a> {
-    forge: &'a dyn Forge,
+    forge: Option<&'a dyn Forge>,
+    reads: Reads,
     at: String,
     units: Units,
     dirty: BTreeSet<String>,
     moves: Vec<Moved>,
     violations: Vec<Violation>,
-    pulls: BTreeMap<String, Result<Pull, ForgeError>>,
-    contains: BTreeMap<(String, String, String), Result<bool, ForgeError>>,
 }
 
-impl Run<'_> {
-    fn steps_at(&self, phase: &Phase) -> Vec<(String, Evidence)> {
+fn merge_of(evidence: &Evidence) -> Option<(GithubRepo, CommitSha)> {
+    let repo = evidence.pr.as_deref().and_then(GithubRepo::of_pr)?;
+    let sha = CommitSha::new(evidence.sha.clone()?);
+    Some((repo, sha))
+}
+
+impl<'a> Run<'a> {
+    fn new(forge: Option<&'a dyn Forge>, reads: Reads, at: String, units: Units) -> Self {
+        Run {
+            forge,
+            reads,
+            at,
+            units,
+            dirty: BTreeSet::new(),
+            moves: Vec::new(),
+            violations: Vec::new(),
+        }
+    }
+
+    fn walk(&mut self) {
+        self.merges();
+        self.tags();
+        self.released();
+        self.deployed();
+    }
+
+    fn steps_at(&self, phase: &Phase) -> Vec<(String, Step)> {
         self.units
             .iter()
             .flat_map(|(unit, state)| {
@@ -43,9 +97,7 @@ impl Run<'_> {
                     .steps
                     .iter()
                     .filter(|(_, step)| step.track.state == *phase)
-                    .map(move |(name, step)| {
-                        (format!("{unit}/{name}"), step.track.evidence.clone())
-                    })
+                    .map(move |(name, step)| (format!("{unit}/{name}"), step.clone()))
             })
             .collect()
     }
@@ -86,28 +138,40 @@ impl Run<'_> {
         });
     }
 
-    fn pull(&mut self, url: &str) -> Result<Pull, ForgeError> {
-        let forge = self.forge;
-        self.pulls
-            .entry(url.to_owned())
-            .or_insert_with(|| forge.pull(url))
-            .clone()
+    fn pull(&mut self, url: &str) -> Option<Read<Pull>> {
+        cached(&mut self.reads.pulls, url.to_owned(), self.forge, |forge| {
+            forge.pull(url)
+        })
     }
 
-    fn contains(&mut self, repo: &str, tag: &str, sha: &str) -> Result<bool, ForgeError> {
-        let forge = self.forge;
-        self.contains
-            .entry((repo.to_owned(), tag.to_owned(), sha.to_owned()))
-            .or_insert_with(|| forge.tag_contains(repo, tag, sha))
-            .clone()
+    fn tag_exists(&mut self, repo: &GithubRepo, tag: &TagName) -> Option<Read<bool>> {
+        let key = (repo.clone(), tag.clone());
+        cached(&mut self.reads.tags, key, self.forge, |forge| {
+            forge.tag_exists(repo, tag)
+        })
+    }
+
+    fn contains(
+        &mut self,
+        repo: &GithubRepo,
+        tag: &TagName,
+        sha: &CommitSha,
+    ) -> Option<Read<bool>> {
+        let key = (repo.clone(), tag.clone(), sha.clone());
+        cached(&mut self.reads.contains, key, self.forge, |forge| {
+            forge.tag_contains(repo, tag, sha)
+        })
     }
 
     fn merges(&mut self) {
-        for (target, evidence) in self.steps_at(&Phase::PrOpen) {
-            let Some(url) = evidence.pr else {
+        for (target, step) in self.steps_at(&Phase::PrOpen) {
+            let Some(url) = step.track.evidence.pr else {
                 continue;
             };
-            match self.pull(&url) {
+            let Some(read) = self.pull(&url) else {
+                continue;
+            };
+            match read {
                 Ok(Pull {
                     state: PullState::Merged,
                     merge_commit: Some(sha),
@@ -115,7 +179,7 @@ impl Run<'_> {
                     &target,
                     Phase::Merged,
                     Evidence {
-                        sha: Some(sha),
+                        sha: Some(sha.to_string()),
                         ..Evidence::default()
                     },
                 ),
@@ -143,13 +207,11 @@ impl Run<'_> {
     }
 
     fn tags(&mut self) {
-        for (target, evidence) in self.steps_at(&Phase::Merged) {
+        for (target, step) in self.steps_at(&Phase::Merged) {
             let Some(release) = Release::of_target(&target) else {
                 continue;
             };
-            let (Some(repo), Some(sha)) =
-                (evidence.pr.as_deref().and_then(repo_of_pr), evidence.sha)
-            else {
+            let Some((repo, sha)) = merge_of(&step.track.evidence) else {
                 self.unknown(
                     &target,
                     "a merged release step needs its prep PR and merge commit to find its tag"
@@ -157,86 +219,98 @@ impl Run<'_> {
                 );
                 continue;
             };
-            for tag in release.tag_names() {
-                match self.forge.tag_exists(&repo, &tag) {
-                    Ok(false) => continue,
-                    Ok(true) => match self.contains(&repo, &tag, &sha) {
-                        Ok(true) => self.advance(
-                            &target,
-                            Phase::Released,
-                            Evidence {
-                                tag: Some(tag),
-                                ..Evidence::default()
-                            },
-                        ),
-                        Ok(false) => self.violations.push(Violation::new(
-                            &target,
-                            "release-tag",
-                            format!("{repo} tag {tag} does not contain the prep merge {sha}"),
-                        )),
-                        Err(error) => self.unknown(&target, format!("{repo} {tag}: {error}")),
-                    },
-                    Err(error) => self.unknown(&target, format!("{repo} {tag}: {error}")),
-                }
-                break;
+            if !step.ships_from(&release, &repo) {
+                self.violations.push(Violation::new(
+                    &target,
+                    "release-repo",
+                    format!(
+                        "the prep PR is in {repo}, but {} ships from {}",
+                        release,
+                        step.release_repo(&release)
+                    ),
+                ));
+                continue;
+            }
+            let tag = step.release_tag(&release);
+            match self.tag_exists(&repo, &tag) {
+                None | Some(Ok(false)) => {}
+                Some(Ok(true)) => match self.contains(&repo, &tag, &sha) {
+                    None => {}
+                    Some(Ok(true)) => self.advance(
+                        &target,
+                        Phase::Released,
+                        Evidence {
+                            tag: Some(tag.to_string()),
+                            ..Evidence::default()
+                        },
+                    ),
+                    Some(Ok(false)) => self.violations.push(Violation::new(
+                        &target,
+                        "release-tag",
+                        format!("{repo} tag {tag} does not contain the prep merge {sha}"),
+                    )),
+                    Some(Err(error)) => self.unknown(&target, format!("{repo} {tag}: {error}")),
+                },
+                Some(Err(error)) => self.unknown(&target, format!("{repo} {tag}: {error}")),
             }
         }
     }
 
-    fn releases(&self, at_least: &Phase) -> Vec<(Release, String, Evidence)> {
-        let mut out: Vec<(Release, String, Evidence)> = self
+    fn releases(&self, at_least: &Phase) -> Vec<Shipped> {
+        let mut out: Vec<Shipped> = self
             .units
             .iter()
             .flat_map(|(unit, state)| {
                 state
                     .steps
                     .iter()
-                    .map(move |(name, step)| (format!("{unit}/{name}"), &step.track))
+                    .map(move |(name, step)| (format!("{unit}/{name}"), step))
             })
-            .filter(|(_, track)| {
-                matches!((track.state.rank(), at_least.rank()), (Some(at), Some(needed)) if at >= needed)
+            .filter(|(_, step)| {
+                matches!((step.track.state.rank(), at_least.rank()), (Some(at), Some(needed)) if at >= needed)
             })
-            .filter_map(|(target, track)| {
+            .filter_map(|(target, step)| {
                 let release = Release::of_target(&target)?;
-                let repo = track.evidence.pr.as_deref().and_then(repo_of_pr)?;
-                track.evidence.tag.as_ref()?;
-                Some((release, repo, track.evidence.clone()))
+                let repo = step.track.evidence.pr.as_deref().and_then(GithubRepo::of_pr)?;
+                let tag = step.track.evidence.tag.as_deref()?.parse().ok()?;
+                step.ships_from(&release, &repo).then(|| Shipped {
+                    release,
+                    repo,
+                    tag,
+                    digest: step.track.evidence.digest.clone(),
+                })
             })
             .collect();
-        out.sort_by_key(|(release, _, _)| release.version);
+        out.sort_by_key(|shipped| shipped.release.version);
         out
     }
 
     fn released(&mut self) {
         let releases = self.releases(&Phase::Released);
-        for (target, evidence) in self.steps_at(&Phase::Merged) {
+        for (target, step) in self.steps_at(&Phase::Merged) {
             if Release::of_target(&target).is_some() {
                 continue;
             }
-            let (Some(repo), Some(sha)) =
-                (evidence.pr.as_deref().and_then(repo_of_pr), evidence.sha)
-            else {
+            let Some((repo, sha)) = merge_of(&step.track.evidence) else {
                 continue;
             };
-            for (_, release_repo, release) in releases.iter().filter(|(_, r, _)| *r == repo) {
-                let Some(tag) = &release.tag else {
-                    continue;
-                };
-                match self.contains(release_repo, tag, &sha) {
-                    Ok(true) => {
+            for shipped in releases.iter().filter(|shipped| shipped.repo == repo) {
+                match self.contains(&repo, &shipped.tag, &sha) {
+                    None => break,
+                    Some(Ok(true)) => {
                         self.advance(
                             &target,
                             Phase::Released,
                             Evidence {
-                                tag: Some(tag.clone()),
+                                tag: Some(shipped.tag.to_string()),
                                 ..Evidence::default()
                             },
                         );
                         break;
                     }
-                    Ok(false) => {}
-                    Err(error) => {
-                        self.unknown(&target, format!("{repo} {tag}: {error}"));
+                    Some(Ok(false)) => {}
+                    Some(Err(error)) => {
+                        self.unknown(&target, format!("{repo} {}: {error}", shipped.tag));
                         break;
                     }
                 }
@@ -245,23 +319,56 @@ impl Run<'_> {
     }
 
     fn deployed(&mut self) {
+        let released = self.releases(&Phase::Released);
         let deployed = self.releases(&Phase::Deployed);
-        for (target, evidence) in self.steps_at(&Phase::Released) {
+        for (target, step) in self.steps_at(&Phase::Released) {
             if Release::of_target(&target).is_some() {
                 continue;
             }
-            let repo = evidence.pr.as_deref().and_then(repo_of_pr);
-            let found = deployed.iter().find(|(_, release_repo, release)| {
-                Some(release_repo) == repo.as_ref() && release.tag == evidence.tag
-            });
-            if let Some((_, _, release)) = found
-                && let Some(digest) = &release.digest
-            {
+            let Some((repo, sha)) = merge_of(&step.track.evidence) else {
+                continue;
+            };
+            let Some(tag) = step
+                .track
+                .evidence
+                .tag
+                .as_deref()
+                .and_then(|tag| tag.parse::<TagName>().ok())
+            else {
+                continue;
+            };
+            let line = released
+                .iter()
+                .find(|shipped| shipped.repo == repo && shipped.tag == tag)
+                .map(|shipped| shipped.release.line.clone());
+            let mut found = None;
+            for shipped in deployed.iter().filter(|shipped| shipped.repo == repo) {
+                if shipped.tag == tag {
+                    found = Some(shipped);
+                    break;
+                }
+                if line.as_ref() != Some(&shipped.release.line) {
+                    continue;
+                }
+                match self.contains(&repo, &shipped.tag, &sha) {
+                    None => break,
+                    Some(Ok(true)) => {
+                        found = Some(shipped);
+                        break;
+                    }
+                    Some(Ok(false)) => {}
+                    Some(Err(error)) => {
+                        self.unknown(&target, format!("{repo} {}: {error}", shipped.tag));
+                        break;
+                    }
+                }
+            }
+            if let Some(digest) = found.and_then(|shipped| shipped.digest.clone()) {
                 self.advance(
                     &target,
                     Phase::Deployed,
                     Evidence {
-                        digest: Some(digest.clone()),
+                        digest: Some(digest),
                         ..Evidence::default()
                     },
                 );
@@ -270,28 +377,33 @@ impl Run<'_> {
     }
 }
 
-pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> {
-    let _lock = lock(root)?;
+fn guard(root: &Path) -> Result<Vec<Violation>> {
     let campaign = store::load_campaign(root)?;
     let mut guard = journal::check(root, &campaign);
     guard.extend(closed(root, &campaign));
-    if !guard.is_empty() {
-        return Ok(Outcome::refused(guard));
+    Ok(guard)
+}
+
+pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> {
+    let found = guard(root)?;
+    if !found.is_empty() {
+        return Ok(Outcome::refused(found));
     }
-    let mut run = Run {
-        forge,
-        at: stamp(host.now()),
-        units: plan::load_units(root)?,
-        dirty: BTreeSet::new(),
-        moves: Vec::new(),
-        violations: Vec::new(),
-        pulls: BTreeMap::new(),
-        contains: BTreeMap::new(),
-    };
-    run.merges();
-    run.tags();
-    run.released();
-    run.deployed();
+    let at = stamp(host.now());
+    let mut read = Run::new(
+        Some(forge),
+        Reads::default(),
+        at.clone(),
+        plan::load_units(root)?,
+    );
+    read.walk();
+    let _lock = lock(root)?;
+    let found = guard(root)?;
+    if !found.is_empty() {
+        return Ok(Outcome::refused(found));
+    }
+    let mut run = Run::new(None, read.reads, at, plan::load_units(root)?);
+    run.walk();
     for name in &run.dirty {
         write_unit(&root.join(name), &run.units[name])?;
     }

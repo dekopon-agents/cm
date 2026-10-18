@@ -51,9 +51,9 @@ error.
 | Command | Contract |
 |---|---|
 | `cm init [DIR]` | Writes `RESUME.md`, `JOURNAL.md`, `LIMITS.toml`, `OWNER-QUEUE.md` and `.cm/state.json` from templates embedded in the binary. Never overwrites: in an existing folder it writes only what is missing and adopts each existing file as the baseline once it lints clean. `cm init <NN-name>/<unit>` inside a campaign writes the unit's `.cm/state.json` and its rendered `STATE.md`. |
-| `cm init <NN-name>/<unit>/<step> --lane L [--after A]…` | Declares a step `drafted` in lane `pi`, `codex`, `claude-cloud`, `fable` or `owner`, creating the unit if needed. Each `--after` is one gate (see [Order](#order)); every step or release it names must already be declared, so the order has no cycles. A declaration is never changed: the same one again is a no-op, a different one is `step-declared`. |
-| `cm next [<NN-name>/<unit>/<step>] [--lane L]` | Lists the declared `drafted` steps whose every `--after` is met and whose folder has `kickoff.md` (`steps`), the rest with what each waits on (`waiting`), and the merged release steps that wait for their tag (`tags`). Nothing is next while `LIMITS.toml` is paused. Given a step, it refuses (exit 1) unless that step is next, naming every unmet gate. |
-| `cm sync` | Reads GitHub with read-only `gh api` calls and moves steps along: `pr-open` → `merged` when the PR merged (the merge commit is the evidence), a release step `merged` → `released` when its tag exists and contains the prep merge, any other step `merged` → `released` by the first release of its repository whose tag contains its merge, and `released` → `deployed` once its release step is `deployed`. One journal entry lists the moves; a sync that moves nothing journals nothing. It rewrites `CARD.md`, whose first line is `Last run: <stamp>`. A PR closed unmerged (`pr-closed`) or an observation `gh` could not make (`sync-unknown`) exits 1 after the rest is applied. |
+| `cm init <NN-name>/<unit>/<step> --lane L [--after A]… [--github OWNER/NAME] [--tag PATTERN]` | Declares a step `drafted` in lane `pi`, `codex`, `claude-cloud`, `fable` or `owner`, creating the unit if needed. Each `--after` is one gate (see [Order](#order)); every step or release it names must already be declared, so the order has no cycles. `--github` and `--tag` declare a release step's repository and tag (see [Releases](#releases)). A relative folder resolves against `-C` when it is given. A declaration is never changed: the same one again is a no-op, a different one is `step-declared`. |
+| `cm next [<NN-name>/<unit>/<step>] [--lane L]` | Lists the declared `drafted` steps whose every `--after` is met and whose folder has `kickoff.md` (`steps`), the rest with what each waits on (`waiting`), and the merged release steps that wait for their tag (`tags`). Nothing is next while `LIMITS.toml` is paused. `tags` is in version order. Given a step, it refuses (exit 1) unless that step is next, naming every unmet gate, and lists a refused step under `waiting`, never `steps`. |
+| `cm sync` | Reads GitHub with read-only `gh api` calls, each killed after 60 seconds, without holding `.cm/lock`; then it takes the lock, reloads the state and applies the moves that still hold. It moves steps along: `pr-open` → `merged` when the PR merged (the merge commit is the evidence), a release step `merged` → `released` when its declared tag exists in its repository and contains the prep merge, any other step `merged` → `released` by the first release of its repository whose tag contains its merge, and `released` → `deployed` once a `deployed` release of the same line contains its merge. One journal entry lists the moves; a sync that moves nothing journals nothing. It rewrites `CARD.md`, whose first line is `Last run: <stamp>`. A PR closed unmerged (`pr-closed`) or an observation `gh` could not make (`sync-unknown`) exits 1 after the rest is applied. |
 | `cm epoch planning\|working\|closed [--skill-revision R] [--plan-revision S]` | Moves `EPOCH.md`'s front matter one status along `OPEN → PLANNING → WORKING → CLOSED`, stamps `planning_started_at`, `working_started_at` or `closed_at` with the date, sets the pins it is given, and journals the move. It refuses a null pin: PLANNING needs `skill_revision`, WORKING and CLOSED also `approved_plan_revision`. `closed` follows `cm close`. |
 | `cm journal "<title>" [--body-file F]` | Appends `## YYYY-MM-DDTHH:MMZ — <title>` and the body (`-` reads stdin). The only way `JOURNAL.md` grows. A body may not hold a `#` or `##` heading. |
 | `cm launch <NN-name>/<unit>/<step> [--worktree PATH]` | Runs the launch checks and reports every failure: `LIMITS.toml` not paused; a declared step's every `--after` met (`after-unmet`); for the local `pi` lane and undeclared steps, free disk on `disk_volume` minus `kache_headroom_gib` over `min_free_disk_gib`, live heavy builds (top-level `cargo` processes) under `max_heavy_builds` and the worktree, which they require; the step folder has `kickoff.md`; every path its packet names exists. Then it marks the step (and a drafted unit) launched, journals the launch and, for a local step, prints the command. It spawns nothing. |
@@ -163,13 +163,14 @@ was blocked from, or moves to that state's successor; a step blocked before its 
 | `launched` | `cm launch` only | | the launch checks |
 | `pr-open` | `--pr`, `--sha` | | URL is `https://github.com/<owner>/<repo>/pull/<n>`; the SHA resolves to a commit |
 | `merged` | `--sha` | | resolves to a commit |
-| `released` | `--tag` | `--digest` | the tag resolves locally |
+| `released` | `--tag` | `--digest` | the tag resolves locally; a release step's is its declared tag |
 | `deployed` | `--digest` | | `sha256:<64 hex>` |
 | `done` | | | |
 
 SHAs and tags resolve in `--repo`, else the step's worktree, else (for a unit) any step's worktree.
-A commit or tag made elsewhere needs a `git fetch` first. A release step's `--tag` must name its own
-version (`release-tag`). `cm sync` reads the same evidence from GitHub instead.
+A commit or tag made elsewhere needs a `git fetch` first. A release step's `--tag` must be the tag it
+was declared with (`release-tag`), and its `pr-open --pr` must be in its repository (`release-repo`).
+`cm sync` reads the same evidence from GitHub instead.
 
 ### Order
 
@@ -180,21 +181,31 @@ met. `--after` takes:
 |---|---|
 | `<step>` or `<NN-name>/<unit>/<step>` | that step is `merged` or later |
 | `pr-open:<step>` | that step is `pr-open` or later (a chain that builds on an open PR) |
-| `tag:<repo>@<version>` | the release step `00-release/<repo>/<version>` is `released` or later |
-| `deployed:<repo>@<version>` | that release step is `deployed` or later |
+| `tag:<line>@<version>` | the release step `00-release/<line>/<version>` is `released` or later |
+| `deployed:<line>@<version>` | that release step is `deployed` or later |
 
-A blocked step meets no gate. A bare step name is in the declaring step's unit.
+A blocked step meets the gates of the state it was blocked from. A bare step name is in the declaring step's unit.
 
 ### Releases
 
-A release is a step `00-release/<repo>/<major>.<minor>.<patch>`: its packet is the prep PR, and
-its name is the only place a tag version comes from. Each declared version must be above every
-release already declared for that repository. Once the prep PR is `merged`, `cm next --json` lists it
-under `tags` with the version and the merge commit to tag. Its tag is `v<version>`,
-`<repo>-<version>` or `<version>`; `cm sync` records `released` when one of them exists and contains
-the prep merge, and moves the repository's merged steps that the tag contains along with it. The
-tick's smoke receipt is `cm advance 00-release/<repo>/<version> deployed --digest …`; the next sync
-carries `deployed` to the steps that release shipped.
+A release is a step `00-release/<line>/<major>.<minor>.<patch>`: its packet is the prep PR, and
+its name is the only place a tag version comes from. A line is one thing a repository ships under
+its own tags; one repository can hold several (`runner` tagged `v<version>` and `guest` tagged
+`guest-v<version>` in `xrl/vm-runner`). Each declared version must be above every release already
+declared for that line.
+
+`cm init 00-release/<line>/<version> --lane L [--github OWNER/NAME] [--tag PATTERN]` records the
+release's repository and its one tag: `PATTERN` holds `{version}` once and defaults to
+`v{version}`; without `--github` the prep PR must be in a repository named `<line>`. A release step
+declared before cm 0.3.1 has neither recorded; declaring it again with the same lane and `--after`
+records its `--tag` and `--github` once. Once the prep
+PR is `merged`, `cm next --json` lists it under `tags` with the version, the merge commit and
+`tags`, the one declared tag name. `cm sync` records `released` when that tag exists in that
+repository and contains the prep merge, and moves the repository's merged steps that the tag
+contains along with it. The tick's smoke receipt is
+`cm advance 00-release/<line>/<version> deployed --digest …`; the next sync carries `deployed` to
+every step a deployed release of that line contains, so a fix-forward release deploys what the one
+before it shipped.
 
 ## Releases
 
