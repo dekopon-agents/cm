@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::evidence::CampaignFile;
 use crate::forge::{GithubRepo, TagName};
 
-pub const SCHEMA: u32 = 2;
+pub const SCHEMA: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -19,6 +19,7 @@ pub enum Phase {
     Released,
     Deployed,
     Done,
+    Superseded,
     Blocked(String),
 }
 
@@ -41,6 +42,10 @@ impl Phase {
     pub fn rank(&self) -> Option<usize> {
         ORDER.iter().position(|phase| phase == self)
     }
+
+    pub fn is_final(&self) -> bool {
+        matches!(self, Phase::Done | Phase::Superseded)
+    }
 }
 
 impl fmt::Display for Phase {
@@ -53,6 +58,7 @@ impl fmt::Display for Phase {
             Phase::Released => "released",
             Phase::Deployed => "deployed",
             Phase::Done => "done",
+            Phase::Superseded => "superseded",
             Phase::Blocked(reason) => return write!(f, "blocked:{reason}"),
         };
         f.write_str(name)
@@ -91,12 +97,13 @@ impl std::str::FromStr for Phase {
         }
         ORDER
             .iter()
+            .chain([&Phase::Superseded])
             .find(|phase| phase.to_string() == text)
             .cloned()
             .ok_or_else(|| {
                 let names: Vec<String> = ORDER.iter().map(Phase::to_string).collect();
                 format!(
-                    "`{text}` is not a state; states are {}, blocked:<reason>",
+                    "`{text}` is not a state; states are {}, superseded, blocked:<reason>",
                     names.join(", ")
                 )
             })
@@ -196,7 +203,7 @@ pub fn evidence_for(phase: &Phase, finish: Finish) -> (&'static [Flag], &'static
         (Phase::Merged, _) => (&[Flag::Sha], &[]),
         (Phase::Released, _) => (&[Flag::Tag], &[Flag::Digest]),
         (Phase::Deployed, _) => (&[Flag::Digest], &[]),
-        (Phase::Done, Finish::Evidence) => (&[Flag::File], &[]),
+        (Phase::Done, Finish::Evidence) | (Phase::Superseded, _) => (&[Flag::File], &[]),
         (
             Phase::Drafted | Phase::Launched | Phase::Blocked(_) | Phase::Done,
             Finish::Evidence | Finish::Shipped,
@@ -238,11 +245,11 @@ impl Track {
     }
 
     pub fn check(&self, to: &Phase, finish: Finish) -> Result<(), String> {
-        if self.state == Phase::Done {
-            return Err("done is final".into());
+        if self.state.is_final() {
+            return Err(format!("{} is final", self.state));
         }
         match (to, finish) {
-            (Phase::Blocked(_), Finish::Shipped | Finish::Evidence)
+            (Phase::Blocked(_) | Phase::Superseded, Finish::Shipped | Finish::Evidence)
             | (Phase::Done, Finish::Evidence) => return Ok(()),
             (Phase::Drafted, Finish::Shipped | Finish::Evidence) => {
                 return Err("drafted is where a track starts, never a move".into());

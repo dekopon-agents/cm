@@ -108,6 +108,30 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         worktree: Option<PathBuf>,
     },
+    /// Release a blocked unit or step to the state it was blocked from, with the evidence that cleared it.
+    Unblock {
+        /// <NN-name>/<unit> or <NN-name>/<unit>/<step>
+        #[arg(value_parser = any_target)]
+        target: Target,
+        /// A non-empty file in the campaign folder, outside `.cm/`, showing what cleared the block.
+        #[arg(long, value_name = "PATH")]
+        evidence: PathBuf,
+    },
+    /// Change a drafted or launched step's declaration: mark it a study, move its lane or add a gate.
+    Amend {
+        /// <NN-name>/<unit>/<step>
+        #[arg(value_parser = step_target)]
+        target: Target,
+        /// The step ships no PR and finishes with `cm advance <step> done --evidence <path>`.
+        #[arg(long)]
+        study: bool,
+        /// The step's new lane.
+        #[arg(long)]
+        lane: Option<Lane>,
+        /// A gate to add, as `cm init --after` takes it. Repeat for each.
+        #[arg(long, value_name = "AFTER")]
+        after: Vec<String>,
+    },
     /// Move a unit or step to its next state with that state's evidence.
     Advance {
         /// <NN-name>/<unit> or <NN-name>/<unit>/<step>
@@ -222,6 +246,24 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
         Commands::Launch { target, worktree } => {
             commands::launch(host, &root()?, target, worktree.as_deref())
         }
+        Commands::Unblock { target, evidence } => {
+            commands::unblock(host, &root()?, target, &under_root(cli, evidence))
+        }
+        Commands::Amend {
+            target,
+            study,
+            lane,
+            after,
+        } => commands::amend(
+            host,
+            &root()?,
+            target,
+            &commands::Amendment {
+                study: *study,
+                lane: *lane,
+                after: after.clone(),
+            },
+        ),
         Commands::Advance {
             target,
             state,
@@ -271,6 +313,8 @@ fn name(command: &Commands) -> &'static str {
         Commands::Epoch { .. } => "epoch",
         Commands::Journal { .. } => "journal",
         Commands::Launch { .. } => "launch",
+        Commands::Unblock { .. } => "unblock",
+        Commands::Amend { .. } => "amend",
         Commands::Advance { .. } => "advance",
         Commands::Lint { .. } => "lint",
     }
