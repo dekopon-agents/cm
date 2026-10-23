@@ -1179,7 +1179,7 @@ pub fn advance(
     Ok(outcome)
 }
 
-fn unit_and_track(
+fn unit_of(
     root: &Path,
     target: &Target,
     violations: &mut Vec<Violation>,
@@ -1197,24 +1197,17 @@ fn unit_and_track(
         ));
         return Ok(None);
     }
-    let unit = store::load_unit(&unit_dir)?;
-    if let Some(step) = &target.step
-        && !unit.steps.contains_key(step)
-    {
-        violations.push(Violation::new(
-            &full,
-            "step-unknown",
-            "the step is not declared",
-        ));
-        return Ok(None);
-    }
-    Ok(Some((unit, full)))
+    Ok(Some((store::load_unit(&unit_dir)?, full)))
 }
 
-fn track_mut<'a>(unit: &'a mut UnitState, target: &Target) -> &'a mut Track {
+fn step_unknown(full: &str) -> Violation {
+    Violation::new(full, "step-unknown", "the step is not declared")
+}
+
+fn track_mut<'a>(unit: &'a mut UnitState, target: &Target) -> Option<&'a mut Track> {
     match &target.step {
-        None => &mut unit.track,
-        Some(step) => &mut unit.steps.get_mut(step).expect("checked").track,
+        None => Some(&mut unit.track),
+        Some(step) => unit.steps.get_mut(step).map(|step| &mut step.track),
     }
 }
 
@@ -1225,10 +1218,14 @@ pub fn unblock(host: &dyn Host, root: &Path, target: &Target, file: &Path) -> Re
     let campaign = store::load_campaign(root)?;
     let mut violations = journal::check(root, &campaign);
     violations.extend(closed(root, &campaign));
-    let Some((mut unit, full)) = unit_and_track(root, target, &mut violations)? else {
+    let Some((mut unit, full)) = unit_of(root, target, &mut violations)? else {
         return Ok(Outcome::refused(violations));
     };
-    let track = track_mut(&mut unit, target).clone();
+    let Some(current) = track_mut(&mut unit, target) else {
+        violations.push(step_unknown(&full));
+        return Ok(Outcome::refused(violations));
+    };
+    let track = current.clone();
     if !matches!(track.state, Phase::Blocked(_)) {
         violations.push(Violation::new(
             &full,
@@ -1246,7 +1243,7 @@ pub fn unblock(host: &dyn Host, root: &Path, target: &Target, file: &Path) -> Re
     }
     let at = stamp(host.now());
     let to = track.resting().clone();
-    track_mut(&mut unit, target).apply(to.clone(), &at, &evidence);
+    current.apply(to.clone(), &at, &evidence);
     unit.history.push(Move {
         at: at.clone(),
         target: full.clone(),
@@ -1319,7 +1316,7 @@ pub fn amend(
     let campaign = store::load_campaign(root)?;
     let mut violations = journal::check(root, &campaign);
     violations.extend(closed(root, &campaign));
-    let Some((mut unit, full)) = unit_and_track(root, target, &mut violations)? else {
+    let Some((mut unit, full)) = unit_of(root, target, &mut violations)? else {
         return Ok(Outcome::refused(violations));
     };
     let Some(step_name) = target.step.as_deref() else {
@@ -1331,7 +1328,10 @@ pub fn amend(
         return Ok(Outcome::refused(violations));
     };
     let units = plan::load_units(root)?;
-    let step = unit.steps[step_name].clone();
+    let Some(step) = unit.steps.get(step_name).cloned() else {
+        violations.push(step_unknown(&full));
+        return Ok(Outcome::refused(violations));
+    };
     if step.lane.is_none() {
         violations.push(Violation::new(
             &full,
