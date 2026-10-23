@@ -49,6 +49,14 @@ fn campaign(host: &Fake) -> Campaign {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("campaign");
     assert!(commands::init(host, &root).unwrap().ok());
+    let git = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&root)
+        .status();
+    assert!(
+        git.unwrap().success(),
+        "a campaign lives in a git repository"
+    );
     Campaign { _temp: temp, root }
 }
 
@@ -121,4 +129,18 @@ fn packets_check_only_tokens_that_look_like_files() {
             "`/var/nope/x` does not exist"
         ]
     );
+}
+
+#[test]
+fn lint_cannot_clear_ignored_folders_outside_git() {
+    let host = at("2026-10-19T09:00:00Z");
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("campaign");
+    assert!(commands::init(&host, &root).unwrap().ok());
+    assert!(lint(&root).unwrap().ok());
+    let c = Campaign { _temp: temp, root };
+    assert!(declare(&host, &c, "01-a/u/S1", Lane::Codex, &[]).ok());
+    let linted = lint(&c.root).unwrap();
+    assert_eq!(rules(&linted), vec!["git-ignored-unknown"]);
+    assert!(linted.lines[0].contains("1 violation"));
 }
