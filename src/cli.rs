@@ -208,6 +208,38 @@ enum Commands {
         #[arg(long, value_name = "FILE")]
         body_file: PathBuf,
     },
+    /// Append one review row to REVIEW-OFF.md, rendered from `.cm/reviews.json`; --import adopts the hand-written rows once.
+    Review {
+        /// <NN-name>/<unit>/<step>
+        #[arg(value_parser = step_target, required_unless_present = "import")]
+        target: Option<Target>,
+        #[arg(long, conflicts_with = "target")]
+        import: bool,
+        #[arg(long, required_unless_present = "import")]
+        pr: Option<String>,
+        #[arg(long, required_unless_present = "import")]
+        head: Option<String>,
+        #[arg(long, required_unless_present = "import")]
+        model: Option<String>,
+        /// The effort as the runtime reports it.
+        #[arg(long, required_unless_present = "import")]
+        effort: Option<String>,
+        /// accept or fix-required.
+        #[arg(long, required_unless_present = "import")]
+        verdict: Option<String>,
+        /// <confirmed>/<false-positive>
+        #[arg(long, required_unless_present = "import")]
+        findings: Option<String>,
+        /// USD.
+        #[arg(long, required_unless_present = "import")]
+        cost: Option<String>,
+        /// Minutes.
+        #[arg(long, required_unless_present = "import")]
+        wall: Option<String>,
+        /// A delta review: the head it reads from.
+        #[arg(long, value_name = "FROM_SHA")]
+        delta: Option<String>,
+    },
     /// Report every violation in the campaign folder; exit 1 when there is any.
     Lint {
         /// A folder inside the campaign; defaults to --root or the current directory.
@@ -459,6 +491,40 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             let body = read_body(body_file)?;
             crate::ledger::evidence(host, &root()?, target, name, &body)
         }
+        Commands::Review { import: true, .. } => crate::review::import_reviews(host, &root()?),
+        Commands::Review {
+            target,
+            pr,
+            head,
+            model,
+            effort,
+            verdict,
+            findings,
+            cost,
+            wall,
+            delta,
+            ..
+        } => {
+            let text = |value: &Option<String>| value.clone().unwrap_or_default();
+            let (pr, head, model, effort) = (text(pr), text(head), text(model), text(effort));
+            let (verdict, findings, cost, wall) =
+                (text(verdict), text(findings), text(cost), text(wall));
+            let args = crate::review::ReviewArgs {
+                pr: &pr,
+                head: &head,
+                model: &model,
+                effort: &effort,
+                verdict: &verdict,
+                findings: &findings,
+                cost: &cost,
+                wall: &wall,
+                delta: delta.as_deref(),
+            };
+            let target = target
+                .clone()
+                .expect("clap requires a target without --import");
+            crate::review::review(host, &root()?, &target, &args)
+        }
         Commands::Lint { dir } => {
             let start = match (dir, &cli.root) {
                 (Some(dir), _) => dir.clone(),
@@ -487,6 +553,7 @@ fn name(command: &Commands) -> &'static str {
         Commands::Feedback { .. } => "feedback",
         Commands::OwnerQueue { .. } => "owner-queue",
         Commands::Evidence { .. } => "evidence",
+        Commands::Review { .. } => "review",
         Commands::Lint { .. } => "lint",
     }
 }

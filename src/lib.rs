@@ -14,6 +14,7 @@ pub mod markdown;
 pub mod outcome;
 pub mod plan;
 pub mod render;
+pub mod review;
 pub mod state;
 pub mod store;
 pub mod sync;

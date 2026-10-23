@@ -8,6 +8,7 @@ use cm::host::Host;
 use cm::ledger::{self, Feedback, QueueItem};
 use cm::lint::lint;
 use cm::outcome::Outcome;
+use cm::review::{self, ReviewArgs};
 use cm::state::{Evidence, Lane, Phase};
 use cm::store::parse_target;
 use cm::templates::LOOP_WITHHELD;
@@ -190,6 +191,79 @@ fn evidence_refuses_an_empty_body() {
         "01-a/u/answer/evidence/ANSWER.md"
     );
     assert!(lint(&root).unwrap().ok());
+}
+
+const REVIEW_OFF: &str = "# Review-off\n\nWho reviewed what.\n\n\
+| # | PR | Kind | Model | Verdict | Confirmed | False positive | Confirmed, missed by the other | Worst severity | Cost | Wall time | Effort reported |\n\
+|---|---|---|---|---|---|---|---|---|---|---|---|\n\
+| 9 | dekopon-provider-decide#4 @a00bcdf0 | release prep (d) | Fable 5.1 | ACCEPT | 0 required; 1 taste (#3's squash puts its `Changelog:` line mid-body, so trailer parsing misses it; confirmed in ca85c2c's body) | 0 | 1 (the trailer-parsing note) | taste | $1.10 | 36 s run (64 s turn) | not exposed (dekopon-rust) |\n";
+
+fn review(root: &Path, pr: &str, delta: Option<&str>) -> Outcome {
+    let step = parse_target("15-machinery/cm/build", true).unwrap();
+    let args = ReviewArgs {
+        pr,
+        head: "1234567890abcdef",
+        model: "claude-opus-5-5",
+        effort: "high",
+        verdict: "accept",
+        findings: "2/1",
+        cost: "3.25",
+        wall: "12",
+        delta,
+    };
+    review::review(&Fake, root, &step, &args).unwrap()
+}
+
+#[test]
+fn review_rows_render_in_pr_order() {
+    let (_temp, root) = campaign();
+    fs::write(root.join("REVIEW-OFF.md"), REVIEW_OFF).unwrap();
+    let imported = review::import_reviews(&Fake, &root).unwrap();
+    assert!(imported.ok(), "{:?}", imported.violations);
+    assert_eq!(
+        fs::read_to_string(root.join("REVIEW-OFF.md")).unwrap(),
+        REVIEW_OFF
+    );
+    assert_eq!(
+        rules(&review::import_reviews(&Fake, &root).unwrap()),
+        vec!["review-imported"]
+    );
+    for (pr, delta) in [
+        ("https://github.com/dekopon-agents/cm/pull/31", None),
+        ("https://github.com/dekopon-agents/cm/pull/30", None),
+        (
+            "https://github.com/dekopon-agents/cm/pull/30",
+            Some("abcdef0123"),
+        ),
+    ] {
+        let added = review(&root, pr, delta);
+        assert!(added.ok(), "{:?}", added.violations);
+    }
+    let text = fs::read_to_string(root.join("REVIEW-OFF.md")).unwrap();
+    let order: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("| 1") || line.starts_with("| 9"))
+        .map(|line| line.split(" | ").next().unwrap())
+        .collect();
+    assert_eq!(order, vec!["| 11", "| 12", "| 10", "| 9"]);
+    assert!(text.contains(
+        "| 12 | cm#30 @12345678 (delta from abcdef01) | 15-machinery/cm/build (delta) |"
+    ));
+    assert!(lint(&root).unwrap().ok());
+    fs::write(
+        root.join("REVIEW-OFF.md"),
+        format!("{text}| 13 | by hand |\n"),
+    )
+    .unwrap();
+    assert_eq!(rules(&lint(&root).unwrap()), vec!["review-hand-edit"]);
+    assert_eq!(
+        rules(&review(
+            &root,
+            "https://github.com/dekopon-agents/cm/pull/32",
+            None
+        )),
+        vec!["review-hand-edit"]
+    );
 }
 
 #[test]
