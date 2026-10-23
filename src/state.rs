@@ -625,6 +625,9 @@ pub struct Attempt {
     pub generation: u32,
     pub coordinator: String,
     pub claimed_at: String,
+    /// `<generation>:<coordinator>:<claim instant>`: what `begin`, `record` and `end` present.
+    #[serde(default)]
+    pub claim: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -657,6 +660,12 @@ pub enum AttemptOutcome {
     Complete,
     Partial,
     Unknown,
+}
+
+impl Attempt {
+    pub fn mint(&mut self, now: jiff::Timestamp) {
+        self.claim = format!("{}:{}:{now}", self.generation, self.coordinator);
+    }
 }
 
 impl std::str::FromStr for AttemptOutcome {

@@ -20,6 +20,8 @@ fn json(output: &Output) -> Value {
 fn init_then_lint_is_clean_and_two_hand_edits_are_both_listed() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
+    let git = Command::new("git").args(["init", "-q"]).arg(root).status();
+    assert!(git.unwrap().success());
     assert_eq!(cm(root, &["init"]).status.code(), Some(0));
     assert_eq!(cm(root, &["init", "01-first/alpha"]).status.code(), Some(0));
     let clean = cm(root, &["lint", "--json"]);

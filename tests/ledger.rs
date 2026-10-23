@@ -38,6 +38,11 @@ fn rules(outcome: &Outcome) -> Vec<&'static str> {
 fn campaign() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("campaign");
+    let git = Command::new("git").args(["init", "-q"]).arg(&root).status();
+    assert!(
+        git.unwrap().success(),
+        "a campaign lives in a git repository"
+    );
     assert!(commands::init(&Fake, &root).unwrap().ok());
     fs::write(
         root.join("EPOCH.md"),

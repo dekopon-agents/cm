@@ -50,6 +50,14 @@ fn campaign(host: &Fake) -> Campaign {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("campaign");
     assert!(commands::init(host, &root).unwrap().ok());
+    let git = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&root)
+        .status();
+    assert!(
+        git.unwrap().success(),
+        "a campaign lives in a git repository"
+    );
     Campaign { _temp: temp, root }
 }
 
@@ -95,12 +103,57 @@ fn launch(host: &Fake, c: &Campaign, step: &str, cap_min: Option<u32>) -> Outcom
     commands::launch_remote(host, &c.root, &target(step), None, &remote).unwrap()
 }
 
-fn act(host: &Fake, c: &Campaign, generation: u32, act: Act) -> Outcome {
-    attempt::attempt(host, &c.root, &target("01-a/u/S1"), Some(generation), &act).unwrap()
+fn act(host: &Fake, root: &Path, claim: &str, act: Act) -> Outcome {
+    attempt::attempt(host, root, &target("01-a/u/S1"), Some(claim), &act).unwrap()
 }
 
-fn status(host: &Fake, c: &Campaign) -> Outcome {
-    attempt::attempt(host, &c.root, &target("01-a/u/S1"), None, &Act::Status).unwrap()
+fn begin(host: &Fake, root: &Path, claim: &str, kind: &str) -> Outcome {
+    act(host, root, claim, Act::Begin { kind: kind.into() })
+}
+
+fn record(host: &Fake, root: &Path, claim: &str, kind: &str, id: &str) -> Outcome {
+    let record = Act::Record {
+        kind: kind.into(),
+        id: id.into(),
+    };
+    act(host, root, claim, record)
+}
+
+fn end(
+    host: &Fake,
+    root: &Path,
+    claim: &str,
+    outcome: AttemptOutcome,
+    file: Option<PathBuf>,
+) -> Outcome {
+    act(host, root, claim, Act::End { outcome, file })
+}
+
+/// Claims the attempt for `coordinator`, returning the new claim token on success.
+fn claim(host: &Fake, root: &Path, coordinator: &str, expect: u32) -> Option<String> {
+    let claim = Act::Claim {
+        coordinator: coordinator.into(),
+        expect,
+    };
+    let claimed = attempt::attempt(host, root, &target("01-a/u/S1"), None, &claim).unwrap();
+    claimed
+        .ok()
+        .then(|| claimed.fields["claim"].as_str().unwrap().to_owned())
+}
+
+fn status(host: &Fake, root: &Path) -> Outcome {
+    attempt::attempt(host, root, &target("01-a/u/S1"), None, &Act::Status).unwrap()
+}
+
+fn launched(host: &Fake, c: &Campaign, cap_min: Option<u32>) -> String {
+    assert!(declare(host, c, "01-a/u/S1", Lane::ClaudeCloud, &[]).ok());
+    let launched = launch(host, c, "01-a/u/S1", cap_min);
+    assert!(launched.ok(), "{:?}", launched.violations);
+    assert_eq!(launched.fields["attempt"]["id"], "01-a/u/S1#1");
+    launched.fields["attempt"]["claim"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 
 /// The remote runtime: each creation is counted, so a redispatch shows.
@@ -111,20 +164,16 @@ struct Runtime {
 }
 
 /// A coordinator that runs the attempt from committed state, stopping at `kill` boundaries.
-fn coordinate(host: &Fake, c: &Campaign, runtime: &mut Runtime, generation: u32, kill: usize) {
+fn coordinate(host: &Fake, c: &Campaign, runtime: &mut Runtime, token: &str, kill: usize) {
     let mut boundary = 0;
     loop {
-        let plan = status(host, c);
-        let (code, last) = (
-            plan.fields["plan"].as_str().unwrap().to_owned(),
-            plan.fields["attempt"]["actions"]
-                .as_array()
-                .and_then(|actions| actions.last().cloned()),
-        );
-        let kind = last
-            .as_ref()
-            .map(|last| last["kind"].as_str().unwrap().to_owned());
-        let begin = match (code.as_str(), kind.as_deref()) {
+        let plan = status(host, &c.root);
+        let code = plan.fields["plan"].as_str().unwrap().to_owned();
+        let last = plan.fields["attempt"]["actions"]
+            .as_array()
+            .and_then(|actions| actions.last().cloned());
+        let kind = last.map(|last| last["kind"].as_str().unwrap().to_owned());
+        let next = match (code.as_str(), kind.as_deref()) {
             ("dispatch", _) => "thread",
             ("resume", Some("thread")) => "turn",
             ("resume", Some("turn")) | ("unknown" | "ended" | "expired", _) => return,
@@ -134,23 +183,15 @@ fn coordinate(host: &Fake, c: &Campaign, runtime: &mut Runtime, generation: u32,
             return;
         }
         boundary += 1;
-        assert!(act(host, c, generation, Act::Begin { kind: begin.into() }).ok());
-        let id = if begin == "thread" {
+        assert!(begin(host, &c.root, token, next).ok());
+        let id = if next == "thread" {
             runtime.threads += 1;
             format!("thread-{}", runtime.threads)
         } else {
             runtime.turns += 1;
             format!("turn-{}", runtime.turns)
         };
-        let recorded = act(
-            host,
-            c,
-            generation,
-            Act::Record {
-                kind: begin.into(),
-                id,
-            },
-        );
+        let recorded = record(host, &c.root, token, next, &id);
         assert!(recorded.ok(), "{:?}", recorded.violations);
     }
 }
@@ -160,65 +201,35 @@ fn a_replacement_coordinator_resumes_one_execution_from_committed_state() {
     for kill in 0..3 {
         let host = at("2026-10-19T09:00:00Z");
         let c = campaign(&host);
-        assert!(declare(&host, &c, "01-a/u/S1", Lane::ClaudeCloud, &[]).ok());
-        let launched = launch(&host, &c, "01-a/u/S1", None);
-        assert!(launched.ok(), "{:?}", launched.violations);
-        assert_eq!(launched.fields["attempt"]["id"], "01-a/u/S1#1");
+        let first = launched(&host, &c, None);
         let mut runtime = Runtime::default();
-        coordinate(&host, &c, &mut runtime, 1, kill);
-        let claimed = act(
-            &host,
-            &c,
-            0,
-            Act::Claim {
-                coordinator: "session_b".into(),
-                expect: 1,
-            },
-        );
-        assert!(claimed.ok(), "{:?}", claimed.violations);
-        coordinate(&host, &c, &mut runtime, 2, usize::MAX);
+        coordinate(&host, &c, &mut runtime, &first, kill);
+        let second = claim(&host, &c.root, "session_b", 1).expect("the claim");
+        coordinate(&host, &c, &mut runtime, &second, usize::MAX);
         assert_eq!((runtime.threads, runtime.turns), (1, 1), "killed at {kill}");
-        assert_eq!(status(&host, &c).fields["plan"], "resume");
+        assert_eq!(status(&host, &c.root).fields["plan"], "resume");
     }
+}
+
+#[test]
+fn an_action_with_no_id_closes_only_as_unknown() {
     let host = at("2026-10-19T09:00:00Z");
     let c = campaign(&host);
-    assert!(declare(&host, &c, "01-a/u/S1", Lane::ClaudeCloud, &[]).ok());
-    assert!(launch(&host, &c, "01-a/u/S1", None).ok());
-    assert!(
-        act(
-            &host,
-            &c,
-            1,
-            Act::Begin {
-                kind: "thread".into()
-            }
-        )
-        .ok()
-    );
-    assert_eq!(status(&host, &c).fields["plan"], "unknown");
+    let token = launched(&host, &c, None);
+    assert!(begin(&host, &c.root, &token, "thread").ok());
+    assert_eq!(status(&host, &c.root).fields["plan"], "unknown");
     assert_eq!(
-        rules(&act(
-            &host,
-            &c,
-            1,
-            Act::Begin {
-                kind: "thread".into()
-            }
-        )),
+        rules(&begin(&host, &c.root, &token, "thread")),
         vec!["attempt-unknown"]
     );
-    assert!(
-        act(
-            &host,
-            &c,
-            1,
-            Act::End {
-                outcome: AttemptOutcome::Unknown,
-                file: None
-            }
-        )
-        .ok()
-    );
+    let notes = note(&c, "notes.md");
+    for outcome in [AttemptOutcome::Complete, AttemptOutcome::Partial] {
+        assert_eq!(
+            rules(&end(&host, &c.root, &token, outcome, Some(notes.clone()))),
+            vec!["attempt-unknown"]
+        );
+    }
+    assert!(end(&host, &c.root, &token, AttemptOutcome::Unknown, None).ok());
     assert!(advance(&host, &c, "01-a/u/S1", "blocked:lost", None).ok());
     assert!(launch(&host, &c, "01-a/u/S1", None).ok());
     assert!(lint(&c.root).unwrap().ok());
@@ -228,20 +239,13 @@ fn a_replacement_coordinator_resumes_one_execution_from_committed_state() {
 fn two_coordinators_racing_one_claim_fence_the_loser() {
     let host = at("2026-10-19T09:00:00Z");
     let c = campaign(&host);
-    assert!(declare(&host, &c, "01-a/u/S1", Lane::ClaudeCloud, &[]).ok());
-    assert!(launch(&host, &c, "01-a/u/S1", None).ok());
-    let won: Vec<bool> = std::thread::scope(|scope| {
+    let first = launched(&host, &c, None);
+    let won: Vec<Option<String>> = std::thread::scope(|scope| {
         let racers: Vec<_> = ["session_b", "session_c"]
             .into_iter()
             .map(|name| {
                 let (host, c) = (&host, &c);
-                scope.spawn(move || {
-                    let claim = Act::Claim {
-                        coordinator: name.into(),
-                        expect: 1,
-                    };
-                    act(host, c, 0, claim).ok()
-                })
+                scope.spawn(move || claim(host, &c.root, name, 1))
             })
             .collect();
         racers
@@ -249,116 +253,98 @@ fn two_coordinators_racing_one_claim_fence_the_loser() {
             .map(|racer| racer.join().unwrap())
             .collect()
     });
-    assert_eq!(won.iter().filter(|won| **won).count(), 1, "{won:?}");
-    for stale in [1, 3] {
+    let winners: Vec<&String> = won.iter().flatten().collect();
+    assert_eq!(winners.len(), 1, "{won:?}");
+    for stale in [first.as_str(), "2:session_x:2026-10-19T09:00:00Z"] {
         assert_eq!(
-            rules(&act(
-                &host,
-                &c,
-                stale,
-                Act::Begin {
-                    kind: "thread".into()
-                }
-            )),
+            rules(&begin(&host, &c.root, stale, "thread")),
             vec!["attempt-fenced"]
         );
     }
-    assert!(
-        act(
-            &host,
-            &c,
-            2,
-            Act::Begin {
-                kind: "thread".into()
-            }
-        )
-        .ok()
+    assert!(begin(&host, &c.root, winners[0], "thread").ok());
+}
+
+/// Two clones each claim generation 2; the push race keeps one, and the loser rebases onto it.
+#[test]
+fn a_clone_that_lost_the_push_race_is_fenced_after_it_rebases() {
+    let host = at("2026-10-19T09:00:00Z");
+    let a = campaign(&host);
+    launched(&host, &a, None);
+    let b = campaign(&host);
+    copy(&a.root, &b.root);
+    let winner = claim(&host, &a.root, "session_b", 1).expect("b claims in its clone");
+    let loser = claim(&host, &b.root, "session_c", 1).expect("c claims in its clone");
+    assert_ne!(winner, loser);
+    assert!(winner.starts_with("2:session_b:") && loser.starts_with("2:session_c:"));
+    copy(&a.root, &b.root);
+    assert_eq!(
+        rules(&begin(&host, &b.root, &loser, "thread")),
+        vec!["attempt-fenced"]
     );
+    assert_eq!(
+        rules(&end(&host, &b.root, &loser, AttemptOutcome::Unknown, None)),
+        vec!["attempt-fenced"]
+    );
+    assert!(begin(&host, &b.root, &winner, "thread").ok());
+}
+
+/// What a rebase onto the winner leaves in the loser's clone: the winner's campaign files.
+fn copy(from: &Path, to: &Path) {
+    for file in ["JOURNAL.md", "01-a/u/.cm/state.json", "01-a/u/STATE.md"] {
+        fs::create_dir_all(to.join(file).parent().unwrap()).unwrap();
+        fs::copy(from.join(file), to.join(file)).unwrap();
+    }
 }
 
 #[test]
 fn a_capped_attempt_keeps_its_deadline_across_a_replacement() {
     let host = at("2026-10-19T09:00:00Z");
     let c = campaign(&host);
-    assert!(declare(&host, &c, "01-a/u/S1", Lane::ClaudeCloud, &[]).ok());
-    let launched = launch(&host, &c, "01-a/u/S1", Some(30));
-    assert_eq!(launched.fields["attempt"]["deadline"], "2026-10-19T09:30Z");
+    let first = launched(&host, &c, Some(30));
+    assert_eq!(
+        status(&host, &c.root).fields["attempt"]["deadline"],
+        "2026-10-19T09:30Z"
+    );
     for (kind, id) in [("thread", "t1"), ("turn", "u1")] {
-        assert!(act(&host, &c, 1, Act::Begin { kind: kind.into() }).ok());
-        assert!(
-            act(
-                &host,
-                &c,
-                1,
-                Act::Record {
-                    kind: kind.into(),
-                    id: id.into()
-                }
-            )
-            .ok()
-        );
+        assert!(begin(&host, &c.root, &first, kind).ok());
+        assert!(record(&host, &c.root, &first, kind, id).ok());
     }
     let later = at("2026-10-19T09:20:00Z");
-    let claim = Act::Claim {
-        coordinator: "session_b".into(),
-        expect: 1,
-    };
-    assert!(act(&later, &c, 0, claim).ok());
-    assert_eq!(status(&later, &c).fields["plan"], "resume");
-    let overrun = at("2026-10-19T09:31:00Z");
-    let expired = status(&overrun, &c);
+    let second = claim(&later, &c.root, "session_b", 1).expect("the claim");
+    assert_eq!(status(&later, &c.root).fields["plan"], "resume");
+    let overrun = at("2026-10-19T09:30:30Z");
+    let expired = status(&overrun, &c.root);
     assert_eq!(expired.fields["plan"], "expired");
-    assert!(
-        expired.fields["next"]
-            .as_str()
-            .unwrap()
-            .contains("cancel turn u1")
-    );
+    let next = expired.fields["next"].as_str().unwrap();
+    assert!(next.contains("cancel turn u1"), "{next}");
     assert_eq!(
-        rules(&act(
-            &overrun,
-            &c,
-            2,
-            Act::Begin {
-                kind: "turn".into()
-            }
-        )),
+        rules(&begin(&overrun, &c.root, &second, "turn")),
         vec!["attempt-deadline"]
     );
-    assert!(
-        act(
-            &overrun,
-            &c,
-            2,
-            Act::Begin {
-                kind: "cancel".into()
-            }
-        )
-        .ok()
-    );
-    assert!(
-        act(
-            &overrun,
-            &c,
-            2,
-            Act::Record {
-                kind: "cancel".into(),
-                id: "u1".into()
-            }
-        )
-        .ok()
-    );
-    let end = |file| Act::End {
-        outcome: AttemptOutcome::Partial,
-        file,
-    };
+    assert!(begin(&overrun, &c.root, &second, "cancel").ok());
+    assert!(record(&overrun, &c.root, &second, "cancel", "u1").ok());
     assert_eq!(
-        rules(&act(&overrun, &c, 2, end(None))),
+        rules(&end(
+            &overrun,
+            &c.root,
+            &second,
+            AttemptOutcome::Partial,
+            None
+        )),
         vec!["evidence-missing"]
     );
     let partial = note(&c, "partial.md");
-    assert!(act(&overrun, &c, 2, end(Some(partial))).ok());
-    let ended = status(&overrun, &c);
+    assert!(
+        end(
+            &overrun,
+            &c.root,
+            &second,
+            AttemptOutcome::Partial,
+            Some(partial)
+        )
+        .ok()
+    );
+    let ended = status(&overrun, &c.root);
     assert_eq!(ended.fields["plan"], "ended");
     assert_eq!(ended.fields["attempt"]["ended"]["outcome"], "partial");
     assert!(lint(&c.root).unwrap().ok());
