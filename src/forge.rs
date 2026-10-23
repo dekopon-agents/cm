@@ -207,27 +207,14 @@ impl Default for Gh {
 
 impl Gh {
     fn json<T: DeserializeOwned>(&self, args: &[&str]) -> Result<T, ForgeError> {
-        let mut command = Command::new(&self.program);
-        command
+        let mut child = Command::new(&self.program)
             .args(args)
             .env("GH_PROMPT_DISABLED", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        // A process forked while `gh` was being written (or replaced by an update) holds it open
-        // for writing until it execs; the exec here then fails with ETXTBSY for a moment.
-        let mut busy = 0;
-        let mut child = loop {
-            match command.spawn() {
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy && busy < 50 =>
-                {
-                    busy += 1;
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                spawned => break spawned.map_err(|_| ForgeError::Spawn)?,
-            }
-        };
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| ForgeError::Spawn)?;
         let mut stdout = child.stdout.take().ok_or(ForgeError::Spawn)?;
         let reader = std::thread::spawn(move || {
             let mut bytes = Vec::new();
