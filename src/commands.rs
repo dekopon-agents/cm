@@ -1024,6 +1024,10 @@ pub fn advance(
         },
     };
     let finish = declared.as_ref().map_or(Finish::Shipped, Step::finish);
+    let single = (*to == Phase::Done && finish == Finish::Evidence && file.is_none())
+        .then(|| crate::ledger::single_evidence(root, target))
+        .flatten();
+    let file = file.or(single.as_deref());
     let finishing_code = *to == Phase::Done && finish == Finish::Shipped && target.step.is_some();
     let code_finish = || {
         Violation::new(

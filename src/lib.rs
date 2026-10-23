@@ -7,6 +7,7 @@ pub mod evidence;
 pub mod forge;
 pub mod host;
 pub mod journal;
+pub mod ledger;
 pub mod limits;
 pub mod lint;
 pub mod markdown;
