@@ -188,9 +188,9 @@ enum Commands {
         /// A follow-up's disposition: proposed, accepted, applied, deferred or rejected.
         #[arg(long)]
         disposition: Option<String>,
-        /// A file holding the body; `-` reads stdin.
+        /// A file holding the body, which may not be empty; `-` reads stdin.
         #[arg(long, value_name = "FILE")]
-        body_file: Option<PathBuf>,
+        body_file: PathBuf,
     },
     /// Add the next numbered item to OWNER-QUEUE.md and withhold RESUME.md's `/loop`.
     OwnerQueue {
@@ -419,13 +419,13 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             disposition,
             body_file,
         } => {
-            let body = body_file.as_deref().map(read_body).transpose()?;
+            let body = read_body(body_file)?;
             let entry = crate::ledger::Feedback {
                 title,
                 urgency: urgency.as_deref(),
                 follow_up: follow_up.as_deref(),
                 disposition: disposition.as_deref(),
-                body: body.as_deref().unwrap_or_default(),
+                body: &body,
             };
             crate::ledger::feedback(host, &root()?, &entry)
         }
