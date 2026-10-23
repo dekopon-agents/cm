@@ -57,7 +57,7 @@ error.
 | `cm epoch planning\|working\|closed [--skill-revision R] [--plan-revision S]` | Moves `EPOCH.md`'s front matter one status along `OPEN → PLANNING → WORKING → CLOSED`, stamps `planning_started_at`, `working_started_at` or `closed_at` with the date, sets the pins it is given, and journals the move. It refuses a null pin: PLANNING needs `skill_revision`, WORKING and CLOSED also `approved_plan_revision`. `closed` follows `cm close`. |
 | `cm journal "<title>" [--body-file F]` | Appends `## YYYY-MM-DDTHH:MMZ — <title>` and the body (`-` reads stdin). The only way `JOURNAL.md` grows. A body may not hold a `#` or `##` heading. |
 | `cm launch <NN-name>/<unit>/<step> [--worktree PATH] [--coordinator LABEL] [--cap-min N]` | Runs the launch checks and reports every failure: `LIMITS.toml` not paused; a declared step's every `--after` met (`after-unmet`); for the local `pi` lane and undeclared steps, free disk on `disk_volume` minus `kache_headroom_gib` over `min_free_disk_gib`, live heavy builds (top-level `cargo` processes) under `max_heavy_builds` and the worktree, which they require; the step folder has `kickoff.md`; every path its packet names exists. The `--after` check runs on every launch, a blocked step's relaunch among them. Then it marks the step (and a drafted unit) launched, journals the launch and, for a local step, prints the command; every other lane (`owner` and `coordinator` among them) prints only the step and its prompt and records its attempt (see [Attempts](#attempts)). It spawns nothing. A step whose last attempt has not ended does not launch again (`attempt-open`). |
-| `cm attempt <NN-name>/<unit>/<step> [--generation G] [claim --coordinator L --expect G \| begin KIND \| record KIND ID \| end complete\|partial\|unknown [--evidence PATH]]` | Shows a remote attempt and what to do next from committed state alone, or extends it; each change is journaled. See [Attempts](#attempts). |
+| `cm attempt <NN-name>/<unit>/<step> [--claim TOKEN] [claim --coordinator L --expect G \| begin KIND \| record KIND ID \| end complete\|partial\|unknown [--evidence PATH]]` | Shows a remote attempt and what to do next from committed state alone, or extends it; each change is journaled. See [Attempts](#attempts). |
 | `cm unblock <NN-name>/<unit>[/<step>] --evidence PATH` | Releases a `blocked:<reason>` track to the state it was blocked from, with the evidence that cleared it (a campaign file, as for `done`), journaled like any move. A step that rests at `drafted` or `launched` still waits on every `--after`: `cm next` and `cm launch` check them again, and the move lists what is still unmet. |
 | `cm amend <NN-name>/<unit>/<step> [--study] [--lane L] [--after A]…` | Changes a declared step that rests at `drafted` or `launched`: marks it a study, moves its lane, or adds gates (each declared, never closing a cycle: `after-cycle`). Journals the change; a change that changes nothing is `amend-empty`. |
 | `cm advance <NN-name>/<unit>[/<step>] <state> [--sha S] [--pr URL] [--tag T] [--digest D] [--evidence PATH] [--repo PATH]` | Moves one state along `drafted → launched → pr-open → merged → released → deployed → done`, or to `blocked:<reason>`; an `owner`-lane or study step moves to `done` from `drafted` or `launched` with `--evidence` (see [Finishing](#finishing)). `superseded --evidence PATH` retires a step replaced by other work from any state short of final; it meets no gate, so its consumers are amended. A release step moves to `released --tag T` from `drafted` or `launched` when the tag was cut without a prep PR (tag-only). Refuses a skipped state and a state without its evidence, journals the move and re-renders `STATE.md`. |
@@ -213,10 +213,10 @@ that uses studies or `--evidence` needs cm 0.4.0 or later on every machine that 
 
 A remote launch records `attempt` in the step's state before anything is dispatched: its id
 (`<step>#<launch>`), the coordinator generation that claimed it (1 at launch, with
-`--coordinator`), and, with `--cap-min`, the absolute `deadline` a replacement inherits instead of
+`--coordinator`), its claim token `<generation>:<coordinator>:<claim instant>`, and, with `--cap-min`, the absolute `deadline` a replacement inherits instead of
 restarting the cap. The coordinator then wraps each external action:
-`cm attempt <step> --generation G begin thread` before the call, and
-`cm attempt <step> --generation G record thread <id>` once it returns, before the next action
+`cm attempt <step> --claim TOKEN begin thread` before the call, and
+`cm attempt <step> --claim TOKEN record thread <id>` once it returns, before the next action
 (`turn`, `session`, `cancel`, …). `cm attempt <step>` reads the plan:
 
 | Plan | Means |
@@ -225,14 +225,15 @@ restarting the cap. The coordinator then wraps each external action:
 | `resume` | the last action returned its id: resume that thread, turn or session |
 | `unknown` | an action began and recorded no id: its outcome is unknown; never redispatch, find it in the runtime, then record its id or `end unknown` |
 | `expired` | the deadline passed: cancel the known turn (`begin cancel` is the one action still allowed), retrieve its partial results and `end partial --evidence <file>` |
-| `ended` | `end` recorded `complete`, `partial` (with its evidence) or `unknown` |
+| `ended` | `end` recorded `complete`, `partial` (with its evidence) or `unknown`; while an action has begun without an id, only `end unknown` closes the attempt |
 
 `.cm/lock` serializes cm on one machine only, so a replacement coordinator first fences the
 generation it replaces: `cm attempt <step> claim --coordinator <label> --expect <G>` succeeds only
-while `G` still holds the attempt and makes `G + 1` its holder; `begin`, `record` and `end` under
-any other generation are `attempt-fenced`. Between machines the committed state is the fence:
-claim, commit and push before dispatching or writing to the homelab, and a claim whose push is
-refused has lost.
+while `G` still holds the attempt, makes `G + 1` its holder and prints the new token; `begin`,
+`record` and `end` with any other token are `attempt-fenced`. Between machines the committed state
+is the fence: claim, commit and push before dispatching or writing to the homelab. Two clones that
+both claim `G + 1` hold different tokens, so the one whose push is refused is fenced as soon as it
+takes the winner's state.
 
 ### Releases
 

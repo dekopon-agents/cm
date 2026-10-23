@@ -857,9 +857,13 @@ pub fn launch_remote(
             deadline: remote
                 .cap_min
                 .map(|minutes| stamp(host.now() + jiff::SignedDuration::from_mins(minutes.into()))),
+            claim: String::new(),
             actions: Vec::new(),
             ended: None,
         });
+        if let Some(attempt) = step.attempt.as_mut() {
+            attempt.mint(host.now());
+        }
     }
     let attempt = step.attempt.clone().filter(|_| !local);
     unit.steps.insert(step_name.to_owned(), step);

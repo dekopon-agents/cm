@@ -143,9 +143,9 @@ enum Commands {
         /// <NN-name>/<unit>/<step>
         #[arg(value_parser = step_target)]
         target: Target,
-        /// The coordinator generation acting; a stale one is fenced.
-        #[arg(long, global = true)]
-        generation: Option<u32>,
+        /// The claim token `cm launch` or `claim` printed; begin, record and end need the current one.
+        #[arg(long, global = true, value_name = "TOKEN")]
+        claim: Option<String>,
         #[command(subcommand)]
         act: Option<AttemptAct>,
     },
@@ -314,11 +314,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 after: after.clone(),
             },
         ),
-        Commands::Attempt {
-            target,
-            generation,
-            act,
-        } => {
+        Commands::Attempt { target, claim, act } => {
             use crate::attempt::Act;
             let act = match act {
                 None => Act::Status,
@@ -339,7 +335,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                     file: evidence.as_deref().map(|file| under_root(cli, file)),
                 },
             };
-            crate::attempt::attempt(host, &root()?, target, *generation, &act)
+            crate::attempt::attempt(host, &root()?, target, claim.as_deref(), &act)
         }
         Commands::Advance {
             target,
