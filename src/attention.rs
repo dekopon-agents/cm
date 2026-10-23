@@ -64,14 +64,186 @@ fn gh_json<T: serde::de::DeserializeOwned>(args: &[&str]) -> Result<T, String> {
     serde_json::from_slice(&output.stdout).map_err(|_| "gh returned invalid JSON evidence".into())
 }
 
-fn read_pr(url: &str) -> Result<PullRequest, String> {
-    gh_json(&[
-        "pr",
-        "view",
-        url,
-        "--json",
-        "url,headRefOid,baseRefOid,state,isDraft,mergeStateStatus,updatedAt,mergedAt,closedAt",
-    ])
+fn api<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, String> {
+    gh_json(&["api", "-H", "Accept: application/vnd.github+json", path])
+}
+
+fn repo_and_number(url: &str) -> Option<(&str, &str)> {
+    url.strip_prefix("https://github.com/")?
+        .split_once("/pull/")
+}
+
+/// Reads the PR over REST (`gh api`), which works where GraphQL is blocked; the fields keep the
+/// names and upper-case values `gh pr view --json` used.
+fn read_pr(url: &str) -> Result<(PullRequest, String), String> {
+    #[derive(Deserialize)]
+    struct Commit {
+        sha: String,
+        #[serde(rename = "ref")]
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct Rest {
+        html_url: String,
+        head: Commit,
+        base: Commit,
+        state: String,
+        merged: bool,
+        draft: bool,
+        mergeable_state: Option<String>,
+        updated_at: String,
+        merged_at: Option<String>,
+        closed_at: Option<String>,
+    }
+    let (repo, number) = repo_and_number(url).ok_or("not a PR URL")?;
+    let rest: Rest = api(&format!("repos/{repo}/pulls/{number}"))?;
+    let pr = PullRequest {
+        url: rest.html_url,
+        head_ref_oid: rest.head.sha,
+        base_ref_oid: rest.base.sha,
+        state: match (rest.merged, rest.state.as_str()) {
+            (true, _) => "MERGED".into(),
+            (false, state) => state.to_uppercase(),
+        },
+        is_draft: rest.draft,
+        merge_state_status: rest
+            .mergeable_state
+            .map_or_else(|| "UNKNOWN".into(), |state| state.to_uppercase()),
+        updated_at: rest.updated_at,
+        merged_at: rest.merged_at,
+        closed_at: rest.closed_at,
+    };
+    Ok((pr, rest.base.name))
+}
+
+/// The base branch's required contexts, from branch protection and rulesets, each named once.
+fn required_contexts(repo: &str, base: &str) -> Result<Vec<String>, String> {
+    #[derive(Deserialize)]
+    struct Protection {
+        #[serde(default)]
+        required_status_checks: Option<Required>,
+    }
+    #[derive(Deserialize)]
+    struct Required {
+        #[serde(default)]
+        contexts: Vec<String>,
+    }
+    #[derive(Deserialize)]
+    struct BranchInfo {
+        #[serde(default)]
+        protection: Option<Protection>,
+    }
+    #[derive(Deserialize)]
+    struct Rule {
+        #[serde(rename = "type")]
+        kind: String,
+        #[serde(default)]
+        parameters: Option<RuleChecks>,
+    }
+    #[derive(Deserialize)]
+    struct RuleChecks {
+        #[serde(default)]
+        required_status_checks: Vec<RuleCheck>,
+    }
+    #[derive(Deserialize)]
+    struct RuleCheck {
+        context: String,
+    }
+    let branch: BranchInfo = api(&format!("repos/{repo}/branches/{base}"))?;
+    let rules: Vec<Rule> = api(&format!("repos/{repo}/rules/branches/{base}"))?;
+    let mut out: Vec<String> = branch
+        .protection
+        .and_then(|protection| protection.required_status_checks)
+        .map(|required| required.contexts)
+        .unwrap_or_default();
+    out.extend(
+        rules
+            .into_iter()
+            .filter(|rule| rule.kind == "required_status_checks")
+            .filter_map(|rule| rule.parameters)
+            .flat_map(|parameters| parameters.required_status_checks)
+            .map(|check| check.context),
+    );
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Each required context on the head, from check runs and commit statuses. A context the head
+/// does not report is `MISSING`, which is never green.
+fn required_checks(repo: &str, head: &str, base: &str) -> Result<Vec<Check>, String> {
+    #[derive(Deserialize)]
+    struct Runs {
+        check_runs: Vec<Run>,
+    }
+    #[derive(Deserialize)]
+    struct Run {
+        name: String,
+        status: String,
+        conclusion: Option<String>,
+        html_url: Option<String>,
+        started_at: Option<String>,
+        completed_at: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Combined {
+        statuses: Vec<Status>,
+    }
+    #[derive(Deserialize)]
+    struct Status {
+        context: String,
+        state: String,
+        target_url: Option<String>,
+        created_at: String,
+        updated_at: String,
+    }
+    let contexts = required_contexts(repo, base)?;
+    if contexts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let runs: Runs = api(&format!(
+        "repos/{repo}/commits/{head}/check-runs?per_page=100"
+    ))?;
+    let combined: Combined = api(&format!("repos/{repo}/commits/{head}/status?per_page=100"))?;
+    Ok(contexts
+        .into_iter()
+        .map(|name| {
+            if let Some(run) = runs.check_runs.iter().find(|run| run.name == name) {
+                let state = match (run.status.as_str(), run.conclusion.as_deref()) {
+                    ("completed", Some(conclusion)) => conclusion.to_uppercase(),
+                    ("completed", None) => "UNKNOWN".into(),
+                    (status, _) => status.to_uppercase(),
+                };
+                return Check {
+                    name,
+                    state,
+                    link: run.html_url.clone().unwrap_or_default(),
+                    started_at: run.started_at.clone().unwrap_or_default(),
+                    completed_at: run.completed_at.clone().unwrap_or_default(),
+                };
+            }
+            match combined
+                .statuses
+                .iter()
+                .find(|status| status.context == name)
+            {
+                Some(status) => Check {
+                    state: status.state.to_uppercase(),
+                    link: status.target_url.clone().unwrap_or_default(),
+                    started_at: status.created_at.clone(),
+                    completed_at: status.updated_at.clone(),
+                    name,
+                },
+                None => Check {
+                    name,
+                    state: "MISSING".into(),
+                    link: String::new(),
+                    started_at: String::new(),
+                    completed_at: String::new(),
+                },
+            }
+        })
+        .collect())
 }
 
 impl Github for Gh {
@@ -81,8 +253,8 @@ impl Github for Gh {
             required_checks: Vec::new(),
             error: None,
         };
-        let first = match read_pr(url) {
-            Ok(pr) => pr,
+        let (first, base) = match read_pr(url) {
+            Ok(read) => read,
             Err(error) => {
                 evidence.error = Some(format!("PR read: {error}"));
                 return evidence;
@@ -96,14 +268,8 @@ impl Github for Gh {
         if first.state == "MERGED" || first.state == "CLOSED" {
             return evidence;
         }
-        match gh_json::<Vec<Check>>(&[
-            "pr",
-            "checks",
-            url,
-            "--required",
-            "--json",
-            "name,state,link,startedAt,completedAt",
-        ]) {
+        let (repo, _) = repo_and_number(url).unwrap_or_default();
+        match required_checks(repo, &first.head_ref_oid, &base) {
             Ok(mut checks) => {
                 checks.sort();
                 evidence.required_checks = checks;
@@ -111,8 +277,8 @@ impl Github for Gh {
             Err(error) => evidence.error = Some(format!("required checks: {error}")),
         }
         match read_pr(url) {
-            Ok(last) if last == first => {}
-            Ok(last) => {
+            Ok((last, _)) if last == first => {}
+            Ok((last, _)) => {
                 evidence.pr = Some(last);
                 evidence.required_checks.clear();
                 evidence.error = Some("PR changed during observation; run attention again".into());

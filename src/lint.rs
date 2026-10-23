@@ -79,6 +79,28 @@ pub fn packet_paths(
     (checked, out)
 }
 
+fn has_extension(span: &str) -> bool {
+    span.rsplit('/')
+        .next()
+        .and_then(|leaf| leaf.rsplit_once('.'))
+        .is_some_and(|(_, ext)| !ext.is_empty() && ext.bytes().any(|b| b.is_ascii_alphabetic()))
+}
+
+/// `01-a/u/S1` or `00-release/cm/0.5.0` names a unit or step, not a file; `01-a/u/S1.md` does.
+fn is_target_id(span: &str) -> bool {
+    !has_extension(span) && store::parse_target(span, false).is_ok()
+}
+
+/// A route such as `/v1/sessions/abc` names no file: no extension, and its first directory is
+/// not on this machine. `/var/lib/x` and `/definitely/not/here.md` are still checked.
+fn is_route(path: &Path, span: &str) -> bool {
+    !has_extension(span)
+        && path
+            .components()
+            .nth(1)
+            .is_some_and(|first| !Path::new("/").join(first).is_dir())
+}
+
 fn packet_targets(
     span: &str,
     home: Option<&Path>,
@@ -87,6 +109,9 @@ fn packet_targets(
     base: &Path,
 ) -> Option<Vec<PathBuf>> {
     if let Some(path) = named_path(span, home) {
+        if span.starts_with('/') && is_route(&path, span) {
+            return None;
+        }
         let mut targets = vec![path.clone()];
         if let Some(repo) = repo.filter(|_| span.starts_with('/'))
             && let Some(name) = repo.file_name()
@@ -106,6 +131,9 @@ fn packet_targets(
         let path = named_path(&format!("/{span}"), None)?;
         let rel = path.strip_prefix("/").ok()?;
         return Some(vec![store::absolute(&base.join(rel))]);
+    }
+    if span.contains("://") || is_target_id(span) {
+        return None;
     }
     let rooted = named_path(&format!("/{span}"), None)?;
     let rel = rooted.strip_prefix("/").ok()?;
@@ -147,6 +175,75 @@ pub fn unit_dirs(root: &Path) -> Vec<PathBuf> {
         .filter(|dir| is_subcampaign_name(name_of(dir)))
         .flat_map(|dir| subdirs(&dir))
         .filter(|dir| is_name(name_of(dir)) && state_path(dir).is_file())
+        .collect()
+}
+
+/// A unit folder holding STATE.md but no `.cm/state.json` lost its state; lint never counts it as
+/// a smaller campaign.
+pub fn orphan_units(root: &Path) -> Vec<Violation> {
+    subdirs(root)
+        .into_iter()
+        .filter(|dir| is_subcampaign_name(name_of(dir)))
+        .flat_map(|dir| subdirs(&dir))
+        .filter(|dir| dir.join(UNIT_STATE).is_file() && !state_path(dir).is_file())
+        .map(|dir| {
+            Violation::new(
+                relative(root, &state_path(&dir)),
+                "unit-state-json-missing",
+                format!(
+                    "{} holds STATE.md but no .cm/state.json; restore it from git (`git checkout HEAD -- {}`)",
+                    relative(root, &dir),
+                    relative(root, &state_path(&dir))
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Unit and step folders git ignores never reach the campaign's repository.
+pub fn ignored(root: &Path, units: &[PathBuf]) -> Vec<Violation> {
+    let dirs: Vec<String> = units
+        .iter()
+        .flat_map(|unit| std::iter::once(unit.clone()).chain(subdirs(unit)))
+        .filter(|dir| name_of(dir) != store::CM_DIR)
+        .map(|dir| format!("{}/", relative(root, &dir)))
+        .collect();
+    if dirs.is_empty() {
+        return Vec::new();
+    }
+    let unknown = |why: String| {
+        vec![Violation::new(
+            ".",
+            "git-ignored-unknown",
+            format!(
+                "cannot tell which unit or step folders git ignores: {why}; the campaign belongs in a git repository"
+            ),
+        )]
+    };
+    let output = match Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["check-ignore", "--no-index", "--"])
+        .args(&dirs)
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => return unknown(format!("git did not run ({error})")),
+    };
+    match output.status.code() {
+        Some(0 | 1) => {}
+        Some(code) => return unknown(format!("`git check-ignore` exited {code}")),
+        None => return unknown("`git check-ignore` was killed".to_owned()),
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|path| {
+            Violation::new(
+                path.trim_end_matches('/'),
+                "git-ignored",
+                "git ignores this folder, so its files never reach the campaign's repository; narrow the .gitignore pattern",
+            )
+        })
         .collect()
 }
 
@@ -368,6 +465,8 @@ pub fn lint(start: &Path) -> Result<Outcome> {
     };
     violations.extend(root_files(&root, state.as_ref()));
     let units = unit_dirs(&root);
+    violations.extend(orphan_units(&root));
+    violations.extend(ignored(&root, &units));
     let sealed = state.as_ref().is_some_and(|state| state.closed.is_some());
     let mut packets = 0;
     for dir in &units {

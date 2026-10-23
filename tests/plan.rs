@@ -69,6 +69,14 @@ fn campaign(host: &Fake) -> Campaign {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("campaign");
     assert!(commands::init(host, &root).unwrap().ok());
+    let git = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&root)
+        .status();
+    assert!(
+        git.unwrap().success(),
+        "a campaign lives in a git repository"
+    );
     Campaign { _temp: temp, root }
 }
 
@@ -1249,6 +1257,7 @@ fn a_campaign_from_cm_0_3_1_loads_unchanged_and_its_owner_step_finishes() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/campaign-0.3.1");
     let root = temp.path().join("campaign");
     copy_tree(&fixture, &root);
+    git(&root, &["init", "-q"]);
     let c = Campaign { _temp: temp, root };
     let clean = lint(&c.root).unwrap();
     assert!(clean.ok(), "{:#?}", clean.violations);

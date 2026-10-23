@@ -1,5 +1,8 @@
 use std::path::Path;
 
+#[allow(dead_code)]
+mod support;
+
 use cm::attention::{self, Action, Check, Evidence, Github, PullRequest};
 use cm::host::Host;
 use cm::{commands, lint};
@@ -175,40 +178,48 @@ fn cli_fixture(
     check_output: &str,
     check_exit: i32,
 ) -> (tempfile::TempDir, std::process::Output) {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let campaign = dir.path().join("campaign");
     commands::init(&Clock, &campaign).unwrap();
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
-    let mut pr = evidence().pr.unwrap();
-    std::fs::write(
-        dir.path().join("first.json"),
-        serde_json::to_vec(&pr).unwrap(),
-    )
-    .unwrap();
-    pr.head_ref_oid = second_head.into();
-    std::fs::write(
-        dir.path().join("second.json"),
-        serde_json::to_vec(&pr).unwrap(),
-    )
-    .unwrap();
-    std::fs::write(dir.path().join("checks.json"), check_output).unwrap();
+    let pull = |head: &str| {
+        serde_json::json!({
+            "html_url": URL, "state": "open", "merged": false, "draft": false,
+            "mergeable_state": "clean", "updated_at": "2026-10-10T13:00:00Z",
+            "merged_at": null, "closed_at": null,
+            "head": { "sha": head, "ref": "topic" },
+            "base": { "sha": "b".repeat(40), "ref": "main" },
+        })
+        .to_string()
+    };
+    let fixture = |name: &str, text: &str| std::fs::write(dir.path().join(name), text).unwrap();
+    fixture("first.json", &pull(&"a".repeat(40)));
+    fixture("second.json", &pull(second_head));
+    fixture(
+        "branch.json",
+        r#"{"protection":{"required_status_checks":{"contexts":["test"]}}}"#,
+    );
+    fixture("rules.json", "[]");
+    fixture("status.json", r#"{"statuses":[]}"#);
+    fixture("runs.json", check_output);
     let script = r#"#!/bin/sh
 printf '%s\n' "$*" >> "$ATTENTION_FIXTURE/args"
-if [ "$2" = view ]; then
-  if [ -f "$ATTENTION_FIXTURE/seen" ]; then cat "$ATTENTION_FIXTURE/second.json"; else
-    touch "$ATTENTION_FIXTURE/seen"
-    cat "$ATTENTION_FIXTURE/first.json"
-  fi
-else
-  cat "$ATTENTION_FIXTURE/checks.json"
-  exit "$ATTENTION_CHECK_EXIT"
-fi
+case "$4" in
+  */pulls/*)
+    if [ -f "$ATTENTION_FIXTURE/seen" ]; then cat "$ATTENTION_FIXTURE/second.json"; else
+      touch "$ATTENTION_FIXTURE/seen"
+      cat "$ATTENTION_FIXTURE/first.json"
+    fi ;;
+  */branches/*) case "$4" in */rules/*) cat "$ATTENTION_FIXTURE/rules.json" ;; *) cat "$ATTENTION_FIXTURE/branch.json" ;; esac ;;
+  */status*) cat "$ATTENTION_FIXTURE/status.json" ;;
+  *)
+    cat "$ATTENTION_FIXTURE/runs.json"
+    exit "$ATTENTION_CHECK_EXIT" ;;
+esac
 "#;
     let gh = bin.join("gh");
-    std::fs::write(&gh, script).unwrap();
-    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    support::write_executable(&gh, script);
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_cm"))
         .args([
             "-C",
@@ -236,8 +247,7 @@ fi
 #[test]
 #[cfg(unix)]
 fn cli_checks_are_required_and_a_racing_head_discards_their_results() {
-    let checks = serde_json::to_string(&evidence().required_checks).unwrap();
-    let (dir, output) = cli_fixture(&"c".repeat(40), &checks, 0);
+    let (dir, output) = cli_fixture(&"c".repeat(40), RUNS, 0);
     assert_eq!(output.status.code(), Some(1));
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let row = &json["observations"][URL];
@@ -250,20 +260,35 @@ fn cli_checks_are_required_and_a_racing_head_discards_their_results() {
             .contains("changed during observation")
     );
     let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
-    assert_eq!(args.lines().count(), 3);
-    assert!(args.contains("--required --json name,state,link,startedAt,completedAt"));
+    assert_eq!(args.lines().count(), 6);
+    assert!(args.lines().all(|line| line.starts_with("api ")), "{args}");
+    assert!(args.contains("repos/example/project/commits/"));
+}
+
+const RUNS: &str = r#"{"check_runs":[{"name":"test","status":"completed","conclusion":"success","html_url":"https://github.com/example/project/runs/1","started_at":"2026-10-10T13:00:00Z","completed_at":"2026-10-10T13:02:00Z"}]}"#;
+
+#[test]
+#[cfg(unix)]
+fn cli_reads_github_over_rest_and_a_missing_required_check_is_not_green() {
+    let (_, output) = cli_fixture(&"a".repeat(40), RUNS, 0);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let row = &json["observations"][URL];
+    assert_eq!(row["action"], "review-head");
+    assert_eq!(row["evidence"]["required_checks"][0]["state"], "SUCCESS");
+    assert_eq!(row["evidence"]["pr"]["mergeStateStatus"], "CLEAN");
+    let (_, output) = cli_fixture(&"a".repeat(40), r#"{"check_runs":[]}"#, 0);
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let row = &json["observations"][URL];
+    assert_eq!(row["action"], "verify-checks");
+    assert_eq!(row["evidence"]["required_checks"][0]["state"], "MISSING");
 }
 
 #[test]
 #[cfg(unix)]
 fn cli_rejects_malformed_json_and_unsuccessful_gh_even_with_success_bytes() {
-    for (payload, exit) in [
-        ("not JSON".to_owned(), 0),
-        (
-            serde_json::to_string(&evidence().required_checks).unwrap(),
-            1,
-        ),
-    ] {
+    for (payload, exit) in [("not JSON".to_owned(), 0), (RUNS.to_owned(), 1)] {
         let (_, output) = cli_fixture(&"a".repeat(40), &payload, exit);
         assert_eq!(output.status.code(), Some(1));
         let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
