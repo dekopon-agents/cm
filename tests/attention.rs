@@ -1,5 +1,8 @@
 use std::path::Path;
 
+#[allow(dead_code)]
+mod support;
+
 use cm::attention::{self, Action, Check, Evidence, Github, PullRequest};
 use cm::host::Host;
 use cm::{commands, lint};
@@ -175,7 +178,6 @@ fn cli_fixture(
     check_output: &str,
     check_exit: i32,
 ) -> (tempfile::TempDir, std::process::Output) {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let campaign = dir.path().join("campaign");
     commands::init(&Clock, &campaign).unwrap();
@@ -217,8 +219,7 @@ case "$4" in
 esac
 "#;
     let gh = bin.join("gh");
-    std::fs::write(&gh, script).unwrap();
-    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    support::write_executable(&gh, script);
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_cm"))
         .args([
             "-C",
