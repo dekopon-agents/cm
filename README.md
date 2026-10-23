@@ -61,7 +61,7 @@ error.
 | `cm amend <NN-name>/<unit>/<step> [--study] [--lane L] [--after A]…` | Changes a declared step that rests at `drafted` or `launched`: marks it a study, moves its lane, or adds gates (each declared, never closing a cycle: `after-cycle`). Journals the change; a change that changes nothing is `amend-empty`. |
 | `cm advance <NN-name>/<unit>[/<step>] <state> [--sha S] [--pr URL] [--tag T] [--digest D] [--evidence PATH] [--repo PATH]` | Moves one state along `drafted → launched → pr-open → merged → released → deployed → done`, or to `blocked:<reason>`; an `owner`-lane or study step moves to `done` from `drafted` or `launched` with `--evidence` (see [Finishing](#finishing)). `superseded --evidence PATH` retires a step replaced by other work from any state short of final; it meets no gate, so its consumers are amended. A release step moves to `released --tag T` from `drafted` or `launched` when the tag was cut without a prep PR (tag-only). Refuses a skipped state and a state without its evidence, journals the move and re-renders `STATE.md`. |
 | `cm close` | Seals the campaign. Refuses, listing every gap, while `OWNER-QUEUE.md` has an open item or any unit or step is short of `done` or `blocked:<reason>`. Then it stamps `closed` in `.cm/state.json` and journals the close. From there unit `cm init`, `cm launch`, `cm advance` and a second `cm close` refuse with `campaign-closed`; `cm journal` stays open for follow-up observations. |
-| `cm lint [DIR]` | Template conformance, cm-owned files against `.cm/state.json`, the journal against git, `.cm/JOURNAL.md` and `.cm/lock` out of git (`cm-tracked`), and the path check for every drafted or launched packet. In a closed campaign, also an empty owner queue and every track done or blocked; its packets are no longer checked, since nothing launches there. |
+| `cm lint [DIR]` | Template conformance, cm-owned files against `.cm/state.json`, the journal against git, `.cm/JOURNAL.md` and `.cm/lock` out of git (`cm-tracked`), the path check for every drafted or launched packet, a unit or step folder git ignores (`git-ignored`), and a unit folder holding `STATE.md` but no `.cm/state.json` (`unit-state-json-missing`), which is never counted as a smaller campaign. In a closed campaign, also an empty owner queue and every track done or blocked; its packets are no longer checked, since nothing launches there. |
 
 ## The folder
 
@@ -105,7 +105,7 @@ entries with `cm journal`), and `rm <NN-name>/<unit>/STATE.md && cm init <NN-nam
 | `LIMITS.toml` | `paused` (bool); `runaway_ceiling_usd`, `min_free_disk_gib`, `kache_headroom_gib`, `pr_ci_expected_min`, `pr_ci_deadline_min` (non-negative numbers); `max_heavy_builds` (non-negative integer); `driver_model`, `driver_effort`, `verifier_model`, `supervisor_model`, `supervisor_effort`, `disk_volume` (non-empty strings). Other keys are allowed. |
 | `OWNER-QUEUE.md` | First heading `# Owner queue`; each `##` item has a line starting `Context:`, one starting `Recommendation:` and one starting `Answer:`. A queue written before cm 0.4 whose items lack `Context:` is reported, never rewritten. |
 | `<unit>/STATE.md` | Byte-equal to the render of the unit's `.cm/state.json`. |
-| Packets | In `kickoff.md`, `step-*.md` and `resume*.md` of a drafted or launched step, every absolute or `~/` path inside backticks exists. A span with whitespace, a glob or placeholder character (`* ? < > $ { } [ ] \|`), or a single component such as `/loop` or `//!` is not a path; a trailing `:line` or `:start-end` is dropped. Fenced blocks are not read. |
+| Packets | In `kickoff.md`, `step-*.md` and `resume*.md` of a drafted or launched step, every absolute or `~/` path inside backticks exists. A span with whitespace, a glob or placeholder character (`* ? < > $ { } [ ] \|`), or a single component such as `/loop` or `//!` is not a path; a trailing `:line` or `:start-end` is dropped. Only spans that could name a file are checked: a cm id (`01-a/u/S1`, `00-release/cm/0.5.0`), a URL and a route (an absolute path with no file extension whose first directory is not on this machine, such as `/v1/sessions/abc`) are not. Fenced blocks are not read. |
 
 ### State files
 
@@ -254,8 +254,11 @@ license ([LICENSE-MIT](LICENSE-MIT)) at your option.
 
 `cm attention` makes one read-only GitHub observation for explicit PRs and routes the next
 step to a named worker or coordinator. It works for prose-only campaign items; no unit
-initialization or lifecycle migration is required. Use an authenticated GitHub CLI with
-support for `gh pr checks --required --json` on PATH. GitHub.com PR URLs are required.
+initialization or lifecycle migration is required. Use an authenticated GitHub CLI on PATH:
+every read is a REST `gh api` call, so it works where GraphQL is blocked. GitHub.com PR URLs are
+required. The required checks are the base branch's required status contexts, from branch
+protection and rulesets, each looked up among the head's check runs and commit statuses; a
+required context the head does not report is `MISSING`.
 
 ```sh
 cm -C /path/to/campaign attention \
