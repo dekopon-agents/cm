@@ -1139,7 +1139,7 @@ fn a_study_done_with_evidence_frees_its_consumer() {
     let stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(c.root.join("01-a/u/.cm/state.json")).unwrap())
             .unwrap();
-    assert_eq!(stored["schema"], 2);
+    assert_eq!(stored["schema"], 3);
     let moved = unit.history.last().unwrap();
     assert_eq!((&moved.from, &moved.to), (&Phase::Drafted, &Phase::Done));
     assert_eq!(moved.at, track.since);
@@ -1389,17 +1389,17 @@ fn a_unit_from_a_newer_schema_is_refused() {
     let path = c.root.join("01-a/u/.cm/state.json");
     let mut stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(stored["schema"], 2);
-    stored["schema"] = 3.into();
+    assert_eq!(stored["schema"], 3);
+    stored["schema"] = 4.into();
     fs::write(&path, serde_json::to_string_pretty(&stored).unwrap()).unwrap();
     let error = store::load_unit(&c.root.join("01-a/u")).unwrap_err();
     let newer = error.downcast_ref::<store::NewerSchema>().unwrap();
-    assert_eq!(newer.found, 3);
+    assert_eq!(newer.found, 4);
     let linted = lint(&c.root).unwrap();
     assert_eq!(rules(&linted), vec!["state-parse"]);
     assert!(
         linted.violations[0]
             .message
-            .contains("has schema 3, newer than the schema 2")
+            .contains("has schema 4, newer than the schema 3")
     );
 }

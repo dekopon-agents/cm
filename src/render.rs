@@ -129,7 +129,7 @@ pub fn card(at: &str, name: &str, units: &Units, next: &Next, moves: &[Moved]) -
     let order = crate::state::ORDER
         .iter()
         .map(ToString::to_string)
-        .chain(["blocked".to_owned()]);
+        .chain(["superseded".to_owned(), "blocked".to_owned()]);
     for state in order {
         if let Some(count) = counts.get(&state) {
             out.push_str(&format!("| {state} | {count} |\n"));

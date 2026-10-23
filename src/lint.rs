@@ -308,7 +308,10 @@ pub fn root_files(root: &Path, state: Option<&CampaignState>) -> Vec<Violation> 
 }
 
 fn open_track(out: &mut Vec<Violation>, target: &str, track: &Track) {
-    if !matches!(track.state, Phase::Done | Phase::Blocked(_)) {
+    if !matches!(
+        track.state,
+        Phase::Done | Phase::Superseded | Phase::Blocked(_)
+    ) {
         out.push(Violation::new(
             target,
             "closed-track",

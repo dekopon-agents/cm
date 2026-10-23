@@ -332,6 +332,45 @@ fn record_release(
     Ok(outcome)
 }
 
+/// The same declaration again finishes one an interrupted `cm init` left half written: the step
+/// folder and a missing or stale STATE.md. The journal is not replayed.
+fn repair(
+    host: &dyn Host,
+    root: &Path,
+    dir: &Path,
+    unit: Option<&UnitState>,
+    step_name: &str,
+    full: &str,
+) -> Result<Outcome> {
+    let mut outcome = Outcome::default();
+    outcome.field("target", full);
+    let Some(unit) = unit else {
+        return Ok(outcome);
+    };
+    let mut repaired = Vec::new();
+    if !dir.join(step_name).is_dir() {
+        fs::create_dir_all(dir.join(step_name))?;
+        repaired.push(format!("{full}/"));
+    }
+    if !lint::unit_state_file(root, dir, unit).is_empty() {
+        write_atomic(&dir.join(UNIT_STATE), render::unit(unit).as_bytes())?;
+        repaired.push(relative(root, &dir.join(UNIT_STATE)));
+    }
+    if repaired.is_empty() {
+        outcome.line(format!("nothing to do: {full} is declared"));
+    } else {
+        let at = stamp(host.now());
+        let body = format!("- re-rendered: {}\n", repaired.join(", "));
+        outcome.field(
+            "journal",
+            record(root, &at, &format!("repair {full}"), &body)?,
+        );
+        outcome.line(format!("repaired {full}: {}", repaired.join(", ")));
+    }
+    outcome.field("repaired", repaired);
+    Ok(outcome)
+}
+
 fn init_step(
     host: &dyn Host,
     root: &Path,
@@ -412,10 +451,7 @@ fn init_step(
             && same_tag
             && violations.is_empty()
         {
-            let mut outcome = Outcome::default();
-            outcome.field("target", full.clone());
-            outcome.line(format!("nothing to do: {full} is declared"));
-            return Ok(outcome);
+            return repair(host, root, &dir, existing.as_ref(), step_name, &full);
         }
         if let (Some(mut unit), Some(tag)) = (existing.clone(), &tag)
             && step.tag.is_none()
@@ -701,9 +737,7 @@ pub fn launch(
                 ),
             ));
         }
-        if fresh {
-            violations.extend(plan::unmet(&full, &plan::gates(&units, step)));
-        }
+        violations.extend(plan::unmet(&full, &plan::gates(&units, step)));
     }
     let step_dir = unit_dir.join(step_name);
     let files = packet_files(&step_dir);
@@ -944,7 +978,11 @@ pub fn advance(
             ),
         )
     };
+    let tag_only = *to == Phase::Released
+        && Release::of_target(&full).is_some()
+        && matches!(track.resting(), Phase::Drafted | Phase::Launched);
     match track.check(to, finish) {
+        Err(_) if tag_only && !track.state.is_final() => {}
         Err(_) if finishing_code && track.state != Phase::Done => violations.push(code_finish()),
         Err(message) => violations.push(Violation::new(&full, "advance-refused", message)),
         Ok(()) if finishing_code && file.is_some() => violations.push(code_finish()),
@@ -1137,6 +1175,248 @@ pub fn advance(
     outcome.field("from", from.to_string());
     outcome.field("to", to.to_string());
     outcome.field("evidence", serde_json::to_value(&evidence)?);
+    outcome.field("journal", heading);
+    Ok(outcome)
+}
+
+fn unit_of(
+    root: &Path,
+    target: &Target,
+    violations: &mut Vec<Violation>,
+) -> Result<Option<(UnitState, String)>> {
+    let full = match &target.step {
+        Some(step) => format!("{}/{step}", target.unit),
+        None => target.unit.clone(),
+    };
+    let unit_dir = root.join(&target.unit);
+    if !store::is_unit(&unit_dir) {
+        violations.push(Violation::new(
+            &target.unit,
+            "unit-missing",
+            format!("no unit state; run `cm init {}`", target.unit),
+        ));
+        return Ok(None);
+    }
+    Ok(Some((store::load_unit(&unit_dir)?, full)))
+}
+
+fn step_unknown(full: &str) -> Violation {
+    Violation::new(full, "step-unknown", "the step is not declared")
+}
+
+fn track_mut<'a>(unit: &'a mut UnitState, target: &Target) -> Option<&'a mut Track> {
+    match &target.step {
+        None => Some(&mut unit.track),
+        Some(step) => unit.steps.get_mut(step).map(|step| &mut step.track),
+    }
+}
+
+/// Releases a blocked unit or step to the state it was blocked from, with the evidence that
+/// cleared the block. A step that rests at drafted or launched still waits on every `--after`.
+pub fn unblock(host: &dyn Host, root: &Path, target: &Target, file: &Path) -> Result<Outcome> {
+    let _lock = lock(root)?;
+    let campaign = store::load_campaign(root)?;
+    let mut violations = journal::check(root, &campaign);
+    violations.extend(closed(root, &campaign));
+    let Some((mut unit, full)) = unit_of(root, target, &mut violations)? else {
+        return Ok(Outcome::refused(violations));
+    };
+    let Some(current) = track_mut(&mut unit, target) else {
+        violations.push(step_unknown(&full));
+        return Ok(Outcome::refused(violations));
+    };
+    let track = current.clone();
+    if !matches!(track.state, Phase::Blocked(_)) {
+        violations.push(Violation::new(
+            &full,
+            "unblock-state",
+            format!("{full} is {}, not blocked", track.state),
+        ));
+    }
+    let mut evidence = Evidence::default();
+    match CampaignFile::resolve(root, file) {
+        Ok(found) => evidence.file = Some(found),
+        Err(error) => violations.push(Violation::new(&full, "evidence-file", error.to_string())),
+    }
+    if !violations.is_empty() {
+        return Ok(Outcome::refused(violations));
+    }
+    let at = stamp(host.now());
+    let to = track.resting().clone();
+    current.apply(to.clone(), &at, &evidence);
+    unit.history.push(Move {
+        at: at.clone(),
+        target: full.clone(),
+        from: track.state.clone(),
+        to: to.clone(),
+        evidence: evidence.clone(),
+    });
+    write_unit(&root.join(&target.unit), &unit)?;
+    let units = plan::load_units(root)?;
+    let waits: Vec<String> = plan::step(&units, &full)
+        .filter(|_| matches!(to, Phase::Drafted | Phase::Launched))
+        .map(|step| plan::unmet(&full, &plan::gates(&units, step)))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|violation| violation.message)
+        .collect();
+    let mut body = format!("- evidence: {}\n", evidence.summary());
+    for wait in &waits {
+        body.push_str(&format!("- still: {wait}\n"));
+    }
+    let heading = record(
+        root,
+        &at,
+        &format!("unblock {full}: {} → {to}", track.state),
+        &body,
+    )?;
+    let mut outcome = Outcome::default();
+    outcome.line(format!("{full}: {} → {to}", track.state));
+    outcome.lines.extend(waits.iter().cloned());
+    outcome.field("target", full);
+    outcome.field("from", track.state.to_string());
+    outcome.field("to", to.to_string());
+    outcome.field("waits_on", waits);
+    outcome.field("journal", heading);
+    Ok(outcome)
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Amendment {
+    pub study: bool,
+    pub lane: Option<Lane>,
+    pub after: Vec<String>,
+}
+
+fn reaches(units: &Units, from: &str, to: &str) -> bool {
+    let mut stack = vec![from.to_owned()];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(at) = stack.pop() {
+        if at == to {
+            return true;
+        }
+        if seen.insert(at.clone())
+            && let Some(step) = plan::step(units, &at)
+        {
+            stack.extend(step.after.iter().map(After::target));
+        }
+    }
+    false
+}
+
+/// Changes a declared step that has not opened its PR: marks it a study, moves its lane or adds a
+/// gate. Journaled like any move; a gate that would close a cycle is refused.
+pub fn amend(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    amendment: &Amendment,
+) -> Result<Outcome> {
+    let _lock = lock(root)?;
+    let campaign = store::load_campaign(root)?;
+    let mut violations = journal::check(root, &campaign);
+    violations.extend(closed(root, &campaign));
+    let Some((mut unit, full)) = unit_of(root, target, &mut violations)? else {
+        return Ok(Outcome::refused(violations));
+    };
+    let Some(step_name) = target.step.as_deref() else {
+        violations.push(Violation::new(
+            &full,
+            "amend-target",
+            "`cm amend` takes a step",
+        ));
+        return Ok(Outcome::refused(violations));
+    };
+    let units = plan::load_units(root)?;
+    let Some(step) = unit.steps.get(step_name).cloned() else {
+        violations.push(step_unknown(&full));
+        return Ok(Outcome::refused(violations));
+    };
+    if step.lane.is_none() {
+        violations.push(Violation::new(
+            &full,
+            "amend-target",
+            "the step was launched without a declaration; only a declared step is amended",
+        ));
+    }
+    if !matches!(step.track.resting(), Phase::Drafted | Phase::Launched) {
+        violations.push(Violation::new(
+            &full,
+            "amend-state",
+            format!(
+                "{full} is {}; only a drafted or launched step is amended",
+                step.track.state
+            ),
+        ));
+    }
+    let mut changes = Vec::new();
+    let mut next = step.clone();
+    if amendment.study && step.work.is_code() {
+        if Release::of_target(&full).is_some() {
+            violations.push(Violation::new(
+                &full,
+                "amend-target",
+                "a release step ships a tag; --study marks a step that ships none",
+            ));
+        }
+        next.work = Work::Study;
+        changes
+            .push("- study: finishes with `cm advance <step> done --evidence <path>`".to_owned());
+    }
+    if let Some(lane) = amendment.lane.filter(|lane| step.lane != Some(*lane)) {
+        next.lane = Some(lane);
+        changes.push(format!(
+            "- lane: {} → {lane}",
+            step.lane.map_or("—", Lane::name)
+        ));
+    }
+    for text in &amendment.after {
+        match After::parse(text, &target.unit) {
+            Err(message) => violations.push(Violation::new(&full, "after-parse", message)),
+            Ok(after) if next.after.contains(&after) => {}
+            Ok(after) if plan::step(&units, &after.target()).is_none() => {
+                violations.push(Violation::new(
+                    &full,
+                    "after-unknown",
+                    format!("`{text}` names {}, which is not declared", after.target()),
+                ))
+            }
+            Ok(after) if reaches(&units, &after.target(), &full) => {
+                violations.push(Violation::new(
+                    &full,
+                    "after-cycle",
+                    format!(
+                        "{} already waits on {full}; the order would have a cycle",
+                        after.target()
+                    ),
+                ))
+            }
+            Ok(after) => {
+                changes.push(format!("- after: + {after}"));
+                next.after.push(after);
+            }
+        }
+    }
+    if changes.is_empty() && violations.is_empty() {
+        violations.push(Violation::new(
+            &full,
+            "amend-empty",
+            "nothing changes; pass --study, a new --lane or a new --after",
+        ));
+    }
+    if !violations.is_empty() {
+        return Ok(Outcome::refused(violations));
+    }
+    let at = stamp(host.now());
+    unit.steps.insert(step_name.to_owned(), next);
+    write_unit(&root.join(&target.unit), &unit)?;
+    let body: String = changes.iter().map(|line| format!("{line}\n")).collect();
+    let heading = record(root, &at, &format!("amend {full}"), &body)?;
+    let mut outcome = Outcome::default();
+    outcome.line(format!("amended {full}"));
+    outcome.lines.extend(changes.iter().cloned());
+    outcome.field("target", full);
+    outcome.field("changes", changes);
     outcome.field("journal", heading);
     Ok(outcome)
 }
