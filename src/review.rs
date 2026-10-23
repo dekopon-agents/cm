@@ -7,7 +7,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::host::{Host, stamp};
-use crate::ledger::{guard, journal_line, one_line};
+use crate::ledger::{declared, guard, journal_line, one_line, read_existing};
 use crate::markdown::first_difference;
 use crate::outcome::{Outcome, Violation};
 use crate::store::{CM_DIR, Target, read_json, write_atomic, write_json};
@@ -21,6 +21,9 @@ pub const REVIEW_HEADER: &str = "| # | PR | Kind | Model | Verdict | Confirmed |
 pub struct Reviews {
     pub preamble: String,
     pub rows: Vec<Row>,
+    /// Everything after the table (per-PR adjudications, rules), re-emitted byte for byte.
+    #[serde(default)]
+    pub postamble: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,11 +101,8 @@ impl Row {
                 let pr = cells.get(1).map_or("", String::as_str);
                 let id = pr.split_whitespace().next().unwrap_or_default();
                 let (repo, number) = id.split_once('#').unwrap_or((id, ""));
-                (
-                    repo.to_owned(),
-                    number.parse().unwrap_or(u64::MAX),
-                    pr.contains("delta"),
-                )
+                let delta = cells.first().is_some_and(|cell| cell.contains('Δ'));
+                (repo.to_owned(), number.parse().unwrap_or(u64::MAX), delta)
             }
             Row::Review(review) => {
                 let (repo, number) = pr_key(&review.pr);
@@ -115,7 +115,7 @@ impl Row {
         match self {
             Row::Imported { cells } => cells
                 .first()
-                .and_then(|cell| cell.parse().ok())
+                .and_then(|cell| cell.trim_end_matches('Δ').parse().ok())
                 .unwrap_or(0),
             Row::Review(review) => review.number,
         }
@@ -151,6 +151,7 @@ pub fn render_reviews(reviews: &Reviews) -> String {
             .collect();
         out.push_str(&format!("| {} |\n", cells.join(" | ")));
     }
+    out.push_str(&reviews.postamble);
     out
 }
 
@@ -161,7 +162,11 @@ fn split_cells(line: &str) -> Vec<String> {
     for c in inner.chars() {
         match c {
             '|' if !escaped => cells.push(String::new()),
-            _ => cells.last_mut().expect("one cell").push(c),
+            _ => {
+                if let Some(cell) = cells.last_mut() {
+                    cell.push(c);
+                }
+            }
         }
         escaped = c == '\\';
     }
@@ -171,7 +176,8 @@ fn split_cells(line: &str) -> Vec<String> {
         .collect()
 }
 
-/// Parses a hand-written REVIEW-OFF.md as it stands: the text above the table and its rows.
+/// Parses a hand-written REVIEW-OFF.md as it stands: the text above the table, its rows, and
+/// everything after the table.
 pub fn parse_reviews(text: &str) -> Result<Reviews, String> {
     let Some(start) = text.find(REVIEW_HEADER) else {
         return Err(format!(
@@ -179,24 +185,28 @@ pub fn parse_reviews(text: &str) -> Result<Reviews, String> {
         ));
     };
     let mut rows = Vec::new();
-    for line in text[start..].lines().skip(2) {
-        if !line.starts_with('|') {
-            if line.trim().is_empty() {
-                break;
-            }
-            return Err(format!(
-                "`{line}` follows the table; cm keeps only rows there"
-            ));
+    let mut end = text.len();
+    let mut at = start;
+    for (index, line) in text[start..].split_inclusive('\n').enumerate() {
+        let row = line.trim_end_matches(['\n', '\r']);
+        if index >= 2 && !row.starts_with('|') {
+            end = at;
+            break;
         }
-        let cells = split_cells(line);
+        at += line.len();
+        if index < 2 {
+            continue;
+        }
+        let cells = split_cells(row);
         if cells.len() != 12 {
-            return Err(format!("`{line}` does not have the table's 12 cells"));
+            return Err(format!("`{row}` does not have the table's 12 cells"));
         }
         rows.push(Row::Imported { cells });
     }
     Ok(Reviews {
         preamble: text[..start].to_owned(),
         rows,
+        postamble: text[end..].to_owned(),
     })
 }
 
@@ -220,9 +230,9 @@ pub fn lint_reviews(root: &Path) -> Vec<Violation> {
         }
     };
     let rendered = render_reviews(&reviews);
-    match fs::read_to_string(root.join(REVIEW_OFF)) {
-        Ok(text) if text == rendered => Vec::new(),
-        Ok(text) => vec![
+    match read_existing(&root.join(REVIEW_OFF)) {
+        Ok(Some(text)) if text == rendered => Vec::new(),
+        Ok(Some(text)) => vec![
             Violation::new(
                 REVIEW_OFF,
                 "review-hand-edit",
@@ -230,7 +240,8 @@ pub fn lint_reviews(root: &Path) -> Vec<Violation> {
             )
             .at(first_difference(&text, &rendered)),
         ],
-        Err(_) => vec![Violation::new(REVIEW_OFF, "review-missing", "REVIEW-OFF.md is gone; `git checkout HEAD -- REVIEW-OFF.md`")],
+        Ok(None) => vec![Violation::new(REVIEW_OFF, "review-missing", "REVIEW-OFF.md is gone; `git checkout HEAD -- REVIEW-OFF.md`")],
+        Err(error) => vec![Violation::new(REVIEW_OFF, "review-unreadable", format!("{error:#}"))],
     }
 }
 
@@ -251,12 +262,13 @@ fn load_or_import(root: &Path) -> Result<Result<(Reviews, bool), String>> {
     if path.exists() {
         return Ok(Ok((read_json(&path)?, false)));
     }
-    Ok(match fs::read_to_string(root.join(REVIEW_OFF)) {
-        Ok(text) => parse_reviews(&text).map(|reviews| (reviews, true)),
-        Err(_) => Ok((
+    Ok(match read_existing(&root.join(REVIEW_OFF))? {
+        Some(text) => parse_reviews(&text).map(|reviews| (reviews, true)),
+        None => Ok((
             Reviews {
                 preamble: "# Review-off\n\nRendered by cm from `.cm/reviews.json`; add a row with `cm review`.\n\n".into(),
                 rows: Vec::new(),
+                postamble: String::new(),
             },
             true,
         )),
@@ -359,6 +371,13 @@ pub fn review(host: &dyn Host, root: &Path, target: &Target, args: &ReviewArgs) 
     }
     for (field, text) in [("--model", args.model), ("--effort", args.effort)] {
         one_line(field, text, &mut violations, &full);
+    }
+    if !declared(root, target)? {
+        violations.push(Violation::new(
+            &full,
+            "step-unknown",
+            "the step is not declared",
+        ));
     }
     let loaded = match load_or_import(root)? {
         Ok(loaded) => Some(loaded),

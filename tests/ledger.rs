@@ -203,8 +203,25 @@ const REVIEW_OFF: &str = "# Review-off\n\nWho reviewed what.\n\n\
 |---|---|---|---|---|---|---|---|---|---|---|---|\n\
 | 9 | dekopon-provider-decide#4 @a00bcdf0 | release prep (d) | Fable 5.1 | ACCEPT | 0 required; 1 taste (#3's squash puts its `Changelog:` line mid-body, so trailer parsing misses it; confirmed in ca85c2c's body) | 0 | 1 (the trailer-parsing note) | taste | $1.10 | 36 s run (64 s turn) | not exposed (dekopon-rust) |\n";
 
+fn declare_build(root: &Path) {
+    let declaration = Declaration {
+        lane: Some(Lane::ClaudeCloud),
+        ..Declaration::default()
+    };
+    let target = root.join("15-machinery/cm/build");
+    assert!(
+        commands::declare(&Fake, &target, &declaration)
+            .unwrap()
+            .ok()
+    );
+}
+
 fn review(root: &Path, pr: &str, delta: Option<&str>) -> Outcome {
-    let step = parse_target("15-machinery/cm/build", true).unwrap();
+    review_step(root, "15-machinery/cm/build", pr, delta)
+}
+
+fn review_step(root: &Path, step: &str, pr: &str, delta: Option<&str>) -> Outcome {
+    let step = parse_target(step, true).unwrap();
     let args = ReviewArgs {
         pr,
         head: "1234567890abcdef",
@@ -222,6 +239,7 @@ fn review(root: &Path, pr: &str, delta: Option<&str>) -> Outcome {
 #[test]
 fn review_rows_render_in_pr_order() {
     let (_temp, root) = campaign();
+    declare_build(&root);
     fs::write(root.join("REVIEW-OFF.md"), REVIEW_OFF).unwrap();
     let imported = review::import_reviews(&Fake, &root).unwrap();
     assert!(imported.ok(), "{:?}", imported.violations);
@@ -269,6 +287,50 @@ fn review_rows_render_in_pr_order() {
         )),
         vec!["review-hand-edit"]
     );
+}
+
+const AFTER_TABLE: &str = "\n### PR 4: dekopon-provider-decide#4\n\nBoth reviewers accepted; the taste note rides the next PR.\n\n## Rules\n\n- One row per review.\n- A delta row sits under its PR.\n";
+
+const DELTA_ROW: &str = "| 9Δ | dekopon-provider-decide#4 @b11cdf01 | release prep (d), delta | Fable 5.1 | ACCEPT | 0 | 0 | 0 | — | $0.20 | 9 s run | not exposed |\n";
+
+#[test]
+fn review_off_keeps_what_follows_the_table_byte_for_byte() {
+    let (_temp, root) = campaign();
+    declare_build(&root);
+    let hand = format!("{REVIEW_OFF}{DELTA_ROW}{AFTER_TABLE}");
+    fs::write(root.join("REVIEW-OFF.md"), &hand).unwrap();
+    let added = review(&root, "https://github.com/dekopon-agents/cm/pull/30", None);
+    assert!(added.ok(), "{:?}", added.violations);
+    assert_eq!(added.fields["number"], 10);
+    let text = fs::read_to_string(root.join("REVIEW-OFF.md")).unwrap();
+    assert!(text.ends_with(AFTER_TABLE), "{text}");
+    let rows: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("| 1") || line.starts_with("| 9"))
+        .map(|line| line.split(" | ").next().unwrap())
+        .collect();
+    assert_eq!(rows, vec!["| 10", "| 9", "| 9Δ"]);
+    assert!(lint(&root).unwrap().ok());
+    let (_other, fresh) = campaign();
+    fs::write(fresh.join("REVIEW-OFF.md"), &hand).unwrap();
+    assert!(review::import_reviews(&Fake, &fresh).unwrap().ok());
+    assert_eq!(
+        fs::read_to_string(fresh.join("REVIEW-OFF.md")).unwrap(),
+        hand
+    );
+}
+
+#[test]
+fn review_refuses_an_undeclared_step() {
+    let (_temp, root) = campaign();
+    let refused = review_step(
+        &root,
+        "77-nope/u/S9",
+        "https://github.com/dekopon-agents/cm/pull/30",
+        None,
+    );
+    assert_eq!(rules(&refused), vec!["step-unknown"]);
+    assert!(!root.join("REVIEW-OFF.md").exists());
 }
 
 #[test]

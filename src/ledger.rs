@@ -426,6 +426,15 @@ pub fn single_evidence(root: &Path, target: &Target) -> Option<PathBuf> {
     }
 }
 
+/// The target names a step declared in its unit's state.
+pub(crate) fn declared(root: &Path, target: &Target) -> Result<bool> {
+    let dir = root.join(&target.unit);
+    Ok(store::is_unit(&dir)
+        && store::load_unit(&dir)?
+            .steps
+            .contains_key(target.step.as_deref().unwrap_or_default()))
+}
+
 pub fn evidence(
     host: &dyn Host,
     root: &Path,
@@ -439,11 +448,7 @@ pub fn evidence(
         target.unit,
         target.step.as_deref().unwrap_or_default()
     );
-    let declared = store::is_unit(&root.join(&target.unit))
-        && store::load_unit(&root.join(&target.unit))?
-            .steps
-            .contains_key(target.step.as_deref().unwrap_or_default());
-    if !declared {
+    if !declared(root, target)? {
         violations.push(Violation::new(
             &full,
             "step-unknown",
