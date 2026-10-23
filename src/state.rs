@@ -613,6 +613,84 @@ pub struct Step {
     pub tag: Option<TagName>,
     #[serde(default, skip_serializing_if = "Work::is_code")]
     pub work: Work,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<Attempt>,
+}
+
+/// A remote launch's record: what cm knows reached the runtime, so a replacement coordinator
+/// resumes one execution or names an unknown outcome instead of dispatching again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attempt {
+    pub id: String,
+    pub generation: u32,
+    pub coordinator: String,
+    pub claimed_at: String,
+    /// `<generation>:<coordinator>:<claim instant>`: what `begin`, `record` and `end` present.
+    #[serde(default)]
+    pub claim: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<External>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<Ended>,
+}
+
+/// One external action: `began` is written before the call, `id` once it returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct External {
+    pub kind: String,
+    pub began: String,
+    pub generation: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ended {
+    pub at: String,
+    pub outcome: AttemptOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<CampaignFile>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AttemptOutcome {
+    Complete,
+    Partial,
+    Unknown,
+}
+
+impl Attempt {
+    pub fn mint(&mut self, now: jiff::Timestamp) {
+        self.claim = format!("{}:{}:{now}", self.generation, self.coordinator);
+    }
+}
+
+impl std::str::FromStr for AttemptOutcome {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "complete" => Ok(AttemptOutcome::Complete),
+            "partial" => Ok(AttemptOutcome::Partial),
+            "unknown" => Ok(AttemptOutcome::Unknown),
+            _ => Err(format!(
+                "`{text}` is not an outcome; outcomes are complete, partial, unknown"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for AttemptOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            AttemptOutcome::Complete => "complete",
+            AttemptOutcome::Partial => "partial",
+            AttemptOutcome::Unknown => "unknown",
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

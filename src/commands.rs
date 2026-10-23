@@ -14,8 +14,8 @@ use crate::outcome::{Outcome, Violation};
 use crate::plan::{self, Units};
 use crate::render;
 use crate::state::{
-    After, CampaignState, DEFAULT_TAG, Evidence, FLAGS, Finish, Flag, JournalMark, Kind, Lane,
-    Move, Phase, RELEASES, Release, SCHEMA, Step, Track, UnitState, Work, evidence_for,
+    After, Attempt, CampaignState, DEFAULT_TAG, Evidence, FLAGS, Finish, Flag, JournalMark, Kind,
+    Lane, Move, Phase, RELEASES, Release, SCHEMA, Step, Track, UnitState, Work, evidence_for,
 };
 use crate::store::{
     self, JOURNAL, Target, UNIT_STATE, absolute, create_new, find_root, lock, parse_target,
@@ -491,6 +491,7 @@ fn init_step(
             github: ships.github.clone(),
             tag: tag.clone(),
             work,
+            attempt: None,
         },
     );
     write_unit(&dir, &unit)?;
@@ -658,11 +659,28 @@ fn launch_checks(host: &dyn Host, limits: &Limits, report: &mut Vec<String>) -> 
     out
 }
 
+/// What a remote launch records in its attempt.
+#[derive(Debug, Clone, Default)]
+pub struct Remote {
+    pub coordinator: Option<String>,
+    pub cap_min: Option<u32>,
+}
+
 pub fn launch(
     host: &dyn Host,
     root: &Path,
     target: &Target,
     worktree: Option<&Path>,
+) -> Result<Outcome> {
+    launch_remote(host, root, target, worktree, &Remote::default())
+}
+
+pub fn launch_remote(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    worktree: Option<&Path>,
+    remote: &Remote,
 ) -> Result<Outcome> {
     let Some(step_name) = target.step.as_deref() else {
         return Ok(Outcome::refused(vec![Violation::new(
@@ -738,6 +756,20 @@ pub fn launch(
             ));
         }
         violations.extend(plan::unmet(&full, &plan::gates(&units, step)));
+        if let Some(attempt) = step
+            .attempt
+            .as_ref()
+            .filter(|attempt| attempt.ended.is_none())
+        {
+            violations.push(Violation::new(
+                &full,
+                "attempt-open",
+                format!(
+                    "attempt {} has not ended; resume it, or end it with `cm attempt {full} end <outcome>`, before a new launch",
+                    attempt.id
+                ),
+            ));
+        }
     }
     let step_dir = unit_dir.join(step_name);
     let files = packet_files(&step_dir);
@@ -809,12 +841,31 @@ pub fn launch(
         github: None,
         tag: None,
         work: Work::Code,
+        attempt: None,
     });
     let from = step.track.state.clone();
     step.track.apply(Phase::Launched, &at, &Evidence::default());
     step.worktree = worktree_text.clone();
     step.launches += 1;
     let launches = step.launches;
+    if !local {
+        step.attempt = Some(Attempt {
+            id: format!("{full}#{launches}"),
+            generation: 1,
+            coordinator: remote.coordinator.clone().unwrap_or_else(|| "—".to_owned()),
+            claimed_at: at.clone(),
+            deadline: remote
+                .cap_min
+                .map(|minutes| stamp(host.now() + jiff::SignedDuration::from_mins(minutes.into()))),
+            claim: String::new(),
+            actions: Vec::new(),
+            ended: None,
+        });
+        if let Some(attempt) = step.attempt.as_mut() {
+            attempt.mint(host.now());
+        }
+    }
+    let attempt = step.attempt.clone().filter(|_| !local);
     unit.steps.insert(step_name.to_owned(), step);
     unit.history.push(Move {
         at: at.clone(),
@@ -856,6 +907,14 @@ pub fn launch(
     if !worktree_text.is_empty() {
         body.push_str(&format!("- worktree: `{worktree_text}`\n"));
     }
+    if let Some(attempt) = &attempt {
+        body.push_str(&format!(
+            "- attempt: {} (generation 1, coordinator {}, deadline {})\n",
+            attempt.id,
+            attempt.coordinator,
+            attempt.deadline.as_deref().unwrap_or("—")
+        ));
+    }
     match &command {
         Some(command) => body.push_str(&format!("- launch {launches}: `{command}`\n")),
         None => body.push_str(&format!(
@@ -882,6 +941,7 @@ pub fn launch(
     outcome.field("lane", declared.map(Lane::name));
     outcome.field("prompt", relative(root, &prompt));
     outcome.field("launch", command);
+    outcome.field("attempt", serde_json::to_value(&attempt)?);
     outcome.field("journal", heading);
     Ok(outcome)
 }

@@ -107,6 +107,12 @@ enum Commands {
         /// The step's worktree, which must already exist; required for the local pi lane and undeclared steps.
         #[arg(long, value_name = "PATH")]
         worktree: Option<PathBuf>,
+        /// A remote launch: the coordinator session that claims its attempt (generation 1).
+        #[arg(long, value_name = "LABEL")]
+        coordinator: Option<String>,
+        /// A remote launch: its cap in minutes, stored as an absolute deadline a replacement inherits.
+        #[arg(long, value_name = "MINUTES")]
+        cap_min: Option<u32>,
     },
     /// Release a blocked unit or step to the state it was blocked from, with the evidence that cleared it.
     Unblock {
@@ -131,6 +137,17 @@ enum Commands {
         /// A gate to add, as `cm init --after` takes it. Repeat for each.
         #[arg(long, value_name = "AFTER")]
         after: Vec<String>,
+    },
+    /// Show, claim or extend a remote launch's attempt record; every external action is recorded before the next.
+    Attempt {
+        /// <NN-name>/<unit>/<step>
+        #[arg(value_parser = step_target)]
+        target: Target,
+        /// The claim token `cm launch` or `claim` printed; begin, record and end need the current one.
+        #[arg(long, global = true, value_name = "TOKEN")]
+        claim: Option<String>,
+        #[command(subcommand)]
+        act: Option<AttemptAct>,
     },
     /// Move a unit or step to its next state with that state's evidence.
     Advance {
@@ -162,6 +179,27 @@ enum Commands {
     Lint {
         /// A folder inside the campaign; defaults to --root or the current directory.
         dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AttemptAct {
+    /// Fence the generation that holds the attempt and take it over; --expect is that generation.
+    Claim {
+        #[arg(long, value_name = "LABEL")]
+        coordinator: String,
+        #[arg(long, value_name = "GENERATION")]
+        expect: u32,
+    },
+    /// Record that an external action (thread, turn, session, cancel, …) is about to start.
+    Begin { kind: String },
+    /// Record the id the begun action returned.
+    Record { kind: String, id: String },
+    /// End the attempt: complete, partial (with --evidence) or unknown.
+    End {
+        outcome: crate::state::AttemptOutcome,
+        #[arg(long, value_name = "PATH")]
+        evidence: Option<PathBuf>,
     },
 }
 
@@ -243,9 +281,21 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             let body = body_file.as_deref().map(read_body).transpose()?;
             commands::journal(host, &root()?, title, body.as_deref())
         }
-        Commands::Launch { target, worktree } => {
-            commands::launch(host, &root()?, target, worktree.as_deref())
-        }
+        Commands::Launch {
+            target,
+            worktree,
+            coordinator,
+            cap_min,
+        } => commands::launch_remote(
+            host,
+            &root()?,
+            target,
+            worktree.as_deref(),
+            &commands::Remote {
+                coordinator: coordinator.clone(),
+                cap_min: *cap_min,
+            },
+        ),
         Commands::Unblock { target, evidence } => {
             commands::unblock(host, &root()?, target, &under_root(cli, evidence))
         }
@@ -264,6 +314,29 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 after: after.clone(),
             },
         ),
+        Commands::Attempt { target, claim, act } => {
+            use crate::attempt::Act;
+            let act = match act {
+                None => Act::Status,
+                Some(AttemptAct::Claim {
+                    coordinator,
+                    expect,
+                }) => Act::Claim {
+                    coordinator: coordinator.clone(),
+                    expect: *expect,
+                },
+                Some(AttemptAct::Begin { kind }) => Act::Begin { kind: kind.clone() },
+                Some(AttemptAct::Record { kind, id }) => Act::Record {
+                    kind: kind.clone(),
+                    id: id.clone(),
+                },
+                Some(AttemptAct::End { outcome, evidence }) => Act::End {
+                    outcome: *outcome,
+                    file: evidence.as_deref().map(|file| under_root(cli, file)),
+                },
+            };
+            crate::attempt::attempt(host, &root()?, target, claim.as_deref(), &act)
+        }
         Commands::Advance {
             target,
             state,
@@ -315,6 +388,7 @@ fn name(command: &Commands) -> &'static str {
         Commands::Launch { .. } => "launch",
         Commands::Unblock { .. } => "unblock",
         Commands::Amend { .. } => "amend",
+        Commands::Attempt { .. } => "attempt",
         Commands::Advance { .. } => "advance",
         Commands::Lint { .. } => "lint",
     }
