@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use jiff::Timestamp;
 
 use crate::commands::{closed, write_unit};
 use crate::evidence::CampaignFile;
@@ -30,8 +31,17 @@ pub enum Act {
     },
 }
 
+/// Past the deadline; a deadline cm cannot read counts as past.
+fn expired(attempt: &Attempt, now: Timestamp) -> bool {
+    attempt.deadline.as_deref().is_some_and(|deadline| {
+        deadline
+            .parse::<Timestamp>()
+            .map_or(true, |deadline| now >= deadline)
+    })
+}
+
 /// What a coordinator holding only the committed state does next, as `(code, instruction)`.
-pub fn plan(attempt: &Attempt, now: &str) -> (&'static str, String) {
+pub fn plan(attempt: &Attempt, now: Timestamp) -> (&'static str, String) {
     let last = attempt.actions.last();
     let known = |kind: &str| {
         attempt
@@ -53,11 +63,7 @@ pub fn plan(attempt: &Attempt, now: &str) -> (&'static str, String) {
             ),
         );
     }
-    if attempt
-        .deadline
-        .as_deref()
-        .is_some_and(|deadline| now >= deadline)
-    {
+    if expired(attempt, now) {
         let cancel = known("turn").map_or_else(
             || "nothing was admitted to cancel".to_owned(),
             |turn| format!("cancel turn {turn}"),
@@ -91,7 +97,7 @@ pub fn attempt(
     host: &dyn Host,
     root: &Path,
     target: &Target,
-    generation: Option<u32>,
+    claim: Option<&str>,
     act: &Act,
 ) -> Result<Outcome> {
     let full = format!(
@@ -130,14 +136,19 @@ pub fn attempt(
         ));
         return Ok(Outcome::refused(violations));
     };
-    let at = stamp(host.now());
-    let fenced = |given: u32| {
+    let now = host.now();
+    let at = stamp(now);
+    let fenced = |given: &str| {
         Violation::new(
             &full,
             "attempt-fenced",
             format!(
-                "generation {given} is fenced: generation {} ({}) claimed attempt {} at {}",
-                attempt.generation, attempt.coordinator, attempt.id, attempt.claimed_at
+                "`{given}` is fenced: {} holds attempt {} (generation {}, {}, claimed at {})",
+                attempt.claim,
+                attempt.id,
+                attempt.generation,
+                attempt.coordinator,
+                attempt.claimed_at
             ),
         )
     };
@@ -150,7 +161,7 @@ pub fn attempt(
             expect,
         } => {
             if *expect != attempt.generation {
-                violations.push(fenced(*expect));
+                violations.push(fenced(&format!("generation {expect}")));
             }
             if coordinator.trim().is_empty() || coordinator.contains('\n') {
                 violations.push(Violation::new(
@@ -170,7 +181,7 @@ pub fn attempt(
                 violations.push(Violation::new(
                     &full,
                     "attempt-unknown",
-                    plan(&attempt, &at).1,
+                    plan(&attempt, now).1,
                 ));
             }
             if !is_name(kind) {
@@ -180,16 +191,11 @@ pub fn attempt(
                     format!("`{kind}` is not a name such as thread, turn, session or cancel"),
                 ));
             }
-            if kind != "cancel"
-                && attempt
-                    .deadline
-                    .as_deref()
-                    .is_some_and(|deadline| at.as_str() >= deadline)
-            {
+            if kind != "cancel" && expired(&attempt, now) {
                 violations.push(Violation::new(
                     &full,
                     "attempt-deadline",
-                    plan(&attempt, &at).1,
+                    plan(&attempt, now).1,
                 ));
             }
             Some(format!("{} begins {kind}", attempt.id))
@@ -207,16 +213,28 @@ pub fn attempt(
             }
             Some(format!("{} {kind} {id}", attempt.id))
         }
-        Act::End { outcome, .. } => Some(format!("end {}: {outcome}", attempt.id)),
+        Act::End { outcome, .. } => {
+            if let Some(action) = pending.filter(|_| *outcome != AttemptOutcome::Unknown) {
+                violations.push(Violation::new(
+                    &full,
+                    "attempt-unknown",
+                    format!(
+                        "{} began at {} and returned no id, so nobody knows whether it ran: only `end unknown` closes this attempt",
+                        action.kind, action.began
+                    ),
+                ));
+            }
+            Some(format!("end {}: {outcome}", attempt.id))
+        }
     };
     if !matches!(act, Act::Status | Act::Claim { .. }) {
-        match generation {
-            Some(given) if given == attempt.generation => {}
+        match claim {
+            Some(given) if given == attempt.claim && !attempt.claim.is_empty() => {}
             Some(given) => violations.push(fenced(given)),
             None => violations.push(Violation::new(
                 &full,
                 "attempt-fenced",
-                "pass the --generation that claimed the attempt",
+                "pass --claim, the token `cm launch` or `cm attempt claim` printed",
             )),
         }
     }
@@ -224,7 +242,7 @@ pub fn attempt(
         violations.push(Violation::new(
             &full,
             "attempt-ended",
-            plan(&attempt, &at).1,
+            plan(&attempt, now).1,
         ));
     }
     let mut evidence = None;
@@ -253,6 +271,7 @@ pub fn attempt(
             attempt.generation += 1;
             attempt.coordinator.clone_from(coordinator);
             attempt.claimed_at.clone_from(&at);
+            attempt.mint(now);
         }
         Act::Begin { kind } => attempt.actions.push(External {
             kind: kind.clone(),
@@ -293,11 +312,9 @@ pub fn attempt(
         )?;
         outcome.field("journal", heading);
     }
-    let (code, next) = plan(&attempt, &at);
-    outcome.line(format!(
-        "{}: generation {}; {next}",
-        attempt.id, attempt.generation
-    ));
+    let (code, next) = plan(&attempt, now);
+    outcome.line(format!("{}: claim {}; {next}", attempt.id, attempt.claim));
+    outcome.field("claim", attempt.claim.clone());
     outcome.field("target", full);
     outcome.field("plan", code);
     outcome.field("next", next);

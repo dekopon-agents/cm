@@ -39,6 +39,11 @@ fn rules(outcome: &Outcome) -> Vec<&'static str> {
 fn campaign() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("campaign");
+    let git = Command::new("git").args(["init", "-q"]).arg(&root).status();
+    assert!(
+        git.unwrap().success(),
+        "a campaign lives in a git repository"
+    );
     assert!(commands::init(&Fake, &root).unwrap().ok());
     fs::write(
         root.join("EPOCH.md"),
@@ -293,4 +298,50 @@ fn cli_feedback_reads_its_body_from_stdin() {
     assert_eq!(json["id"], "FB-d-001", "{json}");
     let text = fs::read_to_string(root.join("FEEDBACK.md")).unwrap();
     assert!(text.ends_with("The body.\n"));
+}
+
+#[test]
+fn feedback_refuses_an_empty_body() {
+    let (_temp, root) = campaign();
+    for body in ["", " \n\n"] {
+        let empty = Feedback {
+            body,
+            ..entry("a lesson", "urgent")
+        };
+        assert_eq!(
+            rules(&ledger::feedback(&Fake, &root, &empty).unwrap()),
+            vec!["feedback-empty"]
+        );
+    }
+    assert!(!root.join("FEEDBACK.md").exists());
+}
+
+#[test]
+fn an_unreadable_ledger_is_never_rewritten_from_nothing() {
+    let (_temp, root) = campaign();
+    let garbled = b"# Feedback\n\n### FB-d-001 \xff\xfe\n";
+    fs::write(root.join("FEEDBACK.md"), garbled).unwrap();
+    assert!(ledger::feedback(&Fake, &root, &entry("a lesson", "urgent")).is_err());
+    assert_eq!(fs::read(root.join("FEEDBACK.md")).unwrap(), garbled);
+    let queue = fs::read(root.join("OWNER-QUEUE.md")).unwrap();
+    let mut broken = queue.clone();
+    broken.extend_from_slice(b"\xff\n");
+    fs::write(root.join("OWNER-QUEUE.md"), &broken).unwrap();
+    let item = QueueItem {
+        title: "t",
+        context: "c",
+        question: "q",
+        recommendation: "r",
+    };
+    assert!(ledger::owner_queue_add(&Fake, &root, &item).is_err());
+    assert_eq!(fs::read(root.join("OWNER-QUEUE.md")).unwrap(), broken);
+    fs::write(root.join("OWNER-QUEUE.md"), &queue).unwrap();
+    let resume = fs::read_to_string(root.join("RESUME.md")).unwrap();
+    let bare = &resume[resume.find("# Resume").unwrap()..];
+    fs::write(root.join("RESUME.md"), bare).unwrap();
+    assert_eq!(
+        rules(&ledger::owner_queue_add(&Fake, &root, &item).unwrap()),
+        vec!["resume-banner"]
+    );
+    assert_eq!(fs::read(root.join("OWNER-QUEUE.md")).unwrap(), queue);
 }

@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::commands::closed;
 use crate::epoch::EPOCH;
@@ -53,8 +53,19 @@ fn plain_body(path: &str, body: &str, deepest: usize, out: &mut Vec<Violation>) 
     }
 }
 
-fn append(path: &Path, text: &str) -> Result<()> {
-    let mut current = fs::read_to_string(path).unwrap_or_default();
+/// A ledger file's text, `None` only when it is absent: an unreadable file is an error, never
+/// an empty ledger to rewrite.
+pub(crate) fn read_existing(path: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Writes `current`, the file's text as read under the lock, with `text` appended.
+fn append(path: &Path, current: &str, text: &str) -> Result<()> {
+    let mut current = current.to_owned();
     while !current.is_empty() && !current.ends_with("\n\n") {
         current.push('\n');
     }
@@ -175,7 +186,14 @@ pub fn feedback(host: &dyn Host, root: &Path, entry: &Feedback) -> Result<Outcom
             format!("`{urgency}` is not urgent or queued"),
         ));
     }
-    let text = fs::read_to_string(root.join(FEEDBACK)).unwrap_or_else(|_| "# Feedback\n".into());
+    if entry.body.trim().is_empty() {
+        violations.push(Violation::new(
+            FEEDBACK,
+            "feedback-empty",
+            "the body is empty; say what happened in --body-file",
+        ));
+    }
+    let text = read_existing(&root.join(FEEDBACK))?.unwrap_or_else(|| "# Feedback\n".into());
     let found = feedback_headings(&text);
     let heading = match (entry.follow_up, entry.disposition, entry.urgency) {
         (Some(id), Some(disposition), urgency) => {
@@ -243,16 +261,11 @@ pub fn feedback(host: &dyn Host, root: &Path, entry: &Feedback) -> Result<Outcom
     }
     let (id, heading) = heading;
     let at = stamp(host.now());
-    let mut text_out = format!("{heading}\n\nLogged {at} by `cm feedback`.\n");
-    if !entry.body.trim().is_empty() {
-        text_out.push('\n');
-        text_out.push_str(entry.body.trim());
-        text_out.push('\n');
-    }
-    if !root.join(FEEDBACK).exists() {
-        write_atomic(&root.join(FEEDBACK), b"# Feedback\n")?;
-    }
-    append(&root.join(FEEDBACK), &text_out)?;
+    let text_out = format!(
+        "{heading}\n\nLogged {at} by `cm feedback`.\n\n{}\n",
+        entry.body.trim()
+    );
+    append(&root.join(FEEDBACK), &text, &text_out)?;
     let kind = if entry.follow_up.is_some() {
         "feedback follow-up"
     } else {
@@ -277,10 +290,15 @@ fn item_number(text: &str) -> Option<u32> {
     text.split_once(". ")?.0.parse().ok()
 }
 
-/// The RESUME.md banner with its fenced `/loop` replaced by the withheld line.
-fn withhold(resume: &str) -> Option<String> {
+/// The RESUME.md banner with its fenced `/loop` replaced by the withheld line; `Ok(None)` when it
+/// already carries that line, `Err` when RESUME.md opens with no `>` banner.
+fn withhold(resume: &str) -> Result<Option<String>, ()> {
     let lines: Vec<&str> = resume.lines().collect();
-    let start = lines.iter().position(|line| !line.trim().is_empty())?;
+    let start = lines
+        .iter()
+        .position(|line| !line.trim().is_empty())
+        .filter(|start| lines[*start].starts_with('>'))
+        .ok_or(())?;
     let end = start
         + lines[start..]
             .iter()
@@ -290,7 +308,7 @@ fn withhold(resume: &str) -> Option<String> {
         .iter()
         .any(|line| line.contains(LOOP_WITHHELD))
     {
-        return None;
+        return Ok(None);
     }
     let fence: Vec<usize> = (start..end)
         .filter(|index| lines[*index][1..].trim_start().starts_with("```"))
@@ -309,7 +327,7 @@ fn withhold(resume: &str) -> Option<String> {
     if resume.ends_with('\n') {
         text.push('\n');
     }
-    Some(text)
+    Ok(Some(text))
 }
 
 pub struct QueueItem<'a> {
@@ -329,15 +347,26 @@ pub fn owner_queue_add(host: &dyn Host, root: &Path, item: &QueueItem) -> Result
     ] {
         one_line(field, text, &mut violations, QUEUE_FILE);
     }
-    let Ok(queue) = fs::read_to_string(root.join(QUEUE_FILE)) else {
-        violations.push(Violation::new(
-            QUEUE_FILE,
-            "missing-file",
-            "run `cm init` to write it",
-        ));
+    let missing = |name: &str| Violation::new(name, "missing-file", "run `cm init` to write it");
+    let Some(queue) = read_existing(&root.join(QUEUE_FILE))? else {
+        violations.push(missing(QUEUE_FILE));
         return Ok(Outcome::refused(violations));
     };
-    let resume = fs::read_to_string(root.join("RESUME.md")).unwrap_or_default();
+    let Some(resume) = read_existing(&root.join("RESUME.md"))? else {
+        violations.push(missing("RESUME.md"));
+        return Ok(Outcome::refused(violations));
+    };
+    let withheld = match withhold(&resume) {
+        Ok(withheld) => withheld,
+        Err(()) => {
+            violations.push(Violation::new(
+                "RESUME.md",
+                "resume-banner",
+                format!("RESUME.md opens with no `>` banner to carry `{LOOP_WITHHELD}`; restore the banner first"),
+            ));
+            None
+        }
+    };
     if !violations.is_empty() {
         return Ok(Outcome::refused(violations));
     }
@@ -351,6 +380,7 @@ pub fn owner_queue_add(host: &dyn Host, root: &Path, item: &QueueItem) -> Result
     let title = format!("{number}. {}", item.title.trim());
     append(
         &root.join(QUEUE_FILE),
+        &queue,
         &format!(
             "## {title}\n\nContext: {}\n{}\nRecommendation: {}\nAnswer:\n",
             item.context.trim(),
@@ -358,7 +388,6 @@ pub fn owner_queue_add(host: &dyn Host, root: &Path, item: &QueueItem) -> Result
             item.recommendation.trim()
         ),
     )?;
-    let withheld = withhold(&resume);
     if let Some(text) = &withheld {
         write_atomic(&root.join("RESUME.md"), text.as_bytes())?;
     }

@@ -143,9 +143,9 @@ enum Commands {
         /// <NN-name>/<unit>/<step>
         #[arg(value_parser = step_target)]
         target: Target,
-        /// The coordinator generation acting; a stale one is fenced.
-        #[arg(long, global = true)]
-        generation: Option<u32>,
+        /// The claim token `cm launch` or `claim` printed; begin, record and end need the current one.
+        #[arg(long, global = true, value_name = "TOKEN")]
+        claim: Option<String>,
         #[command(subcommand)]
         act: Option<AttemptAct>,
     },
@@ -188,9 +188,9 @@ enum Commands {
         /// A follow-up's disposition: proposed, accepted, applied, deferred or rejected.
         #[arg(long)]
         disposition: Option<String>,
-        /// A file holding the body; `-` reads stdin.
+        /// A file holding the body, which may not be empty; `-` reads stdin.
         #[arg(long, value_name = "FILE")]
-        body_file: Option<PathBuf>,
+        body_file: PathBuf,
     },
     /// Add the next numbered item to OWNER-QUEUE.md and withhold RESUME.md's `/loop`.
     OwnerQueue {
@@ -393,11 +393,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 after: after.clone(),
             },
         ),
-        Commands::Attempt {
-            target,
-            generation,
-            act,
-        } => {
+        Commands::Attempt { target, claim, act } => {
             use crate::attempt::Act;
             let act = match act {
                 None => Act::Status,
@@ -418,7 +414,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                     file: evidence.as_deref().map(|file| under_root(cli, file)),
                 },
             };
-            crate::attempt::attempt(host, &root()?, target, *generation, &act)
+            crate::attempt::attempt(host, &root()?, target, claim.as_deref(), &act)
         }
         Commands::Advance {
             target,
@@ -455,13 +451,13 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             disposition,
             body_file,
         } => {
-            let body = body_file.as_deref().map(read_body).transpose()?;
+            let body = read_body(body_file)?;
             let entry = crate::ledger::Feedback {
                 title,
                 urgency: urgency.as_deref(),
                 follow_up: follow_up.as_deref(),
                 disposition: disposition.as_deref(),
-                body: body.as_deref().unwrap_or_default(),
+                body: &body,
             };
             crate::ledger::feedback(host, &root()?, &entry)
         }
