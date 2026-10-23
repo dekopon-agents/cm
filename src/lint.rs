@@ -211,15 +211,30 @@ pub fn ignored(root: &Path, units: &[PathBuf]) -> Vec<Violation> {
     if dirs.is_empty() {
         return Vec::new();
     }
-    let Ok(output) = Command::new("git")
+    let unknown = |why: String| {
+        vec![Violation::new(
+            ".",
+            "git-ignored-unknown",
+            format!(
+                "cannot tell which unit or step folders git ignores: {why}; the campaign belongs in a git repository"
+            ),
+        )]
+    };
+    let output = match Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["check-ignore", "--no-index", "--"])
         .args(&dirs)
         .output()
-    else {
-        return Vec::new();
+    {
+        Ok(output) => output,
+        Err(error) => return unknown(format!("git did not run ({error})")),
     };
+    match output.status.code() {
+        Some(0 | 1) => {}
+        Some(code) => return unknown(format!("`git check-ignore` exited {code}")),
+        None => return unknown("`git check-ignore` was killed".to_owned()),
+    }
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(|path| {

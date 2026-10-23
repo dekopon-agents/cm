@@ -51,6 +51,14 @@ fn campaign(host: &Fake) -> Campaign {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("campaign");
     assert!(commands::init(host, &root).unwrap().ok());
+    let git = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&root)
+        .status();
+    assert!(
+        git.unwrap().success(),
+        "a campaign lives in a git repository"
+    );
     Campaign { _temp: temp, root }
 }
 
