@@ -175,6 +175,39 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         repo: Option<PathBuf>,
     },
+    /// Append an entry, or a follow-up to one, to FEEDBACK.md under the next FB-<sequence>-NNN id.
+    Feedback {
+        /// The entry's title, one line.
+        title: String,
+        /// urgent or queued.
+        #[arg(long)]
+        urgency: Option<String>,
+        /// The id a follow-up answers, e.g. FB-d-011.
+        #[arg(long, value_name = "ID")]
+        follow_up: Option<String>,
+        /// A follow-up's disposition: proposed, accepted, applied, deferred or rejected.
+        #[arg(long)]
+        disposition: Option<String>,
+        /// A file holding the body, which may not be empty; `-` reads stdin.
+        #[arg(long, value_name = "FILE")]
+        body_file: PathBuf,
+    },
+    /// Add the next numbered item to OWNER-QUEUE.md and withhold RESUME.md's `/loop`.
+    OwnerQueue {
+        #[command(subcommand)]
+        act: QueueAct,
+    },
+    /// Write <step>/evidence/<NAME>.md once from a non-empty body.
+    Evidence {
+        /// <NN-name>/<unit>/<step>
+        #[arg(value_parser = step_target)]
+        target: Target,
+        #[arg(long, value_name = "NAME")]
+        name: String,
+        /// A file holding the body; `-` reads stdin.
+        #[arg(long, value_name = "FILE")]
+        body_file: PathBuf,
+    },
     /// Report every violation in the campaign folder; exit 1 when there is any.
     Lint {
         /// A folder inside the campaign; defaults to --root or the current directory.
@@ -200,6 +233,20 @@ enum AttemptAct {
         outcome: crate::state::AttemptOutcome,
         #[arg(long, value_name = "PATH")]
         evidence: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum QueueAct {
+    /// Append `## N. <title>` with its Context, question, Recommendation and an empty Answer.
+    Add {
+        title: String,
+        #[arg(long)]
+        context: String,
+        #[arg(long)]
+        question: String,
+        #[arg(long)]
+        recommendation: String,
     },
 }
 
@@ -365,6 +412,49 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 repo.as_deref(),
             )
         }
+        Commands::Feedback {
+            title,
+            urgency,
+            follow_up,
+            disposition,
+            body_file,
+        } => {
+            let body = read_body(body_file)?;
+            let entry = crate::ledger::Feedback {
+                title,
+                urgency: urgency.as_deref(),
+                follow_up: follow_up.as_deref(),
+                disposition: disposition.as_deref(),
+                body: &body,
+            };
+            crate::ledger::feedback(host, &root()?, &entry)
+        }
+        Commands::OwnerQueue {
+            act:
+                QueueAct::Add {
+                    title,
+                    context,
+                    question,
+                    recommendation,
+                },
+        } => crate::ledger::owner_queue_add(
+            host,
+            &root()?,
+            &crate::ledger::QueueItem {
+                title,
+                context,
+                question,
+                recommendation,
+            },
+        ),
+        Commands::Evidence {
+            target,
+            name,
+            body_file,
+        } => {
+            let body = read_body(body_file)?;
+            crate::ledger::evidence(host, &root()?, target, name, &body)
+        }
         Commands::Lint { dir } => {
             let start = match (dir, &cli.root) {
                 (Some(dir), _) => dir.clone(),
@@ -390,6 +480,9 @@ fn name(command: &Commands) -> &'static str {
         Commands::Amend { .. } => "amend",
         Commands::Attempt { .. } => "attempt",
         Commands::Advance { .. } => "advance",
+        Commands::Feedback { .. } => "feedback",
+        Commands::OwnerQueue { .. } => "owner-queue",
+        Commands::Evidence { .. } => "evidence",
         Commands::Lint { .. } => "lint",
     }
 }

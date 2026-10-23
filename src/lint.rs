@@ -465,6 +465,7 @@ pub fn lint(start: &Path) -> Result<Outcome> {
     };
     violations.extend(root_files(&root, state.as_ref()));
     let units = unit_dirs(&root);
+    violations.extend(crate::ledger::lint_feedback(&root));
     violations.extend(orphan_units(&root));
     violations.extend(ignored(&root, &units));
     let sealed = state.as_ref().is_some_and(|state| state.closed.is_some());
