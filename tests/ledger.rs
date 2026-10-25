@@ -71,6 +71,133 @@ const HAND_WRITTEN: &str = "# Feedback\n\n\
 ### FB-d-014 · manual-write ledger · the WORKING session, 2026-10-23T02:12Z–03:10Z\n\nText.\n";
 
 #[test]
+fn literal_fences_preserve_feedback_ids_follow_ups_and_lint() {
+    let (_temp, root) = campaign();
+    for (title, body, id) in [
+        ("one", "````\n```\nliteral\n````\n", "FB-d-001"),
+        ("two", "plain", "FB-d-002"),
+        ("three", "plain", "FB-d-003"),
+    ] {
+        let added = ledger::feedback(
+            &Fake,
+            &root,
+            &Feedback {
+                body,
+                ..entry(title, "queued")
+            },
+        )
+        .unwrap();
+        assert!(added.ok(), "{:?}", added.violations);
+        assert_eq!(added.fields["id"], id);
+    }
+    for id in ["FB-d-001", "FB-d-002", "FB-d-003"] {
+        let follow = Feedback {
+            follow_up: Some(id),
+            disposition: Some("accepted"),
+            urgency: None,
+            ..entry("reply", "queued")
+        };
+        let added = ledger::feedback(&Fake, &root, &follow).unwrap();
+        assert!(added.ok(), "{:?}", added.violations);
+    }
+    assert!(lint(&root).unwrap().ok());
+}
+
+#[test]
+fn feedback_fences_close_only_with_matching_bare_delimiters() {
+    for (open, body, close) in [
+        ("````rust", "```\n~~~\n````info\n### literal", "````` "),
+        ("~~~~text", "~~~\n```\n~~~~info\n### literal", "~~~~~\t"),
+    ] {
+        let (_temp, root) = campaign();
+        let body = format!("{open}\n{body}\n{close}\n");
+        let added = ledger::feedback(
+            &Fake,
+            &root,
+            &Feedback {
+                body: &body,
+                ..entry("one", "queued")
+            },
+        )
+        .unwrap();
+        assert!(added.ok(), "{:?}", added.violations);
+        let next = ledger::feedback(&Fake, &root, &entry("two", "queued")).unwrap();
+        assert_eq!(next.fields["id"], "FB-d-002");
+    }
+}
+
+#[test]
+fn unterminated_feedback_fences_are_refused_before_writing() {
+    let (_temp, root) = campaign();
+    let journal = fs::read(root.join("JOURNAL.md")).unwrap();
+    for body in [
+        "```\ntext",
+        "~~~~\n~~~",
+        "````\n~~~",
+        "```\n```info",
+        "    ```\ntext",
+    ] {
+        let added = ledger::feedback(
+            &Fake,
+            &root,
+            &Feedback {
+                body,
+                ..entry("one", "queued")
+            },
+        )
+        .unwrap();
+        assert_eq!(rules(&added), vec!["feedback-body-fence"]);
+        assert!(!root.join("FEEDBACK.md").exists());
+        assert_eq!(fs::read(root.join("JOURNAL.md")).unwrap(), journal);
+    }
+}
+
+#[test]
+fn lint_detects_hand_written_duplicate_feedback_ids() {
+    let (_temp, root) = campaign();
+    fs::write(root.join("FEEDBACK.md"), "# Feedback\n\n````\n```\nliteral\n````\n\n### FB-d-001 · queued · one\n\n### FB-d-001 · queued · two\n").unwrap();
+    assert_eq!(rules(&lint(&root).unwrap()), vec!["feedback-id-duplicate"]);
+}
+
+#[test]
+fn concurrent_feedback_appends_get_distinct_ids() {
+    let (_temp, root) = campaign();
+    let body = root.parent().unwrap().join("body");
+    fs::write(&body, "plain\n").unwrap();
+    let children: Vec<_> = (0..4)
+        .map(|_| {
+            Command::new(env!("CARGO_BIN_EXE_cm"))
+                .arg("-C")
+                .arg(&root)
+                .args([
+                    "--json",
+                    "feedback",
+                    "one",
+                    "--urgency",
+                    "queued",
+                    "--body-file",
+                ])
+                .arg(&body)
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let mut ids: Vec<String> = children
+        .into_iter()
+        .map(|child| {
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            json["id"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["FB-d-001", "FB-d-002", "FB-d-003", "FB-d-004"]);
+    assert!(lint(&root).unwrap().ok());
+}
+
+#[test]
 fn feedback_ids_are_sequential_per_campaign() {
     let (_temp, root) = campaign();
     let first = ledger::feedback(&Fake, &root, &entry("one", "urgent")).unwrap();
