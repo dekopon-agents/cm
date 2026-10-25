@@ -1173,3 +1173,91 @@ fn a_new_commit_after_the_reviewed_head_needs_a_review() {
         refused.violations
     );
 }
+
+/// Merges a new base-branch commit into `feature` without conflicts; returns the merge.
+fn clean_merge(c: &Campaign, base: &str, file: &str) -> String {
+    git(&c.repo, &["checkout", "-q", base]);
+    commit(&c.repo, file, "main\n");
+    git(&c.repo, &["checkout", "-q", "feature"]);
+    git(
+        &c.repo,
+        &[
+            "-c",
+            "user.name=cm",
+            "-c",
+            "user.email=cm@example.com",
+            "merge",
+            "-q",
+            "--no-edit",
+            base,
+        ],
+    );
+    c.head()
+}
+
+#[test]
+fn a_clean_update_never_outweighs_a_review_at_the_head_or_a_walked_commit() {
+    let blocking = ["F1 | contract | introduced | src/lib.rs:1 | broken"];
+    let host = at("2026-10-25T06:00:00Z");
+
+    // A FIX REQUIRED review recorded at the head binds there.
+    let c = campaign(&host, true);
+    let (_, base) = reviewed_feature(&host, &c);
+    let head = clean_merge(&c, &base, "main-1.txt");
+    let fix = c.report("head", &head, &blocking, "FIX REQUIRED");
+    assert!(record(&host, &c, &fix, "claude").ok());
+    let refused = merge_with(&host, &c, &base);
+    assert_eq!(
+        rules(&refused),
+        vec!["merge-gate", "merge-gate"],
+        "{:?}",
+        refused.violations
+    );
+    assert!(
+        refused
+            .violations
+            .iter()
+            .any(|v| v.message.contains("R2.F1 unresolved"))
+    );
+
+    // So does a finished Astra receipt at the head whose review is not recorded.
+    let c = campaign(&host, true);
+    let (_, base) = reviewed_feature(&host, &c);
+    let head = clean_merge(&c, &base, "main-1.txt");
+    c.receipt_with(
+        "astra-review-7-head",
+        &head,
+        "gpt-6-astra",
+        "xhigh",
+        |receipt| {
+            receipt["verdict"] = "FIX REQUIRED".into();
+        },
+    );
+    let refused = merge_with(&host, &c, &base);
+    assert!(
+        refused
+            .violations
+            .iter()
+            .any(|v| v.message.contains("it is not recorded")),
+        "{:?}",
+        refused.violations
+    );
+
+    // And a FIX REQUIRED review at a walked commit stops the walk before the ACCEPT under it.
+    let c = campaign(&host, true);
+    let (_, base) = reviewed_feature(&host, &c);
+    let walked = clean_merge(&c, &base, "main-1.txt");
+    let fix = c.report("walked", &walked, &blocking, "FIX REQUIRED");
+    assert!(record(&host, &c, &fix, "claude").ok());
+    clean_merge(&c, &base, "main-2.txt");
+    let refused = merge_with(&host, &c, &base);
+    assert!(
+        refused.violations.iter().any(|v| v.message.contains(&format!(
+            "the nearest reviewed commit before {}, {walked}, joined to it by clean updates, does not clear",
+            c.head()
+        )) && v.message.contains("R2.F1 unresolved")),
+        "{:?}",
+        refused.violations
+    );
+    assert_eq!(c.state(), Phase::PrOpen);
+}

@@ -1288,6 +1288,24 @@ fn unfinished(receipt: &Value) -> Option<&'static str> {
     }
 }
 
+/// The step's evidence holds a receipt for a review of `head` that happened, whatever its model.
+fn finished_receipt_at(root: &Path, target: &Target, head: &str) -> bool {
+    let mut found = Vec::new();
+    receipts(&evidence_dir(root, target), &mut found);
+    found.iter().any(|path| {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .is_some_and(|receipt| {
+                receipt
+                    .pointer("/head")
+                    .and_then(Value::as_str)
+                    .is_some_and(|at| same_commit(at, head))
+                    && unfinished(&receipt).is_none()
+            })
+    })
+}
+
 /// Why the step does not hold an Astra review of `head` of `pr`: a receipt for a review that
 /// happened at that head with effective gpt-6-astra/xhigh, and that review recorded with
 /// `--reviewer astra` (whose verdict (b) then holds to ACCEPT or resolved). `None` when it does.
@@ -1482,7 +1500,17 @@ pub fn merge_gaps(
             .collect()
     };
     let gaps = gaps_at(head);
-    let Some(lineage) = lineage.filter(|_| !gaps.is_empty()) else {
+    // The clean-update rule only skips a review nobody did: a review recorded at a commit, or a
+    // finished receipt for it, binds there and is never outweighed by an earlier ACCEPT.
+    let reviewed_at = |at: &str| {
+        let step = full_name(target);
+        verdicts
+            .reviews
+            .iter()
+            .any(|review| review.step == step && review.at_head(at))
+            || finished_receipt_at(root, target, at)
+    };
+    let Some(lineage) = lineage.filter(|_| !gaps.is_empty() && !reviewed_at(head)) else {
         return Ok(Cleared {
             gaps,
             reviewed: None,
@@ -1499,6 +1527,7 @@ pub fn merge_gaps(
             reviewed: None,
         });
     };
+    let mut gaps = gaps;
     let mut why = format!("more than {MAX_UPDATES} updates");
     for _ in 0..MAX_UPDATES {
         match clean_update(repo, &at, base) {
@@ -1508,14 +1537,24 @@ pub fn merge_gaps(
                 break;
             }
         }
-        if gaps_at(&at).is_empty() {
+        if reviewed_at(&at) {
+            let earlier = gaps_at(&at);
+            if earlier.is_empty() {
+                return Ok(Cleared {
+                    gaps: Vec::new(),
+                    reviewed: Some(at),
+                });
+            }
+            gaps.push(format!(
+                "the nearest reviewed commit before {head}, {at}, joined to it by clean updates, does not clear: {}",
+                earlier.join("; ")
+            ));
             return Ok(Cleared {
-                gaps: Vec::new(),
-                reviewed: Some(at),
+                gaps,
+                reviewed: None,
             });
         }
     }
-    let mut gaps = gaps;
     let step = full_name(target);
     let earlier = verdicts
         .reviews
