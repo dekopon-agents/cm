@@ -338,7 +338,18 @@ pub struct QueueItem<'a> {
 }
 
 pub fn owner_queue_add(host: &dyn Host, root: &Path, item: &QueueItem) -> Result<Outcome> {
-    let (_lock, mut violations) = guard(root)?;
+    let (_lock, violations) = guard(root)?;
+    add_queue_item(host, root, item, violations)
+}
+
+/// `cm owner-queue add` for a caller that already holds the lock and has run `guard`; refuses
+/// with `violations` plus its own when there is any.
+pub(crate) fn add_queue_item(
+    host: &dyn Host,
+    root: &Path,
+    item: &QueueItem,
+    mut violations: Vec<Violation>,
+) -> Result<Outcome> {
     for (field, text) in [
         ("the title", item.title),
         ("--context", item.context),

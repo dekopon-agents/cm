@@ -176,10 +176,35 @@ pub enum PullState {
 pub struct Pull {
     pub state: PullState,
     pub merge_commit: Option<CommitSha>,
+    /// The PR's head commit, as GitHub reports it.
+    pub head: Option<CommitSha>,
+    /// GitHub's `mergeable_state` (`clean`, `dirty`, `blocked`, `unknown`, …), lower case.
+    pub mergeable_state: Option<String>,
+}
+
+/// One check run or commit status on a commit, its state lower case: a check run's conclusion
+/// once completed (`success`, `failure`, `skipped`, …), else its status; a status's state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheckState {
+    pub name: String,
+    pub state: String,
+}
+
+impl CheckState {
+    pub fn green(&self) -> bool {
+        matches!(self.state.as_str(), "success" | "neutral" | "skipped")
+    }
+}
+
+/// CI is green on a commit when it reports at least one check and every one is green.
+pub fn ci_green(checks: &[CheckState]) -> bool {
+    !checks.is_empty() && checks.iter().all(CheckState::green)
 }
 
 pub trait Forge {
     fn pull(&self, url: &str) -> Result<Pull, ForgeError>;
+    /// Every check run and commit status GitHub reports on `sha`.
+    fn checks(&self, repo: &GithubRepo, sha: &CommitSha) -> Result<Vec<CheckState>, ForgeError>;
     fn tag_exists(&self, repo: &GithubRepo, tag: &TagName) -> Result<bool, ForgeError>;
     fn tag_contains(
         &self,
@@ -252,6 +277,14 @@ impl Forge for Gh {
             state: String,
             merged: bool,
             merge_commit_sha: Option<String>,
+            #[serde(default)]
+            head: Option<Head>,
+            #[serde(default)]
+            mergeable_state: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Head {
+            sha: String,
         }
         let path = url
             .strip_prefix("https://github.com/")
@@ -271,7 +304,51 @@ impl Forge for Gh {
                 .merge_commit_sha
                 .filter(|_| state == PullState::Merged)
                 .map(CommitSha::new),
+            head: rest.head.map(|head| CommitSha::new(head.sha)),
+            mergeable_state: rest.mergeable_state.map(|state| state.to_lowercase()),
         })
+    }
+
+    fn checks(&self, repo: &GithubRepo, sha: &CommitSha) -> Result<Vec<CheckState>, ForgeError> {
+        #[derive(Deserialize)]
+        struct Runs {
+            check_runs: Vec<Run>,
+        }
+        #[derive(Deserialize)]
+        struct Run {
+            name: String,
+            status: String,
+            conclusion: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Combined {
+            statuses: Vec<Status>,
+        }
+        #[derive(Deserialize)]
+        struct Status {
+            context: String,
+            state: String,
+        }
+        let runs: Runs = self.json(&[
+            "api",
+            &format!("repos/{repo}/commits/{sha}/check-runs?per_page=100"),
+        ])?;
+        let combined: Combined = self.json(&[
+            "api",
+            &format!("repos/{repo}/commits/{sha}/status?per_page=100"),
+        ])?;
+        let runs = runs.check_runs.into_iter().map(|run| CheckState {
+            state: match (run.status.as_str(), run.conclusion) {
+                ("completed", Some(conclusion)) => conclusion.to_lowercase(),
+                (status, _) => status.to_lowercase(),
+            },
+            name: run.name,
+        });
+        let statuses = combined.statuses.into_iter().map(|status| CheckState {
+            name: status.context,
+            state: status.state.to_lowercase(),
+        });
+        Ok(runs.chain(statuses).collect())
     }
 
     fn tag_exists(&self, repo: &GithubRepo, tag: &TagName) -> Result<bool, ForgeError> {

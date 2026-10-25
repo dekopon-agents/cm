@@ -8,7 +8,9 @@ use std::process::Command;
 use cm::commands;
 use cm::commands::{Declaration, Ships};
 use cm::epoch::{self, Status};
-use cm::forge::{CommitSha, Forge, ForgeError, Gh, GithubRepo, Pull, PullState, TagName};
+use cm::forge::{
+    CheckState, CommitSha, Forge, ForgeError, Gh, GithubRepo, Pull, PullState, TagName,
+};
 use cm::host::Host;
 use cm::lint::lint;
 use cm::outcome::Outcome;
@@ -371,12 +373,18 @@ impl Forge for FakeForge {
             .get(&(repo.to_string(), tag.to_string()))
             .is_some_and(|shas| shas.contains(sha.as_str())))
     }
+
+    fn checks(&self, _: &GithubRepo, _: &CommitSha) -> Result<Vec<CheckState>, ForgeError> {
+        Err(ForgeError::Spawn)
+    }
 }
 
 fn merged(sha: &str) -> Pull {
     Pull {
         state: PullState::Merged,
         merge_commit: Some(CommitSha::new(sha)),
+        head: None,
+        mergeable_state: None,
     }
 }
 
@@ -431,6 +439,8 @@ fn sync_moves_steps_from_github_state_and_renders_the_card() {
         Pull {
             state: PullState::Closed,
             merge_commit: None,
+            head: None,
+            mergeable_state: None,
         },
     );
     forge.broken.insert(flaky.into());

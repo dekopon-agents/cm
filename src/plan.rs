@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use crate::forge::{GithubRepo, TagName};
@@ -222,6 +223,125 @@ pub fn paused(root: &Path) -> Result<bool, Vec<Violation>> {
     }
 }
 
+/// A codex-lane step launched with no PR whose latest attempt is older than `codex_stall_hours`.
+pub struct Stall {
+    pub target: String,
+    /// The attempt's claim stamp, or the launch stamp for a step launched without one.
+    pub since: String,
+    pub hours: f64,
+}
+
+/// Reads a cm stamp (`2026-10-08T07:04Z`) or any RFC 3339 instant.
+pub fn instant(text: &str) -> Option<Timestamp> {
+    text.parse().ok().or_else(|| {
+        text.strip_suffix('Z')
+            .and_then(|minute| format!("{minute}:00Z").parse().ok())
+    })
+}
+
+pub fn stall_hours(root: &Path) -> f64 {
+    fs::read_to_string(root.join("LIMITS.toml"))
+        .ok()
+        .and_then(|text| limits::check(&text).ok())
+        .map_or(limits::CODEX_STALL_HOURS, |limits| limits.codex_stall_hours)
+}
+
+pub fn stalls(units: &Units, now: Timestamp, limit: f64) -> Vec<Stall> {
+    units
+        .iter()
+        .flat_map(|(unit, state)| {
+            state
+                .steps
+                .iter()
+                .map(move |(name, step)| (format!("{unit}/{name}"), step))
+        })
+        .filter(|(_, step)| {
+            step.lane == Some(Lane::Codex)
+                && step.track.state == Phase::Launched
+                && step.track.evidence.pr.is_none()
+        })
+        .filter_map(|(target, step)| {
+            let since = step
+                .attempt
+                .as_ref()
+                .map_or(&step.track.since, |attempt| &attempt.claimed_at)
+                .clone();
+            let age = now.duration_since(instant(&since)?).as_secs_f64() / 3600.0;
+            (age > limit).then_some(Stall {
+                target,
+                since,
+                hours: (age * 10.0).round() / 10.0,
+            })
+        })
+        .collect()
+}
+
+pub fn stall_json(stall: &Stall, limit: f64) -> Value {
+    json!({
+        "target": stall.target,
+        "since": stall.since,
+        "hours": stall.hours,
+        "limit_hours": limit,
+    })
+}
+
+pub fn stall_line(stall: &Stall, limit: f64) -> String {
+    format!(
+        "stalled {}: codex launch with no PR, attempt since {} ({}h > {limit}h)",
+        stall.target, stall.since, stall.hours
+    )
+}
+
+/// What `cm sync` last saw of an open PR, in `.cm/pulls.json`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Observed {
+    pub target: String,
+    pub at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mergeable_state: Option<String>,
+}
+
+pub const PULLS: &str = "pulls.json";
+
+pub fn pulls_path(root: &Path) -> PathBuf {
+    root.join(store::CM_DIR).join(PULLS)
+}
+
+/// The open PRs whose last sync saw `mergeable_state: dirty`, for steps still at that PR.
+pub fn dirty(root: &Path, units: &Units) -> Vec<(String, Observed)> {
+    let Ok(seen) = store::read_json::<BTreeMap<String, Observed>>(&pulls_path(root)) else {
+        return Vec::new();
+    };
+    seen.into_iter()
+        .filter(|(url, observed)| {
+            observed.mergeable_state.as_deref() == Some("dirty")
+                && step(units, &observed.target).is_some_and(|step| {
+                    step.track.state == Phase::PrOpen
+                        && step.track.evidence.pr.as_deref() == Some(url.as_str())
+                })
+        })
+        .collect()
+}
+
+pub fn dirty_json(url: &str, observed: &Observed) -> Value {
+    json!({
+        "target": observed.target,
+        "pr": url,
+        "head": observed.head,
+        "mergeable_state": observed.mergeable_state,
+        "observed_at": observed.at,
+    })
+}
+
+pub fn dirty_line(url: &str, observed: &Observed) -> String {
+    format!(
+        "dirty {}: {url} has merge conflicts (mergeable_state dirty, seen {})",
+        observed.target, observed.at
+    )
+}
+
 pub struct Next {
     pub paused: bool,
     pub ready: Vec<(String, Option<Lane>)>,
@@ -247,6 +367,15 @@ pub fn summary(root: &Path, units: &Units) -> Next {
 }
 
 pub fn next(root: &Path, target: Option<&Target>, lane: Option<Lane>) -> Result<Outcome> {
+    next_at(root, target, lane, Timestamp::now())
+}
+
+pub fn next_at(
+    root: &Path,
+    target: Option<&Target>,
+    lane: Option<Lane>,
+    now: Timestamp,
+) -> Result<Outcome> {
     let campaign = store::load_campaign(root)?;
     if let Some(at) = &campaign.closed {
         return Ok(Outcome::refused(vec![Violation::new(
@@ -367,6 +496,29 @@ pub fn next(root: &Path, target: Option<&Target>, lane: Option<Lane>) -> Result<
     if ready.is_empty() && waiting.is_empty() && tags.is_empty() {
         outcome.line("nothing is declared and drafted");
     }
+    let limit = stall_hours(root);
+    let stalled = stalls(&units, now, limit);
+    let dirty = dirty(root, &units);
+    for stall in &stalled {
+        outcome.line(stall_line(stall, limit));
+    }
+    for (url, observed) in &dirty {
+        outcome.line(dirty_line(url, observed));
+    }
+    outcome.field(
+        "stalled",
+        stalled
+            .iter()
+            .map(|stall| stall_json(stall, limit))
+            .collect::<Vec<_>>(),
+    );
+    outcome.field(
+        "dirty",
+        dirty
+            .iter()
+            .map(|(url, observed)| dirty_json(url, observed))
+            .collect::<Vec<_>>(),
+    );
     outcome.field(
         "steps",
         ready

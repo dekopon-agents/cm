@@ -14,7 +14,14 @@ pub struct Limits {
     pub max_heavy_builds: u32,
     pub supervisor_model: String,
     pub supervisor_effort: String,
+    pub codex_stall_hours: f64,
 }
+
+/// `codex_stall_hours` when LIMITS.toml leaves it out.
+pub const CODEX_STALL_HOURS: f64 = 2.0;
+
+/// Keys a campaign may leave out; each is checked when present.
+const OPTIONAL: [(&str, Shape); 1] = [("codex_stall_hours", Shape::Number)];
 
 #[derive(Clone, Copy)]
 enum Shape {
@@ -105,6 +112,19 @@ pub fn check(text: &str) -> Result<Limits, Vec<Violation>> {
             Some(_) => {}
         }
     }
+    for (key, shape) in OPTIONAL {
+        if let Some(value) = table.get(key)
+            && !shape.fits(value)
+        {
+            let mut violation = Violation::new(
+                "LIMITS.toml",
+                "limits-key",
+                format!("`{key}` must be {}", shape.name()),
+            );
+            violation.line = line_of(text, key);
+            out.push(violation);
+        }
+    }
     if !out.is_empty() {
         return Err(out);
     }
@@ -126,6 +146,11 @@ pub fn check(text: &str) -> Result<Limits, Vec<Violation>> {
             .unwrap_or(0),
         supervisor_model: text_of("supervisor_model"),
         supervisor_effort: text_of("supervisor_effort"),
+        codex_stall_hours: if table.contains_key("codex_stall_hours") {
+            number("codex_stall_hours")
+        } else {
+            CODEX_STALL_HOURS
+        },
     })
 }
 
@@ -151,5 +176,25 @@ mod tests {
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].rule, "limits-parse");
         assert_eq!(violations[0].line, Some(2));
+    }
+
+    #[test]
+    fn codex_stall_hours_is_optional_and_checked() {
+        let base = include_str!("../templates/LIMITS.toml");
+        assert_eq!(check(base).unwrap().codex_stall_hours, 2.0);
+        let without: String = base
+            .lines()
+            .filter(|line| !line.starts_with("codex_stall_hours"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(
+            check(&without).unwrap().codex_stall_hours,
+            CODEX_STALL_HOURS
+        );
+        let set = format!("{without}codex_stall_hours = 0.5\n");
+        assert_eq!(check(&set).unwrap().codex_stall_hours, 0.5);
+        let bad = check(&format!("{without}codex_stall_hours = \"two\"\n")).unwrap_err();
+        assert_eq!(bad[0].rule, "limits-key");
+        assert!(bad[0].message.contains("codex_stall_hours"), "{bad:?}");
     }
 }

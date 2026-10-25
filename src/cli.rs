@@ -174,6 +174,15 @@ enum Commands {
         /// The repository --sha and --tag resolve in; defaults to the step worktrees.
         #[arg(long, value_name = "PATH")]
         repo: Option<PathBuf>,
+        /// A codex step's merge gate: the PR head when GitHub cannot be read (else it must match).
+        #[arg(long, value_name = "SHA")]
+        head: Option<String>,
+        /// A codex step's merge gate: a campaign file showing green CI at the head, taken only when GitHub cannot be read.
+        #[arg(long, value_name = "PATH")]
+        ci_verified: Option<PathBuf>,
+        /// Waive a codex step's merge gate with a non-empty campaign file saying why; journaled with what it waived.
+        #[arg(long = "override", value_name = "PATH")]
+        waiver: Option<PathBuf>,
     },
     /// Append an entry, or a follow-up to one, to FEEDBACK.md under the next FB-<sequence>-NNN id.
     Feedback {
@@ -208,8 +217,11 @@ enum Commands {
         #[arg(long, value_name = "FILE")]
         body_file: PathBuf,
     },
-    /// Append one review row to REVIEW-OFF.md, rendered from `.cm/reviews.json`; --import adopts the hand-written rows once.
+    /// Append one review row to REVIEW-OFF.md, rendered from `.cm/reviews.json`; --import adopts the hand-written rows once. `record` and `resolve` keep computed verdicts.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Review {
+        #[command(subcommand)]
+        act: Option<ReviewAct>,
         /// <NN-name>/<unit>/<step>
         #[arg(value_parser = step_target, required_unless_present = "import")]
         target: Option<Target>,
@@ -240,6 +252,28 @@ enum Commands {
         #[arg(long, value_name = "FROM_SHA")]
         delta: Option<String>,
     },
+    /// Append a dated ruling to <step>/evidence/coordinator-scope.md, creating it if missing.
+    Ruling {
+        /// <NN-name>/<unit>/<step>
+        #[arg(value_parser = step_target)]
+        target: Target,
+        /// The ruling, one line.
+        text: String,
+    },
+    /// Print the step's kickoff, then its coordinator-scope.md under a fixed heading: a reviewer's brief.
+    Brief {
+        /// <NN-name>/<unit>/<step>
+        #[arg(value_parser = step_target)]
+        target: Target,
+    },
+    /// List the non-blocking findings recorded by `cm review record`, or close one.
+    Followups {
+        /// Only the open ones, grouped by repository as checklist lines for the epoch's cleanup PR.
+        #[arg(long)]
+        epoch: bool,
+        #[command(subcommand)]
+        act: Option<FollowupAct>,
+    },
     /// Report every violation in the campaign folder; exit 1 when there is any.
     Lint {
         /// A folder inside the campaign; defaults to --root or the current directory.
@@ -265,6 +299,42 @@ enum AttemptAct {
         outcome: crate::state::AttemptOutcome,
         #[arg(long, value_name = "PATH")]
         evidence: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReviewAct {
+    /// Parse a report's `cm-review` block, compute its verdict and record it under the step's evidence.
+    Record {
+        /// <NN-name>/<unit>/<step>
+        #[arg(value_parser = step_target)]
+        target: Target,
+        /// The review report, ending with its `cm-review` block.
+        report: PathBuf,
+        /// Who reviewed: astra, claude, …
+        #[arg(long, value_name = "KIND")]
+        reviewer: Option<String>,
+    },
+    /// Record what resolved a blocking finding: a commit, or a ruling file in the campaign.
+    Resolve {
+        /// <NN-name>/<unit>/<step>
+        #[arg(value_parser = step_target)]
+        target: Target,
+        /// The finding: R<n>.<id>, or <id> in the step's latest review holding it.
+        finding: String,
+        #[arg(long, value_name = "COMMIT|RULING-FILE")]
+        by: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum FollowupAct {
+    /// Close a follow-up with the commit that fixed it or the reason it stays.
+    Close {
+        /// R<n>.<id>, as `cm followups` lists it.
+        id: String,
+        #[arg(long, value_name = "COMMIT|REASON")]
+        by: String,
     },
 }
 
@@ -343,7 +413,9 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             };
             commands::declare(host, &under_root(cli, dir), &declaration)
         }
-        Commands::Next { target, lane } => crate::plan::next(&root()?, target.as_ref(), *lane),
+        Commands::Next { target, lane } => {
+            crate::plan::next_at(&root()?, target.as_ref(), *lane, host.now())
+        }
         Commands::Sync => crate::sync::sync(host, &crate::forge::Gh::default(), &root()?),
         Commands::Epoch {
             status,
@@ -425,6 +497,9 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             digest,
             evidence: file,
             repo,
+            head,
+            ci_verified,
+            waiver,
         } => {
             let evidence = Evidence {
                 sha: sha.clone(),
@@ -434,7 +509,14 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 file: None,
             };
             let file = file.as_deref().map(|file| under_root(cli, file));
-            commands::advance(
+            let forge = crate::forge::Gh::default();
+            let gate = commands::MergeGate {
+                forge: Some(&forge),
+                head: head.clone(),
+                ci_verified: ci_verified.as_deref().map(|file| under_root(cli, file)),
+                waiver: waiver.as_deref().map(|file| under_root(cli, file)),
+            };
+            commands::advance_gated(
                 host,
                 &root()?,
                 target,
@@ -442,6 +524,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 &evidence,
                 file.as_deref(),
                 repo.as_deref(),
+                &gate,
             )
         }
         Commands::Feedback {
@@ -487,6 +570,37 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             let body = read_body(body_file)?;
             crate::ledger::evidence(host, &root()?, target, name, &body)
         }
+        Commands::Review {
+            act:
+                Some(ReviewAct::Record {
+                    target,
+                    report,
+                    reviewer,
+                }),
+            ..
+        } => crate::verdict::record(
+            host,
+            &root()?,
+            target,
+            &under_root(cli, report),
+            reviewer.as_deref(),
+        ),
+        Commands::Review {
+            act:
+                Some(ReviewAct::Resolve {
+                    target,
+                    finding,
+                    by,
+                }),
+            ..
+        } => crate::verdict::resolve(
+            host,
+            &root()?,
+            target,
+            finding,
+            by,
+            &under_root(cli, Path::new(by)),
+        ),
         Commands::Review { import: true, .. } => crate::review::import_reviews(host, &root()?),
         Commands::Review {
             target,
@@ -521,6 +635,13 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 .expect("clap requires a target without --import");
             crate::review::review(host, &root()?, &target, &args)
         }
+        Commands::Ruling { target, text } => crate::verdict::ruling(host, &root()?, target, text),
+        Commands::Brief { target } => crate::verdict::brief(&root()?, target),
+        Commands::Followups { epoch, act: None } => crate::verdict::followups(&root()?, *epoch),
+        Commands::Followups {
+            act: Some(FollowupAct::Close { id, by }),
+            ..
+        } => crate::verdict::close_followup(host, &root()?, id, by),
         Commands::Lint { dir } => {
             let start = match (dir, &cli.root) {
                 (Some(dir), _) => dir.clone(),
@@ -550,6 +671,9 @@ fn name(command: &Commands) -> &'static str {
         Commands::OwnerQueue { .. } => "owner-queue",
         Commands::Evidence { .. } => "evidence",
         Commands::Review { .. } => "review",
+        Commands::Ruling { .. } => "ruling",
+        Commands::Brief { .. } => "brief",
+        Commands::Followups { .. } => "followups",
         Commands::Lint { .. } => "lint",
     }
 }

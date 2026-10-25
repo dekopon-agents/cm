@@ -5,7 +5,7 @@ use std::process::Command;
 use anyhow::Result;
 
 use crate::evidence::CampaignFile;
-use crate::forge::{GithubRepo, TagName};
+use crate::forge::{CheckState, CommitSha, Forge, GithubRepo, TagName, ci_green};
 use crate::host::{Host, stamp};
 use crate::journal;
 use crate::limits::{self, Limits};
@@ -981,6 +981,150 @@ fn is_digest(digest: &str) -> bool {
     })
 }
 
+/// What `cm advance <codex step> merged` reads for its merge gate.
+#[derive(Default)]
+pub struct MergeGate<'a> {
+    /// GitHub, for the PR head and its CI; `None` reads as unreachable.
+    pub forge: Option<&'a dyn Forge>,
+    /// The PR head when GitHub cannot say; else it must match GitHub's.
+    pub head: Option<String>,
+    /// A campaign file showing green CI at the head, taken only when GitHub cannot be read.
+    pub ci_verified: Option<PathBuf>,
+    /// A campaign file that waives the gate; the waiver and what it waived are journaled.
+    pub waiver: Option<PathBuf>,
+}
+
+impl MergeGate<'_> {
+    fn given(&self) -> Vec<&'static str> {
+        [
+            (self.head.is_some(), "--head"),
+            (self.ci_verified.is_some(), "--ci-verified"),
+            (self.waiver.is_some(), "--override"),
+        ]
+        .into_iter()
+        .filter_map(|(given, flag)| given.then_some(flag))
+        .collect()
+    }
+}
+
+/// What GitHub says of a PR for its merge gate, read before cm takes the lock.
+struct GithubRead {
+    pr: String,
+    head: String,
+    checks: Result<Vec<CheckState>, String>,
+    /// `--head` disagreed with GitHub's head.
+    mismatch: Option<String>,
+}
+
+fn read_github(gate: &MergeGate, pr: &str, recorded: Option<&str>) -> GithubRead {
+    let pull = match gate.forge {
+        Some(forge) => forge.pull(pr).map_err(|error| error.to_string()),
+        None => Err("no GitHub reader".to_owned()),
+    };
+    let fallback = || {
+        gate.head
+            .clone()
+            .or_else(|| recorded.map(str::to_owned))
+            .unwrap_or_default()
+    };
+    let (head, unreachable) = match pull.as_ref().map(|pull| pull.head.as_ref()) {
+        Ok(Some(head)) => (head.to_string(), None),
+        Ok(None) => (
+            fallback(),
+            Some(format!("GitHub reported no head for {pr}")),
+        ),
+        Err(error) => (
+            fallback(),
+            Some(format!("cannot read {pr} from GitHub: {error}")),
+        ),
+    };
+    let mismatch = gate
+        .head
+        .as_ref()
+        .filter(|given| unreachable.is_none() && !head.starts_with(&given.to_lowercase()))
+        .map(|given| format!("--head {given} is not {pr}'s head {head}"));
+    let checks = match (&unreachable, gate.forge, GithubRepo::of_pr(pr)) {
+        (Some(why), _, _) => Err(why.clone()),
+        (None, Some(forge), Some(repo)) => forge
+            .checks(&repo, &CommitSha::new(head.clone()))
+            .map_err(|error| format!("cannot read CI at {head}: {error}")),
+        (None, _, _) => Err(format!("cannot read CI for {pr}")),
+    };
+    GithubRead {
+        pr: pr.to_owned(),
+        head,
+        checks,
+        mismatch,
+    }
+}
+
+/// The codex merge gate: (a) an Astra receipt and (b) a cleared review at the PR head from the
+/// step's evidence and `.cm/verdicts.json`, (c) green CI at that head from GitHub or
+/// `--ci-verified`. Returns the unmet conditions and the lines the move journals.
+fn merge_gate(
+    root: &Path,
+    target: &Target,
+    track: &Track,
+    gate: &MergeGate,
+    read: Option<GithubRead>,
+    violations: &mut Vec<Violation>,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let full = format!(
+        "{}/{}",
+        target.unit,
+        target.step.as_deref().unwrap_or_default()
+    );
+    let mut gaps = Vec::new();
+    let mut lines = Vec::new();
+    let Some(pr) = track.evidence.pr.clone() else {
+        gaps.push("no PR is recorded; the gate reads the PR's head".to_owned());
+        return Ok((gaps, lines));
+    };
+    let read = match read.filter(|read| read.pr == pr) {
+        Some(read) => read,
+        None => read_github(gate, &pr, track.evidence.sha.as_deref()),
+    };
+    if let Some(mismatch) = &read.mismatch {
+        violations.push(Violation::new(&full, "merge-head", mismatch.clone()));
+    }
+    let head = read.head;
+    if head.is_empty() {
+        gaps.push("the PR head is unknown; pass --head <sha>".to_owned());
+        return Ok((gaps, lines));
+    }
+    lines.push(format!("- merge gate at {pr} @{head}"));
+    gaps.extend(crate::verdict::merge_gaps(root, target, Some(&pr), &head)?);
+    match read.checks {
+        Ok(checks) if ci_green(&checks) => {
+            lines.push(format!("- CI green at {head} ({} check(s))", checks.len()));
+        }
+        Ok(checks) => {
+            let red: Vec<String> = checks
+                .iter()
+                .filter(|check| !check.green())
+                .map(|check| format!("{} {}", check.name, check.state))
+                .collect();
+            gaps.push(if checks.is_empty() {
+                format!("GitHub reports no CI at {head}")
+            } else {
+                format!("CI is not green at {head}: {}", red.join(", "))
+            });
+        }
+        Err(why) => match &gate.ci_verified {
+            Some(file) => match CampaignFile::resolve(root, file) {
+                Ok(found) => lines.push(format!("- CI verified by {found} ({why})")),
+                Err(error) => {
+                    violations.push(Violation::new(&full, "evidence-file", error.to_string()))
+                }
+            },
+            None => gaps.push(format!(
+                "{why}; CI at {head} is unknown: pass --ci-verified <evidence> once you have checked it"
+            )),
+        },
+    }
+    Ok((gaps, lines))
+}
+
 pub fn advance(
     host: &dyn Host,
     root: &Path,
@@ -990,10 +1134,44 @@ pub fn advance(
     file: Option<&Path>,
     repo: Option<&Path>,
 ) -> Result<Outcome> {
+    advance_gated(
+        host,
+        root,
+        target,
+        to,
+        given,
+        file,
+        repo,
+        &MergeGate::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn advance_gated(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    to: &Phase,
+    given: &Evidence,
+    file: Option<&Path>,
+    repo: Option<&Path>,
+    gate: &MergeGate,
+) -> Result<Outcome> {
     let full = match &target.step {
         Some(step) => format!("{}/{step}", target.unit),
         None => target.unit.clone(),
     };
+    // GitHub is read before the lock, as `cm sync` reads it; the gate re-reads under the lock
+    // only if the step's PR changed meanwhile.
+    let read = (*to == Phase::Merged)
+        .then(|| store::load_unit(&root.join(&target.unit)).ok())
+        .flatten()
+        .and_then(|unit| unit.steps.get(target.step.as_deref()?).cloned())
+        .filter(|step| step.lane == Some(Lane::Codex))
+        .and_then(|step| {
+            let pr = step.track.evidence.pr.as_deref()?;
+            Some(read_github(gate, pr, step.track.evidence.sha.as_deref()))
+        });
     let _lock = lock(root)?;
     let campaign = store::load_campaign(root)?;
     let mut violations = journal::check(root, &campaign);
@@ -1210,6 +1388,38 @@ pub fn advance(
             ));
         }
     }
+    let gated = *to == Phase::Merged
+        && !resuming
+        && declared.as_ref().and_then(|step| step.lane) == Some(Lane::Codex);
+    let mut gate_lines = Vec::new();
+    if gated {
+        let (gaps, lines) = merge_gate(root, target, &track, gate, read, &mut violations)?;
+        gate_lines = lines;
+        match &gate.waiver {
+            Some(waiver) => match CampaignFile::resolve(root, waiver) {
+                Ok(found) => {
+                    gate_lines.push(format!("- merge gate overridden by {found}"));
+                    gate_lines.extend(gaps.iter().map(|gap| format!("- waived: {gap}")));
+                }
+                Err(error) => {
+                    violations.push(Violation::new(&full, "evidence-file", error.to_string()))
+                }
+            },
+            None => violations.extend(
+                gaps.into_iter()
+                    .map(|gap| Violation::new(&full, "merge-gate", gap)),
+            ),
+        }
+    } else if !gate.given().is_empty() {
+        violations.push(Violation::new(
+            &full,
+            "evidence-unexpected",
+            format!(
+                "{} apply only to the merge gate of a codex step moving to merged",
+                gate.given().join(", ")
+            ),
+        ));
+    }
     if !violations.is_empty() {
         return Ok(Outcome::refused(violations));
     }
@@ -1231,16 +1441,71 @@ pub fn advance(
         evidence: evidence.clone(),
     });
     write_unit(&unit_dir, &unit)?;
-    let body = format!("- evidence: {}\n", evidence.summary());
+    let mut body = format!("- evidence: {}\n", evidence.summary());
+    for line in &gate_lines {
+        body.push_str(line);
+        body.push('\n');
+    }
     let heading = record(root, &at, &format!("advance {full}: {from} → {to}"), &body)?;
     let mut outcome = Outcome::default();
     outcome.line(format!("{full}: {from} → {to}"));
+    outcome.lines.extend(
+        gate_lines
+            .iter()
+            .map(|line| line.trim_start_matches("- ").to_owned()),
+    );
+    if gated {
+        outcome.field("merge_gate", gate_lines.clone());
+    }
     outcome.field("target", full);
     outcome.field("from", from.to_string());
     outcome.field("to", to.to_string());
     outcome.field("evidence", serde_json::to_value(&evidence)?);
     outcome.field("journal", heading);
     Ok(outcome)
+}
+
+/// Moves a declared step to `blocked:<reason>` as `cm advance` would, under the lock the caller
+/// holds, and journals the move; `None` when the step cannot move there (already blocked, final).
+pub(crate) fn block_step(
+    root: &Path,
+    target: &Target,
+    reason: &str,
+    at: &str,
+    evidence: &Evidence,
+) -> Result<Option<String>> {
+    let unit_dir = root.join(&target.unit);
+    let mut unit = store::load_unit(&unit_dir)?;
+    let to = Phase::Blocked(reason.to_owned());
+    let Some(step) = target
+        .step
+        .as_ref()
+        .and_then(|step| unit.steps.get_mut(step))
+    else {
+        return Ok(None);
+    };
+    if matches!(step.track.state, Phase::Blocked(_))
+        || step.track.check(&to, step.finish()).is_err()
+    {
+        return Ok(None);
+    }
+    let from = step.track.state.clone();
+    step.track.apply(to.clone(), at, evidence);
+    let full = format!(
+        "{}/{}",
+        target.unit,
+        target.step.as_deref().unwrap_or_default()
+    );
+    unit.history.push(Move {
+        at: at.to_owned(),
+        target: full.clone(),
+        from: from.clone(),
+        to: to.clone(),
+        evidence: evidence.clone(),
+    });
+    write_unit(&unit_dir, &unit)?;
+    let body = format!("- evidence: {}\n", evidence.summary());
+    record(root, at, &format!("advance {full}: {from} → {to}"), &body).map(Some)
 }
 
 fn unit_of(
