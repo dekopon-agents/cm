@@ -43,14 +43,6 @@ fn expired(attempt: &Attempt, now: Timestamp) -> bool {
 /// What a coordinator holding only the committed state does next, as `(code, instruction)`.
 pub fn plan(attempt: &Attempt, now: Timestamp) -> (&'static str, String) {
     let last = attempt.actions.last();
-    let known = |kind: &str| {
-        attempt
-            .actions
-            .iter()
-            .rev()
-            .find(|action| action.kind == kind)
-            .and_then(|action| action.id.clone())
-    };
     if let Some(ended) = &attempt.ended {
         return ("ended", format!("ended {} at {}", ended.outcome, ended.at));
     }
@@ -64,10 +56,22 @@ pub fn plan(attempt: &Attempt, now: Timestamp) -> (&'static str, String) {
         );
     }
     if expired(attempt, now) {
-        let cancel = known("turn").map_or_else(
-            || "nothing was admitted to cancel".to_owned(),
-            |turn| format!("cancel turn {turn}"),
-        );
+        let admitted: Vec<_> = attempt
+            .actions
+            .iter()
+            .rev()
+            .filter_map(|action| {
+                action
+                    .id
+                    .as_ref()
+                    .map(|id| format!("cancel {} {id}", action.kind))
+            })
+            .collect();
+        let cancel = if admitted.is_empty() {
+            "nothing was admitted to cancel".to_owned()
+        } else {
+            format!("inspect the recorded work and {}", admitted.join("; "))
+        };
         return (
             "expired",
             format!(
