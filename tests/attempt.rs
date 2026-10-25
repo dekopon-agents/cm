@@ -323,6 +323,13 @@ fn a_capped_attempt_keeps_its_deadline_across_a_replacement() {
     );
     assert!(begin(&overrun, &c.root, &second, "cancel").ok());
     assert!(record(&overrun, &c.root, &second, "cancel", "u1").ok());
+    let after_cancel = status(&overrun, &c.root);
+    let next = after_cancel.fields["next"].as_str().unwrap();
+    assert!(
+        next.contains("inspect recorded cancellation u1; cancel turn u1; cancel thread t1"),
+        "{next}"
+    );
+    assert!(!next.contains("cancel cancel"), "{next}");
     assert_eq!(
         rules(&end(
             &overrun,
@@ -348,4 +355,88 @@ fn a_capped_attempt_keeps_its_deadline_across_a_replacement() {
     assert_eq!(ended.fields["plan"], "ended");
     assert_eq!(ended.fields["attempt"]["ended"]["outcome"], "partial");
     assert!(lint(&c.root).unwrap().ok());
+}
+
+#[test]
+fn an_expired_session_attempt_names_the_session_to_cancel() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    let first = launched(&host, &c, Some(30));
+    assert!(begin(&host, &c.root, &first, "session").ok());
+    assert!(record(&host, &c.root, &first, "session", "s1").ok());
+    let overrun = at("2026-10-19T09:30:30Z");
+    let expired = status(&overrun, &c.root);
+    assert_eq!(expired.fields["plan"], "expired");
+    let next = expired.fields["next"].as_str().unwrap();
+    assert!(next.contains("cancel session s1"), "{next}");
+    assert!(!next.contains("nothing was admitted"), "{next}");
+}
+
+#[test]
+fn an_expired_thread_only_attempt_names_the_thread_to_cancel() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    let first = launched(&host, &c, Some(30));
+    assert!(begin(&host, &c.root, &first, "thread").ok());
+    assert!(record(&host, &c.root, &first, "thread", "t1").ok());
+    let overrun = at("2026-10-19T09:30:30Z");
+    let expired = status(&overrun, &c.root);
+    assert_eq!(expired.fields["plan"], "expired");
+    let next = expired.fields["next"].as_str().unwrap();
+    assert!(next.contains("cancel thread t1"), "{next}");
+}
+
+#[test]
+fn an_expired_attempt_names_every_admitted_handle_newest_first() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    let first = launched(&host, &c, Some(30));
+    assert!(begin(&host, &c.root, &first, "thread").ok());
+    assert!(record(&host, &c.root, &first, "thread", "t1").ok());
+    assert!(begin(&host, &c.root, &first, "session").ok());
+    assert!(record(&host, &c.root, &first, "session", "s1").ok());
+    assert!(begin(&host, &c.root, &first, "turn").ok());
+    assert!(record(&host, &c.root, &first, "turn", "u1").ok());
+    assert!(begin(&host, &c.root, &first, "turn").ok());
+    assert!(record(&host, &c.root, &first, "turn", "u2").ok());
+    let overrun = at("2026-10-19T09:30:30Z");
+    let expired = status(&overrun, &c.root);
+    assert_eq!(expired.fields["plan"], "expired");
+    let next = expired.fields["next"].as_str().unwrap();
+    assert!(
+        next.contains("cancel turn u2; cancel turn u1; cancel session s1; cancel thread t1"),
+        "{next}"
+    );
+}
+
+#[test]
+fn an_expired_attempt_without_admitted_work_says_so() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    launched(&host, &c, Some(30));
+    let overrun = at("2026-10-19T09:30:30Z");
+    let expired = status(&overrun, &c.root);
+    assert_eq!(expired.fields["plan"], "expired");
+    let next = expired.fields["next"].as_str().unwrap();
+    assert!(next.contains("nothing was admitted to cancel"), "{next}");
+}
+
+#[test]
+fn an_expired_attempt_with_an_in_flight_action_stays_unknown() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    let first = launched(&host, &c, Some(30));
+    assert!(begin(&host, &c.root, &first, "session").ok());
+    let overrun = at("2026-10-19T09:30:30Z");
+    assert_eq!(status(&overrun, &c.root).fields["plan"], "unknown");
+}
+
+#[test]
+fn an_ended_attempt_stays_ended_past_its_deadline() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    let first = launched(&host, &c, Some(30));
+    assert!(end(&host, &c.root, &first, AttemptOutcome::Complete, None).ok());
+    let overrun = at("2026-10-19T09:30:30Z");
+    assert_eq!(status(&overrun, &c.root).fields["plan"], "ended");
 }
