@@ -292,8 +292,9 @@ one `merge-gate` violation per gap, unless at the PR's head (GitHub's, via `gh a
   `effective.model` `gpt-6-astra`, `effective.effort` `xhigh`, that `head`, and, when it names
   them, the PR's `repo` and `pr`; and a review that happened: `turn.status` `completed`, null
   `thread_fresh.forkedFromId` and `thread_fresh.parentThreadId`, and `thread_fresh.turns_in_thread`
-  1. Its report must be recorded at that head with `cm review record … --reviewer astra`, so (b)
-  holds Astra's own verdict; another reviewer's ACCEPT never stands in for it;
+  1. The receipted report itself must be recorded at that head with `cm review record …
+  --reviewer astra`: a recorded copy whose SHA-256 is the receipt's `report_sha256`. (b) then
+  holds Astra's own verdict; another report or reviewer's ACCEPT never stands in for it;
 - (b) at least one review is recorded at that head, and each one there is ACCEPT or has every
   blocking finding resolved (`cm review resolve`);
 - (c) CI is green: GitHub reports at least one check run or commit status on the head and each is

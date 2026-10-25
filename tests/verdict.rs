@@ -15,8 +15,9 @@ use cm::plan;
 use cm::state::{Evidence, Lane, Phase};
 use cm::store::{self, parse_target};
 use cm::sync::sync;
-use cm::verdict;
+use cm::verdict::{self, CleanUpdateError, Lineage};
 use jiff::Timestamp;
+use sha2::{Digest, Sha256};
 
 #[allow(dead_code)]
 mod support;
@@ -105,6 +106,14 @@ impl Forge for FakeForge {
     fn tag_contains(&self, _: &GithubRepo, _: &TagName, _: &CommitSha) -> Result<bool, ForgeError> {
         Ok(false)
     }
+}
+
+/// `sha256sum`'s hex digest of `path`, or of nothing when it does not exist.
+fn sha256(path: &Path) -> String {
+    Sha256::digest(fs::read(path).unwrap_or_default())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn rules(outcome: &Outcome) -> Vec<&'static str> {
@@ -203,8 +212,14 @@ impl Campaign {
             block.push_str(finding);
             block.push('\n');
         }
+        // A report named for an Astra review dir is that review's report.md, beside its receipt.
+        let rel = if name.starts_with("astra-review") {
+            format!("{STEP}/evidence/{name}/report.md")
+        } else {
+            format!("drafts/{name}.md")
+        };
         self.write(
-            &format!("drafts/{name}.md"),
+            &rel,
             &format!("# Review\n\nProse.\n\n```cm-review\n{block}```\n\n{verdict}\n"),
         )
     }
@@ -213,7 +228,8 @@ impl Campaign {
         self.receipt_with(dir, head, model, effort, |_| {});
     }
 
-    /// An `astra-review.sh collect` receipt for a review that happened, changed by `edit`.
+    /// An `astra-review.sh collect` receipt for a review that happened, changed by `edit`; its
+    /// report_sha256 is that of `<dir>/report.md` when one is written.
     fn receipt_with(
         &self,
         dir: &str,
@@ -230,6 +246,7 @@ impl Campaign {
             "effective": {"model": model, "effort": effort, "source": "harness thread/read"},
             "thread_fresh": {"forkedFromId": null, "parentThreadId": null, "turns_in_thread": 1},
             "turn": {"status": "completed", "error": null},
+            "report_sha256": sha256(&self.root.join(format!("{STEP}/evidence/{dir}/report.md"))),
             "verdict": "ACCEPT",
         });
         edit(&mut receipt);
@@ -389,7 +406,7 @@ fn merge_gate_needs_astra_a_cleared_review_and_green_ci_at_the_head() {
     );
     c.receipt("astra-review-7-sol", &head, "gpt-6-sol", "xhigh");
     let fix = c.report(
-        "r1",
+        "astra-review-7",
         &head,
         &["F1 | contract | exposed | src/lib.rs:40 | now reachable"],
         "FIX REQUIRED",
@@ -470,13 +487,13 @@ fn merge_gate_refuses_unknown_ci_unless_verified_and_overrides_only_with_evidenc
     let host = at("2026-10-25T06:00:00Z");
     let c = campaign(&host, true);
     let head = c.head();
-    c.receipt("astra-review-7", &head, "gpt-6-astra", "xhigh");
     let accept = c.report(
-        "r1",
+        "astra-review-7",
         &head,
         &["F1 | taste | introduced | - | a nit"],
         "ACCEPT",
     );
+    c.receipt("astra-review-7", &head, "gpt-6-astra", "xhigh");
     assert!(record(&host, &c, &accept, "astra").ok());
     let down = FakeForge {
         down: true,
@@ -789,8 +806,8 @@ fn sync_holds_a_codex_merge_at_pr_open_until_its_gate_holds() {
         held.violations
     );
     assert_eq!(c.state(), Phase::PrOpen);
+    let accept = c.report("astra-review-7", &head, &[], "ACCEPT");
     c.receipt("astra-review-7", &head, "gpt-6-astra", "xhigh");
-    let accept = c.report("r1", &head, &[], "ACCEPT");
     assert!(record(&host, &c, &accept, "astra").ok());
     let moved = sync(&host, &merged, &c.root).unwrap();
     assert!(moved.ok(), "{:?}", moved.violations);
@@ -840,6 +857,12 @@ fn a_receipt_counts_only_for_a_review_that_happened_and_was_recorded() {
     }
 
     // Astra's FIX REQUIRED receipt with only Claude's ACCEPT recorded does not merge.
+    let astra = c.report(
+        "astra-review-7",
+        &head,
+        &["F1 | contract | introduced | src/lib.rs:1 | broken"],
+        "FIX REQUIRED",
+    );
     c.receipt_with("astra-review-7", &head, "gpt-6-astra", "xhigh", |receipt| {
         receipt["verdict"] = "FIX REQUIRED".into();
     });
@@ -851,12 +874,6 @@ fn a_receipt_counts_only_for_a_review_that_happened_and_was_recorded() {
         ),
         "{:?}",
         unrecorded.violations
-    );
-    let astra = c.report(
-        "astra",
-        &head,
-        &["F1 | contract | introduced | src/lib.rs:1 | broken"],
-        "FIX REQUIRED",
     );
     assert!(record(&host, &c, &astra, "astra").ok());
     let blocked = c.merge(&host, &gate);
@@ -1027,10 +1044,22 @@ fn reviewed_feature(host: &Fake, c: &Campaign) -> (String, String) {
     let base = git(&c.repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
     git(&c.repo, &["checkout", "-q", "-b", "feature"]);
     let h1 = commit(&c.repo, "shared.txt", "feature\n");
+    let report = c.report("astra-review-7-h1", &h1, &[], "ACCEPT");
     c.receipt("astra-review-7-h1", &h1, "gpt-6-astra", "xhigh");
-    let report = c.report("h1", &h1, &[], "ACCEPT");
     assert!(record(host, c, &report, "astra").ok());
     (h1, base)
+}
+
+/// Why the gate's walk from the head stopped, read straight from `merge_gaps`.
+fn walk_stop(c: &Campaign, base: &str) -> Option<CleanUpdateError> {
+    let tip = git(&c.repo, &["rev-parse", base]);
+    let lineage = Lineage {
+        repo: &c.repo,
+        base: Some(&tip),
+    };
+    verdict::merge_gaps(&c.root, &target(), Some(PR), &c.head(), Some(&lineage))
+        .unwrap()
+        .stop
 }
 
 fn merge_with(host: &Fake, c: &Campaign, base: &str) -> Outcome {
@@ -1114,16 +1143,17 @@ fn a_merge_that_resolved_conflicts_needs_its_own_review() {
         "{:?}",
         refused.violations
     );
-    assert!(
-        refused.violations.iter().any(|v| v
-            .message
-            .contains("resolved merge conflicts; it needs its own review")),
-        "{:?}",
-        refused.violations
-    );
     let merge = c.head();
+    assert_eq!(
+        walk_stop(&c, &base),
+        Some(CleanUpdateError::Conflicts {
+            commit: merge.clone()
+        })
+    );
+    assert!(rules(&refused).contains(&"merge-gate"));
+    let merge = c.head();
+    let report = c.report("astra-review-7-merge", &merge, &[], "ACCEPT");
     c.receipt("astra-review-7-merge", &merge, "gpt-6-astra", "xhigh");
-    let report = c.report("merge", &merge, &[], "ACCEPT");
     assert!(record(&host, &c, &report, "astra").ok());
     let merged = merge_with(&host, &c, &base);
     assert!(merged.ok(), "{:?}", merged.violations);
@@ -1136,14 +1166,11 @@ fn a_new_commit_after_the_reviewed_head_needs_a_review() {
     let (_, base) = reviewed_feature(&host, &c);
     commit(&c.repo, "more.txt", "a fix\n");
     let refused = merge_with(&host, &c, &base);
-    assert!(
-        refused
-            .violations
-            .iter()
-            .any(|v| v.message.contains("is not a merge from the base branch")),
-        "{:?}",
-        refused.violations
+    assert_eq!(
+        walk_stop(&c, &base),
+        Some(CleanUpdateError::NotMerge { commit: c.head() })
     );
+    assert!(rules(&refused).contains(&"merge-gate"));
     // A merge from a branch other than the base is no clean update either.
     let c = campaign(&host, true);
     let (_, base) = reviewed_feature(&host, &c);
@@ -1164,14 +1191,17 @@ fn a_new_commit_after_the_reviewed_head_needs_a_review() {
         ],
     );
     let refused = merge_with(&host, &c, &base);
-    assert!(
-        refused
-            .violations
-            .iter()
-            .any(|v| v.message.contains("which is not on the base branch")),
-        "{:?}",
-        refused.violations
+    let side = git(&c.repo, &["rev-parse", "side"]);
+    let tip = git(&c.repo, &["rev-parse", &base]);
+    assert_eq!(
+        walk_stop(&c, &base),
+        Some(CleanUpdateError::OffBase {
+            commit: c.head(),
+            parent: side,
+            base: tip,
+        })
     );
+    assert!(rules(&refused).contains(&"merge-gate"));
 }
 
 /// Merges a new base-branch commit into `feature` without conflicts; returns the merge.
@@ -1260,4 +1290,74 @@ fn a_clean_update_never_outweighs_a_review_at_the_head_or_a_walked_commit() {
         refused.violations
     );
     assert_eq!(c.state(), Phase::PrOpen);
+}
+
+#[test]
+fn the_recorded_astra_review_must_be_the_receipted_report() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let head = c.head();
+    let green = FakeForge::open(&head, &[("fmt, clippy, test", "success")]);
+    let gate = MergeGate {
+        forge: Some(&green),
+        ..MergeGate::default()
+    };
+    let receipted = c.report(
+        "astra-review-7",
+        &head,
+        &["F1 | contract | introduced | src/lib.rs:1 | broken"],
+        "FIX REQUIRED",
+    );
+    c.receipt_with("astra-review-7", &head, "gpt-6-astra", "xhigh", |receipt| {
+        receipt["verdict"] = "FIX REQUIRED".into();
+    });
+    let other = c.report("other", &head, &[], "ACCEPT");
+    assert!(record(&host, &c, &other, "astra").ok());
+    let refused = c.merge(&host, &gate);
+    assert_eq!(
+        rules(&refused),
+        vec!["merge-gate"],
+        "{:?}",
+        refused.violations
+    );
+    assert!(
+        refused.violations[0]
+            .message
+            .contains("but no Astra review recorded at")
+            && refused.violations[0]
+                .message
+                .contains("(R1) is that report"),
+        "{:?}",
+        refused.violations
+    );
+    let unhashed = campaign(&host, true);
+    unhashed.receipt_with(
+        "astra-review-7",
+        &unhashed.head(),
+        "gpt-6-astra",
+        "xhigh",
+        |receipt| {
+            receipt.as_object_mut().unwrap().remove("report_sha256");
+        },
+    );
+    let accept = unhashed.report("astra-review-7", &unhashed.head(), &[], "ACCEPT");
+    assert!(record(&host, &unhashed, &accept, "astra").ok());
+    let green_too = FakeForge::open(&unhashed.head(), &[("fmt, clippy, test", "success")]);
+    let refused = unhashed.merge(
+        &host,
+        &MergeGate {
+            forge: Some(&green_too),
+            ..MergeGate::default()
+        },
+    );
+    assert!(
+        refused.violations[0]
+            .message
+            .contains("names no report_sha256")
+    );
+
+    assert!(record(&host, &c, &receipted, "astra").ok());
+    let blocked = c.merge(&host, &gate);
+    assert_eq!(rules(&blocked), vec!["merge-gate"]);
+    assert!(blocked.violations[0].message.contains("R2.F1 unresolved"));
 }

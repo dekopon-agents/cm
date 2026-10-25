@@ -12,6 +12,7 @@ use std::process::Command;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::evidence::CampaignFile;
 use crate::forge::GithubRepo;
@@ -1288,6 +1289,17 @@ fn unfinished(receipt: &Value) -> Option<&'static str> {
     }
 }
 
+/// The SHA-256 of a recorded review's report copy, lower-case hex, as `sha256sum` prints it.
+fn report_sha256(root: &Path, review: &Recorded) -> Option<String> {
+    let bytes = fs::read(root.join(review.report.as_str())).ok()?;
+    Some(
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
 /// The step's evidence holds a receipt for a review of `head` that happened, whatever its model.
 fn finished_receipt_at(root: &Path, target: &Target, head: &str) -> bool {
     let mut found = Vec::new();
@@ -1351,16 +1363,41 @@ fn astra_gap(
         match (matches, unfinished(&receipt)) {
             (true, None) => {
                 let step = full_name(target);
-                let recorded = verdicts.reviews.iter().any(|review| {
-                    review.step == step
-                        && review.at_head(head)
-                        && review.reviewer.as_deref() == Some(ASTRA_REVIEWER)
-                });
-                return (!recorded).then(|| {
-                    let report = path.with_file_name("report.md");
+                let Some(want) = text_at("/report_sha256").map(str::to_lowercase) else {
+                    return Some(format!(
+                        "{rel} names no report_sha256, so no recorded report is bound to it"
+                    ));
+                };
+                // The receipted report itself must be recorded: its copy hashes to the
+                // receipt's report_sha256, and (b) then holds that report's verdict.
+                let astra: Vec<&Recorded> = verdicts
+                    .reviews
+                    .iter()
+                    .filter(|review| {
+                        review.step == step
+                            && review.at_head(head)
+                            && review.reviewer.as_deref() == Some(ASTRA_REVIEWER)
+                    })
+                    .collect();
+                if astra
+                    .iter()
+                    .any(|review| report_sha256(root, review).as_deref() == Some(want.as_str()))
+                {
+                    return None;
+                }
+                let report = relative(root, &path.with_file_name("report.md"));
+                return Some(if astra.is_empty() {
                     format!(
-                        "{rel} records the Astra review at {head}, but it is not recorded; `cm review record {step} {} --reviewer {ASTRA_REVIEWER}`",
-                        relative(root, &report)
+                        "{rel} records the Astra review at {head}, but it is not recorded; `cm review record {step} {report} --reviewer {ASTRA_REVIEWER}`"
+                    )
+                } else {
+                    format!(
+                        "{rel} receipts a report with sha256 {want}, but no Astra review recorded at {head} ({}) is that report; `cm review record {step} {report} --reviewer {ASTRA_REVIEWER}`",
+                        astra
+                            .iter()
+                            .map(|review| review.id())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     )
                 });
             }
@@ -1448,28 +1485,86 @@ fn is_ancestor(repo: &Path, ancestor: &str, of: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// Why a commit on the walk back from the head is not a clean update from the base branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanUpdateError {
+    /// git could not read the commit, or its remerge diff, in the checkout.
+    Unreadable { commit: String, repo: PathBuf },
+    /// The commit is not a merge.
+    NotMerge { commit: String },
+    /// The merge's second parent is not on the base branch.
+    OffBase {
+        commit: String,
+        parent: String,
+        base: String,
+    },
+    /// The merge's `git show --remerge-diff` is not empty: it resolved conflicts.
+    Conflicts { commit: String },
+    /// The walk passed this many clean updates without reaching a reviewed commit.
+    TooLong { limit: usize },
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(12)]
+}
+
+impl fmt::Display for CleanUpdateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CleanUpdateError::Unreadable { commit, repo } => {
+                write!(f, "cannot read {} in {}", short(commit), repo.display())
+            }
+            CleanUpdateError::NotMerge { commit } => {
+                write!(f, "{} is not a merge from the base branch", short(commit))
+            }
+            CleanUpdateError::OffBase {
+                commit,
+                parent,
+                base,
+            } => write!(
+                f,
+                "{} merges {} which is not on the base branch {base}",
+                short(commit),
+                short(parent)
+            ),
+            CleanUpdateError::Conflicts { commit } => write!(
+                f,
+                "{} resolved merge conflicts; it needs its own review",
+                short(commit)
+            ),
+            CleanUpdateError::TooLong { limit } => write!(f, "more than {limit} updates"),
+        }
+    }
+}
+
 /// `commit`'s first parent when it is a clean update from the base branch: a merge whose second
 /// parent is on `base` and whose `git show --remerge-diff` is empty (no conflict resolved).
-fn clean_update(repo: &Path, commit: &str, base: &str) -> Result<String, String> {
-    let short = &commit[..commit.len().min(12)];
-    let line = git_out(repo, &["rev-list", "--parents", "-n", "1", commit])
-        .ok_or_else(|| format!("cannot read {short} in {}", repo.display()))?;
+pub fn clean_update(repo: &Path, commit: &str, base: &str) -> Result<String, CleanUpdateError> {
+    let unreadable = || CleanUpdateError::Unreadable {
+        commit: commit.to_owned(),
+        repo: repo.to_path_buf(),
+    };
+    let line =
+        git_out(repo, &["rev-list", "--parents", "-n", "1", commit]).ok_or_else(unreadable)?;
     let parents: Vec<&str> = line.split_whitespace().skip(1).collect();
     let [first, second] = parents[..] else {
-        return Err(format!("{short} is not a merge from the base branch"));
+        return Err(CleanUpdateError::NotMerge {
+            commit: commit.to_owned(),
+        });
     };
     if !is_ancestor(repo, second, base) {
-        return Err(format!(
-            "{short} merges {} which is not on the base branch {base}",
-            &second[..second.len().min(12)]
-        ));
+        return Err(CleanUpdateError::OffBase {
+            commit: commit.to_owned(),
+            parent: second.to_owned(),
+            base: base.to_owned(),
+        });
     }
     match git_out(repo, &["show", "--remerge-diff", "--format=", commit]) {
         Some(diff) if diff.is_empty() => Ok(first.to_owned()),
-        Some(_) => Err(format!(
-            "{short} resolved merge conflicts; it needs its own review"
-        )),
-        None => Err(format!("cannot read {short}'s remerge diff")),
+        Some(_) => Err(CleanUpdateError::Conflicts {
+            commit: commit.to_owned(),
+        }),
+        None => Err(unreadable()),
     }
 }
 
@@ -1480,6 +1575,8 @@ pub struct Cleared {
     /// The reviewed head the gate took, when it is an earlier commit than `head` and every
     /// commit since is a clean update from the base branch.
     pub reviewed: Option<String>,
+    /// Why the walk back from the head stopped short of a reviewed commit, when it did.
+    pub stop: Option<CleanUpdateError>,
 }
 
 /// The gate's (a) and (b) at `head`, or, with `lineage`, at the nearest earlier head on its
@@ -1514,6 +1611,7 @@ pub fn merge_gaps(
         return Ok(Cleared {
             gaps,
             reviewed: None,
+            stop: None,
         });
     };
     let repo = lineage.repo;
@@ -1525,10 +1623,11 @@ pub fn merge_gaps(
         return Ok(Cleared {
             gaps,
             reviewed: None,
+            stop: None,
         });
     };
     let mut gaps = gaps;
-    let mut why = format!("more than {MAX_UPDATES} updates");
+    let mut why = CleanUpdateError::TooLong { limit: MAX_UPDATES };
     for _ in 0..MAX_UPDATES {
         match clean_update(repo, &at, base) {
             Ok(parent) => at = parent,
@@ -1543,6 +1642,7 @@ pub fn merge_gaps(
                 return Ok(Cleared {
                     gaps: Vec::new(),
                     reviewed: Some(at),
+                    stop: None,
                 });
             }
             gaps.push(format!(
@@ -1552,6 +1652,7 @@ pub fn merge_gaps(
             return Ok(Cleared {
                 gaps,
                 reviewed: None,
+                stop: None,
             });
         }
     }
@@ -1568,6 +1669,7 @@ pub fn merge_gaps(
     Ok(Cleared {
         gaps,
         reviewed: None,
+        stop: Some(why),
     })
 }
 
