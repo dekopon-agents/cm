@@ -61,10 +61,13 @@ pub fn plan(attempt: &Attempt, now: Timestamp) -> (&'static str, String) {
             .iter()
             .rev()
             .filter_map(|action| {
-                action
-                    .id
-                    .as_ref()
-                    .map(|id| format!("cancel {} {id}", action.kind))
+                action.id.as_ref().map(|id| {
+                    if action.kind == "cancel" {
+                        format!("inspect recorded cancellation {id}")
+                    } else {
+                        format!("cancel {} {id}", action.kind)
+                    }
+                })
             })
             .collect();
         let cancel = if admitted.is_empty() {

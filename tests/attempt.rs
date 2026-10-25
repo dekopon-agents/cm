@@ -323,6 +323,13 @@ fn a_capped_attempt_keeps_its_deadline_across_a_replacement() {
     );
     assert!(begin(&overrun, &c.root, &second, "cancel").ok());
     assert!(record(&overrun, &c.root, &second, "cancel", "u1").ok());
+    let after_cancel = status(&overrun, &c.root);
+    let next = after_cancel.fields["next"].as_str().unwrap();
+    assert!(
+        next.contains("inspect recorded cancellation u1; cancel turn u1; cancel thread t1"),
+        "{next}"
+    );
+    assert!(!next.contains("cancel cancel"), "{next}");
     assert_eq!(
         rules(&end(
             &overrun,
