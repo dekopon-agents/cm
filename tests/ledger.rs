@@ -641,3 +641,71 @@ fn recovery_preserves_the_preamble_and_postamble() {
     assert!(text.starts_with("# Review-off\n\nWho reviewed what.\n\n"));
     assert!(text.ends_with(AFTER_TABLE));
 }
+
+#[test]
+fn an_interrupted_first_review_render_leaves_the_append_retryable() {
+    let (_temp, root) = campaign();
+    declare_build(&root);
+    let obstruction = root.join(".REVIEW-OFF.md.cm-tmp");
+    fs::create_dir(&obstruction).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&root)
+        .args([
+            "review",
+            "15-machinery/cm/build",
+            "--pr",
+            "https://github.com/o/r/pull/1",
+            "--head",
+            "abcdef1",
+            "--model",
+            "m",
+            "--effort",
+            "high",
+            "--verdict",
+            "accept",
+            "--findings",
+            "0/0",
+            "--cost",
+            "1",
+            "--wall",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!root.join(".cm/reviews.json").exists());
+    assert_eq!(review_entries(&root), 0);
+    fs::remove_dir(obstruction).unwrap();
+    assert!(review(&root, "https://github.com/o/r/pull/1", None).ok());
+    assert_eq!(recover_reviews(&root)["ok"], true);
+    let rows: review::Reviews = cm::store::read_json(&root.join(".cm/reviews.json")).unwrap();
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(review_entries(&root), 1);
+}
+
+#[test]
+fn an_interrupted_first_review_journal_entry_can_be_recovered() {
+    let (_temp, root) = campaign();
+    declare_build(&root);
+    let obstruction = root.join(".JOURNAL.md.cm-tmp");
+    fs::create_dir(&obstruction).unwrap();
+    let target = parse_target("15-machinery/cm/build", true).unwrap();
+    let args = ReviewArgs {
+        pr: "https://github.com/o/r/pull/1",
+        head: "abcdef1",
+        model: "m",
+        effort: "high",
+        verdict: "accept",
+        findings: "0/0",
+        cost: "1",
+        wall: "1",
+        delta: None,
+    };
+    assert!(review::review(&Fake, &root, &target, &args).is_err());
+    fs::remove_dir(obstruction).unwrap();
+    assert_eq!(review_entries(&root), 0);
+    assert_eq!(recover_reviews(&root)["ok"], true);
+    assert_eq!(review_entries(&root), 1);
+    assert!(lint(&root).unwrap().ok());
+}

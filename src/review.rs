@@ -453,11 +453,14 @@ pub fn review(host: &dyn Host, root: &Path, target: &Target, args: &ReviewArgs) 
     if !loaded.as_ref().is_some_and(|(_, fresh)| *fresh) {
         violations.extend(lint_reviews(root));
     }
-    let (Some((mut reviews, _)), Some((confirmed, false_positive)), true) =
+    let (Some((mut reviews, fresh)), Some((confirmed, false_positive)), true) =
         (loaded, findings, violations.is_empty())
     else {
         return Ok(Outcome::refused(violations));
     };
+    if fresh && !root.join(REVIEW_OFF).exists() {
+        write_atomic(&root.join(REVIEW_OFF), render_reviews(&reviews).as_bytes())?;
+    }
     let at = stamp(host.now());
     let number = reviews.rows.iter().map(Row::number).max().unwrap_or(0) + 1;
     let review = Review {
