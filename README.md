@@ -235,7 +235,7 @@ restarting the cap. The coordinator then wraps each external action:
 | `dispatch` | nothing began: dispatch under this attempt |
 | `resume` | the last action returned its id: resume that thread, turn or session |
 | `unknown` | an action began and recorded no id: its outcome is unknown; never redispatch, find it in the runtime, then record its id or `end unknown` |
-| `expired` | the deadline passed: cancel the known turn (`begin cancel` is the one action still allowed), retrieve its partial results and `end partial --evidence <file>` |
+| `expired` | the deadline passed: inspect every recorded id newest first, cancel each admitted execution handle and inspect recorded cancellations (`begin cancel` is the one action still allowed), retrieve partial results and `end partial --evidence <file>` |
 | `ended` | `end` recorded `complete`, `partial` (with its evidence) or `unknown`; while an action has begun without an id, only `end unknown` closes the attempt |
 
 `.cm/lock` serializes cm on one machine only, so a replacement coordinator first fences the
