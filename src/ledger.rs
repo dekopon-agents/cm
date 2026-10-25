@@ -178,7 +178,15 @@ pub const DISPOSITIONS: [&str; 5] = ["proposed", "accepted", "applied", "deferre
 pub fn feedback(host: &dyn Host, root: &Path, entry: &Feedback) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
     one_line("the title", entry.title, &mut violations, FEEDBACK);
-    plain_body(FEEDBACK, entry.body, 3, &mut violations);
+    let body = entry.body.trim();
+    plain_body(FEEDBACK, body, 3, &mut violations);
+    if crate::markdown::unterminated_fence(body) {
+        violations.push(Violation::new(
+            FEEDBACK,
+            "feedback-body-fence",
+            "the body must close every Markdown fence before the next entry",
+        ));
+    }
     if let Some(urgency) = entry.urgency.filter(|urgency| !URGENCIES.contains(urgency)) {
         violations.push(Violation::new(
             FEEDBACK,
@@ -261,10 +269,7 @@ pub fn feedback(host: &dyn Host, root: &Path, entry: &Feedback) -> Result<Outcom
     }
     let (id, heading) = heading;
     let at = stamp(host.now());
-    let text_out = format!(
-        "{heading}\n\nLogged {at} by `cm feedback`.\n\n{}\n",
-        entry.body.trim()
-    );
+    let text_out = format!("{heading}\n\nLogged {at} by `cm feedback`.\n\n{}\n", body);
     append(&root.join(FEEDBACK), &text, &text_out)?;
     let kind = if entry.follow_up.is_some() {
         "feedback follow-up"
