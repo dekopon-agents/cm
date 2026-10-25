@@ -123,7 +123,7 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         evidence: PathBuf,
     },
-    /// Change a drafted or launched step's declaration: mark it a study, move its lane or add a gate.
+    /// Change a drafted or launched step's declaration: mark it a study, move its lane or add or remove gates.
     Amend {
         /// <NN-name>/<unit>/<step>
         #[arg(value_parser = step_target)]
@@ -137,6 +137,9 @@ enum Commands {
         /// A gate to add, as `cm init --after` takes it. Repeat for each.
         #[arg(long, value_name = "AFTER")]
         after: Vec<String>,
+        /// A gate to remove, as `cm init --after` takes it. Repeat for each.
+        #[arg(long, value_name = "AFTER")]
+        drop_after: Vec<String>,
     },
     /// Show, claim or extend a remote launch's attempt record; every external action is recorded before the next.
     Attempt {
@@ -457,6 +460,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             study,
             lane,
             after,
+            drop_after,
         } => commands::amend(
             host,
             &root()?,
@@ -465,6 +469,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 study: *study,
                 lane: *lane,
                 after: after.clone(),
+                drop_after: drop_after.clone(),
             },
         ),
         Commands::Attempt { target, claim, act } => {
