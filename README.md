@@ -294,7 +294,9 @@ one `merge-gate` violation per gap, unless at the PR's head (GitHub's, via `gh a
   `thread_fresh.forkedFromId` and `thread_fresh.parentThreadId`, and `thread_fresh.turns_in_thread`
   1. The receipted report itself must be recorded at that head with `cm review record …
   --reviewer astra`: a recorded copy whose SHA-256 is the receipt's `report_sha256`. (b) then
-  holds Astra's own verdict; another report or reviewer's ACCEPT never stands in for it;
+  holds Astra's own verdict; another report or reviewer's ACCEPT never stands in for it. Every such
+  receipt at the head binds: a second, unrecorded one (a rerun) refuses the gate until it too is
+  recorded;
 - (b) at least one review is recorded at that head, and each one there is ACCEPT or has every
   blocking finding resolved (`cm review resolve`);
 - (c) CI is green: GitHub reports at least one check run or commit status on the head and each is

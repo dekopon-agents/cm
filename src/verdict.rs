@@ -1320,19 +1320,23 @@ fn finished_receipt_at(root: &Path, target: &Target, head: &str) -> bool {
 
 /// Why the step does not hold an Astra review of `head` of `pr`: a receipt for a review that
 /// happened at that head with effective gpt-6-astra/xhigh, and that review recorded with
-/// `--reviewer astra` (whose verdict (b) then holds to ACCEPT or resolved). `None` when it does.
+/// `--reviewer astra` (whose verdict (b) then holds to ACCEPT or resolved). Every such receipt at
+/// the head binds, each unbound one a gap; empty when all are recorded.
 fn astra_gap(
     root: &Path,
     target: &Target,
     verdicts: &Verdicts,
     pr: Option<&str>,
     head: &str,
-) -> Option<String> {
+) -> Vec<String> {
     let mut found = Vec::new();
     receipts(&evidence_dir(root, target), &mut found);
     let repo = pr.and_then(GithubRepo::of_pr).map(|repo| repo.to_string());
     let number = pr.and_then(|url| url.rsplit('/').next()?.parse::<u64>().ok());
     let mut seen = Vec::new();
+    // Every finished matching receipt at the head binds: each must have its report recorded.
+    let mut finished = 0;
+    let mut unbound = Vec::new();
     for path in &found {
         let rel = relative(root, path);
         let Ok(text) = fs::read_to_string(path) else {
@@ -1362,11 +1366,13 @@ fn astra_gap(
             && same_pr;
         match (matches, unfinished(&receipt)) {
             (true, None) => {
+                finished += 1;
                 let step = full_name(target);
                 let Some(want) = text_at("/report_sha256").map(str::to_lowercase) else {
-                    return Some(format!(
+                    unbound.push(format!(
                         "{rel} names no report_sha256, so no recorded report is bound to it"
                     ));
+                    continue;
                 };
                 // The receipted report itself must be recorded: its copy hashes to the
                 // receipt's report_sha256, and (b) then holds that report's verdict.
@@ -1383,10 +1389,10 @@ fn astra_gap(
                     .iter()
                     .any(|review| report_sha256(root, review).as_deref() == Some(want.as_str()))
                 {
-                    return None;
+                    continue;
                 }
                 let report = relative(root, &path.with_file_name("report.md"));
-                return Some(if astra.is_empty() {
+                unbound.push(if astra.is_empty() {
                     format!(
                         "{rel} records the Astra review at {head}, but it is not recorded; `cm review record {step} {report} --reviewer {ASTRA_REVIEWER}`"
                     )
@@ -1410,7 +1416,10 @@ fn astra_gap(
             )),
         }
     }
-    Some(if seen.is_empty() {
+    if finished > 0 {
+        return unbound;
+    }
+    vec![if seen.is_empty() {
         format!(
             "no Astra receipt.json under {}",
             relative(root, &evidence_dir(root, target))
@@ -1420,7 +1429,7 @@ fn astra_gap(
             "no Astra receipt at {head} with effective {ASTRA_MODEL}/{ASTRA_EFFORT}; found {}",
             seen.join(", ")
         )
-    })
+    }]
 }
 
 /// Why the recorded reviews do not clear `head`; `None` when at least one review was recorded

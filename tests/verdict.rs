@@ -1361,3 +1361,58 @@ fn the_recorded_astra_review_must_be_the_receipted_report() {
     assert_eq!(rules(&blocked), vec!["merge-gate"]);
     assert!(blocked.violations[0].message.contains("R2.F1 unresolved"));
 }
+
+#[test]
+fn every_finished_astra_receipt_at_the_head_binds() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let head = c.head();
+    let green = FakeForge::open(&head, &[("fmt, clippy, test", "success")]);
+    let gate = MergeGate {
+        forge: Some(&green),
+        ..MergeGate::default()
+    };
+    let accept = c.report("astra-review-7-a", &head, &[], "ACCEPT");
+    c.receipt("astra-review-7-a", &head, "gpt-6-astra", "xhigh");
+    assert!(record(&host, &c, &accept, "astra").ok());
+    let rerun = c.report(
+        "astra-review-7-b",
+        &head,
+        &["F1 | contract | introduced | src/lib.rs:1 | broken"],
+        "FIX REQUIRED",
+    );
+    c.receipt_with(
+        "astra-review-7-b",
+        &head,
+        "gpt-6-astra",
+        "xhigh",
+        |receipt| {
+            receipt["verdict"] = "FIX REQUIRED".into();
+        },
+    );
+    let refused = c.merge(&host, &gate);
+    assert_eq!(
+        rules(&refused),
+        vec!["merge-gate"],
+        "{:?}",
+        refused.violations
+    );
+    assert!(
+        refused.violations[0]
+            .message
+            .starts_with("01-a/u/S1/evidence/astra-review-7-b/receipt.json receipts a report"),
+        "{:?}",
+        refused.violations
+    );
+    assert!(record(&host, &c, &rerun, "astra").ok());
+    let blocked = c.merge(&host, &gate);
+    assert_eq!(rules(&blocked), vec!["merge-gate"]);
+    assert!(blocked.violations[0].message.contains("R2.F1 unresolved"));
+    let ruling = c.write("ruling.md", "Coordinator: F1 is out of scope.\n");
+    assert!(
+        verdict::resolve(&host, &c.root, &target(), "R2.F1", "ruling.md", &ruling)
+            .unwrap()
+            .ok()
+    );
+    assert!(c.merge(&host, &gate).ok());
+}
