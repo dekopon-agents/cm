@@ -1416,3 +1416,50 @@ fn every_finished_astra_receipt_at_the_head_binds() {
     );
     assert!(c.merge(&host, &gate).ok());
 }
+
+#[test]
+fn a_base_that_already_contains_the_head_takes_no_clean_update() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let (_, base) = reviewed_feature(&host, &c);
+    git(&c.repo, &["checkout", "-q", "-b", "side", &base]);
+    commit(&c.repo, "side.txt", "unreviewed\n");
+    git(&c.repo, &["checkout", "-q", "feature"]);
+    let merge = [
+        "-c",
+        "user.name=cm",
+        "-c",
+        "user.email=cm@example.com",
+        "merge",
+        "-q",
+        "--no-ff",
+        "--no-edit",
+    ];
+    git(&c.repo, &[&merge[..], &["side"]].concat());
+    let head = c.head();
+    // Before the PR lands in the base, the side merge is off base.
+    assert!(matches!(
+        walk_stop(&c, &base),
+        Some(CleanUpdateError::OffBase { .. })
+    ));
+    // Once the base holds the PR head (a merge-commit merge of the PR), nothing on the walk is
+    // told apart from the base: the walk does not run and the gate refuses.
+    git(&c.repo, &["checkout", "-q", &base]);
+    git(&c.repo, &[&merge[..], &["feature"]].concat());
+    git(&c.repo, &["checkout", "-q", "feature"]);
+    let tip = git(&c.repo, &["rev-parse", &base]);
+    assert_eq!(
+        walk_stop(&c, &base),
+        Some(CleanUpdateError::BaseContainsHead {
+            head: head.clone(),
+            base: tip,
+        })
+    );
+    let refused = merge_with(&host, &c, &base);
+    assert!(
+        rules(&refused).contains(&"merge-gate"),
+        "{:?}",
+        refused.violations
+    );
+    assert_eq!(c.state(), Phase::PrOpen);
+}

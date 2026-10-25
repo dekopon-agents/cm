@@ -306,7 +306,9 @@ one `merge-gate` violation per gap, unless at the PR's head (GitHub's, via `gh a
 A clean update from the base branch needs no new review, only green CI on the new head: (a) and
 (b) may hold instead at an earlier reviewed head H1 when every commit on the first-parent chain
 from H1 to the head is a merge whose second parent is on the base branch (GitHub's base tip, else
-`origin/HEAD`) and whose `git show --remerge-diff` is empty. A merge that resolved conflicts, or
+`origin/HEAD`) and whose `git show --remerge-diff` is empty. When the base tip already contains
+the head (the PR has merged into it), no merge can be told apart from the PR's own commits, so
+the walk does not run. A merge that resolved conflicts, or
 any other commit, needs its own review. The rule only skips a review nobody did: the walk stops
 at the first commit, from the head back, that has a recorded review or a finished receipt, and
 that commit must clear (a) and (b) itself; an earlier ACCEPT never outweighs it. The walk runs in `--repo` or the step's worktree (for

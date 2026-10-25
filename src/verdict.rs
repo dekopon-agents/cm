@@ -1511,6 +1511,9 @@ pub enum CleanUpdateError {
     Conflicts { commit: String },
     /// The walk passed this many clean updates without reaching a reviewed commit.
     TooLong { limit: usize },
+    /// The base tip already contains the head (the PR merged into it, or it is the base), so
+    /// "on the base branch" says nothing about the head's own commits; the walk does not run.
+    BaseContainsHead { head: String, base: String },
 }
 
 fn short(sha: &str) -> &str {
@@ -1542,6 +1545,11 @@ impl fmt::Display for CleanUpdateError {
                 short(commit)
             ),
             CleanUpdateError::TooLong { limit } => write!(f, "more than {limit} updates"),
+            CleanUpdateError::BaseContainsHead { head, base } => write!(
+                f,
+                "the base {base} already contains {}, so no merge can be told apart from the PR's own commits",
+                short(head)
+            ),
         }
     }
 }
@@ -1637,32 +1645,39 @@ pub fn merge_gaps(
     };
     let mut gaps = gaps;
     let mut why = CleanUpdateError::TooLong { limit: MAX_UPDATES };
-    for _ in 0..MAX_UPDATES {
-        match clean_update(repo, &at, base) {
-            Ok(parent) => at = parent,
-            Err(reason) => {
-                why = reason;
-                break;
+    if is_ancestor(repo, &at, base) {
+        why = CleanUpdateError::BaseContainsHead {
+            head: at.clone(),
+            base: base.to_owned(),
+        };
+    } else {
+        for _ in 0..MAX_UPDATES {
+            match clean_update(repo, &at, base) {
+                Ok(parent) => at = parent,
+                Err(reason) => {
+                    why = reason;
+                    break;
+                }
             }
-        }
-        if reviewed_at(&at) {
-            let earlier = gaps_at(&at);
-            if earlier.is_empty() {
+            if reviewed_at(&at) {
+                let earlier = gaps_at(&at);
+                if earlier.is_empty() {
+                    return Ok(Cleared {
+                        gaps: Vec::new(),
+                        reviewed: Some(at),
+                        stop: None,
+                    });
+                }
+                gaps.push(format!(
+                    "the nearest reviewed commit before {head}, {at}, joined to it by clean updates, does not clear: {}",
+                    earlier.join("; ")
+                ));
                 return Ok(Cleared {
-                    gaps: Vec::new(),
-                    reviewed: Some(at),
+                    gaps,
+                    reviewed: None,
                     stop: None,
                 });
             }
-            gaps.push(format!(
-                "the nearest reviewed commit before {head}, {at}, joined to it by clean updates, does not clear: {}",
-                earlier.join("; ")
-            ));
-            return Ok(Cleared {
-                gaps,
-                reviewed: None,
-                stop: None,
-            });
         }
     }
     let step = full_name(target);
