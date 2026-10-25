@@ -498,7 +498,23 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
     for name in &run.dirty {
         write_unit(&root.join(name), &run.units[name])?;
     }
-    store::write_json(&plan::pulls_path(root), &run.open)?;
+    let mut open = std::mem::take(&mut run.open);
+    if let Ok(seen) = store::read_json::<BTreeMap<String, plan::Observed>>(&plan::pulls_path(root))
+    {
+        // A PR GitHub could not answer for keeps what the last sync saw, stamp and all, while
+        // its step still rests at pr-open on it.
+        for (url, observed) in seen {
+            let failed = !matches!(run.reads.pulls.get(&url), Some(Ok(_)));
+            let current = plan::step(&run.units, &observed.target).is_some_and(|step| {
+                step.track.state == Phase::PrOpen
+                    && step.track.evidence.pr.as_deref() == Some(url.as_str())
+            });
+            if failed && current {
+                open.entry(url).or_insert(observed);
+            }
+        }
+    }
+    store::write_json(&plan::pulls_path(root), &open)?;
     let mut outcome = Outcome::refused(std::mem::take(&mut run.violations));
     if !run.moves.is_empty() {
         let body: String = run

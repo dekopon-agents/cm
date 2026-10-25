@@ -2,9 +2,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use cm::commands::{self, Declaration, MergeGate, Remote};
-use cm::forge::{CheckState, CommitSha, Forge, ForgeError, GithubRepo, Pull, PullState, TagName};
+use cm::forge::{
+    CheckState, CommitSha, Forge, ForgeError, Gh, GithubRepo, Pull, PullState, TagName, ci_green,
+};
 use cm::host::Host;
 use cm::lint::lint;
 use cm::outcome::Outcome;
@@ -14,6 +17,9 @@ use cm::store::{self, parse_target};
 use cm::sync::sync;
 use cm::verdict;
 use jiff::Timestamp;
+
+#[allow(dead_code)]
+mod support;
 
 struct Fake {
     now: Timestamp,
@@ -201,14 +207,29 @@ impl Campaign {
     }
 
     fn receipt(&self, dir: &str, head: &str, model: &str, effort: &str) {
-        let receipt = serde_json::json!({
+        self.receipt_with(dir, head, model, effort, |_| {});
+    }
+
+    /// An `astra-review.sh collect` receipt for a review that happened, changed by `edit`.
+    fn receipt_with(
+        &self,
+        dir: &str,
+        head: &str,
+        model: &str,
+        effort: &str,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let mut receipt = serde_json::json!({
             "repo": "o/r",
             "pr": 7,
             "head": head,
             "requested": {"model": "gpt-6-astra", "effort": "xhigh"},
             "effective": {"model": model, "effort": effort, "source": "harness thread/read"},
+            "thread_fresh": {"forkedFromId": null, "parentThreadId": null, "turns_in_thread": 1},
+            "turn": {"status": "completed", "error": null},
             "verdict": "ACCEPT",
         });
+        edit(&mut receipt);
         self.write(
             &format!("{STEP}/evidence/{dir}/receipt.json"),
             &serde_json::to_string_pretty(&receipt).unwrap(),
@@ -771,4 +792,220 @@ fn sync_holds_a_codex_merge_at_pr_open_until_its_gate_holds() {
     let moved = sync(&host, &merged, &c.root).unwrap();
     assert!(moved.ok(), "{:?}", moved.violations);
     assert_eq!(c.state(), Phase::Merged);
+}
+
+#[test]
+fn a_receipt_counts_only_for_a_review_that_happened_and_was_recorded() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let head = c.head();
+    let green = FakeForge::open(&head, &[("fmt, clippy, test", "success")]);
+    let gate = MergeGate {
+        forge: Some(&green),
+        ..MergeGate::default()
+    };
+    let claude = c.report("claude", &head, &[], "ACCEPT");
+    assert!(record(&host, &c, &claude, "claude").ok());
+    for (dir, edit) in [
+        ("failed", "/turn/status"),
+        ("forked", "/thread_fresh/forkedFromId"),
+        ("child", "/thread_fresh/parentThreadId"),
+        ("long", "/thread_fresh/turns_in_thread"),
+    ] {
+        c.receipt_with(dir, &head, "gpt-6-astra", "xhigh", |receipt| {
+            *receipt.pointer_mut(edit).unwrap() = match edit {
+                "/turn/status" => "failed".into(),
+                "/thread_fresh/turns_in_thread" => 2.into(),
+                _ => "thread-0".into(),
+            };
+        });
+    }
+    let refused = c.merge(&host, &gate);
+    assert_eq!(
+        rules(&refused),
+        vec!["merge-gate"],
+        "{:?}",
+        refused.violations
+    );
+    let message = &refused.violations[0].message;
+    for why in [
+        "turn not completed",
+        "thread forked or has a parent",
+        "thread holds other than one turn",
+    ] {
+        assert!(message.contains(why), "{why}: {message}");
+    }
+
+    // Astra's FIX REQUIRED receipt with only Claude's ACCEPT recorded does not merge.
+    c.receipt_with("astra-review-7", &head, "gpt-6-astra", "xhigh", |receipt| {
+        receipt["verdict"] = "FIX REQUIRED".into();
+    });
+    let unrecorded = c.merge(&host, &gate);
+    assert_eq!(rules(&unrecorded), vec!["merge-gate"]);
+    assert!(
+        unrecorded.violations[0].message.contains(
+            "it is not recorded; `cm review record 01-a/u/S1 01-a/u/S1/evidence/astra-review-7/report.md --reviewer astra`"
+        ),
+        "{:?}",
+        unrecorded.violations
+    );
+    let astra = c.report(
+        "astra",
+        &head,
+        &["F1 | contract | introduced | src/lib.rs:1 | broken"],
+        "FIX REQUIRED",
+    );
+    assert!(record(&host, &c, &astra, "astra").ok());
+    let blocked = c.merge(&host, &gate);
+    assert_eq!(rules(&blocked), vec!["merge-gate"]);
+    assert!(blocked.violations[0].message.contains("R2.F1 unresolved"));
+    let ruling = c.write("ruling.md", "Coordinator: F1 is out of scope.\n");
+    assert!(
+        verdict::resolve(&host, &c.root, &target(), "R2.F1", "ruling.md", &ruling)
+            .unwrap()
+            .ok()
+    );
+    assert!(c.merge(&host, &gate).ok());
+}
+
+#[test]
+fn a_malformed_review_number_names_no_finding() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let report = c.report(
+        "r1",
+        &c.head(),
+        &[
+            "F1 | contract | introduced | src/lib.rs:1 | broken",
+            "F2 | taste | introduced | - | a nit",
+        ],
+        "FIX REQUIRED",
+    );
+    assert!(record(&host, &c, &report, "astra").ok());
+    for id in ["Rbogus.F2", "R.F2", "X1.F2"] {
+        assert_eq!(
+            rules(&verdict::close_followup(&host, &c.root, id, "x").unwrap()),
+            vec!["finding-unknown"],
+            "{id}"
+        );
+    }
+    for id in ["Rbogus.F1", "R1x.F1"] {
+        assert_eq!(
+            rules(
+                &verdict::resolve(
+                    &host,
+                    &c.root,
+                    &target(),
+                    id,
+                    "abcdef1",
+                    Path::new("abcdef1")
+                )
+                .unwrap()
+            ),
+            vec!["finding-unknown"],
+            "{id}"
+        );
+    }
+    let ledger = verdict::load(&c.root).unwrap();
+    assert!(
+        ledger.reviews[0]
+            .findings
+            .iter()
+            .all(|logged| logged.resolution.is_none() && logged.closed.is_none())
+    );
+}
+
+#[test]
+fn ci_reads_every_page_of_checks_and_refuses_a_short_one() {
+    let runs = |range: std::ops::RangeInclusive<u32>, conclusion: &str| {
+        range
+            .map(|n| {
+                format!(r#"{{"name":"c{n}","status":"completed","conclusion":"{conclusion}"}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let gh = support::FakeGh::new(&format!(
+        r#"case "$2" in
+  */check-runs\?per_page=100\&page=1) echo '{{"total_count":101,"check_runs":[{}]}}' ;;
+  */check-runs\?per_page=100\&page=2) echo '{{"total_count":101,"check_runs":[{}]}}' ;;
+  */status\?per_page=100\&page=1) echo '{{"total_count":0,"statuses":[]}}' ;;
+  *) exit 1 ;;
+esac
+"#,
+        runs(1..=100, "success"),
+        runs(101..=101, "failure"),
+    ));
+    let forge = Gh {
+        program: gh.program(),
+        timeout: Duration::from_secs(10),
+    };
+    let repo: GithubRepo = "o/r".parse().unwrap();
+    let checks = forge.checks(&repo, &CommitSha::new("abc")).unwrap();
+    assert_eq!(checks.len(), 101);
+    assert!(!ci_green(&checks));
+    assert_eq!(checks[100].state, "failure");
+
+    let short = support::FakeGh::new(
+        r#"case "$2" in
+  */check-runs\?per_page=100\&page=1) echo '{"total_count":101,"check_runs":[]}' ;;
+  *) echo '{"total_count":0,"statuses":[]}' ;;
+esac
+"#,
+    );
+    let forge = Gh {
+        program: short.program(),
+        timeout: Duration::from_secs(10),
+    };
+    assert_eq!(
+        forge.checks(&repo, &CommitSha::new("abc")),
+        Err(ForgeError::Json)
+    );
+    let broken = support::FakeGh::new(
+        r#"case "$2" in
+  */check-runs\?per_page=100\&page=1) echo '{"total_count":101,"check_runs":[{"name":"a","status":"completed","conclusion":"success"}]}' ;;
+  *) exit 1 ;;
+esac
+"#,
+    );
+    let forge = Gh {
+        program: broken.program(),
+        timeout: Duration::from_secs(10),
+    };
+    assert_eq!(
+        forge.checks(&repo, &CommitSha::new("abc")),
+        Err(ForgeError::Exit(Some(1)))
+    );
+}
+
+#[test]
+fn a_failed_sync_keeps_the_last_dirty_observation() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let dirty = FakeForge {
+        mergeable: "dirty",
+        ..FakeForge::open(&c.head(), &[])
+    };
+    assert!(sync(&host, &dirty, &c.root).unwrap().ok());
+    let later = at("2026-10-25T07:00:00Z");
+    let down = FakeForge {
+        down: true,
+        ..FakeForge::open(&c.head(), &[])
+    };
+    let failed = sync(&later, &down, &c.root).unwrap();
+    assert_eq!(rules(&failed), vec!["sync-unknown"]);
+    assert_eq!(
+        failed.fields["dirty"][0]["observed_at"],
+        "2026-10-25T06:00Z"
+    );
+    let next = plan::next_at(&c.root, None, None, later.now).unwrap();
+    assert_eq!(next.fields["dirty"][0]["target"], STEP);
+    let clean = FakeForge::open(&c.head(), &[]);
+    assert!(sync(&later, &clean, &c.root).unwrap().ok());
+    assert_eq!(
+        plan::next_at(&c.root, None, None, later.now)
+            .unwrap()
+            .fields["dirty"],
+        serde_json::json!([])
+    );
 }

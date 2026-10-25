@@ -230,7 +230,34 @@ impl Default for Gh {
     }
 }
 
+/// Pages a list endpoint reads, 100 items each; more than this many pages is an error.
+const MAX_PAGES: usize = 50;
+
 impl Gh {
+    /// Every item of a paginated list endpoint whose pages report `total_count`: page after page
+    /// until the total is read. A page that cannot be read, or that ends the list short of its
+    /// total, is an error, never a shorter list.
+    fn pages<P: DeserializeOwned, T>(
+        &self,
+        path: &str,
+        split: impl Fn(P) -> (usize, Vec<T>),
+    ) -> Result<Vec<T>, ForgeError> {
+        let mut out = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let (total, items) =
+                split(self.json(&["api", &format!("{path}?per_page=100&page={page}")])?);
+            let empty = items.is_empty();
+            out.extend(items);
+            if out.len() >= total {
+                return Ok(out);
+            }
+            if empty {
+                return Err(ForgeError::Json);
+            }
+        }
+        Err(ForgeError::Json)
+    }
+
     fn json<T: DeserializeOwned>(&self, args: &[&str]) -> Result<T, ForgeError> {
         let mut child = Command::new(&self.program)
             .args(args)
@@ -312,6 +339,7 @@ impl Forge for Gh {
     fn checks(&self, repo: &GithubRepo, sha: &CommitSha) -> Result<Vec<CheckState>, ForgeError> {
         #[derive(Deserialize)]
         struct Runs {
+            total_count: usize,
             check_runs: Vec<Run>,
         }
         #[derive(Deserialize)]
@@ -322,6 +350,7 @@ impl Forge for Gh {
         }
         #[derive(Deserialize)]
         struct Combined {
+            total_count: usize,
             statuses: Vec<Status>,
         }
         #[derive(Deserialize)]
@@ -329,22 +358,22 @@ impl Forge for Gh {
             context: String,
             state: String,
         }
-        let runs: Runs = self.json(&[
-            "api",
-            &format!("repos/{repo}/commits/{sha}/check-runs?per_page=100"),
-        ])?;
-        let combined: Combined = self.json(&[
-            "api",
-            &format!("repos/{repo}/commits/{sha}/status?per_page=100"),
-        ])?;
-        let runs = runs.check_runs.into_iter().map(|run| CheckState {
+        let runs = self.pages(
+            &format!("repos/{repo}/commits/{sha}/check-runs"),
+            |page: Runs| (page.total_count, page.check_runs),
+        )?;
+        let statuses = self.pages(
+            &format!("repos/{repo}/commits/{sha}/status"),
+            |page: Combined| (page.total_count, page.statuses),
+        )?;
+        let runs = runs.into_iter().map(|run| CheckState {
             state: match (run.status.as_str(), run.conclusion) {
                 ("completed", Some(conclusion)) => conclusion.to_lowercase(),
                 (status, _) => status.to_lowercase(),
             },
             name: run.name,
         });
-        let statuses = combined.statuses.into_iter().map(|status| CheckState {
+        let statuses = statuses.into_iter().map(|status| CheckState {
             name: status.context,
             state: status.state.to_lowercase(),
         });

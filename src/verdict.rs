@@ -35,6 +35,8 @@ pub const SCOPE_HEADING: &str = "## Coordinator scope and rulings";
 pub const THIRD_FIX: &str = "third-fix";
 pub const ASTRA_MODEL: &str = "gpt-6-astra";
 pub const ASTRA_EFFORT: &str = "xhigh";
+/// The `--reviewer` kind of the review an Astra receipt records.
+pub const ASTRA_REVIEWER: &str = "astra";
 const RECEIPT: &str = "receipt.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,10 +191,144 @@ fn fence(line: &str) -> Option<(String, &str)> {
     (count >= 3).then(|| (marker.to_string().repeat(count), trimmed[count..].trim()))
 }
 
+/// One problem with a report's `cm-review` block, at its 1-based line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockError {
+    /// The report has no `cm-review` block.
+    Missing {
+        line: usize,
+    },
+    /// The report holds `count` `cm-review` blocks; `line` is where the second opens.
+    Several {
+        line: usize,
+        count: usize,
+    },
+    Unclosed {
+        line: usize,
+    },
+    /// Another fenced block opens after the `cm-review` block.
+    FenceAfter {
+        line: usize,
+    },
+    /// Text other than one verdict line follows the block.
+    TextAfter {
+        line: usize,
+    },
+    SecondHead {
+        line: usize,
+    },
+    NoHead {
+        line: usize,
+    },
+    Sha {
+        line: usize,
+        sha: String,
+    },
+    /// A line that is neither `head:` nor a five-cell finding.
+    Shape {
+        line: usize,
+        text: String,
+    },
+    Id {
+        line: usize,
+        id: String,
+    },
+    DuplicateId {
+        line: usize,
+        id: String,
+    },
+    Type {
+        line: usize,
+        kind: String,
+    },
+    Origin {
+        line: usize,
+        origin: String,
+    },
+    Location {
+        line: usize,
+        at: String,
+    },
+    EmptySummary {
+        line: usize,
+    },
+}
+
+impl BlockError {
+    pub fn line(&self) -> usize {
+        match self {
+            BlockError::Missing { line }
+            | BlockError::Several { line, .. }
+            | BlockError::Unclosed { line }
+            | BlockError::FenceAfter { line }
+            | BlockError::TextAfter { line }
+            | BlockError::SecondHead { line }
+            | BlockError::NoHead { line }
+            | BlockError::Sha { line, .. }
+            | BlockError::Shape { line, .. }
+            | BlockError::Id { line, .. }
+            | BlockError::DuplicateId { line, .. }
+            | BlockError::Type { line, .. }
+            | BlockError::Origin { line, .. }
+            | BlockError::Location { line, .. }
+            | BlockError::EmptySummary { line } => *line,
+        }
+    }
+}
+
+impl fmt::Display for BlockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BlockError::Missing { .. } => write!(
+                f,
+                "the report has no ```{BLOCK} block; a review report ends with one"
+            ),
+            BlockError::Several { count, .. } => write!(
+                f,
+                "the report holds {count} ```{BLOCK} blocks; exactly one ends the report"
+            ),
+            BlockError::Unclosed { .. } => write!(f, "the ```{BLOCK} block is never closed"),
+            BlockError::FenceAfter { .. } => write!(
+                f,
+                "a fenced block follows the ```{BLOCK} block, which ends the report"
+            ),
+            BlockError::TextAfter { .. } => write!(
+                f,
+                "text follows the ```{BLOCK} block; only the final ACCEPT or FIX REQUIRED line may"
+            ),
+            BlockError::SecondHead { .. } => f.write_str("a second `head:` line"),
+            BlockError::NoHead { .. } => {
+                write!(f, "the ```{BLOCK} block names no `head: <sha>`")
+            }
+            BlockError::Sha { sha, .. } => write!(f, "`{sha}` is not a commit SHA"),
+            BlockError::Shape { text, .. } => write!(
+                f,
+                "`{text}` is not `head: <sha>` or `<id> | <type> | <origin> | <file:line> | <summary>`"
+            ),
+            BlockError::Id { id, .. } => {
+                write!(f, "`{id}` is not an id of letters, digits, `-` and `_`")
+            }
+            BlockError::DuplicateId { id, .. } => write!(f, "a second finding `{id}`"),
+            BlockError::Type { kind, .. } => {
+                write!(f, "the type `{kind}` is not contract, guideline or taste")
+            }
+            BlockError::Origin { origin, .. } => write!(
+                f,
+                "the origin `{origin}` is not introduced, exposed or inherited"
+            ),
+            BlockError::Location { at, .. } => write!(
+                f,
+                "`{at}` is not <file>:<line>, <file>:<start>-<end> or `-`"
+            ),
+            BlockError::EmptySummary { .. } => f.write_str("the summary is empty"),
+        }
+    }
+}
+
 /// Parses the `cm-review` block that ends a report. The block is the report's last fenced block;
 /// only blank lines and the final `ACCEPT` or `FIX REQUIRED` line may follow it. Every problem is
 /// listed with its 1-based line.
-pub fn parse_report(text: &str) -> Result<Block, Vec<(usize, String)>> {
+pub fn parse_report(text: &str) -> Result<Block, Vec<BlockError>> {
     let lines: Vec<&str> = text.lines().collect();
     // (info, first body line, closing fence line) for every fenced block.
     let mut blocks: Vec<(String, usize, Option<usize>)> = Vec::new();
@@ -228,35 +364,27 @@ pub fn parse_report(text: &str) -> Result<Block, Vec<(usize, String)>> {
         .collect();
     let index = match ours[..] {
         [] => {
-            return Err(vec![(
-                lines.len().max(1),
-                format!("the report has no ```{BLOCK} block; a review report ends with one"),
-            )]);
+            return Err(vec![BlockError::Missing {
+                line: lines.len().max(1),
+            }]);
         }
         [one] => one,
         _ => {
-            return Err(vec![(
-                blocks[ours[1]].1,
-                format!(
-                    "the report holds {} ```{BLOCK} blocks; exactly one ends the report",
-                    ours.len()
-                ),
-            )]);
+            return Err(vec![BlockError::Several {
+                line: blocks[ours[1]].1,
+                count: ours.len(),
+            }]);
         }
     };
     let (_, first, close) = &blocks[index];
     let mut errors = Vec::new();
     let Some(close) = *close else {
-        return Err(vec![(
-            *first,
-            format!("the ```{BLOCK} block is never closed"),
-        )]);
+        return Err(vec![BlockError::Unclosed { line: *first }]);
     };
     if index + 1 != blocks.len() {
-        errors.push((
-            blocks[index + 1].1,
-            format!("a fenced block follows the ```{BLOCK} block, which ends the report"),
-        ));
+        errors.push(BlockError::FenceAfter {
+            line: blocks[index + 1].1,
+        });
     }
     let after: Vec<(usize, &str)> = lines[close + 1..]
         .iter()
@@ -268,12 +396,7 @@ pub fn parse_report(text: &str) -> Result<Block, Vec<(usize, String)>> {
         [] => None,
         [(_, line)] if verdict_line(line).is_some() => verdict_line(line),
         [(number, _), ..] => {
-            errors.push((
-                number,
-                format!(
-                    "text follows the ```{BLOCK} block; only the final ACCEPT or FIX REQUIRED line may"
-                ),
-            ));
+            errors.push(BlockError::TextAfter { line: number });
             None
         }
     };
@@ -289,9 +412,12 @@ pub fn parse_report(text: &str) -> Result<Block, Vec<(usize, String)>> {
         if let Some(sha) = line.strip_prefix("head:") {
             let sha = sha.trim();
             if head_line {
-                errors.push((number, "a second `head:` line".to_owned()));
+                errors.push(BlockError::SecondHead { line: number });
             } else if !is_sha(sha) {
-                errors.push((number, format!("`{sha}` is not a commit SHA")));
+                errors.push(BlockError::Sha {
+                    line: number,
+                    sha: sha.to_owned(),
+                });
             } else {
                 head = Some(sha.to_lowercase());
             }
@@ -300,47 +426,50 @@ pub fn parse_report(text: &str) -> Result<Block, Vec<(usize, String)>> {
         }
         let cells: Vec<&str> = line.splitn(5, '|').map(str::trim).collect();
         let [id, kind, origin, at, summary] = cells[..] else {
-            errors.push((
-                number,
-                format!(
-                    "`{line}` is not `head: <sha>` or `<id> | <type> | <origin> | <file:line> | <summary>`"
-                ),
-            ));
+            errors.push(BlockError::Shape {
+                line: number,
+                text: line.to_owned(),
+            });
             continue;
         };
         let mut fits = true;
-        let mut bad = |message: String| {
-            errors.push((number, message));
+        let mut bad = |error: BlockError| {
+            errors.push(error);
             fits = false;
         };
         if !is_id(id) {
-            bad(format!(
-                "`{id}` is not an id of letters, digits, `-` and `_`"
-            ));
+            bad(BlockError::Id {
+                line: number,
+                id: id.to_owned(),
+            });
         } else if findings.iter().any(|finding| finding.id == id) {
-            bad(format!("a second finding `{id}`"));
+            bad(BlockError::DuplicateId {
+                line: number,
+                id: id.to_owned(),
+            });
         }
         let kind = FindingType::parse(kind);
         if kind.is_none() {
-            bad(format!(
-                "the type `{}` is not contract, guideline or taste",
-                cells[1]
-            ));
+            bad(BlockError::Type {
+                line: number,
+                kind: cells[1].to_owned(),
+            });
         }
         let origin = Origin::parse(origin);
         if origin.is_none() {
-            bad(format!(
-                "the origin `{}` is not introduced, exposed or inherited",
-                cells[2]
-            ));
+            bad(BlockError::Origin {
+                line: number,
+                origin: cells[2].to_owned(),
+            });
         }
         if !is_location(at) {
-            bad(format!(
-                "`{at}` is not <file>:<line>, <file>:<start>-<end> or `-`"
-            ));
+            bad(BlockError::Location {
+                line: number,
+                at: at.to_owned(),
+            });
         }
         if summary.is_empty() {
-            bad("the summary is empty".to_owned());
+            bad(BlockError::EmptySummary { line: number });
         }
         if let (true, Some(kind), Some(origin)) = (fits, kind, origin) {
             findings.push(Finding {
@@ -353,10 +482,7 @@ pub fn parse_report(text: &str) -> Result<Block, Vec<(usize, String)>> {
         }
     }
     if !head_line {
-        errors.push((
-            *first,
-            format!("the ```{BLOCK} block names no `head: <sha>`"),
-        ));
+        errors.push(BlockError::NoHead { line: *first });
     }
     match (head, errors.is_empty()) {
         (Some(head), true) => Ok(Block {
@@ -542,8 +668,8 @@ pub fn record(
         Ok(text) => match parse_report(&text) {
             Ok(block) => Some((block, text)),
             Err(errors) => {
-                violations.extend(errors.into_iter().map(|(line, message)| {
-                    Violation::new(&shown, "review-block", message).at(line)
+                violations.extend(errors.into_iter().map(|error| {
+                    Violation::new(&shown, "review-block", error.to_string()).at(error.line())
                 }));
                 None
             }
@@ -785,7 +911,7 @@ fn find<'a>(
     id: &str,
 ) -> Option<(String, &'a mut Logged)> {
     let (number, bare) = match id.split_once('.') {
-        Some((review, bare)) => (review.strip_prefix('R')?.parse::<u32>().ok(), bare),
+        Some((review, bare)) => (Some(review.strip_prefix('R')?.parse::<u32>().ok()?), bare),
         None => (None, id),
     };
     let review = verdicts.reviews.iter_mut().rev().find(|review| {
@@ -1142,8 +1268,35 @@ fn same_commit(a: &str, b: &str) -> bool {
     a.len().min(b.len()) >= 7 && (a.starts_with(&b) || b.starts_with(&a))
 }
 
-/// Why the step's evidence does not hold an Astra receipt for `head` of `pr`; `None` when it does.
-fn astra_gap(root: &Path, target: &Target, pr: Option<&str>, head: &str) -> Option<String> {
+/// Why a receipt does not show a review that happened, as `astra-review.sh collect` judges it
+/// before printing REVIEW_BLOCKED: the turn completed in a fresh, unforked one-turn thread.
+fn unfinished(receipt: &Value) -> Option<&'static str> {
+    let null = |pointer: &str| receipt.pointer(pointer) == Some(&Value::Null);
+    if receipt.pointer("/turn/status").and_then(Value::as_str) != Some("completed") {
+        Some("turn not completed")
+    } else if !null("/thread_fresh/forkedFromId") || !null("/thread_fresh/parentThreadId") {
+        Some("thread forked or has a parent")
+    } else if receipt
+        .pointer("/thread_fresh/turns_in_thread")
+        .and_then(Value::as_u64)
+        != Some(1)
+    {
+        Some("thread holds other than one turn")
+    } else {
+        None
+    }
+}
+
+/// Why the step does not hold an Astra review of `head` of `pr`: a receipt for a review that
+/// happened at that head with effective gpt-6-astra/xhigh, and that review recorded with
+/// `--reviewer astra` (whose verdict (b) then holds to ACCEPT or resolved). `None` when it does.
+fn astra_gap(
+    root: &Path,
+    target: &Target,
+    verdicts: &Verdicts,
+    pr: Option<&str>,
+    head: &str,
+) -> Option<String> {
     let mut found = Vec::new();
     receipts(&evidence_dir(root, target), &mut found);
     let repo = pr.and_then(GithubRepo::of_pr).map(|repo| repo.to_string());
@@ -1171,20 +1324,35 @@ fn astra_gap(root: &Path, target: &Target, pr: Option<&str>, head: &str) -> Opti
                 .get("pr")
                 .is_none_or(|found| found.as_u64() == Some(number))
         });
-        if model == Some(ASTRA_MODEL)
+        let matches = model == Some(ASTRA_MODEL)
             && effort == Some(ASTRA_EFFORT)
             && at.is_some_and(|at| same_commit(at, head))
             && same_repo
-            && same_pr
-        {
-            return None;
+            && same_pr;
+        match (matches, unfinished(&receipt)) {
+            (true, None) => {
+                let step = full_name(target);
+                let recorded = verdicts.reviews.iter().any(|review| {
+                    review.step == step
+                        && review.at_head(head)
+                        && review.reviewer.as_deref() == Some(ASTRA_REVIEWER)
+                });
+                return (!recorded).then(|| {
+                    let report = path.with_file_name("report.md");
+                    format!(
+                        "{rel} records the Astra review at {head}, but it is not recorded; `cm review record {step} {} --reviewer {ASTRA_REVIEWER}`",
+                        relative(root, &report)
+                    )
+                });
+            }
+            (true, Some(why)) => seen.push(format!("{rel} (the review did not happen: {why})")),
+            (false, _) => seen.push(format!(
+                "{rel} (effective {}/{}, head {})",
+                model.unwrap_or("—"),
+                effort.unwrap_or("—"),
+                at.unwrap_or("—")
+            )),
         }
-        seen.push(format!(
-            "{rel} (effective {}/{}, head {})",
-            model.unwrap_or("—"),
-            effort.unwrap_or("—"),
-            at.unwrap_or("—")
-        ));
     }
     Some(if seen.is_empty() {
         format!(
@@ -1237,7 +1405,7 @@ pub fn merge_gaps(
     head: &str,
 ) -> Result<Vec<String>> {
     let verdicts = load(root)?;
-    Ok(astra_gap(root, target, pr, head)
+    Ok(astra_gap(root, target, &verdicts, pr, head)
         .into_iter()
         .chain(review_gap(&verdicts, &full_name(target), head))
         .collect())
@@ -1282,48 +1450,95 @@ mod tests {
 
     #[test]
     fn a_malformed_block_lists_every_problem() {
-        let first = |text: &str| parse_report(text).unwrap_err()[0].1.clone();
-        assert!(first("# Review\n\nACCEPT\n").contains("no ```cm-review"));
-        let errors = parse_report(&report(
-            "F1 | contract | new | src/a.rs | x\nF1 | flaw | introduced | src/a.rs:1 |\nhead: nope\n",
-            "",
-        ))
-        .unwrap_err();
-        let all: Vec<String> = errors
-            .iter()
-            .map(|(line, message)| format!("{line}: {message}"))
-            .collect();
-        let all = all.join("\n");
-        for needle in [
-            "origin `new`",
-            "`src/a.rs` is not",
-            "type `flaw`",
-            "summary is empty",
-            "8: `nope` is not a commit SHA",
-        ] {
-            assert!(all.contains(needle), "{needle}: {all}");
-        }
-        assert!(!all.contains("names no `head"), "{all}");
-        let trailing = parse_report(&report(
-            &format!("head: {SHA}\n"),
-            "\nMore prose.\nACCEPT\n",
-        ))
-        .unwrap_err();
-        assert_eq!(trailing[0].0, 9);
-        assert!(trailing[0].1.contains("text follows"), "{trailing:?}");
-        assert!(first(&format!("```{BLOCK}\nhead: {SHA}\n")).contains("never closed"));
+        let errors = |text: &str| parse_report(text).unwrap_err();
+        assert_eq!(
+            errors("# Review\n\nACCEPT\n"),
+            [BlockError::Missing { line: 3 }]
+        );
+        assert_eq!(
+            errors(&report(
+                "F1 | contract | new | src/a.rs | x\nF1 | flaw | introduced | src/a.rs:1 |\nhead: nope\nhead: abcdef1\n",
+                "",
+            )),
+            [
+                BlockError::Origin {
+                    line: 6,
+                    origin: "new".into()
+                },
+                BlockError::Location {
+                    line: 6,
+                    at: "src/a.rs".into()
+                },
+                BlockError::Type {
+                    line: 7,
+                    kind: "flaw".into()
+                },
+                BlockError::EmptySummary { line: 7 },
+                BlockError::Sha {
+                    line: 8,
+                    sha: "nope".into()
+                },
+                BlockError::SecondHead { line: 9 },
+            ]
+        );
+        assert_eq!(
+            errors(&report(
+                &format!(
+                    "head: {SHA}\nF1 | taste | introduced | - | x\nF1 | taste | introduced | - | y\nF 2 | taste | introduced | - | z\n"
+                ),
+                "",
+            )),
+            [
+                BlockError::DuplicateId {
+                    line: 8,
+                    id: "F1".into()
+                },
+                BlockError::Id {
+                    line: 9,
+                    id: "F 2".into()
+                },
+            ]
+        );
+        assert_eq!(
+            errors(&report("F1 | taste | introduced | - | x\n", "")),
+            [BlockError::NoHead { line: 5 }]
+        );
+        assert_eq!(
+            errors(&report(
+                &format!("head: {SHA}\n"),
+                "\nMore prose.\nACCEPT\n"
+            )),
+            [BlockError::TextAfter { line: 9 }]
+        );
+        assert_eq!(
+            errors(&format!(
+                "{}\n```sh\nls\n```\n",
+                report(&format!("head: {SHA}\n"), "")
+            )),
+            [
+                BlockError::FenceAfter { line: 9 },
+                BlockError::TextAfter { line: 9 }
+            ]
+        );
+        assert_eq!(
+            errors(&format!("```{BLOCK}\nhead: {SHA}\n")),
+            [BlockError::Unclosed { line: 1 }]
+        );
         let two = format!(
             "{}{}",
             report(&format!("head: {SHA}\n"), ""),
             report(&format!("head: {SHA}\n"), "")
         );
-        assert!(first(&two).contains("2 ```cm-review blocks"));
-        assert!(
-            first(&report(
+        assert_eq!(errors(&two), [BlockError::Several { line: 12, count: 2 }]);
+        assert_eq!(
+            errors(&report(
                 &format!("head: {SHA}\nF1 contract introduced\n"),
                 ""
-            ))
-            .contains("is not `head: <sha>`")
+            )),
+            [BlockError::Shape {
+                line: 7,
+                text: "F1 contract introduced".into()
+            }]
         );
     }
 
