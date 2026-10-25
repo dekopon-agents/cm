@@ -266,7 +266,18 @@ impl Track {
             | (Phase::Done, Finish::Shipped) => {}
         }
         let resting = self.resting();
-        if matches!(self.state, Phase::Blocked(_)) && to == resting {
+        let blocked = match self.state {
+            Phase::Blocked(_) => true,
+            Phase::Drafted
+            | Phase::Launched
+            | Phase::PrOpen
+            | Phase::Merged
+            | Phase::Released
+            | Phase::Deployed
+            | Phase::Done
+            | Phase::Superseded => false,
+        };
+        if blocked && to == resting {
             return Ok(());
         }
         let next = resting.successor();
@@ -292,8 +303,16 @@ impl Track {
 
     pub fn apply(&mut self, to: Phase, at: &str, evidence: &Evidence) {
         if let Phase::Blocked(_) = to {
-            if !matches!(self.state, Phase::Blocked(_)) {
-                self.blocked_from = Some(self.state.clone());
+            match self.state {
+                Phase::Blocked(_) => {}
+                Phase::Drafted
+                | Phase::Launched
+                | Phase::PrOpen
+                | Phase::Merged
+                | Phase::Released
+                | Phase::Deployed
+                | Phase::Done
+                | Phase::Superseded => self.blocked_from = Some(self.state.clone()),
             }
         } else {
             self.blocked_from = None;

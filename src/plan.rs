@@ -6,7 +6,7 @@ use anyhow::Result;
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
-use crate::forge::{GithubRepo, TagName};
+use crate::forge::{GithubRepo, MergeableState, TagName};
 use crate::limits;
 use crate::lint::unit_dirs;
 use crate::outcome::{Outcome, Violation};
@@ -300,7 +300,7 @@ pub struct Observed {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mergeable_state: Option<String>,
+    pub mergeable_state: Option<MergeableState>,
 }
 
 pub const PULLS: &str = "pulls.json";
@@ -316,7 +316,11 @@ pub fn dirty(root: &Path, units: &Units) -> Vec<(String, Observed)> {
     };
     seen.into_iter()
         .filter(|(url, observed)| {
-            observed.mergeable_state.as_deref() == Some("dirty")
+            let dirty = match observed.mergeable_state {
+                Some(MergeableState::Dirty) => true,
+                Some(MergeableState::Other(_)) | None => false,
+            };
+            dirty
                 && step(units, &observed.target).is_some_and(|step| {
                     step.track.state == Phase::PrOpen
                         && step.track.evidence.pr.as_deref() == Some(url.as_str())

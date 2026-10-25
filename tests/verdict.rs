@@ -80,7 +80,7 @@ impl Forge for FakeForge {
                 .then(|| CommitSha::new(self.head.clone())),
             head: Some(CommitSha::new(self.head.clone())),
             base: self.base.clone().map(CommitSha::new),
-            mergeable_state: Some(self.mergeable.to_owned()),
+            mergeable_state: Some(self.mergeable.to_owned().into()),
         })
     }
 
@@ -94,7 +94,7 @@ impl Forge for FakeForge {
             .iter()
             .map(|(name, state)| CheckState {
                 name: (*name).to_owned(),
-                state: (*state).to_owned(),
+                state: (*state).to_owned().into(),
             })
             .collect())
     }
@@ -268,13 +268,15 @@ impl Campaign {
             host,
             &self.root,
             &target(),
-            &Phase::Merged,
-            &Evidence {
-                sha: Some(self.head()),
-                ..Evidence::default()
+            commands::Advance {
+                to: &Phase::Merged,
+                given: &Evidence {
+                    sha: Some(self.head()),
+                    ..Evidence::default()
+                },
+                file: None,
+                repo: Some(&self.repo),
             },
-            None,
-            Some(&self.repo),
             gate,
         )
         .unwrap()
@@ -1437,13 +1439,10 @@ fn a_base_that_already_contains_the_head_takes_no_clean_update() {
     ];
     git(&c.repo, &[&merge[..], &["side"]].concat());
     let head = c.head();
-    // Before the PR lands in the base, the side merge is off base.
     assert!(matches!(
         walk_stop(&c, &base),
         Some(CleanUpdateError::OffBase { .. })
     ));
-    // Once the base holds the PR head (a merge-commit merge of the PR), nothing on the walk is
-    // told apart from the base: the walk does not run and the gate refuses.
     git(&c.repo, &["checkout", "-q", &base]);
     git(&c.repo, &[&merge[..], &["feature"]].concat());
     git(&c.repo, &["checkout", "-q", "feature"]);
