@@ -520,10 +520,12 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 host,
                 &root()?,
                 target,
-                state,
-                &evidence,
-                file.as_deref(),
-                repo.as_deref(),
+                commands::Advance {
+                    to: state,
+                    given: &evidence,
+                    file: file.as_deref(),
+                    repo: repo.as_deref(),
+                },
                 &gate,
             )
         }

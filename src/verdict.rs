@@ -1,11 +1,6 @@
-//! Computed review verdicts. A review report ends with a `cm-review` block naming the reviewed
-//! head and each finding's type and origin; `cm review record` parses it, computes the verdict
-//! (FIX REQUIRED iff a `contract` finding is `introduced` or `exposed`), copies the report under
-//! the step's evidence and keeps the finding in `.cm/verdicts.json`. The same ledger holds each
-//! blocking finding's resolution, which the codex merge gate reads, and each follow-up's status.
-
 use std::fmt;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -27,17 +22,12 @@ use crate::store::{
 };
 
 pub const VERDICTS: &str = "verdicts.json";
-/// The info string of the fenced block that ends a review report.
 pub const BLOCK: &str = "cm-review";
-/// Each step's scope and coordinator rulings, under its `evidence/`.
 pub const SCOPE: &str = "coordinator-scope.md";
-/// The heading `cm brief` prints above the scope file.
 pub const SCOPE_HEADING: &str = "## Coordinator scope and rulings";
-/// The reason a step's third FIX REQUIRED round blocks it with.
 pub const THIRD_FIX: &str = "third-fix";
 pub const ASTRA_MODEL: &str = "gpt-6-astra";
 pub const ASTRA_EFFORT: &str = "xhigh";
-/// The `--reviewer` kind of the review an Astra receipt records.
 pub const ASTRA_REVIEWER: &str = "astra";
 const RECEIPT: &str = "receipt.json";
 
@@ -123,9 +113,12 @@ pub struct Finding {
 }
 
 impl Finding {
-    /// Only an introduced or exposed contract finding blocks; everything else is a follow-up.
     pub fn blocks(&self) -> bool {
-        self.kind == FindingType::Contract && self.origin != Origin::Inherited
+        self.kind == FindingType::Contract
+            && match self.origin {
+                Origin::Introduced | Origin::Exposed => true,
+                Origin::Inherited => false,
+            }
     }
 }
 
@@ -733,7 +726,18 @@ pub fn record(
         unit.steps
             .get(target.step.as_deref().unwrap_or_default())
             .is_some_and(|step| {
-                !matches!(step.track.state, Phase::Blocked(_)) && !step.track.state.is_final()
+                let blocked = match step.track.state {
+                    Phase::Blocked(_) => true,
+                    Phase::Drafted
+                    | Phase::Launched
+                    | Phase::PrOpen
+                    | Phase::Merged
+                    | Phase::Released
+                    | Phase::Deployed
+                    | Phase::Done
+                    | Phase::Superseded => false,
+                };
+                !blocked && !step.track.state.is_final()
             })
     };
     let mut queued = None;
@@ -1264,7 +1268,6 @@ fn receipts(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Two SHAs name one commit when one, at least 7 long, prefixes the other.
 fn same_commit(a: &str, b: &str) -> bool {
     let (a, b) = (a.to_lowercase(), b.to_lowercase());
     a.len().min(b.len()) >= 7 && (a.starts_with(&b) || b.starts_with(&a))
@@ -1291,9 +1294,12 @@ fn unfinished(receipt: &Value) -> Option<&'static str> {
 
 /// The SHA-256 of a recorded review's report copy, lower-case hex, as `sha256sum` prints it.
 fn report_sha256(root: &Path, review: &Recorded) -> Option<String> {
-    let bytes = fs::read(root.join(review.report.as_str())).ok()?;
+    let mut report = fs::File::open(root.join(review.report.as_str())).ok()?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut report, &mut hasher).ok()?;
     Some(
-        Sha256::digest(&bytes)
+        hasher
+            .finalize()
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect(),
@@ -1333,8 +1339,9 @@ fn astra_gap(
     receipts(&evidence_dir(root, target), &mut found);
     let repo = pr.and_then(GithubRepo::of_pr).map(|repo| repo.to_string());
     let number = pr.and_then(|url| url.rsplit('/').next()?.parse::<u64>().ok());
+    let step = full_name(target);
+    let mut astra: Option<Vec<(&Recorded, Option<String>)>> = None;
     let mut seen = Vec::new();
-    // Every finished matching receipt at the head binds: each must have its report recorded.
     let mut finished = 0;
     let mut unbound = Vec::new();
     for path in &found {
@@ -1367,27 +1374,27 @@ fn astra_gap(
         match (matches, unfinished(&receipt)) {
             (true, None) => {
                 finished += 1;
-                let step = full_name(target);
                 let Some(want) = text_at("/report_sha256").map(str::to_lowercase) else {
                     unbound.push(format!(
                         "{rel} names no report_sha256, so no recorded report is bound to it"
                     ));
                     continue;
                 };
-                // The receipted report itself must be recorded: its copy hashes to the
-                // receipt's report_sha256, and (b) then holds that report's verdict.
-                let astra: Vec<&Recorded> = verdicts
-                    .reviews
-                    .iter()
-                    .filter(|review| {
-                        review.step == step
-                            && review.at_head(head)
-                            && review.reviewer.as_deref() == Some(ASTRA_REVIEWER)
-                    })
-                    .collect();
+                let astra = astra.get_or_insert_with(|| {
+                    verdicts
+                        .reviews
+                        .iter()
+                        .filter(|review| {
+                            review.step == step
+                                && review.at_head(head)
+                                && review.reviewer.as_deref() == Some(ASTRA_REVIEWER)
+                        })
+                        .map(|review| (review, report_sha256(root, review)))
+                        .collect()
+                });
                 if astra
                     .iter()
-                    .any(|review| report_sha256(root, review).as_deref() == Some(want.as_str()))
+                    .any(|(_, sha256)| sha256.as_deref() == Some(want.as_str()))
                 {
                     continue;
                 }
@@ -1401,7 +1408,7 @@ fn astra_gap(
                         "{rel} receipts a report with sha256 {want}, but no Astra review recorded at {head} ({}) is that report; `cm review record {step} {report} --reviewer {ASTRA_REVIEWER}`",
                         astra
                             .iter()
-                            .map(|review| review.id())
+                            .map(|(review, _)| review.id())
                             .collect::<Vec<_>>()
                             .join(", ")
                     )
@@ -1469,7 +1476,6 @@ pub struct Lineage<'a> {
     pub base: Option<&'a str>,
 }
 
-/// Commits the gate walks back from the head looking for a reviewed one.
 const MAX_UPDATES: usize = 100;
 
 fn git_out(repo: &Path, args: &[&str]) -> Option<String> {

@@ -181,7 +181,34 @@ pub struct Pull {
     /// The base branch's tip, as GitHub reports it.
     pub base: Option<CommitSha>,
     /// GitHub's `mergeable_state` (`clean`, `dirty`, `blocked`, `unknown`, …), lower case.
-    pub mergeable_state: Option<String>,
+    pub mergeable_state: Option<MergeableState>,
+}
+
+/// GitHub's `mergeable_state` as cm reads it; any value but `dirty` keeps its string, so it
+/// round-trips through `.cm/pulls.json` unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum MergeableState {
+    Dirty,
+    Other(String),
+}
+
+impl From<String> for MergeableState {
+    fn from(state: String) -> Self {
+        match state.as_str() {
+            "dirty" => MergeableState::Dirty,
+            _ => MergeableState::Other(state),
+        }
+    }
+}
+
+impl From<MergeableState> for String {
+    fn from(state: MergeableState) -> Self {
+        match state {
+            MergeableState::Dirty => "dirty".to_owned(),
+            MergeableState::Other(state) => state,
+        }
+    }
 }
 
 /// One check run or commit status on a commit, its state lower case: a check run's conclusion
@@ -189,16 +216,68 @@ pub struct Pull {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CheckState {
     pub name: String,
-    pub state: String,
+    pub state: Conclusion,
+}
+
+/// A check's state; every value but the three green ones keeps its string and is not green.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(into = "String")]
+pub enum Conclusion {
+    Success,
+    Neutral,
+    Skipped,
+    Other(String),
+}
+
+impl Conclusion {
+    fn as_str(&self) -> &str {
+        match self {
+            Conclusion::Success => "success",
+            Conclusion::Neutral => "neutral",
+            Conclusion::Skipped => "skipped",
+            Conclusion::Other(state) => state,
+        }
+    }
+}
+
+impl From<String> for Conclusion {
+    fn from(state: String) -> Self {
+        match state.as_str() {
+            "success" => Conclusion::Success,
+            "neutral" => Conclusion::Neutral,
+            "skipped" => Conclusion::Skipped,
+            _ => Conclusion::Other(state),
+        }
+    }
+}
+
+impl From<Conclusion> for String {
+    fn from(state: Conclusion) -> Self {
+        state.as_str().to_owned()
+    }
+}
+
+impl PartialEq<&str> for Conclusion {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl fmt::Display for Conclusion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl CheckState {
     pub fn green(&self) -> bool {
-        matches!(self.state.as_str(), "success" | "neutral" | "skipped")
+        match self.state {
+            Conclusion::Success | Conclusion::Neutral | Conclusion::Skipped => true,
+            Conclusion::Other(_) => false,
+        }
     }
 }
 
-/// CI is green on a commit when it reports at least one check and every one is green.
 pub fn ci_green(checks: &[CheckState]) -> bool {
     !checks.is_empty() && checks.iter().all(CheckState::green)
 }
@@ -337,7 +416,9 @@ impl Forge for Gh {
                 .map(CommitSha::new),
             head: rest.head.map(|head| CommitSha::new(head.sha)),
             base: rest.base.map(|base| CommitSha::new(base.sha)),
-            mergeable_state: rest.mergeable_state.map(|state| state.to_lowercase()),
+            mergeable_state: rest
+                .mergeable_state
+                .map(|state| state.to_lowercase().into()),
         })
     }
 
@@ -375,12 +456,13 @@ impl Forge for Gh {
             state: match (run.status.as_str(), run.conclusion) {
                 ("completed", Some(conclusion)) => conclusion.to_lowercase(),
                 (status, _) => status.to_lowercase(),
-            },
+            }
+            .into(),
             name: run.name,
         });
         let statuses = statuses.into_iter().map(|status| CheckState {
             name: status.context,
-            state: status.state.to_lowercase(),
+            state: status.state.to_lowercase().into(),
         });
         Ok(runs.chain(statuses).collect())
     }

@@ -1156,25 +1156,37 @@ pub fn advance(
         host,
         root,
         target,
-        to,
-        given,
-        file,
-        repo,
+        Advance {
+            to,
+            given,
+            file,
+            repo,
+        },
         &MergeGate::default(),
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy)]
+pub struct Advance<'a> {
+    pub to: &'a Phase,
+    pub given: &'a Evidence,
+    pub file: Option<&'a Path>,
+    pub repo: Option<&'a Path>,
+}
+
 pub fn advance_gated(
     host: &dyn Host,
     root: &Path,
     target: &Target,
-    to: &Phase,
-    given: &Evidence,
-    file: Option<&Path>,
-    repo: Option<&Path>,
+    advance: Advance,
     gate: &MergeGate,
 ) -> Result<Outcome> {
+    let Advance {
+        to,
+        given,
+        file,
+        repo,
+    } = advance;
     let full = match &target.step {
         Some(step) => format!("{}/{step}", target.unit),
         None => target.unit.clone(),
@@ -1510,9 +1522,18 @@ pub(crate) fn block_step(
     else {
         return Ok(None);
     };
-    if matches!(step.track.state, Phase::Blocked(_))
-        || step.track.check(&to, step.finish()).is_err()
-    {
+    let blocked = match step.track.state {
+        Phase::Blocked(_) => true,
+        Phase::Drafted
+        | Phase::Launched
+        | Phase::PrOpen
+        | Phase::Merged
+        | Phase::Released
+        | Phase::Deployed
+        | Phase::Done
+        | Phase::Superseded => false,
+    };
+    if blocked || step.track.check(&to, step.finish()).is_err() {
         return Ok(None);
     }
     let from = step.track.state.clone();
