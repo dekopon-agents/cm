@@ -14,20 +14,61 @@ pub fn first_difference(now: &str, then: &str) -> usize {
         + 1
 }
 
-fn is_fence(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+#[derive(Default)]
+struct Fences {
+    open: Option<(u8, usize)>,
+}
+
+impl Fences {
+    fn contains(&mut self, line: &str) -> bool {
+        let trimmed = line.trim_start_matches(' ');
+        if line.len() - trimmed.len() > 3 {
+            return self.open.is_some();
+        }
+        let bytes = trimmed.as_bytes();
+        let Some(&character) = bytes.first() else {
+            return self.open.is_some();
+        };
+        if character != b'`' && character != b'~' {
+            return self.open.is_some();
+        }
+        let length = bytes.iter().take_while(|byte| **byte == character).count();
+        let rest = &trimmed[length..];
+        match self.open {
+            Some((opener, minimum)) => {
+                if character == opener
+                    && length >= minimum
+                    && rest.trim_matches([' ', '\t']).is_empty()
+                {
+                    self.open = None;
+                }
+                true
+            }
+            None => {
+                if length >= 3 && (character != b'`' || !rest.contains('`')) {
+                    self.open = Some((character, length));
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn unterminated_fence(text: &str) -> bool {
+    let mut fences = Fences::default();
+    for line in text.lines() {
+        fences.contains(line);
+    }
+    fences.open.is_some()
 }
 
 pub fn headings(text: &str) -> Vec<Heading<'_>> {
-    let mut fenced = false;
+    let mut fences = Fences::default();
     let mut out = Vec::new();
     for (index, line) in text.lines().enumerate() {
-        if is_fence(line) {
-            fenced = !fenced;
-            continue;
-        }
-        if fenced {
+        if fences.contains(line) {
             continue;
         }
         let level = line.bytes().take_while(|byte| *byte == b'#').count();
@@ -43,14 +84,10 @@ pub fn headings(text: &str) -> Vec<Heading<'_>> {
 }
 
 pub fn code_spans(text: &str) -> Vec<(usize, &str)> {
-    let mut fenced = false;
+    let mut fences = Fences::default();
     let mut out = Vec::new();
     for (index, line) in text.lines().enumerate() {
-        if is_fence(line) {
-            fenced = !fenced;
-            continue;
-        }
-        if fenced {
+        if fences.contains(line) {
             continue;
         }
         let bytes = line.as_bytes();
