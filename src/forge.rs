@@ -219,7 +219,6 @@ pub struct CheckState {
     pub state: Conclusion,
 }
 
-/// A check's state; every value but the three green ones keeps its string and is not green.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(into = "String")]
 pub enum Conclusion {

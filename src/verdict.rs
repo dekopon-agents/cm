@@ -114,11 +114,11 @@ pub struct Finding {
 
 impl Finding {
     pub fn blocks(&self) -> bool {
-        self.kind == FindingType::Contract
-            && match self.origin {
-                Origin::Introduced | Origin::Exposed => true,
-                Origin::Inherited => false,
-            }
+        match (self.kind, self.origin) {
+            (FindingType::Contract, Origin::Introduced | Origin::Exposed) => true,
+            (FindingType::Contract, Origin::Inherited)
+            | (FindingType::Guideline | FindingType::Taste, _) => false,
+        }
     }
 }
 
@@ -189,7 +189,6 @@ fn fence(line: &str) -> Option<(String, &str)> {
 /// One problem with a report's `cm-review` block, at its 1-based line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockError {
-    /// The report has no `cm-review` block.
     Missing {
         line: usize,
     },
@@ -1504,9 +1503,13 @@ fn is_ancestor(repo: &Path, ancestor: &str, of: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CleanUpdateError {
     /// git could not read the commit, or its remerge diff, in the checkout.
-    Unreadable { commit: String, repo: PathBuf },
-    /// The commit is not a merge.
-    NotMerge { commit: String },
+    Unreadable {
+        commit: String,
+        repo: PathBuf,
+    },
+    NotMerge {
+        commit: String,
+    },
     /// The merge's second parent is not on the base branch.
     OffBase {
         commit: String,
@@ -1514,12 +1517,19 @@ pub enum CleanUpdateError {
         base: String,
     },
     /// The merge's `git show --remerge-diff` is not empty: it resolved conflicts.
-    Conflicts { commit: String },
+    Conflicts {
+        commit: String,
+    },
     /// The walk passed this many clean updates without reaching a reviewed commit.
-    TooLong { limit: usize },
+    TooLong {
+        limit: usize,
+    },
     /// The base tip already contains the head (the PR merged into it, or it is the base), so
     /// "on the base branch" says nothing about the head's own commits; the walk does not run.
-    BaseContainsHead { head: String, base: String },
+    BaseContainsHead {
+        head: String,
+        base: String,
+    },
 }
 
 fn short(sha: &str) -> &str {
