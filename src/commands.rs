@@ -1749,8 +1749,8 @@ pub fn amend(
         match After::parse(text, &target.unit) {
             Err(message) => violations.push(Violation::new(&full, "after-parse", message)),
             Ok(after) => {
-                if let Some(index) = next.after.iter().position(|gate| gate == &after) {
-                    next.after.remove(index);
+                if next.after.contains(&after) {
+                    next.after.retain(|gate| gate != &after);
                     changes.push(format!("- after: - {after}"));
                 } else {
                     violations.push(Violation::new(
@@ -1790,7 +1790,7 @@ pub fn amend(
             ));
         }
     }
-    if changes.is_empty() && violations.is_empty() {
+    if next == step && violations.is_empty() {
         violations.push(Violation::new(
             &full,
             "amend-empty",

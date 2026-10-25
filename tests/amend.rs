@@ -503,3 +503,44 @@ fn the_cli_removes_multiple_gates_from_a_launched_step() {
     assert!(step.after.is_empty());
     assert!(lint(&c.root).unwrap().ok());
 }
+
+#[test]
+fn replacing_a_duplicated_superseded_gate_permits_launch() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/old", Lane::Codex, &[]).ok());
+    assert!(declare(&host, &c, "01-a/u/replacement", Lane::Owner, &[]).ok());
+    assert!(declare(&host, &c, "01-a/u/consumer", Lane::Codex, &["old", "old"]).ok());
+    let why = note(&c, "superseded.md");
+    assert!(advance(&host, &c, "01-a/u/old", "superseded", Some(&why)).ok());
+    let done = note(&c, "done.md");
+    assert!(advance(&host, &c, "01-a/u/replacement", "done", Some(&done)).ok());
+    let amendment = Amendment {
+        drop_after: vec!["old".into()],
+        after: vec!["replacement".into()],
+        ..Amendment::default()
+    };
+    let amended = commands::amend(&host, &c.root, &target("01-a/u/consumer"), &amendment).unwrap();
+    assert!(amended.ok(), "{:?}", amended.violations);
+    let launched = launch(&host, &c, "01-a/u/consumer");
+    assert!(launched.ok(), "{:?}", launched.violations);
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    assert_eq!(journal.matches("- after: - 01-a/u/old\n").count(), 1);
+}
+
+#[test]
+fn dropping_and_readding_the_same_gate_refuses_an_unchanged_amendment() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/old", Lane::Codex, &[]).ok());
+    assert!(declare(&host, &c, "01-a/u/consumer", Lane::Codex, &["old"]).ok());
+    let before = fs::read(c.root.join("JOURNAL.md")).unwrap();
+    let amendment = Amendment {
+        drop_after: vec!["old".into()],
+        after: vec!["old".into()],
+        ..Amendment::default()
+    };
+    let refused = commands::amend(&host, &c.root, &target("01-a/u/consumer"), &amendment).unwrap();
+    assert_eq!(rules(&refused), vec!["amend-empty"]);
+    assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), before);
+}
