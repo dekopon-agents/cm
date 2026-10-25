@@ -376,7 +376,10 @@ impl<'a> Run<'a> {
             })
             .filter_map(|(target, step)| {
                 let release = Release::of_target(&target)?;
-                let repo = step.track.evidence.pr.as_deref().and_then(GithubRepo::of_pr)?;
+                let repo = match step.track.evidence.pr.as_deref() {
+                    Some(pr) => GithubRepo::of_pr(pr)?,
+                    None => step.github.clone()?,
+                };
                 let tag = step.track.evidence.tag.as_deref()?.parse().ok()?;
                 step.ships_from(&release, &repo).then(|| Shipped {
                     release,

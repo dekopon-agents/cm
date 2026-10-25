@@ -1662,6 +1662,7 @@ pub struct Amendment {
     pub study: bool,
     pub lane: Option<Lane>,
     pub after: Vec<String>,
+    pub drop_after: Vec<String>,
 }
 
 fn reaches(units: &Units, from: &str, to: &str) -> bool {
@@ -1680,8 +1681,6 @@ fn reaches(units: &Units, from: &str, to: &str) -> bool {
     false
 }
 
-/// Changes a declared step that has not opened its PR: marks it a study, moves its lane or adds a
-/// gate. Journaled like any move; a gate that would close a cycle is refused.
 pub fn amend(
     host: &dyn Host,
     root: &Path,
@@ -1746,38 +1745,56 @@ pub fn amend(
             step.lane.map_or("—", Lane::name)
         ));
     }
+    for text in &amendment.drop_after {
+        match After::parse(text, &target.unit) {
+            Err(message) => violations.push(Violation::new(&full, "after-parse", message)),
+            Ok(after) => {
+                if next.after.contains(&after) {
+                    next.after.retain(|gate| gate != &after);
+                    changes.push(format!("- after: - {after}"));
+                } else {
+                    violations.push(Violation::new(
+                        &full,
+                        "after-absent",
+                        format!("{full} does not have gate `{after}`"),
+                    ));
+                }
+            }
+        }
+    }
     for text in &amendment.after {
         match After::parse(text, &target.unit) {
             Err(message) => violations.push(Violation::new(&full, "after-parse", message)),
             Ok(after) if next.after.contains(&after) => {}
-            Ok(after) if plan::step(&units, &after.target()).is_none() => {
-                violations.push(Violation::new(
-                    &full,
-                    "after-unknown",
-                    format!("`{text}` names {}, which is not declared", after.target()),
-                ))
-            }
-            Ok(after) if reaches(&units, &after.target(), &full) => {
-                violations.push(Violation::new(
-                    &full,
-                    "after-cycle",
-                    format!(
-                        "{} already waits on {full}; the order would have a cycle",
-                        after.target()
-                    ),
-                ))
-            }
             Ok(after) => {
                 changes.push(format!("- after: + {after}"));
                 next.after.push(after);
             }
         }
     }
-    if changes.is_empty() && violations.is_empty() {
+    for after in &next.after {
+        if plan::step(&units, &after.target()).is_none() {
+            violations.push(Violation::new(
+                &full,
+                "after-unknown",
+                format!("`{after}` names {}, which is not declared", after.target()),
+            ));
+        } else if reaches(&units, &after.target(), &full) {
+            violations.push(Violation::new(
+                &full,
+                "after-cycle",
+                format!(
+                    "{} already waits on {full}; the order would have a cycle",
+                    after.target()
+                ),
+            ));
+        }
+    }
+    if next == step && violations.is_empty() {
         violations.push(Violation::new(
             &full,
             "amend-empty",
-            "nothing changes; pass --study, a new --lane or a new --after",
+            "nothing changes; pass --study, a new --lane, --after or --drop-after",
         ));
     }
     if !violations.is_empty() {
