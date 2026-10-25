@@ -5,14 +5,16 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::commands::{closed, write_unit};
-use crate::forge::{CommitSha, Forge, ForgeError, GithubRepo, Pull, PullState, TagName};
+use crate::forge::{
+    CheckState, CommitSha, Forge, ForgeError, GithubRepo, Pull, PullState, TagName, ci_green,
+};
 use crate::host::{Host, stamp};
 use crate::journal;
 use crate::outcome::{Outcome, Violation};
 use crate::plan::{self, Units};
 use crate::render;
-use crate::state::{Evidence, Move, Phase, Release, Step};
-use crate::store::{self, lock, write_atomic};
+use crate::state::{Evidence, Lane, Move, Phase, Release, Step};
+use crate::store::{self, lock, parse_target, write_atomic};
 
 pub const CARD: &str = "CARD.md";
 
@@ -30,6 +32,7 @@ struct Reads {
     pulls: BTreeMap<String, Read<Pull>>,
     tags: BTreeMap<(GithubRepo, TagName), Read<bool>>,
     contains: BTreeMap<(GithubRepo, TagName, CommitSha), Read<bool>>,
+    checks: BTreeMap<(GithubRepo, CommitSha), Read<Vec<CheckState>>>,
 }
 
 fn cached<K: Ord, T: Clone>(
@@ -54,6 +57,7 @@ struct Shipped {
 }
 
 struct Run<'a> {
+    root: &'a Path,
     forge: Option<&'a dyn Forge>,
     reads: Reads,
     at: String,
@@ -61,6 +65,7 @@ struct Run<'a> {
     dirty: BTreeSet<String>,
     moves: Vec<Moved>,
     violations: Vec<Violation>,
+    open: BTreeMap<String, plan::Observed>,
 }
 
 fn merge_of(evidence: &Evidence) -> Option<(GithubRepo, CommitSha)> {
@@ -70,8 +75,15 @@ fn merge_of(evidence: &Evidence) -> Option<(GithubRepo, CommitSha)> {
 }
 
 impl<'a> Run<'a> {
-    fn new(forge: Option<&'a dyn Forge>, reads: Reads, at: String, units: Units) -> Self {
+    fn new(
+        root: &'a Path,
+        forge: Option<&'a dyn Forge>,
+        reads: Reads,
+        at: String,
+        units: Units,
+    ) -> Self {
         Run {
+            root,
             forge,
             reads,
             at,
@@ -79,6 +91,7 @@ impl<'a> Run<'a> {
             dirty: BTreeSet::new(),
             moves: Vec::new(),
             violations: Vec::new(),
+            open: BTreeMap::new(),
         }
     }
 
@@ -163,9 +176,81 @@ impl<'a> Run<'a> {
         })
     }
 
+    fn checks(&mut self, repo: &GithubRepo, sha: &CommitSha) -> Option<Read<Vec<CheckState>>> {
+        let key = (repo.clone(), sha.clone());
+        cached(&mut self.reads.checks, key, self.forge, |forge| {
+            forge.checks(repo, sha)
+        })
+    }
+
+    /// A codex step merged on GitHub moves to merged only when its merge gate holds at the PR
+    /// head, as `cm advance` requires; otherwise it stays at pr-open with a `merge-gate`.
+    fn gate_holds(
+        &mut self,
+        target: &str,
+        step: &Step,
+        url: &str,
+        head: Option<&CommitSha>,
+        base: Option<&CommitSha>,
+    ) -> bool {
+        if step.lane != Some(Lane::Codex) {
+            return true;
+        }
+        let Some(head) = head else {
+            self.unknown(
+                target,
+                format!("{url} is merged but GitHub reported no head"),
+            );
+            return false;
+        };
+        let Some(parsed) = parse_target(target, true).ok() else {
+            return false;
+        };
+        // A local step's worktree lets the gate take a clean update from the base branch;
+        // without one it needs a review at the merged head itself.
+        let worktree = Path::new(&step.worktree);
+        let lineage =
+            (!step.worktree.is_empty() && worktree.exists()).then(|| crate::verdict::Lineage {
+                repo: worktree,
+                base: base.map(CommitSha::as_str),
+            });
+        let mut gaps = match crate::verdict::merge_gaps(
+            self.root,
+            &parsed,
+            Some(url),
+            head.as_str(),
+            lineage.as_ref(),
+        ) {
+            Ok(cleared) => cleared.gaps,
+            Err(error) => {
+                self.unknown(target, format!("{error:#}"));
+                return false;
+            }
+        };
+        let Some(repo) = GithubRepo::of_pr(url) else {
+            return false;
+        };
+        match self.checks(&repo, head) {
+            None => return false,
+            Some(Ok(checks)) if ci_green(&checks) => {}
+            Some(Ok(_)) => gaps.push(format!("CI is not green at {head}")),
+            Some(Err(error)) => gaps.push(format!("cannot read CI at {head}: {error}")),
+        }
+        for gap in &gaps {
+            self.violations.push(Violation::new(
+                target,
+                "merge-gate",
+                format!(
+                    "{url} merged on GitHub, but {gap}; it stays pr-open until the gate holds or `cm advance {target} merged --override <evidence>`"
+                ),
+            ));
+        }
+        gaps.is_empty()
+    }
+
     fn merges(&mut self) {
         for (target, step) in self.steps_at(&Phase::PrOpen) {
-            let Some(url) = step.track.evidence.pr else {
+            let Some(url) = step.track.evidence.pr.clone() else {
                 continue;
             };
             let Some(read) = self.pull(&url) else {
@@ -175,17 +260,25 @@ impl<'a> Run<'a> {
                 Ok(Pull {
                     state: PullState::Merged,
                     merge_commit: Some(sha),
-                }) => self.advance(
-                    &target,
-                    Phase::Merged,
-                    Evidence {
-                        sha: Some(sha.to_string()),
-                        ..Evidence::default()
-                    },
-                ),
+                    head,
+                    base,
+                    ..
+                }) => {
+                    if self.gate_holds(&target, &step, &url, head.as_ref(), base.as_ref()) {
+                        self.advance(
+                            &target,
+                            Phase::Merged,
+                            Evidence {
+                                sha: Some(sha.to_string()),
+                                ..Evidence::default()
+                            },
+                        );
+                    }
+                }
                 Ok(Pull {
                     state: PullState::Merged,
                     merge_commit: None,
+                    ..
                 }) => self.unknown(&target, format!("{url} is merged but has no merge commit")),
                 Ok(Pull {
                     state: PullState::Closed,
@@ -199,8 +292,20 @@ impl<'a> Run<'a> {
                 )),
                 Ok(Pull {
                     state: PullState::Open,
+                    head,
+                    mergeable_state,
                     ..
-                }) => {}
+                }) => {
+                    self.open.insert(
+                        url.clone(),
+                        plan::Observed {
+                            target: target.clone(),
+                            at: self.at.clone(),
+                            head: head.map(|head| head.to_string()),
+                            mergeable_state,
+                        },
+                    );
+                }
                 Err(error) => self.unknown(&target, format!("{url}: {error}")),
             }
         }
@@ -391,6 +496,7 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
     }
     let at = stamp(host.now());
     let mut read = Run::new(
+        root,
         Some(forge),
         Reads::default(),
         at.clone(),
@@ -402,11 +508,28 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
     if !found.is_empty() {
         return Ok(Outcome::refused(found));
     }
-    let mut run = Run::new(None, read.reads, at, plan::load_units(root)?);
+    let mut run = Run::new(root, None, read.reads, at, plan::load_units(root)?);
     run.walk();
     for name in &run.dirty {
         write_unit(&root.join(name), &run.units[name])?;
     }
+    let mut open = std::mem::take(&mut run.open);
+    if let Ok(seen) = store::read_json::<BTreeMap<String, plan::Observed>>(&plan::pulls_path(root))
+    {
+        // A PR GitHub could not answer for keeps what the last sync saw, stamp and all, while
+        // its step still rests at pr-open on it.
+        for (url, observed) in seen {
+            let failed = !matches!(run.reads.pulls.get(&url), Some(Ok(_)));
+            let current = plan::step(&run.units, &observed.target).is_some_and(|step| {
+                step.track.state == Phase::PrOpen
+                    && step.track.evidence.pr.as_deref() == Some(url.as_str())
+            });
+            if failed && current {
+                open.entry(url).or_insert(observed);
+            }
+        }
+    }
+    store::write_json(&plan::pulls_path(root), &open)?;
     let mut outcome = Outcome::refused(std::mem::take(&mut run.violations));
     if !run.moves.is_empty() {
         let body: String = run
@@ -442,6 +565,29 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
             moved.evidence.summary()
         ));
     }
+    let limit = plan::stall_hours(root);
+    let stalled = plan::stalls(&run.units, host.now(), limit);
+    let dirty = plan::dirty(root, &run.units);
+    for stall in &stalled {
+        outcome.line(plan::stall_line(stall, limit));
+    }
+    for (url, observed) in &dirty {
+        outcome.line(plan::dirty_line(url, observed));
+    }
+    outcome.field(
+        "stalled",
+        stalled
+            .iter()
+            .map(|stall| plan::stall_json(stall, limit))
+            .collect::<Vec<_>>(),
+    );
+    outcome.field(
+        "dirty",
+        dirty
+            .iter()
+            .map(|(url, observed)| plan::dirty_json(url, observed))
+            .collect::<Vec<_>>(),
+    );
     outcome.line(format!(
         "synced at {}: {} move(s); wrote {CARD}",
         run.at,

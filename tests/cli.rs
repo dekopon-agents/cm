@@ -166,3 +166,90 @@ fn a_queue_item_without_context_is_reported_and_left_as_written() {
         queue
     );
 }
+
+#[test]
+fn review_record_ruling_and_brief_run_beside_the_review_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(cm(root, &["init"]).status.success());
+    assert!(
+        cm(root, &["init", "01-a/u/S1", "--lane", "codex"])
+            .status
+            .success()
+    );
+    fs::write(root.join("01-a/u/S1/kickoff.md"), "Go.\n").unwrap();
+    assert!(
+        cm(root, &["ruling", "01-a/u/S1", "the edge is in scope"])
+            .status
+            .success()
+    );
+    let brief = json(&cm(root, &["--json", "brief", "01-a/u/S1"]));
+    assert!(
+        brief["brief"]
+            .as_str()
+            .unwrap()
+            .starts_with("Go.\n\n## Coordinator scope and rulings\n")
+    );
+    fs::write(
+        root.join("report.md"),
+        "Prose.\n\n```cm-review\nhead: abcdef1\nF1 | taste | introduced | - | a nit\n```\n\nACCEPT\n",
+    )
+    .unwrap();
+    let recorded = cm(
+        root,
+        &[
+            "--json",
+            "review",
+            "record",
+            "01-a/u/S1",
+            "report.md",
+            "--reviewer",
+            "astra",
+        ],
+    );
+    assert_eq!(recorded.status.code(), Some(0), "{recorded:?}");
+    assert_eq!(json(&recorded)["verdict"], "ACCEPT");
+    let row = cm(
+        root,
+        &[
+            "review",
+            "01-a/u/S1",
+            "--pr",
+            "https://github.com/o/r/pull/1",
+            "--head",
+            "abcdef1",
+            "--model",
+            "m",
+            "--effort",
+            "e",
+            "--verdict",
+            "accept",
+            "--findings",
+            "0/0",
+            "--cost",
+            "1",
+            "--wall",
+            "2",
+        ],
+    );
+    assert_eq!(row.status.code(), Some(0), "{row:?}");
+    let followups = json(&cm(root, &["--json", "followups"]));
+    assert_eq!(followups["followups"][0]["id"], "R1.F1");
+    assert!(
+        cm(
+            root,
+            &["followups", "close", "R1.F1", "--by", "stays: style"]
+        )
+        .status
+        .success()
+    );
+    assert_eq!(cm(root, &["lint"]).status.code(), Some(0));
+}

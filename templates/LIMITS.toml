@@ -21,3 +21,6 @@ max_heavy_builds = 4
 
 pr_ci_expected_min = 5
 pr_ci_deadline_min = 8
+
+# cm next and cm sync flag a launched codex-lane step with no PR once its attempt is older.
+codex_stall_hours = 2
