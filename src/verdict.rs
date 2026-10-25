@@ -560,7 +560,6 @@ impl Recorded {
         format!("R{}", self.number)
     }
 
-    /// The blocking findings no resolution has cleared.
     pub fn unresolved(&self) -> Vec<&Logged> {
         self.findings
             .iter()
@@ -1293,6 +1292,8 @@ fn unfinished(receipt: &Value) -> Option<&'static str> {
 
 /// The SHA-256 of a recorded review's report copy, lower-case hex, as `sha256sum` prints it.
 fn report_sha256(root: &Path, review: &Recorded) -> Option<String> {
+    #[cfg(test)]
+    tests::HASHES.with(|hashes| hashes.set(hashes.get() + 1));
     let mut report = fs::File::open(root.join(review.report.as_str())).ok()?;
     let mut hasher = Sha256::new();
     io::copy(&mut report, &mut hasher).ok()?;
@@ -1715,7 +1716,13 @@ pub fn merge_gaps(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    thread_local! {
+        pub(super) static HASHES: Cell<usize> = const { Cell::new(0) };
+    }
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -1853,5 +1860,56 @@ mod tests {
         let block = parse_report(&text).unwrap();
         assert_eq!(block.head, &SHA[..8]);
         assert_eq!(block.stated, None);
+    }
+
+    #[test]
+    fn astra_gap_hashes_each_eligible_report_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let target = Target {
+            unit: "01-a/u".to_owned(),
+            step: Some("S1".to_owned()),
+        };
+        let evidence = evidence_dir(root, &target);
+        let mut reviews = Vec::new();
+        for (number, name) in [(1, "a"), (2, "b")] {
+            let copy = evidence.join("reviews").join(format!("R{number}-astra.md"));
+            fs::create_dir_all(copy.parent().unwrap()).unwrap();
+            fs::write(&copy, format!("report {name}\n")).unwrap();
+            let sha256: String = Sha256::digest(format!("report {name}\n"))
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let receipt = evidence.join(name).join(RECEIPT);
+            fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+            fs::write(
+                &receipt,
+                json!({
+                    "head": SHA,
+                    "effective": {"model": ASTRA_MODEL, "effort": ASTRA_EFFORT},
+                    "turn": {"status": "completed"},
+                    "thread_fresh": {"forkedFromId": null, "parentThreadId": null, "turns_in_thread": 1},
+                    "report_sha256": sha256,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            reviews.push(Recorded {
+                number,
+                at: "2026-10-25T00:00:00Z".to_owned(),
+                step: full_name(&target),
+                reviewer: Some(ASTRA_REVIEWER.to_owned()),
+                pr: None,
+                head: SHA.to_owned(),
+                verdict: Verdict::Accept,
+                stated: None,
+                report: CampaignFile::resolve(root, &copy).unwrap(),
+                findings: Vec::new(),
+            });
+        }
+        let verdicts = Verdicts { reviews };
+        HASHES.with(|hashes| hashes.set(0));
+        assert!(astra_gap(root, &target, &verdicts, None, SHA).is_empty());
+        assert_eq!(HASHES.with(Cell::get), 2);
     }
 }
