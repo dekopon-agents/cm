@@ -191,6 +191,7 @@ impl<'a> Run<'a> {
         step: &Step,
         url: &str,
         head: Option<&CommitSha>,
+        base: Option<&CommitSha>,
     ) -> bool {
         if step.lane != Some(Lane::Codex) {
             return true;
@@ -205,14 +206,27 @@ impl<'a> Run<'a> {
         let Some(parsed) = parse_target(target, true).ok() else {
             return false;
         };
-        let mut gaps =
-            match crate::verdict::merge_gaps(self.root, &parsed, Some(url), head.as_str()) {
-                Ok(gaps) => gaps,
-                Err(error) => {
-                    self.unknown(target, format!("{error:#}"));
-                    return false;
-                }
-            };
+        // A local step's worktree lets the gate take a clean update from the base branch;
+        // without one it needs a review at the merged head itself.
+        let worktree = Path::new(&step.worktree);
+        let lineage =
+            (!step.worktree.is_empty() && worktree.exists()).then(|| crate::verdict::Lineage {
+                repo: worktree,
+                base: base.map(CommitSha::as_str),
+            });
+        let mut gaps = match crate::verdict::merge_gaps(
+            self.root,
+            &parsed,
+            Some(url),
+            head.as_str(),
+            lineage.as_ref(),
+        ) {
+            Ok(cleared) => cleared.gaps,
+            Err(error) => {
+                self.unknown(target, format!("{error:#}"));
+                return false;
+            }
+        };
         let Some(repo) = GithubRepo::of_pr(url) else {
             return false;
         };
@@ -247,9 +261,10 @@ impl<'a> Run<'a> {
                     state: PullState::Merged,
                     merge_commit: Some(sha),
                     head,
+                    base,
                     ..
                 }) => {
-                    if self.gate_holds(&target, &step, &url, head.as_ref()) {
+                    if self.gate_holds(&target, &step, &url, head.as_ref(), base.as_ref()) {
                         self.advance(
                             &target,
                             Phase::Merged,

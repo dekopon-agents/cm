@@ -300,6 +300,14 @@ one `merge-gate` violation per gap, unless at the PR's head (GitHub's, via `gh a
   `success`, `neutral` or `skipped`. Every page of both lists is read; a page that cannot be read,
   or a list that ends short of its `total_count`, leaves CI unknown.
 
+A clean update from the base branch needs no new review, only green CI on the new head: (a) and
+(b) may hold instead at an earlier reviewed head H1 when every commit on the first-parent chain
+from H1 to the head is a merge whose second parent is on the base branch (GitHub's base tip, else
+`origin/HEAD`) and whose `git show --remerge-diff` is empty. A merge that resolved conflicts, or
+any other commit, needs its own review. The walk runs in `--repo` or the step's worktree (for
+`cm sync`, the worktree only), which must hold those commits and the base tip; without one, (a)
+and (b) must hold at the head itself.
+
 When cm cannot read the PR or its checks from GitHub, (c) refuses unless `--ci-verified <path>`
 names a campaign file showing green CI; the head is then `--head`, else the SHA recorded at
 `pr-open`. Given while GitHub answers, `--head` must match its head (`merge-head`).

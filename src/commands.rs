@@ -1011,6 +1011,7 @@ impl MergeGate<'_> {
 struct GithubRead {
     pr: String,
     head: String,
+    base: Option<String>,
     checks: Result<Vec<CheckState>, String>,
     /// `--head` disagreed with GitHub's head.
     mismatch: Option<String>,
@@ -1027,6 +1028,11 @@ fn read_github(gate: &MergeGate, pr: &str, recorded: Option<&str>) -> GithubRead
             .or_else(|| recorded.map(str::to_owned))
             .unwrap_or_default()
     };
+    let base = pull
+        .as_ref()
+        .ok()
+        .and_then(|pull| pull.base.as_ref())
+        .map(ToString::to_string);
     let (head, unreachable) = match pull.as_ref().map(|pull| pull.head.as_ref()) {
         Ok(Some(head)) => (head.to_string(), None),
         Ok(None) => (
@@ -1053,6 +1059,7 @@ fn read_github(gate: &MergeGate, pr: &str, recorded: Option<&str>) -> GithubRead
     GithubRead {
         pr: pr.to_owned(),
         head,
+        base,
         checks,
         mismatch,
     }
@@ -1067,6 +1074,7 @@ fn merge_gate(
     track: &Track,
     gate: &MergeGate,
     read: Option<GithubRead>,
+    repo: Option<&Path>,
     violations: &mut Vec<Violation>,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let full = format!(
@@ -1093,7 +1101,17 @@ fn merge_gate(
         return Ok((gaps, lines));
     }
     lines.push(format!("- merge gate at {pr} @{head}"));
-    gaps.extend(crate::verdict::merge_gaps(root, target, Some(&pr), &head)?);
+    let lineage = repo.map(|repo| crate::verdict::Lineage {
+        repo,
+        base: read.base.as_deref(),
+    });
+    let cleared = crate::verdict::merge_gaps(root, target, Some(&pr), &head, lineage.as_ref())?;
+    if let Some(reviewed) = &cleared.reviewed {
+        lines.push(format!(
+            "- reviewed at {reviewed}; every commit since is a clean update from the base branch"
+        ));
+    }
+    gaps.extend(cleared.gaps);
     match read.checks {
         Ok(checks) if ci_green(&checks) => {
             lines.push(format!("- CI green at {head} ({} check(s))", checks.len()));
@@ -1393,7 +1411,15 @@ pub fn advance_gated(
         && declared.as_ref().and_then(|step| step.lane) == Some(Lane::Codex);
     let mut gate_lines = Vec::new();
     if gated {
-        let (gaps, lines) = merge_gate(root, target, &track, gate, read, &mut violations)?;
+        let (gaps, lines) = merge_gate(
+            root,
+            target,
+            &track,
+            gate,
+            read,
+            repos.first().map(PathBuf::as_path),
+            &mut violations,
+        )?;
         gate_lines = lines;
         match &gate.waiver {
             Some(waiver) => match CampaignFile::resolve(root, waiver) {

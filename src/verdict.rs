@@ -7,6 +7,7 @@
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -1397,18 +1398,138 @@ fn review_gap(verdicts: &Verdicts, step: &str, head: &str) -> Option<String> {
     })
 }
 
-/// The gate's (a) and (b) for a codex step about to merge at `head`: each unmet condition.
+/// Where the gate may walk a PR's history: a checkout holding its commits, and the base branch's
+/// tip (GitHub's, else `origin/HEAD` in the checkout).
+pub struct Lineage<'a> {
+    pub repo: &'a Path,
+    pub base: Option<&'a str>,
+}
+
+/// Commits the gate walks back from the head looking for a reviewed one.
+const MAX_UPDATES: usize = 100;
+
+fn git_out(repo: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn is_ancestor(repo: &Path, ancestor: &str, of: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", ancestor, of])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// `commit`'s first parent when it is a clean update from the base branch: a merge whose second
+/// parent is on `base` and whose `git show --remerge-diff` is empty (no conflict resolved).
+fn clean_update(repo: &Path, commit: &str, base: &str) -> Result<String, String> {
+    let short = &commit[..commit.len().min(12)];
+    let line = git_out(repo, &["rev-list", "--parents", "-n", "1", commit])
+        .ok_or_else(|| format!("cannot read {short} in {}", repo.display()))?;
+    let parents: Vec<&str> = line.split_whitespace().skip(1).collect();
+    let [first, second] = parents[..] else {
+        return Err(format!("{short} is not a merge from the base branch"));
+    };
+    if !is_ancestor(repo, second, base) {
+        return Err(format!(
+            "{short} merges {} which is not on the base branch {base}",
+            &second[..second.len().min(12)]
+        ));
+    }
+    match git_out(repo, &["show", "--remerge-diff", "--format=", commit]) {
+        Some(diff) if diff.is_empty() => Ok(first.to_owned()),
+        Some(_) => Err(format!(
+            "{short} resolved merge conflicts; it needs its own review"
+        )),
+        None => Err(format!("cannot read {short}'s remerge diff")),
+    }
+}
+
+/// The gate's (a) and (b) for a codex step about to merge at `head`.
+pub struct Cleared {
+    /// Each unmet condition; empty when the gate's review half holds.
+    pub gaps: Vec<String>,
+    /// The reviewed head the gate took, when it is an earlier commit than `head` and every
+    /// commit since is a clean update from the base branch.
+    pub reviewed: Option<String>,
+}
+
+/// The gate's (a) and (b) at `head`, or, with `lineage`, at the nearest earlier head on its
+/// first-parent chain where both hold and every first-parent commit after it is a clean update
+/// from the base branch: a clean update needs no review beyond green CI on the new head.
 pub fn merge_gaps(
     root: &Path,
     target: &Target,
     pr: Option<&str>,
     head: &str,
-) -> Result<Vec<String>> {
+    lineage: Option<&Lineage>,
+) -> Result<Cleared> {
     let verdicts = load(root)?;
-    Ok(astra_gap(root, target, &verdicts, pr, head)
-        .into_iter()
-        .chain(review_gap(&verdicts, &full_name(target), head))
-        .collect())
+    let gaps_at = |at: &str| -> Vec<String> {
+        astra_gap(root, target, &verdicts, pr, at)
+            .into_iter()
+            .chain(review_gap(&verdicts, &full_name(target), at))
+            .collect()
+    };
+    let gaps = gaps_at(head);
+    let Some(lineage) = lineage.filter(|_| !gaps.is_empty()) else {
+        return Ok(Cleared {
+            gaps,
+            reviewed: None,
+        });
+    };
+    let repo = lineage.repo;
+    let base = lineage.base.unwrap_or("origin/HEAD");
+    let Some(mut at) = git_out(
+        repo,
+        &["rev-parse", "--verify", &format!("{head}^{{commit}}")],
+    ) else {
+        return Ok(Cleared {
+            gaps,
+            reviewed: None,
+        });
+    };
+    let mut why = format!("more than {MAX_UPDATES} updates");
+    for _ in 0..MAX_UPDATES {
+        match clean_update(repo, &at, base) {
+            Ok(parent) => at = parent,
+            Err(reason) => {
+                why = reason;
+                break;
+            }
+        }
+        if gaps_at(&at).is_empty() {
+            return Ok(Cleared {
+                gaps: Vec::new(),
+                reviewed: Some(at),
+            });
+        }
+    }
+    let mut gaps = gaps;
+    let step = full_name(target);
+    let earlier = verdicts
+        .reviews
+        .iter()
+        .any(|review| review.step == step && !review.at_head(head));
+    if earlier {
+        gaps.push(format!(
+            "no reviewed head before {head} is joined to it by clean updates from the base branch: {why}"
+        ));
+    }
+    Ok(Cleared {
+        gaps,
+        reviewed: None,
+    })
 }
 
 #[cfg(test)]

@@ -52,6 +52,7 @@ struct FakeForge {
     mergeable: &'static str,
     checks: Vec<(&'static str, &'static str)>,
     down: bool,
+    base: Option<String>,
 }
 
 impl FakeForge {
@@ -62,6 +63,7 @@ impl FakeForge {
             mergeable: "clean",
             checks: checks.to_vec(),
             down: false,
+            base: None,
         }
     }
 }
@@ -76,6 +78,7 @@ impl Forge for FakeForge {
             merge_commit: (self.state == PullState::Merged)
                 .then(|| CommitSha::new(self.head.clone())),
             head: Some(CommitSha::new(self.head.clone())),
+            base: self.base.clone().map(CommitSha::new),
             mergeable_state: Some(self.mergeable.to_owned()),
         })
     }
@@ -1007,5 +1010,166 @@ fn a_failed_sync_keeps_the_last_dirty_observation() {
             .unwrap()
             .fields["dirty"],
         serde_json::json!([])
+    );
+}
+
+/// Commits `file` with `text` on the current branch of `repo` and returns the new head.
+fn commit(repo: &Path, file: &str, text: &str) -> String {
+    fs::write(repo.join(file), text).unwrap();
+    git(repo, &["add", file]);
+    git(repo, &["commit", "-q", "-m", file]);
+    git(repo, &["rev-parse", "HEAD"])
+}
+
+/// The repo with a feature branch whose tip H1 is reviewed and accepted, and the base branch's
+/// name, checked out on the feature branch.
+fn reviewed_feature(host: &Fake, c: &Campaign) -> (String, String) {
+    let base = git(&c.repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    git(&c.repo, &["checkout", "-q", "-b", "feature"]);
+    let h1 = commit(&c.repo, "shared.txt", "feature\n");
+    c.receipt("astra-review-7-h1", &h1, "gpt-6-astra", "xhigh");
+    let report = c.report("h1", &h1, &[], "ACCEPT");
+    assert!(record(host, c, &report, "astra").ok());
+    (h1, base)
+}
+
+fn merge_with(host: &Fake, c: &Campaign, base: &str) -> Outcome {
+    let head = c.head();
+    let tip = git(&c.repo, &["rev-parse", base]);
+    let forge = FakeForge {
+        base: Some(tip),
+        ..FakeForge::open(&head, &[("fmt, clippy, test", "success")])
+    };
+    c.merge(
+        host,
+        &MergeGate {
+            forge: Some(&forge),
+            ..MergeGate::default()
+        },
+    )
+}
+
+#[test]
+fn a_clean_update_from_the_base_branch_needs_no_new_review() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let (h1, base) = reviewed_feature(&host, &c);
+    for round in 0..2 {
+        git(&c.repo, &["checkout", "-q", &base]);
+        commit(&c.repo, &format!("main-{round}.txt"), "main\n");
+        git(&c.repo, &["checkout", "-q", "feature"]);
+        git(
+            &c.repo,
+            &[
+                "-c",
+                "user.name=cm",
+                "-c",
+                "user.email=cm@example.com",
+                "merge",
+                "-q",
+                "--no-edit",
+                &base,
+            ],
+        );
+    }
+    let merged = merge_with(&host, &c, &base);
+    assert!(merged.ok(), "{:?}", merged.violations);
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    assert!(
+        journal.contains(&format!(
+            "- reviewed at {h1}; every commit since is a clean update from the base branch"
+        )),
+        "{journal}"
+    );
+}
+
+#[test]
+fn a_merge_that_resolved_conflicts_needs_its_own_review() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let (_, base) = reviewed_feature(&host, &c);
+    git(&c.repo, &["checkout", "-q", &base]);
+    commit(&c.repo, "shared.txt", "main\n");
+    git(&c.repo, &["checkout", "-q", "feature"]);
+    let conflicted = Command::new("git")
+        .arg("-C")
+        .arg(&c.repo)
+        .args([
+            "-c",
+            "user.name=cm",
+            "-c",
+            "user.email=cm@example.com",
+            "merge",
+            "-q",
+            "--no-edit",
+            &base,
+        ])
+        .output()
+        .unwrap();
+    assert!(!conflicted.status.success(), "the merge conflicts");
+    commit(&c.repo, "shared.txt", "feature and main\n");
+    let refused = merge_with(&host, &c, &base);
+    assert!(
+        rules(&refused).iter().all(|rule| *rule == "merge-gate"),
+        "{:?}",
+        refused.violations
+    );
+    assert!(
+        refused.violations.iter().any(|v| v
+            .message
+            .contains("resolved merge conflicts; it needs its own review")),
+        "{:?}",
+        refused.violations
+    );
+    let merge = c.head();
+    c.receipt("astra-review-7-merge", &merge, "gpt-6-astra", "xhigh");
+    let report = c.report("merge", &merge, &[], "ACCEPT");
+    assert!(record(&host, &c, &report, "astra").ok());
+    let merged = merge_with(&host, &c, &base);
+    assert!(merged.ok(), "{:?}", merged.violations);
+}
+
+#[test]
+fn a_new_commit_after_the_reviewed_head_needs_a_review() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let (_, base) = reviewed_feature(&host, &c);
+    commit(&c.repo, "more.txt", "a fix\n");
+    let refused = merge_with(&host, &c, &base);
+    assert!(
+        refused
+            .violations
+            .iter()
+            .any(|v| v.message.contains("is not a merge from the base branch")),
+        "{:?}",
+        refused.violations
+    );
+    // A merge from a branch other than the base is no clean update either.
+    let c = campaign(&host, true);
+    let (_, base) = reviewed_feature(&host, &c);
+    git(&c.repo, &["checkout", "-q", "-b", "side", &base]);
+    commit(&c.repo, "side.txt", "side\n");
+    git(&c.repo, &["checkout", "-q", "feature"]);
+    git(
+        &c.repo,
+        &[
+            "-c",
+            "user.name=cm",
+            "-c",
+            "user.email=cm@example.com",
+            "merge",
+            "-q",
+            "--no-edit",
+            "side",
+        ],
+    );
+    let refused = merge_with(&host, &c, &base);
+    assert!(
+        refused
+            .violations
+            .iter()
+            .any(|v| v.message.contains("which is not on the base branch")),
+        "{:?}",
+        refused.violations
     );
 }

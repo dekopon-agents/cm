@@ -178,6 +178,8 @@ pub struct Pull {
     pub merge_commit: Option<CommitSha>,
     /// The PR's head commit, as GitHub reports it.
     pub head: Option<CommitSha>,
+    /// The base branch's tip, as GitHub reports it.
+    pub base: Option<CommitSha>,
     /// GitHub's `mergeable_state` (`clean`, `dirty`, `blocked`, `unknown`, …), lower case.
     pub mergeable_state: Option<String>,
 }
@@ -307,6 +309,8 @@ impl Forge for Gh {
             #[serde(default)]
             head: Option<Head>,
             #[serde(default)]
+            base: Option<Head>,
+            #[serde(default)]
             mergeable_state: Option<String>,
         }
         #[derive(Deserialize)]
@@ -332,6 +336,7 @@ impl Forge for Gh {
                 .filter(|_| state == PullState::Merged)
                 .map(CommitSha::new),
             head: rest.head.map(|head| CommitSha::new(head.sha)),
+            base: rest.base.map(|base| CommitSha::new(base.sha)),
             mergeable_state: rest.mergeable_state.map(|state| state.to_lowercase()),
         })
     }
