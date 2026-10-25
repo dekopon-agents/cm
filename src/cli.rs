@@ -307,6 +307,8 @@ enum AttemptAct {
 
 #[derive(Subcommand)]
 enum ReviewAct {
+    /// Recover an interrupted review save from persisted rows and reconcile the journal.
+    Render,
     /// Parse a report's `cm-review` block, compute its verdict and record it under the step's evidence.
     Record {
         /// <NN-name>/<unit>/<step>
@@ -608,6 +610,10 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             by,
             &under_root(cli, Path::new(by)),
         ),
+        Commands::Review {
+            act: Some(ReviewAct::Render),
+            ..
+        } => crate::review::recover_reviews(&root()?),
         Commands::Review { import: true, .. } => crate::review::import_reviews(host, &root()?),
         Commands::Review {
             target,

@@ -319,6 +319,70 @@ fn save_reviews(root: &Path, reviews: &Reviews) -> Result<()> {
     write_atomic(&root.join(REVIEW_OFF), render_reviews(reviews).as_bytes())
 }
 
+fn review_entry(review: &Review) -> String {
+    crate::journal::entry(
+        &review.at,
+        &format!(
+            "review {} #{}: {}",
+            review.step, review.number, review.verdict
+        ),
+        Some(&format!(
+            "- {REVIEW_OFF}: {} @{} by {}, {}/{}\n",
+            review.pr,
+            short(&review.head),
+            review.model,
+            review.confirmed,
+            review.false_positive
+        )),
+    )
+}
+
+pub(crate) fn recover_reviews(root: &Path) -> Result<Outcome> {
+    let (_lock, mut violations) = guard(root)?;
+    let reviews: Reviews = read_json(&reviews_path(root))?;
+    let current = read_existing(&root.join(REVIEW_OFF))?;
+    let rendered = render_reviews(&reviews);
+    let mut prefix = reviews.clone();
+    let mut generated = current.as_deref() == Some(rendered.as_str());
+    while !generated {
+        match prefix.rows.pop() {
+            Some(Row::Review(_)) => {
+                generated = current.as_deref() == Some(render_reviews(&prefix).as_str());
+            }
+            Some(Row::Imported { .. }) | None => break,
+        }
+    }
+    if !generated {
+        violations.extend(lint_reviews(root));
+    }
+    if !violations.is_empty() {
+        return Ok(Outcome::refused(violations));
+    }
+    if current.as_deref() != Some(rendered.as_str()) {
+        write_atomic(&root.join(REVIEW_OFF), rendered.as_bytes())?;
+    }
+    let journal = fs::read_to_string(root.join(crate::store::JOURNAL))?;
+    for row in &reviews.rows {
+        match row {
+            Row::Imported { .. } => {}
+            Row::Review(review) => {
+                let entry = review_entry(review);
+                let recorded = journal.match_indices(&entry).any(|(at, _)| {
+                    (at == 0 || journal[..at].ends_with('\n'))
+                        && (at + entry.len() == journal.len()
+                            || journal[at + entry.len()..].starts_with('\n'))
+                });
+                if !recorded {
+                    crate::journal::append(root, &entry)?;
+                }
+            }
+        }
+    }
+    let mut outcome = Outcome::default();
+    outcome.line(format!("recovered {REVIEW_OFF} and review journal entries"));
+    Ok(outcome)
+}
+
 pub fn review(host: &dyn Host, root: &Path, target: &Target, args: &ReviewArgs) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
     let full = format!(
@@ -389,14 +453,17 @@ pub fn review(host: &dyn Host, root: &Path, target: &Target, args: &ReviewArgs) 
     if !loaded.as_ref().is_some_and(|(_, fresh)| *fresh) {
         violations.extend(lint_reviews(root));
     }
-    let (Some((mut reviews, _)), Some((confirmed, false_positive)), true) =
+    let (Some((mut reviews, fresh)), Some((confirmed, false_positive)), true) =
         (loaded, findings, violations.is_empty())
     else {
         return Ok(Outcome::refused(violations));
     };
+    if fresh && !root.join(REVIEW_OFF).exists() {
+        write_atomic(&root.join(REVIEW_OFF), render_reviews(&reviews).as_bytes())?;
+    }
     let at = stamp(host.now());
     let number = reviews.rows.iter().map(Row::number).max().unwrap_or(0) + 1;
-    reviews.rows.push(Row::Review(Box::new(Review {
+    let review = Review {
         number,
         at: at.clone(),
         step: full.clone(),
@@ -410,19 +477,13 @@ pub fn review(host: &dyn Host, root: &Path, target: &Target, args: &ReviewArgs) 
         cost: args.cost.trim_start_matches('$').to_owned(),
         wall: args.wall.to_owned(),
         delta: args.delta.map(str::to_owned),
-    })));
+    };
+    let entry = review_entry(&review);
+    reviews.rows.push(Row::Review(Box::new(review)));
     save_reviews(root, &reviews)?;
-    let journal = journal_line(
-        root,
-        &at,
-        &format!("review {full} #{number}: {}", args.verdict),
-        &format!(
-            "- {REVIEW_OFF}: {} @{} by {}, {confirmed}/{false_positive}\n",
-            args.pr,
-            short(args.head),
-            args.model.trim()
-        ),
-    )?;
+    crate::journal::append(root, &entry)?;
+    let journal =
+        crate::journal::heading(&at, &format!("review {full} #{number}: {}", args.verdict));
     let mut outcome = Outcome::default();
     outcome.line(format!("{REVIEW_OFF} row #{number}"));
     outcome.field("number", number);

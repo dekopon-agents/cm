@@ -534,3 +534,178 @@ fn an_unreadable_ledger_is_never_rewritten_from_nothing() {
     );
     assert_eq!(fs::read(root.join("OWNER-QUEUE.md")).unwrap(), queue);
 }
+
+fn recover_reviews(root: &Path) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(root)
+        .args(["review", "render", "--json"])
+        .output()
+        .unwrap();
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn interrupted_review(root: &Path, obstruction: &str) {
+    declare_build(root);
+    assert!(review(root, "https://github.com/o/r/pull/1", None).ok());
+    fs::create_dir(root.join(obstruction)).unwrap();
+    let target = parse_target("15-machinery/cm/build", true).unwrap();
+    let args = ReviewArgs {
+        pr: "https://github.com/o/r/pull/2",
+        head: "abcdef1",
+        model: "m",
+        effort: "high",
+        verdict: "accept",
+        findings: "0/0",
+        cost: "1",
+        wall: "1",
+        delta: None,
+    };
+    assert!(review::review(&Fake, root, &target, &args).is_err());
+    fs::remove_dir(root.join(obstruction)).unwrap();
+}
+
+fn review_entries(root: &Path) -> usize {
+    fs::read_to_string(root.join("JOURNAL.md"))
+        .unwrap()
+        .lines()
+        .filter(|line| {
+            line.starts_with("## ") && line.contains(" — review 15-machinery/cm/build #")
+        })
+        .count()
+}
+
+#[test]
+fn a_review_interrupted_after_json_can_be_recovered_before_appending() {
+    let (_temp, root) = campaign();
+    interrupted_review(&root, ".REVIEW-OFF.md.cm-tmp");
+    assert_eq!(review_entries(&root), 1);
+    assert_eq!(recover_reviews(&root)["ok"], true);
+    assert!(review(&root, "https://github.com/o/r/pull/3", None).ok());
+    let rows: review::Reviews = cm::store::read_json(&root.join(".cm/reviews.json")).unwrap();
+    assert_eq!(rows.rows.len(), 3);
+    assert_eq!(review_entries(&root), 3);
+    assert!(lint(&root).unwrap().ok());
+}
+
+#[test]
+fn a_review_interrupted_after_markdown_recovers_its_journal_entry() {
+    let (_temp, root) = campaign();
+    interrupted_review(&root, ".JOURNAL.md.cm-tmp");
+    let markdown = fs::read(root.join("REVIEW-OFF.md")).unwrap();
+    assert_eq!(review_entries(&root), 1);
+    assert_eq!(recover_reviews(&root)["ok"], true);
+    assert_eq!(review_entries(&root), 2);
+    assert_eq!(fs::read(root.join("REVIEW-OFF.md")).unwrap(), markdown);
+}
+
+#[test]
+fn repeated_review_recovery_converges_without_duplicate_rows_or_entries() {
+    let (_temp, root) = campaign();
+    interrupted_review(&root, ".REVIEW-OFF.md.cm-tmp");
+    assert_eq!(recover_reviews(&root)["ok"], true);
+    let paths = [".cm/reviews.json", "REVIEW-OFF.md", "JOURNAL.md"];
+    let before = paths.map(|path| fs::read(root.join(path)).unwrap());
+    assert_eq!(recover_reviews(&root)["ok"], true);
+    assert_eq!(paths.map(|path| fs::read(root.join(path)).unwrap()), before);
+    assert_eq!(review_entries(&root), 2);
+}
+
+#[test]
+fn recovery_refuses_a_genuine_hand_edit_without_overwriting_it() {
+    let (_temp, root) = campaign();
+    interrupted_review(&root, ".REVIEW-OFF.md.cm-tmp");
+    let path = root.join("REVIEW-OFF.md");
+    let edited = fs::read_to_string(&path)
+        .unwrap()
+        .replace("ACCEPT", "FIX REQUIRED");
+    fs::write(&path, &edited).unwrap();
+    let result = recover_reviews(&root);
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["violations"][0]["rule"], "review-hand-edit");
+    assert_eq!(fs::read_to_string(path).unwrap(), edited);
+    assert_eq!(review_entries(&root), 1);
+}
+
+#[test]
+fn recovery_preserves_the_preamble_and_postamble() {
+    let (_temp, root) = campaign();
+    fs::write(
+        root.join("REVIEW-OFF.md"),
+        format!("{REVIEW_OFF}{AFTER_TABLE}"),
+    )
+    .unwrap();
+    interrupted_review(&root, ".REVIEW-OFF.md.cm-tmp");
+    assert_eq!(recover_reviews(&root)["ok"], true);
+    let text = fs::read_to_string(root.join("REVIEW-OFF.md")).unwrap();
+    assert!(text.starts_with("# Review-off\n\nWho reviewed what.\n\n"));
+    assert!(text.ends_with(AFTER_TABLE));
+}
+
+#[test]
+fn an_interrupted_first_review_render_leaves_the_append_retryable() {
+    let (_temp, root) = campaign();
+    declare_build(&root);
+    let obstruction = root.join(".REVIEW-OFF.md.cm-tmp");
+    fs::create_dir(&obstruction).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&root)
+        .args([
+            "review",
+            "15-machinery/cm/build",
+            "--pr",
+            "https://github.com/o/r/pull/1",
+            "--head",
+            "abcdef1",
+            "--model",
+            "m",
+            "--effort",
+            "high",
+            "--verdict",
+            "accept",
+            "--findings",
+            "0/0",
+            "--cost",
+            "1",
+            "--wall",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!root.join(".cm/reviews.json").exists());
+    assert_eq!(review_entries(&root), 0);
+    fs::remove_dir(obstruction).unwrap();
+    assert!(review(&root, "https://github.com/o/r/pull/1", None).ok());
+    assert_eq!(recover_reviews(&root)["ok"], true);
+    let rows: review::Reviews = cm::store::read_json(&root.join(".cm/reviews.json")).unwrap();
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(review_entries(&root), 1);
+}
+
+#[test]
+fn an_interrupted_first_review_journal_entry_can_be_recovered() {
+    let (_temp, root) = campaign();
+    declare_build(&root);
+    let obstruction = root.join(".JOURNAL.md.cm-tmp");
+    fs::create_dir(&obstruction).unwrap();
+    let target = parse_target("15-machinery/cm/build", true).unwrap();
+    let args = ReviewArgs {
+        pr: "https://github.com/o/r/pull/1",
+        head: "abcdef1",
+        model: "m",
+        effort: "high",
+        verdict: "accept",
+        findings: "0/0",
+        cost: "1",
+        wall: "1",
+        delta: None,
+    };
+    assert!(review::review(&Fake, &root, &target, &args).is_err());
+    fs::remove_dir(obstruction).unwrap();
+    assert_eq!(review_entries(&root), 0);
+    assert_eq!(recover_reviews(&root)["ok"], true);
+    assert_eq!(review_entries(&root), 1);
+    assert!(lint(&root).unwrap().ok());
+}
