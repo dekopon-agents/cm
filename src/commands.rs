@@ -1766,27 +1766,28 @@ pub fn amend(
         match After::parse(text, &target.unit) {
             Err(message) => violations.push(Violation::new(&full, "after-parse", message)),
             Ok(after) if next.after.contains(&after) => {}
-            Ok(after) if plan::step(&units, &after.target()).is_none() => {
-                violations.push(Violation::new(
-                    &full,
-                    "after-unknown",
-                    format!("`{text}` names {}, which is not declared", after.target()),
-                ))
-            }
-            Ok(after) if reaches(&units, &after.target(), &full) => {
-                violations.push(Violation::new(
-                    &full,
-                    "after-cycle",
-                    format!(
-                        "{} already waits on {full}; the order would have a cycle",
-                        after.target()
-                    ),
-                ))
-            }
             Ok(after) => {
                 changes.push(format!("- after: + {after}"));
                 next.after.push(after);
             }
+        }
+    }
+    for after in &next.after {
+        if plan::step(&units, &after.target()).is_none() {
+            violations.push(Violation::new(
+                &full,
+                "after-unknown",
+                format!("`{after}` names {}, which is not declared", after.target()),
+            ));
+        } else if reaches(&units, &after.target(), &full) {
+            violations.push(Violation::new(
+                &full,
+                "after-cycle",
+                format!(
+                    "{} already waits on {full}; the order would have a cycle",
+                    after.target()
+                ),
+            ));
         }
     }
     if changes.is_empty() && violations.is_empty() {

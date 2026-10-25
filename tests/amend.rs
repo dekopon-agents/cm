@@ -385,3 +385,121 @@ fn a_consumer_launches_after_its_superseded_gate_is_replaced() {
     let launched = launch(&host, &c, "01-a/u/consumer");
     assert!(launched.ok(), "{:?}", launched.violations);
 }
+
+#[test]
+fn replacing_a_gate_refuses_an_unknown_replacement() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/old", Lane::Codex, &[]).ok());
+    assert!(declare(&host, &c, "01-a/u/consumer", Lane::Codex, &["old"]).ok());
+    let amendment = Amendment {
+        drop_after: vec!["old".into()],
+        after: vec!["unknown".into()],
+        ..Amendment::default()
+    };
+    let refused = commands::amend(&host, &c.root, &target("01-a/u/consumer"), &amendment).unwrap();
+    assert_eq!(rules(&refused), vec!["after-unknown"]);
+    let units = plan::load_units(&c.root).unwrap();
+    assert_eq!(
+        plan::step(&units, "01-a/u/consumer").unwrap().after[0].to_string(),
+        "01-a/u/old"
+    );
+}
+
+#[test]
+fn removing_a_gate_the_step_lacks_is_refused() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/other", Lane::Codex, &[]).ok());
+    assert!(declare(&host, &c, "01-a/u/consumer", Lane::Codex, &[]).ok());
+    let amendment = Amendment {
+        drop_after: vec!["other".into()],
+        ..Amendment::default()
+    };
+    let refused = commands::amend(&host, &c.root, &target("01-a/u/consumer"), &amendment).unwrap();
+    assert_eq!(rules(&refused), vec!["after-absent"]);
+}
+
+#[test]
+fn replacing_a_gate_cannot_create_a_cycle() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/old", Lane::Codex, &[]).ok());
+    assert!(declare(&host, &c, "01-a/u/consumer", Lane::Codex, &["old"]).ok());
+    assert!(declare(&host, &c, "01-a/u/replacement", Lane::Codex, &["consumer"]).ok());
+    let amendment = Amendment {
+        drop_after: vec!["old".into()],
+        after: vec!["replacement".into()],
+        ..Amendment::default()
+    };
+    let refused = commands::amend(&host, &c.root, &target("01-a/u/consumer"), &amendment).unwrap();
+    assert_eq!(rules(&refused), vec!["after-cycle"]);
+}
+
+#[test]
+fn a_superseded_prerequisite_keeps_its_consumer_blocked() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/old", Lane::Codex, &[]).ok());
+    assert!(declare(&host, &c, "01-a/u/consumer", Lane::Codex, &["old"]).ok());
+    let why = note(&c, "superseded.md");
+    assert!(advance(&host, &c, "01-a/u/old", "superseded", Some(&why)).ok());
+    assert_eq!(
+        rules(&launch(&host, &c, "01-a/u/consumer")),
+        vec!["after-unmet"]
+    );
+}
+
+#[test]
+fn malformed_gate_removal_is_refused() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/consumer", Lane::Codex, &[]).ok());
+    let amendment = Amendment {
+        drop_after: vec!["tag:invalid".into()],
+        ..Amendment::default()
+    };
+    let refused = commands::amend(&host, &c.root, &target("01-a/u/consumer"), &amendment).unwrap();
+    assert_eq!(rules(&refused), vec!["after-parse"]);
+}
+
+#[test]
+fn the_cli_removes_multiple_gates_from_a_launched_step() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    let done = note(&c, "done.md");
+    for gate in ["first", "second"] {
+        let step = format!("01-a/u/{gate}");
+        assert!(declare(&host, &c, &step, Lane::Owner, &[]).ok());
+        assert!(advance(&host, &c, &step, "done", Some(&done)).ok());
+    }
+    assert!(
+        declare(
+            &host,
+            &c,
+            "01-a/u/consumer",
+            Lane::Codex,
+            &["first", "second"]
+        )
+        .ok()
+    );
+    assert!(launch(&host, &c, "01-a/u/consumer").ok());
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .current_dir(&c.root)
+        .args([
+            "amend",
+            "01-a/u/consumer",
+            "--drop-after",
+            "first",
+            "--drop-after",
+            "second",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let units = plan::load_units(&c.root).unwrap();
+    let step = plan::step(&units, "01-a/u/consumer").unwrap();
+    assert_eq!(step.track.state, Phase::Launched);
+    assert!(step.after.is_empty());
+    assert!(lint(&c.root).unwrap().ok());
+}

@@ -347,6 +347,7 @@ struct FakeForge {
     tags: BTreeMap<(String, String), BTreeSet<String>>,
     broken: BTreeSet<String>,
     calls: RefCell<usize>,
+    containment_queries: RefCell<Vec<(String, String, String)>>,
 }
 
 impl Forge for FakeForge {
@@ -368,6 +369,11 @@ impl Forge for FakeForge {
         tag: &TagName,
         sha: &CommitSha,
     ) -> Result<bool, ForgeError> {
+        self.containment_queries.borrow_mut().push((
+            repo.to_string(),
+            tag.to_string(),
+            sha.to_string(),
+        ));
         Ok(self
             .tags
             .get(&(repo.to_string(), tag.to_string()))
@@ -1461,4 +1467,126 @@ fn a_tag_only_release_releases_a_merged_member_it_contains() {
     sync(&host, &forge, &c.root).unwrap();
     sync(&host, &forge, &c.root).unwrap();
     assert_eq!(state(&c, "01-a/u/S1"), Phase::Released);
+}
+
+fn tag_only_member(host: &Fake, github: Option<&str>) -> (Campaign, FakeForge) {
+    let c = campaign(host);
+    let repo = c.root.parent().unwrap().join("cm-repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "release"]);
+    git(&repo, &["tag", "v0.7.0"]);
+    let declared = match github {
+        Some(github) => declare_release(host, &c, "00-release/cm/0.7.0", github, "v{version}"),
+        None => declare(host, &c, "00-release/cm/0.7.0", Lane::Pi, &[]),
+    };
+    assert!(declared.ok());
+    let released = commands::advance(
+        host,
+        &c.root,
+        &parse_target("00-release/cm/0.7.0", false).unwrap(),
+        &Phase::Released,
+        &Evidence {
+            tag: Some("v0.7.0".into()),
+            ..Evidence::default()
+        },
+        None,
+        Some(&repo),
+    )
+    .unwrap();
+    assert!(released.ok(), "{:?}", released.violations);
+    assert!(declare(host, &c, "01-a/u/S1", Lane::Pi, &[]).ok());
+    kickoff(&c, "01-a/u/S1");
+    let pr = "https://github.com/o/cm/pull/1";
+    open_pr(host, &c, "01-a/u/S1", pr);
+    let mut forge = FakeForge::default();
+    forge.pulls.insert(pr.into(), merged("s1"));
+    (c, forge)
+}
+
+#[test]
+fn a_tag_only_release_does_not_release_a_member_it_does_not_contain() {
+    let host = at("2026-10-17T08:00:00Z");
+    let (c, mut forge) = tag_only_member(&host, Some("o/cm"));
+    forge.tags.insert(
+        ("o/cm".into(), "v0.7.0".into()),
+        ["other".to_owned()].into(),
+    );
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(state(&c, "01-a/u/S1"), Phase::Merged);
+    assert_eq!(
+        *forge.containment_queries.borrow(),
+        vec![("o/cm".into(), "v0.7.0".into(), "s1".into())]
+    );
+}
+
+#[test]
+fn a_tag_only_release_without_a_declared_repository_is_skipped() {
+    let host = at("2026-10-17T08:00:00Z");
+    let (c, mut forge) = tag_only_member(&host, None);
+    forge
+        .tags
+        .insert(("o/cm".into(), "v0.7.0".into()), ["s1".to_owned()].into());
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(state(&c, "01-a/u/S1"), Phase::Merged);
+    assert!(forge.containment_queries.borrow().is_empty());
+}
+
+#[test]
+fn a_deployed_tag_only_release_deploys_a_member_it_contains() {
+    let host = at("2026-10-17T08:00:00Z");
+    let (c, mut forge) = tag_only_member(&host, Some("o/cm"));
+    let digest = format!("sha256:{}", "c".repeat(64));
+    assert!(
+        advance(
+            &host,
+            &c,
+            "00-release/cm/0.7.0",
+            "deployed",
+            Evidence {
+                digest: Some(digest.clone()),
+                ..Evidence::default()
+            }
+        )
+        .ok()
+    );
+    forge
+        .tags
+        .insert(("o/cm".into(), "v0.7.0".into()), ["s1".to_owned()].into());
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(state(&c, "01-a/u/S1"), Phase::Deployed);
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    assert_eq!(
+        unit.steps["S1"].track.evidence.digest.as_deref(),
+        Some(digest.as_str())
+    );
+    assert!(lint(&c.root).unwrap().ok());
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    assert!(journal.contains("01-a/u/S1: merged → released"));
+    assert!(journal.contains("01-a/u/S1: released → deployed"));
+}
+
+#[test]
+fn a_pr_backed_release_still_uses_its_prep_repository() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    for target in ["00-release/cm/0.7.0", "01-a/u/S1"] {
+        assert!(declare(&host, &c, target, Lane::Pi, &[]).ok());
+        kickoff(&c, target);
+    }
+    let prep = "https://github.com/o/cm/pull/1";
+    let member = "https://github.com/o/cm/pull/2";
+    open_pr(&host, &c, "00-release/cm/0.7.0", prep);
+    open_pr(&host, &c, "01-a/u/S1", member);
+    let mut forge = FakeForge::default();
+    forge.pulls.insert(prep.into(), merged("prep"));
+    forge.pulls.insert(member.into(), merged("s1"));
+    forge.tags.insert(
+        ("o/cm".into(), "v0.7.0".into()),
+        ["prep".to_owned(), "s1".to_owned()].into(),
+    );
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(state(&c, "00-release/cm/0.7.0"), Phase::Released);
+    assert_eq!(state(&c, "01-a/u/S1"), Phase::Released);
+    assert!(lint(&c.root).unwrap().ok());
 }
