@@ -235,7 +235,7 @@ case "$4" in
   */branches/*) case "$4" in */rules/*) cat "$ATTENTION_FIXTURE/rules.json" ;; *) cat "$ATTENTION_FIXTURE/branch.json" ;; esac ;;
   */status*) cat "$ATTENTION_FIXTURE/status$page.json" ;;
   *)
-    cat "$ATTENTION_FIXTURE/runs$page.json"
+    cat "$ATTENTION_FIXTURE/runs$page.json" || exit 1
     exit "$ATTENTION_CHECK_EXIT" ;;
 esac
 "#;
@@ -437,7 +437,7 @@ fn a_ruleset_app_constraint_excludes_other_apps() {
     let mut other = runs["check_runs"][0].clone();
     other["app"]["id"] = 2.into();
     other["conclusion"] = "failure".into();
-    runs["check_runs"].as_array_mut().unwrap().push(other);
+    runs["check_runs"].as_array_mut().unwrap().insert(0, other);
     let rules = r#"[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"test","integration_id":1}]}}]"#;
     let row = source_row(&[runs.to_string()], &[status_page("success")], "{}", rules);
     assert_eq!(row["action"], "review-head");
@@ -488,4 +488,19 @@ fn a_failed_second_page_discards_partial_evidence() {
         assert_eq!(row["action"], "investigate-evidence");
         assert_eq!(row["evidence"]["required_checks"], serde_json::json!([]));
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn branch_checks_require_only_the_named_app() {
+    let mut runs: serde_json::Value = serde_json::from_str(RUNS).unwrap();
+    runs["check_runs"][0]["app"] = serde_json::json!({"id": 1});
+    let mut other = runs["check_runs"][0].clone();
+    other["app"]["id"] = 2.into();
+    other["conclusion"] = "failure".into();
+    runs["check_runs"].as_array_mut().unwrap().insert(0, other);
+    let branch =
+        r#"{"protection":{"required_status_checks":{"checks":[{"context":"test","app_id":1}]}}}"#;
+    let row = source_row(&[runs.to_string()], &[EMPTY_STATUS.into()], branch, "[]");
+    assert_eq!(row["action"], "review-head");
 }
