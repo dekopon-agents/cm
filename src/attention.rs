@@ -186,6 +186,7 @@ fn required_contexts(repo: &str, base: &str) -> Result<Vec<RequiredContext>, Str
 fn required_checks(repo: &str, head: &str, base: &str) -> Result<Vec<Check>, String> {
     #[derive(Deserialize)]
     struct Runs {
+        total_count: usize,
         check_runs: Vec<Run>,
     }
     #[derive(Deserialize)]
@@ -204,6 +205,7 @@ fn required_checks(repo: &str, head: &str, base: &str) -> Result<Vec<Check>, Str
     }
     #[derive(Deserialize)]
     struct Combined {
+        total_count: usize,
         statuses: Vec<Status>,
     }
     #[derive(Deserialize)]
@@ -218,67 +220,102 @@ fn required_checks(repo: &str, head: &str, base: &str) -> Result<Vec<Check>, Str
     if contexts.is_empty() {
         return Ok(Vec::new());
     }
-    let mut runs = Vec::new();
+    let mut requirements: BTreeMap<String, BTreeMap<Option<i64>, bool>> = BTreeMap::new();
+    for required in contexts {
+        requirements
+            .entry(required.context)
+            .or_default()
+            .insert(required.app_id.filter(|id| *id != -1), false);
+    }
+    let mut checks = Vec::new();
+    let mut consumed = 0;
+    let mut total = 0;
     for page in 1.. {
         let batch: Runs = api(&format!(
             "repos/{repo}/commits/{head}/check-runs?per_page=100&filter=all&page={page}"
         ))?;
         let last = batch.check_runs.len() < 100;
-        runs.extend(batch.check_runs);
+        consumed += batch.check_runs.len();
+        total = total.max(batch.total_count);
+        for run in batch.check_runs {
+            let Some(apps) = requirements.get_mut(&run.name) else {
+                continue;
+            };
+            let mut applicable = false;
+            for (app_id, matched) in apps {
+                if app_id.is_none_or(|id| run.app.as_ref().is_some_and(|app| app.id == id)) {
+                    *matched = true;
+                    applicable = true;
+                }
+            }
+            if !applicable {
+                continue;
+            }
+            let state = match (run.status.as_str(), run.conclusion.as_deref()) {
+                ("completed", Some("success")) => "SUCCESS".into(),
+                (
+                    "completed",
+                    Some(
+                        conclusion @ ("failure" | "error" | "timed_out" | "cancelled"
+                        | "action_required" | "startup_failure" | "neutral"
+                        | "skipped" | "stale"),
+                    ),
+                ) => conclusion.to_uppercase(),
+                (status @ ("queued" | "in_progress" | "waiting" | "requested" | "pending"), _) => {
+                    status.to_uppercase()
+                }
+                _ => "UNKNOWN".into(),
+            };
+            checks.push(Check {
+                name: run.name,
+                state,
+                link: run.html_url.unwrap_or_default(),
+                started_at: run.started_at.unwrap_or_default(),
+                completed_at: run.completed_at.unwrap_or_default(),
+            });
+        }
         if last {
+            if consumed < total {
+                return Err("check-run pagination ended before total_count was reached".into());
+            }
             break;
         }
     }
-    let mut statuses = Vec::new();
+    let mut consumed = 0;
+    let mut total = 0;
     for page in 1.. {
         let batch: Combined = api(&format!(
             "repos/{repo}/commits/{head}/status?per_page=100&page={page}"
         ))?;
         let last = batch.statuses.len() < 100;
-        statuses.extend(batch.statuses);
+        consumed += batch.statuses.len();
+        total = total.max(batch.total_count);
+        for status in batch.statuses {
+            let Some(apps) = requirements.get_mut(&status.context) else {
+                continue;
+            };
+            if let Some(matched) = apps.get_mut(&None) {
+                *matched = true;
+            }
+            checks.push(Check {
+                name: status.context,
+                state: status.state.to_uppercase(),
+                link: status.target_url.unwrap_or_default(),
+                started_at: status.created_at,
+                completed_at: status.updated_at,
+            });
+        }
         if last {
+            if consumed < total {
+                return Err("status pagination ended before total_count was reached".into());
+            }
             break;
         }
     }
-    let mut checks = Vec::new();
-    for required in contexts {
-        let start = checks.len();
-        for run in runs.iter().filter(|run| {
-            run.name == required.context
-                && required
-                    .app_id
-                    .filter(|id| *id != -1)
-                    .is_none_or(|id| run.app.as_ref().is_some_and(|app| app.id == id))
-        }) {
-            let state = match (run.status.as_str(), run.conclusion.as_deref()) {
-                ("completed", Some(conclusion)) => conclusion.to_uppercase(),
-                ("completed", None) => "UNKNOWN".into(),
-                (status, _) => status.to_uppercase(),
-            };
+    for (name, apps) in requirements {
+        if apps.values().any(|matched| !matched) {
             checks.push(Check {
-                name: required.context.clone(),
-                state,
-                link: run.html_url.clone().unwrap_or_default(),
-                started_at: run.started_at.clone().unwrap_or_default(),
-                completed_at: run.completed_at.clone().unwrap_or_default(),
-            });
-        }
-        let missing_app = checks.len() == start && required.app_id.is_some_and(|id| id != -1);
-        for status in statuses
-            .iter()
-            .filter(|status| status.context == required.context)
-        {
-            checks.push(Check {
-                name: required.context.clone(),
-                state: status.state.to_uppercase(),
-                link: status.target_url.clone().unwrap_or_default(),
-                started_at: status.created_at.clone(),
-                completed_at: status.updated_at.clone(),
-            });
-        }
-        if missing_app || checks.len() == start {
-            checks.push(Check {
-                name: required.context,
+                name,
                 state: "MISSING".into(),
                 link: String::new(),
                 started_at: String::new(),
