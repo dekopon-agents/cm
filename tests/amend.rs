@@ -186,6 +186,7 @@ fn amend_marks_a_study_moves_a_lane_and_adds_an_acyclic_gate() {
             study: true,
             lane: Some(Lane::Coordinator),
             after: Vec::new(),
+            ..Amendment::default()
         },
     );
     assert!(changed.ok(), "{:?}", changed.violations);
@@ -338,4 +339,49 @@ fn a_tag_only_release_and_a_superseded_step_are_recorded() {
     );
     assert!(!ready(&c).contains(&"01-a/u/after-pin".to_owned()));
     assert!(lint(&c.root).unwrap().ok());
+}
+
+#[test]
+fn a_consumer_launches_after_its_superseded_gate_is_replaced() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/old", Lane::Codex, &[]).ok());
+    assert!(declare(&host, &c, "01-a/u/replacement", Lane::Coordinator, &[]).ok());
+    let study = Amendment {
+        study: true,
+        ..Amendment::default()
+    };
+    assert!(
+        commands::amend(&host, &c.root, &target("01-a/u/replacement"), &study)
+            .unwrap()
+            .ok()
+    );
+    assert!(declare(&host, &c, "01-a/u/consumer", Lane::Codex, &["old"]).ok());
+    let why = note(&c, "superseded.md");
+    assert!(advance(&host, &c, "01-a/u/old", "superseded", Some(&why)).ok());
+    let done = note(&c, "done.md");
+    assert!(advance(&host, &c, "01-a/u/replacement", "done", Some(&done)).ok());
+    let regate = Amendment {
+        drop_after: vec!["old".into()],
+        after: vec!["replacement".into()],
+        ..Amendment::default()
+    };
+    let amended = commands::amend(&host, &c.root, &target("01-a/u/consumer"), &regate).unwrap();
+    assert!(amended.ok(), "{:?}", amended.violations);
+    let units = plan::load_units(&c.root).unwrap();
+    let step = plan::step(&units, "01-a/u/consumer").unwrap();
+    assert_eq!(
+        step.after
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec!["01-a/u/replacement"]
+    );
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    assert!(journal.contains("- after: - 01-a/u/old\n- after: + 01-a/u/replacement\n"));
+    let rendered = fs::read_to_string(c.root.join("01-a/u/STATE.md")).unwrap();
+    assert!(rendered.contains("| consumer | codex | 01-a/u/replacement |"));
+    assert!(lint(&c.root).unwrap().ok());
+    let launched = launch(&host, &c, "01-a/u/consumer");
+    assert!(launched.ok(), "{:?}", launched.violations);
 }

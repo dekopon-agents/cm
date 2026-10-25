@@ -1424,3 +1424,41 @@ fn a_unit_from_a_newer_schema_is_refused() {
             .contains("has schema 4, newer than the schema 3")
     );
 }
+
+#[test]
+fn a_tag_only_release_releases_a_merged_member_it_contains() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let repo = c.root.parent().unwrap().join("cm-repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "release"]);
+    git(&repo, &["tag", "v0.7.0"]);
+    assert!(declare_release(&host, &c, "00-release/cm/0.7.0", "o/cm", "v{version}").ok());
+    let released = commands::advance(
+        &host,
+        &c.root,
+        &parse_target("00-release/cm/0.7.0", false).unwrap(),
+        &Phase::Released,
+        &Evidence {
+            tag: Some("v0.7.0".into()),
+            ..Evidence::default()
+        },
+        None,
+        Some(&repo),
+    )
+    .unwrap();
+    assert!(released.ok(), "{:?}", released.violations);
+    assert!(declare(&host, &c, "01-a/u/S1", Lane::Pi, &[]).ok());
+    kickoff(&c, "01-a/u/S1");
+    let pr = "https://github.com/o/cm/pull/1";
+    open_pr(&host, &c, "01-a/u/S1", pr);
+    let mut forge = FakeForge::default();
+    forge.pulls.insert(pr.into(), merged("s1"));
+    forge
+        .tags
+        .insert(("o/cm".into(), "v0.7.0".into()), ["s1".to_owned()].into());
+    sync(&host, &forge, &c.root).unwrap();
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(state(&c, "01-a/u/S1"), Phase::Released);
+}
