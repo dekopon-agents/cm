@@ -116,8 +116,14 @@ fn read_pr(url: &str) -> Result<(PullRequest, String), String> {
     Ok((pr, rest.base.name))
 }
 
-/// The base branch's required contexts, from branch protection and rulesets, each named once.
-fn required_contexts(repo: &str, base: &str) -> Result<Vec<String>, String> {
+#[derive(Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+struct RequiredContext {
+    context: String,
+    #[serde(default, alias = "integration_id")]
+    app_id: Option<i64>,
+}
+
+fn required_contexts(repo: &str, base: &str) -> Result<Vec<RequiredContext>, String> {
     #[derive(Deserialize)]
     struct Protection {
         #[serde(default)]
@@ -127,6 +133,8 @@ fn required_contexts(repo: &str, base: &str) -> Result<Vec<String>, String> {
     struct Required {
         #[serde(default)]
         contexts: Vec<String>,
+        #[serde(default)]
+        checks: Vec<RequiredContext>,
     }
     #[derive(Deserialize)]
     struct BranchInfo {
@@ -143,37 +151,42 @@ fn required_contexts(repo: &str, base: &str) -> Result<Vec<String>, String> {
     #[derive(Deserialize)]
     struct RuleChecks {
         #[serde(default)]
-        required_status_checks: Vec<RuleCheck>,
-    }
-    #[derive(Deserialize)]
-    struct RuleCheck {
-        context: String,
+        required_status_checks: Vec<RequiredContext>,
     }
     let branch: BranchInfo = api(&format!("repos/{repo}/branches/{base}"))?;
     let rules: Vec<Rule> = api(&format!("repos/{repo}/rules/branches/{base}"))?;
-    let mut out: Vec<String> = branch
+    let mut out: Vec<RequiredContext> = branch
         .protection
         .and_then(|protection| protection.required_status_checks)
-        .map(|required| required.contexts)
+        .map(|required| {
+            let mut checks = required.checks;
+            for context in required.contexts {
+                if !checks.iter().any(|check| check.context == context) {
+                    checks.push(RequiredContext {
+                        context,
+                        app_id: None,
+                    });
+                }
+            }
+            checks
+        })
         .unwrap_or_default();
     out.extend(
         rules
             .into_iter()
             .filter(|rule| rule.kind == "required_status_checks")
             .filter_map(|rule| rule.parameters)
-            .flat_map(|parameters| parameters.required_status_checks)
-            .map(|check| check.context),
+            .flat_map(|parameters| parameters.required_status_checks),
     );
     out.sort();
     out.dedup();
     Ok(out)
 }
 
-/// Each required context on the head, from check runs and commit statuses. A context the head
-/// does not report is `MISSING`, which is never green.
 fn required_checks(repo: &str, head: &str, base: &str) -> Result<Vec<Check>, String> {
     #[derive(Deserialize)]
     struct Runs {
+        total_count: usize,
         check_runs: Vec<Run>,
     }
     #[derive(Deserialize)]
@@ -184,9 +197,15 @@ fn required_checks(repo: &str, head: &str, base: &str) -> Result<Vec<Check>, Str
         html_url: Option<String>,
         started_at: Option<String>,
         completed_at: Option<String>,
+        app: Option<App>,
+    }
+    #[derive(Deserialize)]
+    struct App {
+        id: i64,
     }
     #[derive(Deserialize)]
     struct Combined {
+        total_count: usize,
         statuses: Vec<Status>,
     }
     #[derive(Deserialize)]
@@ -201,49 +220,112 @@ fn required_checks(repo: &str, head: &str, base: &str) -> Result<Vec<Check>, Str
     if contexts.is_empty() {
         return Ok(Vec::new());
     }
-    let runs: Runs = api(&format!(
-        "repos/{repo}/commits/{head}/check-runs?per_page=100"
-    ))?;
-    let combined: Combined = api(&format!("repos/{repo}/commits/{head}/status?per_page=100"))?;
-    Ok(contexts
-        .into_iter()
-        .map(|name| {
-            if let Some(run) = runs.check_runs.iter().find(|run| run.name == name) {
-                let state = match (run.status.as_str(), run.conclusion.as_deref()) {
-                    ("completed", Some(conclusion)) => conclusion.to_uppercase(),
-                    ("completed", None) => "UNKNOWN".into(),
-                    (status, _) => status.to_uppercase(),
-                };
-                return Check {
-                    name,
-                    state,
-                    link: run.html_url.clone().unwrap_or_default(),
-                    started_at: run.started_at.clone().unwrap_or_default(),
-                    completed_at: run.completed_at.clone().unwrap_or_default(),
-                };
+    let mut requirements: BTreeMap<String, BTreeMap<Option<i64>, bool>> = BTreeMap::new();
+    for required in contexts {
+        requirements
+            .entry(required.context)
+            .or_default()
+            .insert(required.app_id.filter(|id| *id != -1), false);
+    }
+    let mut checks = Vec::new();
+    let mut consumed = 0;
+    let mut total = 0;
+    for page in 1.. {
+        let batch: Runs = api(&format!(
+            "repos/{repo}/commits/{head}/check-runs?per_page=100&filter=all&page={page}"
+        ))?;
+        let last = batch.check_runs.len() < 100;
+        consumed += batch.check_runs.len();
+        total = total.max(batch.total_count);
+        for run in batch.check_runs {
+            let Some(apps) = requirements.get_mut(&run.name) else {
+                continue;
+            };
+            let mut applicable = false;
+            for (app_id, matched) in apps {
+                if app_id.is_none_or(|id| run.app.as_ref().is_some_and(|app| app.id == id)) {
+                    *matched = true;
+                    applicable = true;
+                }
             }
-            match combined
-                .statuses
-                .iter()
-                .find(|status| status.context == name)
-            {
-                Some(status) => Check {
-                    state: status.state.to_uppercase(),
-                    link: status.target_url.clone().unwrap_or_default(),
-                    started_at: status.created_at.clone(),
-                    completed_at: status.updated_at.clone(),
-                    name,
-                },
-                None => Check {
-                    name,
-                    state: "MISSING".into(),
-                    link: String::new(),
-                    started_at: String::new(),
-                    completed_at: String::new(),
-                },
+            if !applicable {
+                continue;
             }
-        })
-        .collect())
+            let state = match (run.status.as_str(), run.conclusion.as_deref()) {
+                ("completed", Some("success")) => "SUCCESS".into(),
+                (
+                    "completed",
+                    Some(
+                        conclusion @ ("failure" | "error" | "timed_out" | "cancelled"
+                        | "action_required" | "startup_failure" | "neutral"
+                        | "skipped" | "stale"),
+                    ),
+                ) => conclusion.to_uppercase(),
+                (status @ ("queued" | "in_progress" | "waiting" | "requested" | "pending"), _) => {
+                    status.to_uppercase()
+                }
+                _ => "UNKNOWN".into(),
+            };
+            checks.push(Check {
+                name: run.name,
+                state,
+                link: run.html_url.unwrap_or_default(),
+                started_at: run.started_at.unwrap_or_default(),
+                completed_at: run.completed_at.unwrap_or_default(),
+            });
+        }
+        if last {
+            if consumed < total {
+                return Err("check-run pagination ended before total_count was reached".into());
+            }
+            break;
+        }
+    }
+    let mut consumed = 0;
+    let mut total = 0;
+    for page in 1.. {
+        let batch: Combined = api(&format!(
+            "repos/{repo}/commits/{head}/status?per_page=100&page={page}"
+        ))?;
+        let last = batch.statuses.len() < 100;
+        consumed += batch.statuses.len();
+        total = total.max(batch.total_count);
+        for status in batch.statuses {
+            let Some(apps) = requirements.get_mut(&status.context) else {
+                continue;
+            };
+            if let Some(matched) = apps.get_mut(&None) {
+                *matched = true;
+            }
+            checks.push(Check {
+                name: status.context,
+                state: status.state.to_uppercase(),
+                link: status.target_url.unwrap_or_default(),
+                started_at: status.created_at,
+                completed_at: status.updated_at,
+            });
+        }
+        if last {
+            if consumed < total {
+                return Err("status pagination ended before total_count was reached".into());
+            }
+            break;
+        }
+    }
+    for (name, apps) in requirements {
+        if apps.values().any(|matched| !matched) {
+            checks.push(Check {
+                name,
+                state: "MISSING".into(),
+                link: String::new(),
+                started_at: String::new(),
+                completed_at: String::new(),
+            });
+        }
+    }
+    checks.sort();
+    checks.dedup();
+    Ok(checks)
 }
 
 impl Github for Gh {

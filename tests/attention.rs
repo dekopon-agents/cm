@@ -178,6 +178,25 @@ fn cli_fixture(
     check_output: &str,
     check_exit: i32,
 ) -> (tempfile::TempDir, std::process::Output) {
+    source_fixture(
+        second_head,
+        &[check_output.to_owned()],
+        &[r#"{"statuses":[]}"#.to_owned()],
+        r#"{"protection":{"required_status_checks":{"contexts":["test"]}}}"#,
+        "[]",
+        check_exit,
+    )
+}
+
+#[cfg(unix)]
+fn source_fixture(
+    second_head: &str,
+    runs: &[String],
+    statuses: &[String],
+    branch: &str,
+    rules: &str,
+    check_exit: i32,
+) -> (tempfile::TempDir, std::process::Output) {
     let dir = tempfile::tempdir().unwrap();
     let campaign = dir.path().join("campaign");
     commands::init(&Clock, &campaign).unwrap();
@@ -196,15 +215,35 @@ fn cli_fixture(
     let fixture = |name: &str, text: &str| std::fs::write(dir.path().join(name), text).unwrap();
     fixture("first.json", &pull(&"a".repeat(40)));
     fixture("second.json", &pull(second_head));
-    fixture(
-        "branch.json",
-        r#"{"protection":{"required_status_checks":{"contexts":["test"]}}}"#,
-    );
-    fixture("rules.json", "[]");
-    fixture("status.json", r#"{"statuses":[]}"#);
-    fixture("runs.json", check_output);
+    fixture("branch.json", branch);
+    fixture("rules.json", rules);
+    for (prefix, field, pages) in [
+        ("runs", "check_runs", runs),
+        ("status", "statuses", statuses),
+    ] {
+        let total: usize = pages
+            .iter()
+            .filter_map(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+            .filter_map(|body| body[field].as_array().map(Vec::len))
+            .sum();
+        for (page, body) in pages.iter().enumerate() {
+            let body = match serde_json::from_str::<serde_json::Value>(body) {
+                Ok(mut value) => {
+                    value
+                        .as_object_mut()
+                        .unwrap()
+                        .entry("total_count")
+                        .or_insert(total.into());
+                    value.to_string()
+                }
+                Err(_) => body.clone(),
+            };
+            fixture(&format!("{prefix}{}.json", page + 1), &body);
+        }
+    }
     let script = r#"#!/bin/sh
 printf '%s\n' "$*" >> "$ATTENTION_FIXTURE/args"
+page=1; case "$*" in *page=2*) page=2 ;; *page=3*) page=3 ;; esac
 case "$4" in
   */pulls/*)
     if [ -f "$ATTENTION_FIXTURE/seen" ]; then cat "$ATTENTION_FIXTURE/second.json"; else
@@ -212,9 +251,9 @@ case "$4" in
       cat "$ATTENTION_FIXTURE/first.json"
     fi ;;
   */branches/*) case "$4" in */rules/*) cat "$ATTENTION_FIXTURE/rules.json" ;; *) cat "$ATTENTION_FIXTURE/branch.json" ;; esac ;;
-  */status*) cat "$ATTENTION_FIXTURE/status.json" ;;
+  */status*) cat "$ATTENTION_FIXTURE/status$page.json" ;;
   *)
-    cat "$ATTENTION_FIXTURE/runs.json"
+    cat "$ATTENTION_FIXTURE/runs$page.json" || exit 1
     exit "$ATTENTION_CHECK_EXIT" ;;
 esac
 "#;
@@ -294,4 +333,243 @@ fn cli_rejects_malformed_json_and_unsuccessful_gh_even_with_success_bytes() {
         let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(json["observations"][URL]["action"], "investigate-evidence");
     }
+}
+
+#[cfg(unix)]
+fn source_row(
+    runs: &[String],
+    statuses: &[String],
+    branch: &str,
+    rules: &str,
+) -> serde_json::Value {
+    let (_, output) = source_fixture(&"a".repeat(40), runs, statuses, branch, rules, 0);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    json["observations"][URL].clone()
+}
+
+const REQUIRED: &str = r#"{"protection":{"required_status_checks":{"contexts":["test"]}}}"#;
+const EMPTY_STATUS: &str = r#"{"statuses":[]}"#;
+
+fn status_page(state: &str) -> String {
+    serde_json::json!({"statuses": [{"context": "test", "state": state,
+        "target_url": "https://ci.example/1", "created_at": "2026-10-10T13:00:00Z",
+        "updated_at": "2026-10-10T13:01:00Z"}]})
+    .to_string()
+}
+
+fn full_page(field: &str) -> String {
+    let rows: Vec<_> = (0..100).map(|i| match field {
+        "check_runs" => serde_json::json!({"name": format!("other-{i}"), "status": "completed",
+            "conclusion": "success", "html_url": null, "started_at": null, "completed_at": null}),
+        _ => serde_json::json!({"context": format!("other-{i}"), "state": "success",
+            "target_url": null, "created_at": "2026-10-10T13:00:00Z", "updated_at": "2026-10-10T13:01:00Z"}),
+    }).collect();
+    serde_json::json!({field: rows, "total_count": 101}).to_string()
+}
+
+#[test]
+#[cfg(unix)]
+fn a_failing_status_beside_a_green_run_of_the_same_name_is_not_green() {
+    let row = source_row(&[RUNS.into()], &[status_page("failure")], REQUIRED, "[]");
+    assert_eq!(row["action"], "fix-ci");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_required_run_on_the_second_page_is_found() {
+    let row = source_row(
+        &[full_page("check_runs"), RUNS.into()],
+        &[EMPTY_STATUS.into()],
+        REQUIRED,
+        "[]",
+    );
+    assert_eq!(row["evidence"]["required_checks"][0]["state"], "SUCCESS");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_required_status_on_the_second_page_is_found() {
+    let row = source_row(
+        &[r#"{"check_runs":[]}"#.into()],
+        &[full_page("statuses"), status_page("success")],
+        REQUIRED,
+        "[]",
+    );
+    assert_eq!(row["action"], "review-head");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_later_failing_run_beats_an_earlier_green_run() {
+    let mut first: serde_json::Value = serde_json::from_str(&full_page("check_runs")).unwrap();
+    first["check_runs"][0] =
+        serde_json::from_str::<serde_json::Value>(RUNS).unwrap()["check_runs"][0].clone();
+    let row = source_row(
+        &[first.to_string(), RUNS.replace("success", "failure")],
+        &[EMPTY_STATUS.into()],
+        REQUIRED,
+        "[]",
+    );
+    assert_eq!(row["action"], "fix-ci");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_later_failing_status_beats_a_green_run() {
+    let row = source_row(
+        &[RUNS.into()],
+        &[full_page("statuses"), status_page("failure")],
+        REQUIRED,
+        "[]",
+    );
+    assert_eq!(row["action"], "fix-ci");
+}
+
+#[test]
+#[cfg(unix)]
+fn every_app_reporting_an_unrestricted_name_must_be_green() {
+    let mut runs: serde_json::Value = serde_json::from_str(RUNS).unwrap();
+    runs["check_runs"][0]["app"] = serde_json::json!({"id": 1});
+    let mut failed = runs["check_runs"][0].clone();
+    failed["app"]["id"] = 2.into();
+    failed["conclusion"] = "failure".into();
+    runs["check_runs"].as_array_mut().unwrap().push(failed);
+    let row = source_row(&[runs.to_string()], &[EMPTY_STATUS.into()], REQUIRED, "[]");
+    assert_eq!(row["action"], "fix-ci");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_different_app_cannot_satisfy_a_required_app() {
+    let runs = RUNS.replace(r#""name":"test""#, r#""app":{"id":2},"name":"test""#);
+    let branch = r#"{"protection":{"required_status_checks":{"contexts":["test"],"checks":[{"context":"test","app_id":1}]}}}"#;
+    let row = source_row(&[runs], &[status_page("success")], branch, "[]");
+    assert_eq!(row["action"], "verify-checks");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_ruleset_app_constraint_excludes_other_apps() {
+    let mut runs: serde_json::Value = serde_json::from_str(RUNS).unwrap();
+    runs["check_runs"][0]["app"] = serde_json::json!({"id": 1});
+    let mut other = runs["check_runs"][0].clone();
+    other["app"]["id"] = 2.into();
+    other["conclusion"] = "failure".into();
+    runs["check_runs"].as_array_mut().unwrap().insert(0, other);
+    let rules = r#"[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"test","integration_id":1}]}}]"#;
+    let row = source_row(&[runs.to_string()], &[status_page("success")], "{}", rules);
+    assert_eq!(row["action"], "review-head");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_pending_status_beside_a_green_run_stays_pending() {
+    let row = source_row(&[RUNS.into()], &[status_page("pending")], REQUIRED, "[]");
+    assert_eq!(row["action"], "wait-for-ci");
+}
+
+#[test]
+#[cfg(unix)]
+fn absent_sources_leave_a_required_context_missing() {
+    let row = source_row(
+        &[r#"{"check_runs":[]}"#.into()],
+        &[EMPTY_STATUS.into()],
+        REQUIRED,
+        "[]",
+    );
+    assert_eq!(row["evidence"]["required_checks"][0]["state"], "MISSING");
+    assert_eq!(row["action"], "verify-checks");
+}
+
+#[test]
+#[cfg(unix)]
+fn green_runs_and_statuses_allow_head_review() {
+    let row = source_row(&[RUNS.into()], &[status_page("success")], REQUIRED, "[]");
+    assert_eq!(row["action"], "review-head");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_failed_second_page_discards_partial_evidence() {
+    for field in ["check_runs", "statuses"] {
+        let runs = if field == "check_runs" {
+            vec![full_page(field)]
+        } else {
+            vec![RUNS.into()]
+        };
+        let statuses = if field == "statuses" {
+            vec![full_page(field)]
+        } else {
+            vec![EMPTY_STATUS.into()]
+        };
+        let row = source_row(&runs, &statuses, REQUIRED, "[]");
+        assert_eq!(row["action"], "investigate-evidence");
+        assert_eq!(row["evidence"]["required_checks"], serde_json::json!([]));
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn branch_checks_require_only_the_named_app() {
+    let mut runs: serde_json::Value = serde_json::from_str(RUNS).unwrap();
+    runs["check_runs"][0]["app"] = serde_json::json!({"id": 1});
+    let mut other = runs["check_runs"][0].clone();
+    other["app"]["id"] = 2.into();
+    other["conclusion"] = "failure".into();
+    runs["check_runs"].as_array_mut().unwrap().insert(0, other);
+    let branch =
+        r#"{"protection":{"required_status_checks":{"checks":[{"context":"test","app_id":1}]}}}"#;
+    let row = source_row(&[runs.to_string()], &[EMPTY_STATUS.into()], branch, "[]");
+    assert_eq!(row["action"], "review-head");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_truncated_check_run_page_discards_partial_evidence() {
+    let mut first: serde_json::Value = serde_json::from_str(&full_page("check_runs")).unwrap();
+    first["total_count"] = 102.into();
+    let mut second: serde_json::Value = serde_json::from_str(RUNS).unwrap();
+    second["total_count"] = 102.into();
+    let row = source_row(
+        &[first.to_string(), second.to_string()],
+        &[EMPTY_STATUS.into()],
+        REQUIRED,
+        "[]",
+    );
+    assert_eq!(row["action"], "investigate-evidence");
+    assert_eq!(row["evidence"]["required_checks"], serde_json::json!([]));
+}
+
+#[test]
+#[cfg(unix)]
+fn a_truncated_status_page_discards_partial_evidence() {
+    let mut first: serde_json::Value = serde_json::from_str(&full_page("statuses")).unwrap();
+    first["total_count"] = 102.into();
+    let mut second: serde_json::Value = serde_json::from_str(&status_page("success")).unwrap();
+    second["total_count"] = 102.into();
+    let row = source_row(
+        &[RUNS.into()],
+        &[first.to_string(), second.to_string()],
+        REQUIRED,
+        "[]",
+    );
+    assert_eq!(row["action"], "investigate-evidence");
+    assert_eq!(row["evidence"]["required_checks"], serde_json::json!([]));
+}
+
+#[test]
+#[cfg(unix)]
+fn an_unknown_run_phase_on_a_later_page_cannot_be_green() {
+    let malformed = RUNS.replace(
+        r#""status":"completed","conclusion":"success""#,
+        r#""status":"success","conclusion":null"#,
+    );
+    let row = source_row(
+        &[full_page("check_runs"), malformed],
+        &[EMPTY_STATUS.into()],
+        REQUIRED,
+        "[]",
+    );
+    assert_eq!(row["action"], "verify-checks");
+    assert_eq!(row["evidence"]["required_checks"][0]["state"], "UNKNOWN");
 }
