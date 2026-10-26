@@ -13,8 +13,8 @@ use crate::ledger::{guard, journal_line, one_line};
 use crate::outcome::{Outcome, Violation};
 use crate::plan::{self, Units};
 use crate::state::{
-    After, KnownRed, Phase, Pin, Resolved, Revision, Signal, Step, Watch, WatchStatus, is_commit,
-    same_commit,
+    After, Evidence, KnownRed, Move, Phase, Pin, Resolved, Revision, Signal, Step, Watch,
+    WatchStatus, is_commit, same_commit,
 };
 use crate::store::{self, Target};
 
@@ -71,8 +71,38 @@ pub fn verify(check: &CheckState, base: Option<&[CheckState]>) -> Result<(), Unc
     Ok(())
 }
 
+/// Closed once its condition held; a gate the condition's step later reopens, such as through
+/// stale pinned evidence, does not reopen the exception.
 pub fn is_open(units: &Units, exception: &KnownRed) -> bool {
-    !plan::gate(units, &exception.until).met()
+    let gate = plan::gate(units, &exception.until);
+    exception.closed.is_none()
+        && !gate
+            .track
+            .as_ref()
+            .is_some_and(|track| exception.until.met_by(track, gate.finish))
+}
+
+/// Records each exception whose closing condition now holds; returns the journal lines.
+pub fn mark_closed(units: &mut Units, at: &str) -> Vec<(String, String)> {
+    let snapshot = units.clone();
+    let mut out = Vec::new();
+    for (unit_name, unit) in units.iter_mut() {
+        for (name, step) in unit.steps.iter_mut() {
+            for exception in step.known_red.iter_mut() {
+                if exception.closed.is_none() && !is_open(&snapshot, exception) {
+                    exception.closed = Some(at.to_owned());
+                    out.push((
+                        unit_name.clone(),
+                        format!(
+                            "- known-red {unit_name}/{name}: `{}` at {} closed, {} holds; the check blocks again",
+                            exception.check, exception.commit, exception.until
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    out
 }
 
 pub fn cover<'a>(
@@ -275,6 +305,7 @@ pub fn known_red(
         owner: args.owner.trim().to_owned(),
         until,
         at: at.clone(),
+        closed: None,
     };
     let Some(step) = unit
         .steps
@@ -437,7 +468,26 @@ pub fn watch_resolve(
         ),
         Some(WatchStatus::Open | WatchStatus::Resolved) | None => String::new(),
     };
-    let body = format!("- signal: {}\n- evidence: {evidence}\n{late}", watch.signal);
+    let mut body = format!("- signal: {}\n- evidence: {evidence}\n{late}", watch.signal);
+    let mut rolled = Vec::new();
+    if let Some(step) = unit
+        .steps
+        .get_mut(target.step.as_deref().unwrap_or_default())
+    {
+        rolled = step.roll_up_all(&at, &Evidence::default());
+    }
+    for (from, to) in &rolled {
+        body.push_str(&format!(
+            "- {full}: {from} → {to}, every part has reached {to}\n"
+        ));
+        unit.history.push(Move {
+            at: at.clone(),
+            target: full.clone(),
+            from: from.clone(),
+            to: to.clone(),
+            evidence: Evidence::default(),
+        });
+    }
     write_unit(&dir, &unit)?;
     let journal = journal_line(root, &at, &format!("watch {full}#{id} resolved"), &body)?;
     let mut outcome = Outcome::default();
@@ -450,9 +500,18 @@ pub fn watch_resolve(
 }
 
 pub fn head(root: &Path, units: &Units, target: &str) -> Option<String> {
-    let step = plan::step(units, target)?;
-    let at_pr = match step.track.resting() {
-        Phase::PrOpen => step.parts.is_empty(),
+    let (name, part) = match target.split_once('#') {
+        Some((name, part)) => (name, Some(part)),
+        None => (target, None),
+    };
+    let step = plan::step(units, name)?;
+    let track = match part {
+        Some(part) => step.parts.get(part)?,
+        None if step.parts.is_empty() => &step.track,
+        None => return None,
+    };
+    match track.resting() {
+        Phase::PrOpen => {}
         Phase::Drafted
         | Phase::Launched
         | Phase::Merged
@@ -460,18 +519,15 @@ pub fn head(root: &Path, units: &Units, target: &str) -> Option<String> {
         | Phase::Deployed
         | Phase::Done
         | Phase::Superseded
-        | Phase::Blocked(_) => false,
-    };
-    if !at_pr {
-        return None;
+        | Phase::Blocked(_) => return None,
     }
-    let observed = step.track.evidence.pr.as_deref().and_then(|pr| {
+    let observed = track.evidence.pr.as_deref().and_then(|pr| {
         store::read_json::<BTreeMap<String, plan::Observed>>(&plan::pulls_path(root))
             .ok()?
             .remove(pr)?
             .head
     });
-    observed.or_else(|| step.track.evidence.sha.clone())
+    observed.or_else(|| track.evidence.sha.clone())
 }
 
 pub fn revision(
@@ -485,18 +541,32 @@ pub fn revision(
         Some((name, sha)) => (name, Some(sha)),
         None => (text, None),
     };
+    let (name, part) = match name.split_once('#') {
+        Some((name, part)) => (name, Some(part)),
+        None => (name, None),
+    };
     let refuse = |message: String| Violation::new(flag, "pin-revision", message);
     let step = match After::parse(name, unit) {
         Ok(After::Merged(step)) => step,
         Ok(After::PrOpen(_) | After::Tag(_) | After::Deployed(_)) | Err(_) => {
             return Err(refuse(format!(
-                "`{text}` is not <step>[@<sha>] or <NN-name>/<unit>/<step>[@<sha>]"
+                "`{text}` is not <step>[#<part>][@<sha>] or <NN-name>/<unit>/<step>[#<part>][@<sha>]"
             )));
         }
     };
-    if plan::step(units, &step).is_none() {
+    let Some(declared) = plan::step(units, &step) else {
         return Err(refuse(format!("{step} is not declared")));
-    }
+    };
+    let step = match part {
+        Some(part) if declared.parts.contains_key(part) => format!("{step}#{part}"),
+        Some(part) => return Err(refuse(format!("{step} declares no part `{part}`"))),
+        None if declared.parts.is_empty() => step,
+        None => {
+            return Err(refuse(format!(
+                "{step} is a multipart step; pin evidence to one part's head as {step}#<part>"
+            )));
+        }
+    };
     let current = head(root, units, &step);
     match (sha, current) {
         (Some(sha), _) if !is_commit(sha) => Err(refuse(format!("`{sha}` is not a commit"))),

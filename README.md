@@ -336,7 +336,8 @@ infrastructure failure: cancelled, timed out, never run), or is green at the PR'
 regression this change made). The merge gate, in `cm advance` and `cm sync`, applies the same
 test at merge time: an exception covers a red check only at its exact commit, for its exact check
 name, while the check still fails and was not green at the base, and until its closing condition
-holds; every other check must still be green. The move journals each exception it used.
+holds; every other check must still be green. The move journals each exception it used, and
+`cm sync` journals once when an exception's closing condition first holds; it stays closed.
 
 ### Parts
 
@@ -346,13 +347,15 @@ moves parts through merged, released and deployed as it moves steps); the step's
 up behind them, moving to a state only once every part rests there, so a gate on the step stays
 closed until the last part arrives. Moving the step itself past `launched` names the short parts
 (`part-short`). Declaring parts on a step that already moved on hands the step's state and
-evidence to the first new part and rests the step at `launched`. A release step, a study and an
+evidence to the first new part and rests the step at `launched`. A step a watch held below
+`deployed` rolls up when the watch resolves. A release step, a study and an
 owner-lane step have no parts.
 
 ### Pinned evidence
 
 `cm evidence <step> --name N --body-file F --candidate S [--harness H]` pins the evidence to the
-commits it was produced against: `S` and `H` are declared steps, each with an optional `@<sha>`;
+commits it was produced against: `S` and `H` are declared steps, each with an optional `@<sha>`
+(a multipart step is named by one part, `<step>#<part>`);
 without one cm takes the step's open PR head (the head `cm sync` last saw, else the one recorded at
 `pr-open`), and a sha given for a step whose PR is open must be that head. When `cm sync` sees the
 candidate's or the harness's PR head move off the pinned commit, it marks the pin stale and

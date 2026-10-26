@@ -1657,6 +1657,15 @@ fn a_known_red_exception_covers_only_its_failing_check_at_its_head_until_it_clos
         "{:?}",
         closed.violations
     );
+    sync(&host, &red, &closing.root).unwrap();
+    sync(&host, &red, &closing.root).unwrap();
+    let journal = fs::read_to_string(closing.root.join("JOURNAL.md")).unwrap();
+    assert_eq!(
+        journal.matches("- known-red 01-a/u/S1: `lab` at").count(),
+        1,
+        "{journal}"
+    );
+    assert!(journal.contains("closed, 01-a/u/build holds"), "{journal}");
 
     let waiver = closing.write("waiver.md", "Owner: merge anyway.\n");
     let waived = closing.merge(

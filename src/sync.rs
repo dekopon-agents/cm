@@ -122,7 +122,9 @@ impl<'a> Run<'a> {
         self.tags();
         self.released();
         self.deployed();
+        self.settle();
         let mut notes = crate::holds::mark_stale(&mut self.units, &self.heads, &self.at);
+        notes.extend(crate::holds::mark_closed(&mut self.units, &self.at));
         notes.extend(crate::holds::mark_expired(
             &mut self.units,
             self.now,
@@ -132,6 +134,32 @@ impl<'a> Run<'a> {
             self.dirty.insert(unit.clone());
         }
         self.notes.extend(notes);
+    }
+
+    /// Rolls up a multipart step whose parts moved on while something held it, such as a watch
+    /// resolved after its last part deployed.
+    fn settle(&mut self) {
+        for (unit_name, unit) in self.units.iter_mut() {
+            for (name, step) in unit.steps.iter_mut() {
+                let target = format!("{unit_name}/{name}");
+                for (from, to) in step.roll_up_all(&self.at, &Evidence::default()) {
+                    unit.history.push(Move {
+                        at: self.at.clone(),
+                        target: target.clone(),
+                        from: from.clone(),
+                        to: to.clone(),
+                        evidence: Evidence::default(),
+                    });
+                    self.dirty.insert(unit_name.clone());
+                    self.moves.push(Moved {
+                        target: target.clone(),
+                        from,
+                        to,
+                        evidence: Evidence::default(),
+                    });
+                }
+            }
+        }
     }
 
     fn tracks_at(&self, phase: &Phase) -> Vec<Tracked> {
@@ -212,15 +240,15 @@ impl<'a> Run<'a> {
             to,
             evidence: evidence.clone(),
         }];
-        if part.is_some()
-            && let Some((from, to)) = step.roll_up(&self.at, &evidence)
-        {
-            moved.push(Moved {
-                target: target.to_owned(),
-                from,
-                to,
-                evidence,
-            });
+        if part.is_some() {
+            for (from, to) in step.roll_up_all(&self.at, &evidence) {
+                moved.push(Moved {
+                    target: target.to_owned(),
+                    from,
+                    to,
+                    evidence: evidence.clone(),
+                });
+            }
         }
         for moved in moved {
             unit.history.push(Move {
@@ -366,9 +394,7 @@ impl<'a> Run<'a> {
             let Some(read) = self.pull(&url) else {
                 continue;
             };
-            if tracked.part.is_none()
-                && let Some(head) = head_of(&read)
-            {
+            if let Some(head) = head_of(&read) {
                 self.heads.insert(target.clone(), head);
             }
             match read {

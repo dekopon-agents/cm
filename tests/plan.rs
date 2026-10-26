@@ -2084,3 +2084,131 @@ fn a_watch_past_its_deadline_without_evidence_stays_unresolved_and_holds_the_ste
     assert_eq!(state(&c, step), Phase::Deployed);
     assert!(lint(&c.root).unwrap().ok());
 }
+
+fn multipart(host: &Fake, c: &Campaign, step: &str, parts: &[&str]) -> (String, Vec<String>) {
+    assert!(declare(host, c, step, Lane::Pi, &[]).ok());
+    kickoff(c, step);
+    let worktree = c.root.parent().unwrap().join("wt");
+    if !worktree.exists() {
+        fs::create_dir_all(&worktree).unwrap();
+        git(&worktree, &["init", "-q"]);
+    }
+    git(&worktree, &["commit", "-q", "--allow-empty", "-m", step]);
+    let target = parse_target(step, true).unwrap();
+    assert!(
+        commands::launch(host, &c.root, &target, Some(&worktree))
+            .unwrap()
+            .ok()
+    );
+    let amendment = commands::Amendment {
+        parts: parts.iter().map(|part| (*part).to_owned()).collect(),
+        ..commands::Amendment::default()
+    };
+    assert!(
+        commands::amend(host, &c.root, &target, &amendment)
+            .unwrap()
+            .ok()
+    );
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+    let prs: Vec<String> = parts
+        .iter()
+        .enumerate()
+        .map(|(n, _)| format!("https://github.com/dekopon-agents/dekopon/pull/{}", 800 + n))
+        .collect();
+    for (part, pr) in parts.iter().zip(&prs) {
+        let opened = advance_part(
+            host,
+            c,
+            step,
+            part,
+            "pr-open",
+            Evidence {
+                pr: Some(pr.clone()),
+                sha: Some(head.clone()),
+                ..Evidence::default()
+            },
+        );
+        assert!(opened.ok(), "{:?}", opened.violations);
+    }
+    (head, prs)
+}
+
+#[test]
+fn a_multipart_step_held_by_a_watch_deploys_once_the_watch_resolves() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/events";
+    let (_, prs) = multipart(&host, &c, step, &["pr1", "pr2"]);
+    let target = parse_target(step, true).unwrap();
+    assert!(
+        cm::holds::watch_add(
+            &host,
+            &c.root,
+            &target,
+            "log:github.event",
+            "2026-10-27T06:00Z"
+        )
+        .unwrap()
+        .ok()
+    );
+    let mut forge = FakeForge::default();
+    forge.pulls.insert(prs[0].clone(), merged("aaa1"));
+    forge.pulls.insert(prs[1].clone(), merged("bbb2"));
+    deployed_release(&host, &c, &mut forge, &["aaa1", "bbb2"]);
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(part_state(&c, step, "pr1"), Phase::Deployed);
+    assert_eq!(part_state(&c, step, "pr2"), Phase::Deployed);
+    assert_eq!(state(&c, step), Phase::Released, "the watch holds the step");
+
+    let read = c.root.join(step).join("evidence/event.md");
+    fs::create_dir_all(read.parent().unwrap()).unwrap();
+    fs::write(&read, "1 github.event record.\n").unwrap();
+    let resolved = cm::holds::watch_resolve(&host, &c.root, &target, 1, &read).unwrap();
+    assert!(resolved.ok(), "{:?}", resolved.violations);
+    assert_eq!(state(&c, step), Phase::Deployed);
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(state(&c, step), Phase::Deployed);
+    assert!(lint(&c.root).unwrap().ok());
+}
+
+#[test]
+fn evidence_pinned_to_a_part_goes_stale_when_that_part_head_moves() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/events";
+    let (head, prs) = multipart(&host, &c, step, &["pr1", "pr2"]);
+    assert!(declare_work(&host, &c, "01-a/u/run", Lane::Coordinator, &[], Work::Study).ok());
+    kickoff(&c, "01-a/u/run");
+    let pin = |name: &str, candidate: &str| {
+        cm::ledger::evidence_pinned(
+            &host,
+            &c.root,
+            &parse_target("01-a/u/run", true).unwrap(),
+            name,
+            "Lab run.\n",
+            &cm::ledger::PinArgs {
+                candidate: Some(candidate),
+                harness: None,
+            },
+        )
+        .unwrap()
+    };
+    let other = "9".repeat(40);
+    assert_eq!(
+        rules(&pin("run-0", &format!("events@{other}"))),
+        vec!["pin-revision"]
+    );
+    assert_eq!(rules(&pin("run-0", "events")), vec!["pin-revision"]);
+    assert_eq!(
+        rules(&pin("run-0", &format!("events#pr1@{other}"))),
+        vec!["pin-revision"]
+    );
+    let pinned = pin("run-1", "events#pr1");
+    assert!(pinned.ok(), "{:?}", pinned.violations);
+    assert_eq!(pinned.fields["candidate"], format!("{step}#pr1@{head}"));
+    let mut forge = FakeForge::default();
+    forge.pulls.insert(prs[0].clone(), open(&"1".repeat(40)));
+    forge.pulls.insert(prs[1].clone(), open(&head));
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(rules(&lint(&c.root).unwrap()), vec!["evidence-stale"]);
+}

@@ -1650,7 +1650,7 @@ pub fn advance_gated(
     }
     let at = stamp(host.now());
     let from = track.state.clone();
-    let mut rolled = None;
+    let mut rolled = Vec::new();
     match &target.step {
         None => unit.track.apply(to.clone(), &at, &evidence),
         Some(step) => {
@@ -1658,7 +1658,7 @@ pub fn advance_gated(
                 match part.and_then(|part| step.parts.get_mut(part)) {
                     Some(track) => {
                         track.apply(to.clone(), &at, &evidence);
-                        rolled = step.roll_up(&at, &evidence);
+                        rolled = step.roll_up_all(&at, &evidence);
                     }
                     None => step.track.apply(to.clone(), &at, &evidence),
                 }
@@ -1673,7 +1673,7 @@ pub fn advance_gated(
         to: to.clone(),
         evidence: evidence.clone(),
     });
-    if let Some((from, to)) = &rolled {
+    for (from, to) in &rolled {
         unit.history.push(Move {
             at: at.clone(),
             target: step_full.clone(),
@@ -1684,10 +1684,11 @@ pub fn advance_gated(
     }
     write_unit(&unit_dir, &unit)?;
     let mut body = format!("- evidence: {}\n", evidence.summary());
-    let rolled_line = rolled
-        .as_ref()
-        .map(|(from, to)| format!("{step_full}: {from} → {to}, every part has reached {to}"));
-    if let Some(line) = &rolled_line {
+    let rolled_lines: Vec<String> = rolled
+        .iter()
+        .map(|(from, to)| format!("{step_full}: {from} → {to}, every part has reached {to}"))
+        .collect();
+    for line in &rolled_lines {
         body.push_str(&format!("- {line}\n"));
     }
     for line in &gate_lines {
@@ -1697,9 +1698,9 @@ pub fn advance_gated(
     let heading = record(root, &at, &format!("advance {full}: {from} → {to}"), &body)?;
     let mut outcome = Outcome::default();
     outcome.line(format!("{full}: {from} → {to}"));
-    if let Some(line) = rolled_line {
-        outcome.line(line.clone());
-        outcome.field("rolled_up", line);
+    outcome.lines.extend(rolled_lines.iter().cloned());
+    if !rolled_lines.is_empty() {
+        outcome.field("rolled_up", rolled_lines);
     }
     outcome.lines.extend(
         gate_lines

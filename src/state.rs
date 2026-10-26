@@ -699,6 +699,8 @@ pub struct KnownRed {
     pub owner: String,
     pub until: After,
     pub at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<String>,
 }
 
 /// A red check an `--override` waived, kept so lint can name the ones no exception covers.
@@ -984,7 +986,11 @@ impl Step {
             .collect()
     }
 
-    pub fn roll_up(&mut self, at: &str, evidence: &Evidence) -> Option<(Phase, Phase)> {
+    pub fn roll_up_all(&mut self, at: &str, evidence: &Evidence) -> Vec<(Phase, Phase)> {
+        std::iter::from_fn(|| self.roll_up(at, evidence)).collect()
+    }
+
+    fn roll_up(&mut self, at: &str, evidence: &Evidence) -> Option<(Phase, Phase)> {
         let reach = self.parts_reach()?;
         let from = self.track.state.clone();
         if self.track.resting().successor().as_ref() != Some(&reach)
