@@ -332,10 +332,10 @@ one failing check at one commit. Every field is required: the commit is all 40 h
 be the head of a PR the step (or one of its parts) records; `--until` is a gate as `--after` takes
 it, naming a declared step or release, and must not already hold. cm reads GitHub before it
 records the exception and refuses one whose check is absent, is anything but `failure` (an
-infrastructure failure: cancelled, timed out, never run), or is green at the PR's base (a
-regression this change made). The merge gate, in `cm advance` and `cm sync`, applies the same
+infrastructure failure: cancelled, timed out, never run), or did not also fail at the PR's base
+(green there is a regression this change made; absent, pending or unread there may be one). The merge gate, in `cm advance` and `cm sync`, applies the same
 test at merge time: an exception covers a red check only at its exact commit, for its exact check
-name, while the check still fails and was not green at the base, and until its closing condition
+name, while the check still fails and also failed at the base, and until its closing condition
 holds; every other check must still be green. The move journals each exception it used, and
 `cm sync` journals once when an exception's closing condition first holds; it stays closed.
 
@@ -361,7 +361,9 @@ without one cm takes the step's open PR head (the head `cm sync` last saw, else 
 candidate's or the harness's PR head move off the pinned commit, it marks the pin stale and
 journals it. A stale pin fails `cm lint` (`evidence-stale`), closes every gate on the step that
 holds it, is listed by `cm next` under `stale`, and refuses `done --evidence`, until a later pin
-of the same candidate and harness steps supersedes it.
+of the same candidate and harness steps supersedes it. Another step cannot finish on a stale
+pinned file either, and a step that did is a closed gate. A pin naming a step that later becomes
+multipart goes stale at the next `cm sync`.
 
 ### Watches
 
@@ -369,7 +371,8 @@ of the same candidate and harness steps supersedes it.
 coordinator cannot cause: the signal is a stored span event, log record or metric
 (`span:`, `log:` or `metric:`), never a stdout-only line, and the deadline lies ahead. While a
 watch is unresolved the step does not move to `deployed` or `done`, in `cm advance` or `cm sync`.
-`cm watch <step> resolve <id> --evidence <path>` closes it. Past its deadline an unresolved watch
+`cm watch <step> resolve <id> --evidence <path>` closes it, for as long as that file holds: a
+deleted or emptied file reopens the watch (`cm lint` names it, `evidence-file`) until resolved anew. Past its deadline an unresolved watch
 reads `expired: unresolved`: never a pass, journaled once by the next `cm sync`, warned by
 `cm lint`, and listed by `cm next` under `watches` with every open one, so the coordinator reads
 it from state instead of polling it.

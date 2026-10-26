@@ -308,8 +308,22 @@ fn lint_holds(root: &Path, unit: &UnitState, seen: &mut Seen, out: &mut Vec<Viol
                 ),
             ));
         }
-        for watch in step.unresolved_watches() {
-            match watch.status(seen.now) {
+        for watch in &step.watches {
+            if let Some(resolved) = &watch.resolved
+                && let Err(error) = resolved.evidence.check(root)
+            {
+                out.push(Violation::new(
+                    &target,
+                    "evidence-file",
+                    format!(
+                        "watch {} was resolved by {}, which no longer holds: {error}; it holds the step again until resolved anew",
+                        watch.id, resolved.evidence
+                    ),
+                ));
+            }
+        }
+        for watch in step.unresolved_watches(root) {
+            match watch.status(seen.now, root) {
                 crate::state::WatchStatus::Expired => seen.warnings.push(format!(
                     "{target}#{}: expired: unresolved ({}, deadline {}); it holds the step below deployed",
                     watch.id, watch.signal, watch.deadline

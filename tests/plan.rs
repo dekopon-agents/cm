@@ -1785,7 +1785,6 @@ fn part_state(c: &Campaign, target: &str, part: &str) -> Phase {
         .clone()
 }
 
-/// A deployed release 0.49.0 whose tag holds `shas`, so sync deploys the steps that merged them.
 fn deployed_release(host: &Fake, c: &Campaign, forge: &mut FakeForge, shas: &[&str]) {
     let release = "00-release/dekopon/0.49.0";
     let prep = "https://github.com/dekopon-agents/dekopon/pull/799";
@@ -1987,6 +1986,23 @@ fn evidence_pinned_to_a_candidate_or_harness_head_goes_stale_when_that_head_move
         next.fields["stale"][0]["file"],
         "01-a/u/run/evidence/run-1.md"
     );
+    assert!(
+        declare_work(
+            &host,
+            &c,
+            "01-a/u/other",
+            Lane::Coordinator,
+            &[],
+            Work::Study
+        )
+        .ok()
+    );
+    kickoff(&c, "01-a/u/other");
+    assert_eq!(
+        rules(&finish(&c, "01-a/u/other", Some(&evidence))),
+        vec!["evidence-stale"],
+        "another study cannot finish on a stale pinned file"
+    );
     let old = pin("run-x", &format!("feature@{candidate_head}"));
     assert_eq!(rules(&old), vec!["pin-revision"]);
 
@@ -2080,9 +2096,72 @@ fn a_watch_past_its_deadline_without_evidence_stays_unresolved_and_holds_the_ste
     fs::write(&read, "1 broker.decision record at 2026-10-27T06:40Z.\n").unwrap();
     let resolved = cm::holds::watch_resolve(&late, &c.root, &target, 1, &read).unwrap();
     assert!(resolved.ok(), "{:?}", resolved.violations);
+    fs::remove_file(&read).unwrap();
+    sync(&late, &forge, &c.root).unwrap();
+    assert_eq!(
+        state(&c, step),
+        Phase::Released,
+        "deleted evidence resolves nothing"
+    );
+    assert_eq!(rules(&lint(&c.root).unwrap()), vec!["evidence-file"]);
+    fs::write(&read, "1 broker.decision record at 2026-10-27T06:40Z.\n").unwrap();
     sync(&late, &forge, &c.root).unwrap();
     assert_eq!(state(&c, step), Phase::Deployed);
     assert!(lint(&c.root).unwrap().ok());
+}
+
+#[test]
+fn evidence_pinned_to_a_step_later_split_into_parts_goes_stale() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host);
+    let candidate = "01-a/u/feature";
+    assert!(declare(&host, &c, candidate, Lane::Pi, &[]).ok());
+    assert!(declare_work(&host, &c, "01-a/u/run", Lane::Coordinator, &[], Work::Study).ok());
+    kickoff(&c, candidate);
+    kickoff(&c, "01-a/u/run");
+    let pr = "https://github.com/dekopon-agents/dekopon/pull/759";
+    open_pr(&host, &c, candidate, pr);
+    let pinned = cm::ledger::evidence_pinned(
+        &host,
+        &c.root,
+        &parse_target("01-a/u/run", true).unwrap(),
+        "run-1",
+        "Lab run.\n",
+        &cm::ledger::PinArgs {
+            candidate: Some("feature"),
+            harness: None,
+        },
+    )
+    .unwrap();
+    assert!(pinned.ok(), "{:?}", pinned.violations);
+    let amendment = commands::Amendment {
+        parts: vec!["p1".into(), "p2".into()],
+        ..commands::Amendment::default()
+    };
+    let split = commands::amend(
+        &host,
+        &c.root,
+        &parse_target(candidate, true).unwrap(),
+        &amendment,
+    )
+    .unwrap();
+    assert!(split.ok(), "{:?}", split.violations);
+    assert_eq!(part_state(&c, candidate, "p1"), Phase::PrOpen);
+    let head = store::load_unit(&c.root.join("01-a/u")).unwrap().steps["feature"].parts["p1"]
+        .evidence
+        .sha
+        .clone()
+        .unwrap();
+    let mut forge = FakeForge::default();
+    forge.pulls.insert(pr.into(), open(&head));
+    sync(&host, &forge, &c.root).unwrap();
+    let stale = lint(&c.root).unwrap();
+    assert_eq!(rules(&stale), vec!["evidence-stale"]);
+    assert!(
+        stale.violations[0].message.contains("became multipart"),
+        "{:?}",
+        stale.violations
+    );
 }
 
 fn multipart(host: &Fake, c: &Campaign, step: &str, parts: &[&str]) -> (String, Vec<String>) {

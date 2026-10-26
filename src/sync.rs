@@ -129,6 +129,7 @@ impl<'a> Run<'a> {
             &mut self.units,
             self.now,
             &self.at,
+            self.root,
         ));
         for (unit, _) in &notes {
             self.dirty.insert(unit.clone());
@@ -136,13 +137,11 @@ impl<'a> Run<'a> {
         self.notes.extend(notes);
     }
 
-    /// Rolls up a multipart step whose parts moved on while something held it, such as a watch
-    /// resolved after its last part deployed.
     fn settle(&mut self) {
         for (unit_name, unit) in self.units.iter_mut() {
             for (name, step) in unit.steps.iter_mut() {
                 let target = format!("{unit_name}/{name}");
-                for (from, to) in step.roll_up_all(&self.at, &Evidence::default()) {
+                for (from, to) in step.roll_up_all(&self.at, &Evidence::default(), self.root) {
                     unit.history.push(Move {
                         at: self.at.clone(),
                         target: target.clone(),
@@ -241,7 +240,7 @@ impl<'a> Run<'a> {
             evidence: evidence.clone(),
         }];
         if part.is_some() {
-            for (from, to) in step.roll_up_all(&self.at, &evidence) {
+            for (from, to) in step.roll_up_all(&self.at, &evidence, self.root) {
                 moved.push(Moved {
                     target: target.to_owned(),
                     from,
@@ -601,12 +600,12 @@ impl<'a> Run<'a> {
 
     fn watched(&mut self, target: &str, step: &Step) -> bool {
         let held: Vec<String> = step
-            .unresolved_watches()
+            .unresolved_watches(self.root)
             .map(|watch| {
                 format!(
                     "#{} {} ({}, deadline {})",
                     watch.id,
-                    watch.status(self.now).name(),
+                    watch.status(self.now, self.root).name(),
                     watch.signal,
                     watch.deadline
                 )
@@ -728,9 +727,8 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
         // its step still rests at pr-open on it.
         for (url, observed) in seen {
             let failed = !matches!(run.reads.pulls.get(&url), Some(Ok(_)));
-            let current = plan::step(&run.units, &observed.target).is_some_and(|step| {
-                step.track.state == Phase::PrOpen
-                    && step.track.evidence.pr.as_deref() == Some(url.as_str())
+            let current = plan::track(&run.units, &observed.target).is_some_and(|track| {
+                track.state == Phase::PrOpen && track.evidence.pr.as_deref() == Some(url.as_str())
             });
             if failed && current {
                 open.entry(url).or_insert(observed);

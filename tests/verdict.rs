@@ -1560,6 +1560,19 @@ fn a_known_red_exception_covers_only_its_failing_check_at_its_head_until_it_clos
         "{:?}",
         refused.violations
     );
+    let unseen = FakeForge {
+        base_checks: vec![("quality", "success")],
+        ..red_at_head(&head, "failure", "failure")
+    };
+    assert_eq!(
+        rules(&known_red(&host, &c, &unseen, &head, why, "build")),
+        vec!["known-red-refused"]
+    );
+    let pending = red_at_head(&head, "failure", "in_progress");
+    assert_eq!(
+        rules(&known_red(&host, &c, &pending, &head, why, "build")),
+        vec!["known-red-refused"]
+    );
     let added = known_red(&host, &c, &red, &head, why, "build");
     assert!(added.ok(), "{:?}", added.violations);
 
@@ -1600,6 +1613,11 @@ fn a_known_red_exception_covers_only_its_failing_check_at_its_head_until_it_clos
         rules(&gate(&red_at_head(&head, "failure", "success"))),
         vec!["merge-gate"]
     );
+    let unseen = FakeForge {
+        base_checks: vec![("quality", "success")],
+        ..red_at_head(&head, "failure", "failure")
+    };
+    assert_eq!(rules(&gate(&unseen)), vec!["merge-gate"]);
 
     let merged = gate(&red);
     assert!(merged.ok(), "{:?}", merged.violations);

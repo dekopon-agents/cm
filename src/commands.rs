@@ -1001,7 +1001,6 @@ struct GithubRead {
     head: String,
     base: Option<String>,
     checks: Result<Vec<CheckState>, String>,
-    /// CI at the PR's base, read only when a check failed at the head.
     base_checks: Option<Vec<CheckState>>,
     /// `--head` disagreed with GitHub's head.
     mismatch: Option<String>,
@@ -1369,7 +1368,7 @@ pub fn advance_gated(
         | Phase::Blocked(_) => false,
     };
     if watched && let Some(step) = &declared {
-        for watch in step.unresolved_watches() {
+        for watch in step.unresolved_watches(root) {
             violations.push(Violation::new(
                 &full,
                 "watch-open",
@@ -1378,7 +1377,7 @@ pub fn advance_gated(
                     watch.id,
                     watch.signal,
                     watch.deadline,
-                    watch.status(host.now()).name(),
+                    watch.status(host.now(), root).name(),
                     watch.id
                 ),
             ));
@@ -1463,11 +1462,13 @@ pub fn advance_gated(
     if let Some(file) = file {
         match CampaignFile::resolve(root, file) {
             Ok(found) => {
-                if let Some(pin) = declared.as_ref().and_then(|step| {
-                    step.pins
-                        .iter()
-                        .find(|pin| pin.file == found && pin.stale.is_some())
-                }) {
+                let units = plan::load_units(root)?;
+                if let Some(pin) = units
+                    .values()
+                    .flat_map(|unit| unit.steps.values())
+                    .flat_map(|step| step.pins.iter())
+                    .find(|pin| pin.file == found && pin.stale.is_some())
+                {
                     violations.push(Violation::new(
                         &full,
                         "evidence-stale",
@@ -1658,7 +1659,7 @@ pub fn advance_gated(
                 match part.and_then(|part| step.parts.get_mut(part)) {
                     Some(track) => {
                         track.apply(to.clone(), &at, &evidence);
-                        rolled = step.roll_up_all(&at, &evidence);
+                        rolled = step.roll_up_all(&at, &evidence, root);
                     }
                     None => step.track.apply(to.clone(), &at, &evidence),
                 }
@@ -1881,8 +1882,6 @@ pub struct Amendment {
     pub parts: Vec<String>,
 }
 
-/// Declares parts on `step`. A step that already moved past launched with no parts hands its track
-/// to the first new part; the step then rests at launched until every part reaches a state.
 fn add_parts(
     full: &str,
     names: &[String],

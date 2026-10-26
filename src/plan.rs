@@ -31,6 +31,13 @@ pub fn step<'a>(units: &'a Units, target: &str) -> Option<&'a Step> {
     units.get(unit)?.steps.get(name)
 }
 
+pub fn track<'a>(units: &'a Units, target: &str) -> Option<&'a Track> {
+    match target.split_once('#') {
+        Some((name, part)) => step(units, name)?.parts.get(part),
+        None => step(units, target).map(|step| &step.track),
+    }
+}
+
 pub struct Gate {
     pub after: After,
     pub track: Option<Track>,
@@ -82,14 +89,28 @@ pub fn gate(units: &Units, after: &After) -> Gate {
         track: target.map(|step| step.track.clone()),
         finish: target.map_or(Finish::Shipped, Step::finish),
         stale: target
-            .map(|step| {
-                step.stale_pins()
-                    .iter()
-                    .map(|pin| pin.file.to_string())
-                    .collect()
-            })
+            .map(|step| stale_for(units, step))
             .unwrap_or_default(),
     }
+}
+
+pub fn stale_for(units: &Units, step: &Step) -> Vec<String> {
+    let mut stale: Vec<String> = step
+        .stale_pins()
+        .iter()
+        .map(|pin| pin.file.to_string())
+        .collect();
+    if let Some(file) = &step.track.evidence.file
+        && !stale.contains(&file.to_string())
+        && units
+            .values()
+            .flat_map(|unit| unit.steps.values())
+            .flat_map(Step::stale_pins)
+            .any(|pin| pin.file == *file)
+    {
+        stale.push(file.to_string());
+    }
+    stale
 }
 
 pub fn gates(units: &Units, step: &Step) -> Vec<Gate> {
@@ -336,9 +357,9 @@ pub fn dirty(root: &Path, units: &Units) -> Vec<(String, Observed)> {
                 Some(MergeableState::Other(_)) | None => false,
             };
             dirty
-                && step(units, &observed.target).is_some_and(|step| {
-                    step.track.state == Phase::PrOpen
-                        && step.track.evidence.pr.as_deref() == Some(url.as_str())
+                && track(units, &observed.target).is_some_and(|track| {
+                    track.state == Phase::PrOpen
+                        && track.evidence.pr.as_deref() == Some(url.as_str())
                 })
         })
         .collect()
@@ -524,7 +545,7 @@ pub fn next_at(
     for (url, observed) in &dirty {
         outcome.line(dirty_line(url, observed));
     }
-    let held = crate::holds::held(&units, now);
+    let held = crate::holds::held(&units, now, root);
     outcome.lines.extend(held.lines);
     outcome.field("watches", held.watches);
     outcome.field("stale", held.stale);

@@ -47,7 +47,7 @@ impl fmt::Display for Uncovered {
                 "it passes at the PR's base, so this change broke it; an exception never covers a regression",
             ),
             Uncovered::BaseUnknown => f.write_str(
-                "its state at the PR's base is unknown, so it may be a regression",
+                "it did not fail at the PR's base (absent, unread or not a completed failure), so it may be a regression",
             ),
             Uncovered::Closed(until) => write!(f, "its exception closed when {until} held"),
         }
@@ -61,14 +61,18 @@ pub fn verify(check: &CheckState, base: Option<&[CheckState]>) -> Result<(), Unc
             return Err(Uncovered::NotAFailure(check.state.clone()));
         }
     }
-    let base = base.ok_or(Uncovered::BaseUnknown)?;
-    if base
+    let before = base
+        .ok_or(Uncovered::BaseUnknown)?
         .iter()
-        .any(|before| before.name == check.name && before.green())
-    {
-        return Err(Uncovered::GreenAtBase);
+        .find(|before| before.name == check.name)
+        .ok_or(Uncovered::BaseUnknown)?;
+    match before.state {
+        Conclusion::Failure => Ok(()),
+        Conclusion::Success | Conclusion::Neutral | Conclusion::Skipped => {
+            Err(Uncovered::GreenAtBase)
+        }
+        Conclusion::Other(_) => Err(Uncovered::BaseUnknown),
     }
-    Ok(())
 }
 
 /// Closed once its condition held; a gate the condition's step later reopens, such as through
@@ -82,7 +86,6 @@ pub fn is_open(units: &Units, exception: &KnownRed) -> bool {
             .is_some_and(|track| exception.until.met_by(track, gate.finish))
 }
 
-/// Records each exception whose closing condition now holds; returns the journal lines.
 pub fn mark_closed(units: &mut Units, at: &str) -> Vec<(String, String)> {
     let snapshot = units.clone();
     let mut out = Vec::new();
@@ -439,7 +442,7 @@ pub fn watch_resolve(
         .steps
         .get_mut(target.step.as_deref().unwrap_or_default())
         .and_then(|step| step.watches.iter_mut().find(|watch| watch.id == id));
-    let status = watch.as_ref().map(|watch| watch.status(now));
+    let status = watch.as_ref().map(|watch| watch.status(now, root));
     match status {
         None => violations.push(Violation::new(
             &full,
@@ -474,7 +477,7 @@ pub fn watch_resolve(
         .steps
         .get_mut(target.step.as_deref().unwrap_or_default())
     {
-        rolled = step.roll_up_all(&at, &Evidence::default());
+        rolled = step.roll_up_all(&at, &Evidence::default(), root);
     }
     for (from, to) in &rolled {
         body.push_str(&format!(
@@ -599,6 +602,15 @@ pub fn mark_stale(
     heads: &BTreeMap<String, String>,
     at: &str,
 ) -> Vec<(String, String)> {
+    let multipart: Vec<String> = units
+        .iter()
+        .flat_map(|(unit_name, unit)| {
+            unit.steps
+                .iter()
+                .filter(|(_, step)| !step.parts.is_empty())
+                .map(move |(name, _)| format!("{unit_name}/{name}"))
+        })
+        .collect();
     let mut out = Vec::new();
     for (unit_name, unit) in units.iter_mut() {
         for (name, step) in unit.steps.iter_mut() {
@@ -606,6 +618,12 @@ pub fn mark_stale(
                 let moved = std::iter::once(&pin.candidate)
                     .chain(pin.harness.as_ref())
                     .find_map(|revision| {
+                        if multipart.contains(&revision.step) {
+                            return Some(format!(
+                                "{} became multipart; pin to one part as {}#<part>",
+                                revision.step, revision.step
+                            ));
+                        }
                         let now = heads.get(&revision.step)?;
                         (!same_commit(now, &revision.sha)).then(|| {
                             format!("{} moved from {} to {now}", revision.step, revision.sha)
@@ -627,12 +645,18 @@ pub fn mark_stale(
     out
 }
 
-pub fn mark_expired(units: &mut Units, now: jiff::Timestamp, at: &str) -> Vec<(String, String)> {
+pub fn mark_expired(
+    units: &mut Units,
+    now: jiff::Timestamp,
+    at: &str,
+    root: &Path,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (unit_name, unit) in units.iter_mut() {
         for (name, step) in unit.steps.iter_mut() {
             for watch in step.watches.iter_mut() {
-                let first = watch.expired.is_none() && watch.status(now) == WatchStatus::Expired;
+                let first =
+                    watch.expired.is_none() && watch.status(now, root) == WatchStatus::Expired;
                 if first {
                     watch.expired = Some(at.to_owned());
                     out.push((
@@ -655,7 +679,7 @@ pub struct Held {
     pub lines: Vec<String>,
 }
 
-pub fn held(units: &Units, now: jiff::Timestamp) -> Held {
+pub fn held(units: &Units, now: jiff::Timestamp, root: &Path) -> Held {
     let mut held = Held {
         watches: Vec::new(),
         stale: Vec::new(),
@@ -664,8 +688,8 @@ pub fn held(units: &Units, now: jiff::Timestamp) -> Held {
     for (unit_name, unit) in units {
         for (name, step) in &unit.steps {
             let target = format!("{unit_name}/{name}");
-            for watch in step.unresolved_watches() {
-                let status = watch.status(now);
+            for watch in step.unresolved_watches(root) {
+                let status = watch.status(now, root);
                 held.lines.push(format!(
                     "watch {target}#{} {}: {} (deadline {})",
                     watch.id,

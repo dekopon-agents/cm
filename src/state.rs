@@ -659,13 +659,8 @@ impl fmt::Display for Revision {
 }
 
 pub fn same_commit(a: &str, b: &str) -> bool {
-    let (a, b) = (a.to_ascii_lowercase(), b.to_ascii_lowercase());
-    let (short, long) = if a.len() <= b.len() {
-        (&a, &b)
-    } else {
-        (&b, &a)
-    };
-    short.len() >= 7 && long.starts_with(short.as_str())
+    let (a, b) = (a.to_lowercase(), b.to_lowercase());
+    a.len().min(b.len()) >= 7 && (a.starts_with(&b) || b.starts_with(&a))
 }
 
 pub fn is_commit(text: &str) -> bool {
@@ -816,9 +811,14 @@ impl WatchStatus {
 }
 
 impl Watch {
-    pub fn status(&self, now: jiff::Timestamp) -> WatchStatus {
+    /// Resolved only while its evidence file still holds; a deleted file reopens the watch.
+    pub fn status(&self, now: jiff::Timestamp, root: &Path) -> WatchStatus {
         let past = crate::plan::instant(&self.deadline).is_some_and(|deadline| deadline <= now);
-        match (&self.resolved, &self.expired) {
+        let resolved = self
+            .resolved
+            .as_ref()
+            .filter(|resolved| resolved.evidence.check(root).is_ok());
+        match (resolved, &self.expired) {
             (Some(_), _) => WatchStatus::Resolved,
             (None, Some(_)) => WatchStatus::Expired,
             (None, None) if past => WatchStatus::Expired,
@@ -968,8 +968,13 @@ impl Step {
             .and_then(|rank| ORDER.get(rank).cloned())
     }
 
-    pub fn unresolved_watches(&self) -> impl Iterator<Item = &Watch> {
-        self.watches.iter().filter(|watch| watch.resolved.is_none())
+    pub fn unresolved_watches(&self, root: &Path) -> impl Iterator<Item = &Watch> {
+        self.watches.iter().filter(move |watch| {
+            watch
+                .resolved
+                .as_ref()
+                .is_none_or(|resolved| resolved.evidence.check(root).is_err())
+        })
     }
 
     pub fn stale_pins(&self) -> Vec<&Pin> {
@@ -986,17 +991,22 @@ impl Step {
             .collect()
     }
 
-    pub fn roll_up_all(&mut self, at: &str, evidence: &Evidence) -> Vec<(Phase, Phase)> {
-        std::iter::from_fn(|| self.roll_up(at, evidence)).collect()
+    pub fn roll_up_all(
+        &mut self,
+        at: &str,
+        evidence: &Evidence,
+        root: &Path,
+    ) -> Vec<(Phase, Phase)> {
+        std::iter::from_fn(|| self.roll_up(at, evidence, root)).collect()
     }
 
-    fn roll_up(&mut self, at: &str, evidence: &Evidence) -> Option<(Phase, Phase)> {
+    fn roll_up(&mut self, at: &str, evidence: &Evidence, root: &Path) -> Option<(Phase, Phase)> {
         let reach = self.parts_reach()?;
         let from = self.track.state.clone();
         if self.track.resting().successor().as_ref() != Some(&reach)
             || self.track.blocked_from.is_some()
             || self.track.check(&reach, self.finish()).is_err()
-            || (reach == Phase::Deployed && self.unresolved_watches().next().is_some())
+            || (reach == Phase::Deployed && self.unresolved_watches(root).next().is_some())
         {
             return None;
         }
