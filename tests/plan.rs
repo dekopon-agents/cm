@@ -1431,6 +1431,99 @@ fn a_unit_from_a_newer_schema_is_refused() {
     );
 }
 
+fn shared_release_lines(host: &Fake) -> (Campaign, FakeForge) {
+    let c = campaign(host);
+    let mut forge = FakeForge::default();
+    for (target, pattern, tag, pr, sha) in [
+        (
+            "00-release/dekopon/0.55.0",
+            "v{version}",
+            "v0.55.0",
+            "https://github.com/o/dekopon/pull/2",
+            "core",
+        ),
+        (
+            "00-release/dekopon-chart/0.42.0",
+            "dekopon-chart-{version}",
+            "dekopon-chart-0.42.0",
+            "https://github.com/o/dekopon/pull/3",
+            "chart",
+        ),
+    ] {
+        assert!(declare_release(host, &c, target, "o/dekopon", pattern).ok());
+        kickoff(&c, target);
+        open_pr(host, &c, target, pr);
+        forge.pulls.insert(pr.into(), merged(sha));
+        forge.tags.insert(
+            ("o/dekopon".into(), tag.into()),
+            [sha.to_owned(), "s1".to_owned()].into(),
+        );
+    }
+    assert!(declare(host, &c, "01-a/u/S1", Lane::Pi, &[]).ok());
+    kickoff(&c, "01-a/u/S1");
+    let pr = "https://github.com/o/dekopon/pull/1";
+    open_pr(host, &c, "01-a/u/S1", pr);
+    forge.pulls.insert(pr.into(), merged("s1"));
+    (c, forge)
+}
+
+#[test]
+fn a_member_in_two_release_lines_records_the_repositorys_own_tag() {
+    let host = at("2026-10-17T08:00:00Z");
+    let (c, forge) = shared_release_lines(&host);
+    sync(&host, &forge, &c.root).unwrap();
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    assert_eq!(
+        unit.steps["S1"].track.evidence.tag.as_deref(),
+        Some("v0.55.0")
+    );
+}
+
+#[test]
+fn a_member_contained_only_by_the_chart_records_the_chart_tag() {
+    let host = at("2026-10-17T08:00:00Z");
+    let (c, mut forge) = shared_release_lines(&host);
+    forge
+        .tags
+        .get_mut(&("o/dekopon".into(), "v0.55.0".into()))
+        .unwrap()
+        .remove("s1");
+    sync(&host, &forge, &c.root).unwrap();
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    assert_eq!(
+        unit.steps["S1"].track.evidence.tag.as_deref(),
+        Some("dekopon-chart-0.42.0")
+    );
+}
+
+#[test]
+fn a_member_in_two_release_lines_follows_the_core_deploy_receipt() {
+    let host = at("2026-10-17T08:00:00Z");
+    let (c, forge) = shared_release_lines(&host);
+    sync(&host, &forge, &c.root).unwrap();
+    let digest = format!("sha256:{}", "d".repeat(64));
+    assert!(
+        advance(
+            &host,
+            &c,
+            "00-release/dekopon/0.55.0",
+            "deployed",
+            Evidence {
+                digest: Some(digest.clone()),
+                ..Evidence::default()
+            }
+        )
+        .ok()
+    );
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(state(&c, "01-a/u/S1"), Phase::Deployed);
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    assert_eq!(
+        unit.steps["S1"].track.evidence.digest.as_deref(),
+        Some(digest.as_str())
+    );
+}
+
 #[test]
 fn a_tag_only_release_releases_a_merged_member_it_contains() {
     let host = at("2026-10-17T08:00:00Z");

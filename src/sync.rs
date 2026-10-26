@@ -395,33 +395,51 @@ impl<'a> Run<'a> {
 
     fn released(&mut self) {
         let releases = self.releases(&Phase::Released);
-        for (target, step) in self.steps_at(&Phase::Merged) {
+        'steps: for (target, step) in self.steps_at(&Phase::Merged) {
             if Release::of_target(&target).is_some() {
                 continue;
             }
             let Some((repo, sha)) = merge_of(&step.track.evidence) else {
                 continue;
             };
+            let mut found: Option<&Shipped> = None;
+            let order = |shipped: &Shipped| {
+                (
+                    shipped.release.line != repo.name(),
+                    shipped.release.version,
+                    shipped.release.line.clone(),
+                )
+            };
             for shipped in releases.iter().filter(|shipped| shipped.repo == repo) {
                 match self.contains(&repo, &shipped.tag, &sha) {
-                    None => break,
-                    Some(Ok(true)) => {
-                        self.advance(
+                    None => {
+                        self.unknown(
                             &target,
-                            Phase::Released,
-                            Evidence {
-                                tag: Some(shipped.tag.to_string()),
-                                ..Evidence::default()
-                            },
+                            format!("{repo} {}: containment not read", shipped.tag),
                         );
-                        break;
+                        continue 'steps;
+                    }
+                    Some(Ok(true)) => {
+                        if found.is_none_or(|current| order(shipped) < order(current)) {
+                            found = Some(shipped);
+                        }
                     }
                     Some(Ok(false)) => {}
                     Some(Err(error)) => {
                         self.unknown(&target, format!("{repo} {}: {error}", shipped.tag));
-                        break;
+                        continue 'steps;
                     }
                 }
+            }
+            if let Some(shipped) = found {
+                self.advance(
+                    &target,
+                    Phase::Released,
+                    Evidence {
+                        tag: Some(shipped.tag.to_string()),
+                        ..Evidence::default()
+                    },
+                );
             }
         }
     }
