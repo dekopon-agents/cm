@@ -359,11 +359,14 @@ commits it was produced against: `S` and `H` are declared steps, each with an op
 without one cm takes the step's open PR head (the head `cm sync` last saw, else the one recorded at
 `pr-open`), and a sha given for a step whose PR is open must be that head. When `cm sync` sees the
 candidate's or the harness's PR head move off the pinned commit, it marks the pin stale and
-journals it. A stale pin fails `cm lint` (`evidence-stale`), closes every gate on the step that
-holds it, is listed by `cm next` under `stale`, and refuses `done --evidence`, until a later pin
-of the same candidate and harness steps supersedes it. Another step cannot finish on a stale
-pinned file either, and a step that did is a closed gate. A pin naming a step that later becomes
-multipart goes stale at the next `cm sync`.
+journals it. A step stands on every file it pinned and the file it finished on; such a file is
+stale while any pin of it, anywhere in the campaign, is stale and the step holds no fresh pin that
+renews it. A fresh pin renews a stale one when their candidate and harness steps match exactly,
+or when the stale pin names a whole step and the fresh one a part of it (`<step>#<part>`); a part
+never renews a sibling part. A stale file fails `cm lint` (`evidence-stale`) on each step that
+stands on it, closes every gate on those steps, is listed by `cm next` under `stale`, and refuses
+`done --evidence`. A pin naming a step that later becomes multipart goes stale at the next
+`cm sync`.
 
 ### Watches
 

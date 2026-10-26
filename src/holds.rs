@@ -712,7 +712,7 @@ pub fn held(units: &Units, now: jiff::Timestamp, root: &Path) -> Held {
                     "status": status.name(),
                 }));
             }
-            for pin in step.stale_pins() {
+            for pin in plan::stale_evidence(units, step) {
                 let why = pin.stale.clone().unwrap_or_default();
                 held.lines
                     .push(format!("stale {target}: {} ({why})", pin.file));

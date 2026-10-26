@@ -2004,7 +2004,11 @@ fn evidence_pinned_to_a_candidate_or_harness_head_goes_stale_when_that_head_move
         "{:?}",
         synced.lines
     );
-    assert_eq!(rules(&lint(&c.root).unwrap()), vec!["evidence-stale"]);
+    assert_eq!(
+        rules(&lint(&c.root).unwrap()),
+        vec!["evidence-stale", "evidence-stale"],
+        "the holder and the step that borrowed its file"
+    );
     assert_eq!(rules(&next_one(&c, "02-b/v/consumer")), vec!["after-unmet"]);
     let next = plan::next(&c.root, None, None).unwrap();
     assert_eq!(
@@ -2032,23 +2036,50 @@ fn evidence_pinned_to_a_candidate_or_harness_head_goes_stale_when_that_head_move
     assert_eq!(rules(&old), vec!["pin-revision"]);
 
     assert!(pin("run-2", "feature").ok());
-    assert!(lint(&c.root).unwrap().ok());
     assert!(next_one(&c, "02-b/v/consumer").ok());
     assert_eq!(
         rules(&next_one(&c, "02-b/v/downstream")),
         vec!["after-unmet"],
         "a step that finished on another step's stale file stays a closed gate"
     );
+    let borrowed = lint(&c.root).unwrap();
+    assert_eq!(rules(&borrowed), vec!["evidence-stale"]);
+    assert_eq!(borrowed.violations[0].path, "01-a/u/borrower");
+    let next = plan::next(&c.root, None, None).unwrap();
+    assert_eq!(next.fields["stale"][0]["target"], "01-a/u/borrower");
+    let renewed = cm::ledger::evidence_pinned(
+        &host,
+        &c.root,
+        &parse_target("01-a/u/borrower", true).unwrap(),
+        "b-1",
+        "Borrower re-read the fresh run.\n",
+        &cm::ledger::PinArgs {
+            candidate: Some("feature"),
+            harness: Some("harness"),
+        },
+    )
+    .unwrap();
+    assert!(renewed.ok(), "{:?}", renewed.violations);
+    assert!(lint(&c.root).unwrap().ok());
+    assert!(next_one(&c, "02-b/v/downstream").ok());
 
     forge.pulls.insert(harness_pr.into(), open(&"2".repeat(40)));
     sync(&host, &forge, &c.root).unwrap();
     let stale = lint(&c.root).unwrap();
-    assert_eq!(rules(&stale), vec!["evidence-stale"]);
     assert!(
-        stale.violations[0].message.contains("run-2.md"),
+        stale.violations.iter().all(|v| v.rule == "evidence-stale"),
         "{:?}",
         stale.violations
     );
+    assert!(
+        stale
+            .violations
+            .iter()
+            .any(|v| v.path == "01-a/u/run" && v.message.contains("run-2.md")),
+        "{:?}",
+        stale.violations
+    );
+    assert_eq!(rules(&next_one(&c, "02-b/v/consumer")), vec!["after-unmet"]);
 }
 
 #[test]
@@ -2341,4 +2372,47 @@ fn evidence_pinned_to_a_part_goes_stale_when_that_part_head_moves() {
     forge.pulls.insert(prs[1].clone(), open(&head));
     sync(&host, &forge, &c.root).unwrap();
     assert_eq!(rules(&lint(&c.root).unwrap()), vec!["evidence-stale"]);
+}
+
+#[test]
+fn a_fresh_pin_of_one_part_never_renews_a_stale_pin_of_its_sibling() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/events";
+    let (head, prs) = multipart(&host, &c, step, &["pr1", "pr2"]);
+    assert!(declare_work(&host, &c, "01-a/u/run", Lane::Coordinator, &[], Work::Study).ok());
+    assert!(declare(&host, &c, "02-b/v/consumer", Lane::Pi, &["01-a/u/run"]).ok());
+    kickoff(&c, "01-a/u/run");
+    kickoff(&c, "02-b/v/consumer");
+    let pin = |name: &str, candidate: &str| {
+        cm::ledger::evidence_pinned(
+            &host,
+            &c.root,
+            &parse_target("01-a/u/run", true).unwrap(),
+            name,
+            "Lab run.\n",
+            &cm::ledger::PinArgs {
+                candidate: Some(candidate),
+                harness: None,
+            },
+        )
+        .unwrap()
+    };
+    assert!(pin("run-1", "events#pr1").ok());
+    assert!(pin("run-2", "events#pr2").ok());
+    let evidence = c.root.join("01-a/u/run/evidence/run-1.md");
+    assert!(finish(&c, "01-a/u/run", Some(&evidence)).ok());
+    assert!(next_one(&c, "02-b/v/consumer").ok());
+    let mut forge = FakeForge::default();
+    forge.pulls.insert(prs[0].clone(), open(&"1".repeat(40)));
+    forge.pulls.insert(prs[1].clone(), open(&head));
+    sync(&host, &forge, &c.root).unwrap();
+    let stale = lint(&c.root).unwrap();
+    assert_eq!(rules(&stale), vec!["evidence-stale"]);
+    assert!(
+        stale.violations[0].message.contains("run-1.md"),
+        "{:?}",
+        stale.violations
+    );
+    assert_eq!(rules(&next_one(&c, "02-b/v/consumer")), vec!["after-unmet"]);
 }

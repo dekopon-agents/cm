@@ -278,6 +278,7 @@ struct Seen<'a> {
     packets: usize,
     warnings: Vec<String>,
     now: jiff::Timestamp,
+    units: crate::plan::Units,
 }
 
 fn lint_holds(root: &Path, unit: &UnitState, seen: &mut Seen, out: &mut Vec<Violation>) {
@@ -292,7 +293,7 @@ fn lint_holds(root: &Path, unit: &UnitState, seen: &mut Seen, out: &mut Vec<Viol
                 ));
             }
         }
-        for pin in step.stale_pins() {
+        for pin in crate::plan::stale_evidence(&seen.units, step) {
             out.push(Violation::new(
                 &target,
                 "evidence-stale",
@@ -549,6 +550,7 @@ pub fn lint_at(start: &Path, now: jiff::Timestamp) -> Result<Outcome> {
         packets: 0,
         warnings: Vec::new(),
         now,
+        units: crate::plan::load_units(&root).unwrap_or_default(),
     };
     for dir in &units {
         violations.extend(lint_unit(&root, dir, &mut seen));

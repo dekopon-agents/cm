@@ -679,15 +679,20 @@ pub struct Pin {
 }
 
 impl Pin {
-    fn supersedes(&self, older: &Pin) -> bool {
-        let step = |revision: &Revision| {
-            revision
-                .step
-                .split_once('#')
-                .map_or(revision.step.clone(), |(step, _)| step.to_owned())
+    /// A fresh pin renews a stale one of the same candidate and harness; a part renews only a pin
+    /// of its whole step from before the split, never a sibling part's.
+    pub fn renews(&self, older: &Pin) -> bool {
+        let same = |new: &Revision, old: &Revision| {
+            new.step == old.step
+                || (!old.step.contains('#') && new.step.starts_with(&format!("{}#", old.step)))
         };
-        step(&self.candidate) == step(&older.candidate)
-            && self.harness.as_ref().map(step) == older.harness.as_ref().map(step)
+        self.stale.is_none()
+            && same(&self.candidate, &older.candidate)
+            && match (&self.harness, &older.harness) {
+                (Some(new), Some(old)) => same(new, old),
+                (None, None) => true,
+                (Some(_), None) | (None, Some(_)) => false,
+            }
     }
 }
 
@@ -979,20 +984,6 @@ impl Step {
                 .as_ref()
                 .is_none_or(|resolved| resolved.evidence.check(root).is_err())
         })
-    }
-
-    pub fn stale_pins(&self) -> Vec<&Pin> {
-        self.pins
-            .iter()
-            .enumerate()
-            .filter(|(at, pin)| {
-                pin.stale.is_some()
-                    && !self.pins[at + 1..]
-                        .iter()
-                        .any(|later| later.supersedes(pin))
-            })
-            .map(|(_, pin)| pin)
-            .collect()
     }
 
     pub fn roll_up_all(

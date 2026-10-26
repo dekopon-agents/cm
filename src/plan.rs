@@ -89,33 +89,42 @@ pub fn gate(units: &Units, after: &After) -> Gate {
         track: target.map(|step| step.track.clone()),
         finish: target.map_or(Finish::Shipped, Step::finish),
         stale: target
-            .map(|step| stale_for(units, step))
+            .map(|step| {
+                stale_evidence(units, step)
+                    .iter()
+                    .map(|pin| pin.file.to_string())
+                    .collect()
+            })
             .unwrap_or_default(),
     }
 }
 
-pub fn stale_for(units: &Units, step: &Step) -> Vec<String> {
-    let mut stale: Vec<String> = step
-        .stale_pins()
-        .iter()
-        .map(|pin| pin.file.to_string())
-        .collect();
-    let renewed_here = |file: &crate::evidence::CampaignFile| {
-        step.pins.iter().any(|pin| pin.file == *file)
-            && !step.stale_pins().iter().any(|pin| pin.file == *file)
-    };
-    if let Some(file) = &step.track.evidence.file
-        && !stale.contains(&file.to_string())
-        && !renewed_here(file)
-        && units
+/// The stale pins a step stands on, one per file: for each file it pinned or finished on, a stale
+/// pin of that file, anywhere in the campaign, that no fresh pin of the step renews.
+pub fn stale_evidence<'a>(units: &'a Units, step: &Step) -> Vec<&'a crate::state::Pin> {
+    let mut files: Vec<&crate::evidence::CampaignFile> =
+        step.pins.iter().map(|pin| &pin.file).collect();
+    files.extend(&step.track.evidence.file);
+    files.dedup();
+    let mut out: Vec<&crate::state::Pin> = Vec::new();
+    for file in files {
+        if out.iter().any(|pin| pin.file == *file) {
+            continue;
+        }
+        if let Some(pin) = units
             .values()
             .flat_map(|unit| unit.steps.values())
             .flat_map(|holder| holder.pins.iter())
-            .any(|pin| pin.file == *file && pin.stale.is_some())
-    {
-        stale.push(file.to_string());
+            .find(|pin| {
+                pin.file == *file
+                    && pin.stale.is_some()
+                    && !step.pins.iter().any(|fresh| fresh.renews(pin))
+            })
+        {
+            out.push(pin);
+        }
     }
-    stale
+    out
 }
 
 pub fn gates(units: &Units, step: &Step) -> Vec<Gate> {
