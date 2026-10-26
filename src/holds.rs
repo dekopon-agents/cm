@@ -61,18 +61,25 @@ pub fn verify(check: &CheckState, base: Option<&[CheckState]>) -> Result<(), Unc
             return Err(Uncovered::NotAFailure(check.state.clone()));
         }
     }
-    let before = base
+    let before: Vec<&CheckState> = base
         .ok_or(Uncovered::BaseUnknown)?
         .iter()
-        .find(|before| before.name == check.name)
-        .ok_or(Uncovered::BaseUnknown)?;
-    match before.state {
-        Conclusion::Failure => Ok(()),
-        Conclusion::Success | Conclusion::Neutral | Conclusion::Skipped => {
-            Err(Uncovered::GreenAtBase)
-        }
-        Conclusion::Other(_) => Err(Uncovered::BaseUnknown),
+        .filter(|before| before.name == check.name)
+        .collect();
+    if before.is_empty() {
+        return Err(Uncovered::BaseUnknown);
     }
+    let mut verdict = Ok(());
+    for before in before {
+        match before.state {
+            Conclusion::Failure => {}
+            Conclusion::Success | Conclusion::Neutral | Conclusion::Skipped => {
+                return Err(Uncovered::GreenAtBase);
+            }
+            Conclusion::Other(_) => verdict = Err(Uncovered::BaseUnknown),
+        }
+    }
+    verdict
 }
 
 /// Closed once its condition held; a gate the condition's step later reopens, such as through

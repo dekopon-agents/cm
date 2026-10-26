@@ -816,7 +816,6 @@ impl WatchStatus {
 }
 
 impl Watch {
-    /// Resolved only while its evidence file still holds; a deleted file reopens the watch.
     pub fn status(&self, now: jiff::Timestamp, root: &Path) -> WatchStatus {
         let past = crate::plan::instant(&self.deadline).is_some_and(|deadline| deadline <= now);
         let resolved = self

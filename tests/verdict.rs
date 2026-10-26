@@ -1568,6 +1568,14 @@ fn a_known_red_exception_covers_only_its_failing_check_at_its_head_until_it_clos
         rules(&known_red(&host, &c, &unseen, &head, why, "build")),
         vec!["known-red-refused"]
     );
+    let namesakes = FakeForge {
+        base_checks: vec![("lab", "failure"), ("lab", "success")],
+        ..red_at_head(&head, "failure", "failure")
+    };
+    assert_eq!(
+        rules(&known_red(&host, &c, &namesakes, &head, why, "build")),
+        vec!["known-red-refused"]
+    );
     let pending = red_at_head(&head, "failure", "in_progress");
     assert_eq!(
         rules(&known_red(&host, &c, &pending, &head, why, "build")),

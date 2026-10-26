@@ -1964,6 +1964,31 @@ fn evidence_pinned_to_a_candidate_or_harness_head_goes_stale_when_that_head_move
     assert_eq!(first.fields["harness"], format!("{harness}@{harness_head}"));
     let evidence = c.root.join(study).join("evidence/run-1.md");
     assert!(finish(&c, study, Some(&evidence)).ok());
+    assert!(
+        declare_work(
+            &host,
+            &c,
+            "01-a/u/borrower",
+            Lane::Coordinator,
+            &[],
+            Work::Study
+        )
+        .ok()
+    );
+    assert!(
+        declare(
+            &host,
+            &c,
+            "02-b/v/downstream",
+            Lane::Pi,
+            &["01-a/u/borrower"]
+        )
+        .ok()
+    );
+    kickoff(&c, "01-a/u/borrower");
+    kickoff(&c, "02-b/v/downstream");
+    assert!(finish(&c, "01-a/u/borrower", Some(&evidence)).ok());
+    assert!(next_one(&c, "02-b/v/downstream").ok());
     assert!(next_one(&c, "02-b/v/consumer").ok());
 
     let moved = "1".repeat(40);
@@ -2009,6 +2034,11 @@ fn evidence_pinned_to_a_candidate_or_harness_head_goes_stale_when_that_head_move
     assert!(pin("run-2", "feature").ok());
     assert!(lint(&c.root).unwrap().ok());
     assert!(next_one(&c, "02-b/v/consumer").ok());
+    assert_eq!(
+        rules(&next_one(&c, "02-b/v/downstream")),
+        vec!["after-unmet"],
+        "a step that finished on another step's stale file stays a closed gate"
+    );
 
     forge.pulls.insert(harness_pr.into(), open(&"2".repeat(40)));
     sync(&host, &forge, &c.root).unwrap();

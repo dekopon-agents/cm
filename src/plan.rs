@@ -100,13 +100,18 @@ pub fn stale_for(units: &Units, step: &Step) -> Vec<String> {
         .iter()
         .map(|pin| pin.file.to_string())
         .collect();
+    let renewed_here = |file: &crate::evidence::CampaignFile| {
+        step.pins.iter().any(|pin| pin.file == *file)
+            && !step.stale_pins().iter().any(|pin| pin.file == *file)
+    };
     if let Some(file) = &step.track.evidence.file
         && !stale.contains(&file.to_string())
+        && !renewed_here(file)
         && units
             .values()
             .flat_map(|unit| unit.steps.values())
-            .flat_map(Step::stale_pins)
-            .any(|pin| pin.file == *file)
+            .flat_map(|holder| holder.pins.iter())
+            .any(|pin| pin.file == *file && pin.stale.is_some())
     {
         stale.push(file.to_string());
     }
