@@ -406,8 +406,8 @@ impl<'a> Run<'a> {
             let order = |shipped: &Shipped| {
                 (
                     shipped.release.line != repo.name(),
-                    shipped.release.version,
                     shipped.release.line.clone(),
+                    shipped.release.version,
                 )
             };
             for shipped in releases.iter().filter(|shipped| shipped.repo == repo) {

@@ -374,6 +374,9 @@ impl Forge for FakeForge {
             tag.to_string(),
             sha.to_string(),
         ));
+        if self.broken.contains(tag.as_str()) {
+            return Err(ForgeError::Exit(Some(1)));
+        }
         Ok(self
             .tags
             .get(&(repo.to_string(), tag.to_string()))
@@ -1521,6 +1524,63 @@ fn a_member_in_two_release_lines_follows_the_core_deploy_receipt() {
     assert_eq!(
         unit.steps["S1"].track.evidence.digest.as_deref(),
         Some(digest.as_str())
+    );
+}
+
+#[test]
+fn a_member_without_a_repository_named_line_uses_line_name_then_earliest_version() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let mut forge = FakeForge::default();
+    for (index, (target, pattern, tag)) in [
+        ("00-release/alpha/0.9.0", "alpha-{version}", "alpha-0.9.0"),
+        ("00-release/alpha/0.10.0", "alpha-{version}", "alpha-0.10.0"),
+        ("00-release/zeta/0.1.0", "zeta-{version}", "zeta-0.1.0"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(declare_release(&host, &c, target, "o/cm", pattern).ok());
+        kickoff(&c, target);
+        let pr = format!("https://github.com/o/cm/pull/{}", index + 2);
+        open_pr(&host, &c, target, &pr);
+        forge.pulls.insert(pr, merged("cut"));
+        forge.tags.insert(
+            ("o/cm".into(), tag.into()),
+            ["cut".to_owned(), "s1".to_owned()].into(),
+        );
+    }
+    assert!(declare(&host, &c, "01-a/u/S1", Lane::Pi, &[]).ok());
+    kickoff(&c, "01-a/u/S1");
+    let pr = "https://github.com/o/cm/pull/1";
+    open_pr(&host, &c, "01-a/u/S1", pr);
+    forge.pulls.insert(pr.into(), merged("s1"));
+    sync(&host, &forge, &c.root).unwrap();
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    assert_eq!(
+        unit.steps["S1"].track.evidence.tag.as_deref(),
+        Some("alpha-0.9.0")
+    );
+}
+
+#[test]
+fn a_failed_tag_read_keeps_a_member_unknown_even_after_a_containing_tag() {
+    let host = at("2026-10-17T08:00:00Z");
+    let (c, mut forge) = shared_release_lines(&host);
+    sync(&host, &forge, &c.root).unwrap();
+    assert!(declare(&host, &c, "01-a/u/S2", Lane::Pi, &[]).ok());
+    kickoff(&c, "01-a/u/S2");
+    let pr = "https://github.com/o/dekopon/pull/4";
+    open_pr(&host, &c, "01-a/u/S2", pr);
+    forge.pulls.insert(pr.into(), merged("s1"));
+    forge.broken.insert("v0.55.0".into());
+    let outcome = sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(state(&c, "01-a/u/S2"), Phase::Merged);
+    assert!(
+        outcome
+            .violations
+            .iter()
+            .any(|v| v.path == "01-a/u/S2" && v.rule == "sync-unknown")
     );
 }
 
