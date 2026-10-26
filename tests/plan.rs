@@ -2111,7 +2111,7 @@ fn a_watch_past_its_deadline_without_evidence_stays_unresolved_and_holds_the_ste
 }
 
 #[test]
-fn evidence_pinned_to_a_step_later_split_into_parts_goes_stale() {
+fn evidence_pinned_to_a_step_later_split_into_parts_goes_stale_until_a_part_is_pinned() {
     let host = at("2026-10-26T08:00:00Z");
     let c = campaign(&host);
     let candidate = "01-a/u/feature";
@@ -2134,6 +2134,11 @@ fn evidence_pinned_to_a_step_later_split_into_parts_goes_stale() {
     )
     .unwrap();
     assert!(pinned.ok(), "{:?}", pinned.violations);
+    let evidence = c.root.join("01-a/u/run/evidence/run-1.md");
+    assert!(finish(&c, "01-a/u/run", Some(&evidence)).ok());
+    assert!(declare(&host, &c, "02-b/v/consumer", Lane::Pi, &["01-a/u/run"]).ok());
+    kickoff(&c, "02-b/v/consumer");
+    assert!(next_one(&c, "02-b/v/consumer").ok());
     let amendment = commands::Amendment {
         parts: vec!["p1".into(), "p2".into()],
         ..commands::Amendment::default()
@@ -2162,6 +2167,22 @@ fn evidence_pinned_to_a_step_later_split_into_parts_goes_stale() {
         "{:?}",
         stale.violations
     );
+    assert_eq!(rules(&next_one(&c, "02-b/v/consumer")), vec!["after-unmet"]);
+    let renewed = cm::ledger::evidence_pinned(
+        &host,
+        &c.root,
+        &parse_target("01-a/u/run", true).unwrap(),
+        "run-2",
+        "Lab run again.\n",
+        &cm::ledger::PinArgs {
+            candidate: Some("feature#p1"),
+            harness: None,
+        },
+    )
+    .unwrap();
+    assert!(renewed.ok(), "{:?}", renewed.violations);
+    assert!(lint(&c.root).unwrap().ok());
+    assert!(next_one(&c, "02-b/v/consumer").ok());
 }
 
 fn multipart(host: &Fake, c: &Campaign, step: &str, parts: &[&str]) -> (String, Vec<String>) {

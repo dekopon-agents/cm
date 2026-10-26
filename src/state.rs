@@ -680,9 +680,14 @@ pub struct Pin {
 
 impl Pin {
     fn supersedes(&self, older: &Pin) -> bool {
-        self.candidate.step == older.candidate.step
-            && self.harness.as_ref().map(|rev| &rev.step)
-                == older.harness.as_ref().map(|rev| &rev.step)
+        let step = |revision: &Revision| {
+            revision
+                .step
+                .split_once('#')
+                .map_or(revision.step.clone(), |(step, _)| step.to_owned())
+        };
+        step(&self.candidate) == step(&older.candidate)
+            && self.harness.as_ref().map(step) == older.harness.as_ref().map(step)
     }
 }
 
@@ -1010,6 +1015,17 @@ impl Step {
         {
             return None;
         }
+        let latest = self
+            .parts
+            .values()
+            .max_by(|a, b| a.since.cmp(&b.since))
+            .map(|part| part.evidence.clone())
+            .unwrap_or_default();
+        let evidence = if evidence.is_empty() {
+            &latest
+        } else {
+            evidence
+        };
         self.track.apply(reach.clone(), at, evidence);
         Some((from, reach))
     }
