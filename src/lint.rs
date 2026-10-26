@@ -272,13 +272,83 @@ pub fn unit_state_file(root: &Path, dir: &Path, unit: &UnitState) -> Vec<Violati
     }
 }
 
-fn lint_unit(
-    root: &Path,
-    dir: &Path,
-    home: Option<&Path>,
+struct Seen<'a> {
+    home: Option<&'a Path>,
     sealed: bool,
-    packets: &mut usize,
-) -> Vec<Violation> {
+    packets: usize,
+    warnings: Vec<String>,
+    now: jiff::Timestamp,
+    units: crate::plan::Units,
+}
+
+fn lint_holds(root: &Path, unit: &UnitState, seen: &mut Seen, out: &mut Vec<Violation>) {
+    for (name, step) in &unit.steps {
+        let target = format!("{}/{name}", unit.unit);
+        for pin in &step.pins {
+            if let Err(error) = pin.file.check(root) {
+                out.push(Violation::new(
+                    &target,
+                    "evidence-file",
+                    format!("its pinned evidence {} no longer holds: {error}", pin.file),
+                ));
+            }
+        }
+        for pin in crate::plan::stale_evidence(&seen.units, step) {
+            out.push(Violation::new(
+                &target,
+                "evidence-stale",
+                format!(
+                    "{} was pinned to {}{} and is stale: {}; write fresh evidence pinned to the new head",
+                    pin.file,
+                    pin.candidate,
+                    pin.harness
+                        .as_ref()
+                        .map(|harness| format!(" under {harness}"))
+                        .unwrap_or_default(),
+                    pin.stale.as_deref().unwrap_or_default()
+                ),
+            ));
+        }
+        for watch in &step.watches {
+            if let Some(resolved) = &watch.resolved
+                && let Err(error) = resolved.evidence.check(root)
+            {
+                out.push(Violation::new(
+                    &target,
+                    "evidence-file",
+                    format!(
+                        "watch {} was resolved by {}, which no longer holds: {error}; it holds the step again until resolved anew",
+                        watch.id, resolved.evidence
+                    ),
+                ));
+            }
+        }
+        for watch in step.unresolved_watches(root) {
+            match watch.status(seen.now, root) {
+                crate::state::WatchStatus::Expired => seen.warnings.push(format!(
+                    "{target}#{}: expired: unresolved ({}, deadline {}); it holds the step below deployed",
+                    watch.id, watch.signal, watch.deadline
+                )),
+                crate::state::WatchStatus::Open | crate::state::WatchStatus::Resolved => {}
+            }
+        }
+        for waived in &step.waived {
+            let named = step.known_red.iter().any(|exception| {
+                crate::state::same_commit(&exception.commit, &waived.commit)
+                    && exception.check == waived.check
+            });
+            if !named {
+                seen.warnings.push(format!(
+                    "{target}: --override {} waived red check `{}` at {} with no known-red exception; record one with `cm known-red`",
+                    waived.file, waived.check, waived.commit
+                ));
+            }
+        }
+    }
+}
+
+fn lint_unit(root: &Path, dir: &Path, seen: &mut Seen) -> Vec<Violation> {
+    let (home, sealed) = (seen.home, seen.sealed);
     let state_rel = relative(root, &state_path(dir));
     let unit = match store::load_unit(dir) {
         Ok(unit) => unit,
@@ -303,6 +373,7 @@ fn lint_unit(
         ));
     }
     out.extend(unit_state_file(root, dir, &unit));
+    lint_holds(root, &unit, seen, &mut out);
     let tracks = std::iter::once((expected.clone(), &unit.track)).chain(
         unit.steps
             .iter()
@@ -331,7 +402,7 @@ fn lint_unit(
             Some(step) => matches!(step.track.resting(), Phase::Drafted | Phase::Launched),
         };
         if live {
-            *packets += 1;
+            seen.packets += 1;
             out.extend(packet_paths(root, &files, home).1);
         }
     }
@@ -443,6 +514,10 @@ pub fn unsealed(root: &Path) -> Vec<Violation> {
 }
 
 pub fn lint(start: &Path) -> Result<Outcome> {
+    lint_at(start, jiff::Timestamp::now())
+}
+
+pub fn lint_at(start: &Path, now: jiff::Timestamp) -> Result<Outcome> {
     let Some(root) = find_root(start) else {
         return Ok(Outcome::refused(vec![Violation::new(
             store::absolute(start).to_string_lossy(),
@@ -469,15 +544,26 @@ pub fn lint(start: &Path) -> Result<Outcome> {
     violations.extend(crate::review::lint_reviews(&root));
     violations.extend(orphan_units(&root));
     violations.extend(ignored(&root, &units));
-    let sealed = state.as_ref().is_some_and(|state| state.closed.is_some());
-    let mut packets = 0;
+    let mut seen = Seen {
+        home: home.as_deref(),
+        sealed: state.as_ref().is_some_and(|state| state.closed.is_some()),
+        packets: 0,
+        warnings: Vec::new(),
+        now,
+        units: crate::plan::load_units(&root).unwrap_or_default(),
+    };
     for dir in &units {
-        violations.extend(lint_unit(&root, dir, home.as_deref(), sealed, &mut packets));
+        violations.extend(lint_unit(&root, dir, &mut seen));
     }
+    let packets = seen.packets;
     let mut outcome = Outcome::refused(violations);
     outcome.field("root", root.to_string_lossy().into_owned());
     outcome.field("units", units.len());
     outcome.field("packets", packets);
+    for warning in &seen.warnings {
+        outcome.line(format!("warning: {warning}"));
+    }
+    outcome.field("warnings", seen.warnings);
     let summary = if outcome.ok() {
         format!(
             "clean: {} ({} unit(s), {} live packet(s))",

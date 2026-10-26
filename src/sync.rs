@@ -13,7 +13,7 @@ use crate::journal;
 use crate::outcome::{Outcome, Violation};
 use crate::plan::{self, Units};
 use crate::render;
-use crate::state::{Evidence, Lane, Move, Phase, Release, Step};
+use crate::state::{Evidence, Lane, Move, Phase, Release, Step, Track};
 use crate::store::{self, lock, parse_target, write_atomic};
 
 pub const CARD: &str = "CARD.md";
@@ -66,6 +66,25 @@ struct Run<'a> {
     moves: Vec<Moved>,
     violations: Vec<Violation>,
     open: BTreeMap<String, plan::Observed>,
+    now: jiff::Timestamp,
+    heads: BTreeMap<String, String>,
+    notes: Vec<(String, String)>,
+}
+
+struct Tracked {
+    target: String,
+    part: Option<String>,
+    track: Track,
+    step: Step,
+}
+
+impl Tracked {
+    fn name(&self) -> String {
+        match &self.part {
+            Some(part) => format!("{}#{part}", self.target),
+            None => self.target.clone(),
+        }
+    }
 }
 
 fn merge_of(evidence: &Evidence) -> Option<(GithubRepo, CommitSha)> {
@@ -79,19 +98,22 @@ impl<'a> Run<'a> {
         root: &'a Path,
         forge: Option<&'a dyn Forge>,
         reads: Reads,
-        at: String,
+        now: jiff::Timestamp,
         units: Units,
     ) -> Self {
         Run {
             root,
             forge,
             reads,
-            at,
+            at: stamp(now),
             units,
             dirty: BTreeSet::new(),
             moves: Vec::new(),
             violations: Vec::new(),
             open: BTreeMap::new(),
+            now,
+            heads: BTreeMap::new(),
+            notes: Vec::new(),
         }
     }
 
@@ -100,6 +122,74 @@ impl<'a> Run<'a> {
         self.tags();
         self.released();
         self.deployed();
+        self.settle();
+        let mut notes = crate::holds::mark_stale(&mut self.units, &self.heads, &self.at);
+        notes.extend(crate::holds::mark_closed(&mut self.units, &self.at));
+        notes.extend(crate::holds::mark_expired(
+            &mut self.units,
+            self.now,
+            &self.at,
+            self.root,
+        ));
+        for (unit, _) in &notes {
+            self.dirty.insert(unit.clone());
+        }
+        self.notes.extend(notes);
+    }
+
+    fn settle(&mut self) {
+        for (unit_name, unit) in self.units.iter_mut() {
+            for (name, step) in unit.steps.iter_mut() {
+                let target = format!("{unit_name}/{name}");
+                for (from, to) in step.roll_up_all(&self.at, &Evidence::default(), self.root) {
+                    unit.history.push(Move {
+                        at: self.at.clone(),
+                        target: target.clone(),
+                        from: from.clone(),
+                        to: to.clone(),
+                        evidence: Evidence::default(),
+                    });
+                    self.dirty.insert(unit_name.clone());
+                    self.moves.push(Moved {
+                        target: target.clone(),
+                        from,
+                        to,
+                        evidence: Evidence::default(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn tracks_at(&self, phase: &Phase) -> Vec<Tracked> {
+        let mut out = Vec::new();
+        for (unit, state) in &self.units {
+            for (name, step) in &state.steps {
+                let target = format!("{unit}/{name}");
+                if step.parts.is_empty() {
+                    if step.track.state == *phase {
+                        out.push(Tracked {
+                            target,
+                            part: None,
+                            track: step.track.clone(),
+                            step: step.clone(),
+                        });
+                    }
+                    continue;
+                }
+                for (part, track) in &step.parts {
+                    if track.state == *phase {
+                        out.push(Tracked {
+                            target: target.clone(),
+                            part: Some(part.clone()),
+                            track: track.clone(),
+                            step: step.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn steps_at(&self, phase: &Phase) -> Vec<(String, Step)> {
@@ -120,7 +210,7 @@ impl<'a> Run<'a> {
             .push(Violation::new(target, "sync-unknown", message));
     }
 
-    fn advance(&mut self, target: &str, to: Phase, evidence: Evidence) {
+    fn advance(&mut self, target: &str, part: Option<&str>, to: Phase, evidence: Evidence) {
         let Some((unit_name, step_name)) = plan::split(target) else {
             return;
         };
@@ -130,25 +220,46 @@ impl<'a> Run<'a> {
         let Some(step) = unit.steps.get_mut(step_name) else {
             return;
         };
-        if step.track.check(&to, step.finish()).is_err() {
+        let finish = step.finish();
+        let (track, name) = match part {
+            Some(part) => match step.parts.get_mut(part) {
+                Some(track) => (track, format!("{target}#{part}")),
+                None => return,
+            },
+            None => (&mut step.track, target.to_owned()),
+        };
+        if track.check(&to, finish).is_err() {
             return;
         }
-        let from = step.track.state.clone();
-        step.track.apply(to.clone(), &self.at, &evidence);
-        unit.history.push(Move {
-            at: self.at.clone(),
-            target: target.to_owned(),
-            from: from.clone(),
-            to: to.clone(),
-            evidence: evidence.clone(),
-        });
-        self.dirty.insert(unit_name.to_owned());
-        self.moves.push(Moved {
-            target: target.to_owned(),
+        let from = track.state.clone();
+        track.apply(to.clone(), &self.at, &evidence);
+        let mut moved = vec![Moved {
+            target: name,
             from,
             to,
-            evidence,
-        });
+            evidence: evidence.clone(),
+        }];
+        if part.is_some() {
+            for (from, to) in step.roll_up_all(&self.at, &evidence, self.root) {
+                moved.push(Moved {
+                    target: target.to_owned(),
+                    from,
+                    to,
+                    evidence: evidence.clone(),
+                });
+            }
+        }
+        for moved in moved {
+            unit.history.push(Move {
+                at: self.at.clone(),
+                target: moved.target.clone(),
+                from: moved.from.clone(),
+                to: moved.to.clone(),
+                evidence: moved.evidence.clone(),
+            });
+            self.moves.push(moved);
+        }
+        self.dirty.insert(unit_name.to_owned());
     }
 
     fn pull(&mut self, url: &str) -> Option<Read<Pull>> {
@@ -192,20 +303,18 @@ impl<'a> Run<'a> {
         url: &str,
         head: Option<&CommitSha>,
         base: Option<&CommitSha>,
-    ) -> bool {
+    ) -> Option<Vec<String>> {
         if step.lane != Some(Lane::Codex) {
-            return true;
+            return Some(Vec::new());
         }
         let Some(head) = head else {
             self.unknown(
                 target,
                 format!("{url} is merged but GitHub reported no head"),
             );
-            return false;
+            return None;
         };
-        let Some(parsed) = parse_target(target, true).ok() else {
-            return false;
-        };
+        let parsed = parse_target(target, true).ok()?;
         // A local step's worktree lets the gate take a clean update from the base branch;
         // without one it needs a review at the merged head itself.
         let worktree = Path::new(&step.worktree);
@@ -224,16 +333,39 @@ impl<'a> Run<'a> {
             Ok(cleared) => cleared.gaps,
             Err(error) => {
                 self.unknown(target, format!("{error:#}"));
-                return false;
+                return None;
             }
         };
-        let Some(repo) = GithubRepo::of_pr(url) else {
-            return false;
-        };
+        let repo = GithubRepo::of_pr(url)?;
+        let mut used = Vec::new();
         match self.checks(&repo, head) {
-            None => return false,
+            None => return None,
             Some(Ok(checks)) if ci_green(&checks) => {}
-            Some(Ok(_)) => gaps.push(format!("CI is not green at {head}")),
+            Some(Ok(checks)) if checks.is_empty() => {
+                gaps.push(format!("CI is not green at {head}"));
+            }
+            Some(Ok(checks)) => {
+                let before = match base {
+                    Some(base) => match self.checks(&repo, base) {
+                        Some(Ok(before)) => Some(before),
+                        Some(Err(_)) | None => None,
+                    },
+                    None => None,
+                };
+                let (accepted, refused) = crate::commands::red_checks(
+                    &step.known_red,
+                    &self.units,
+                    head.as_str(),
+                    &checks,
+                    before.as_deref(),
+                );
+                if refused.is_empty() {
+                    used = accepted;
+                } else {
+                    let named: Vec<&str> = refused.iter().map(|(_, text)| text.as_str()).collect();
+                    gaps.push(format!("CI is not green at {head}: {}", named.join(", ")));
+                }
+            }
             Some(Err(error)) => gaps.push(format!("cannot read CI at {head}: {error}")),
         }
         for gap in &gaps {
@@ -245,17 +377,25 @@ impl<'a> Run<'a> {
                 ),
             ));
         }
-        gaps.is_empty()
+        gaps.is_empty().then_some(used)
     }
 
     fn merges(&mut self) {
-        for (target, step) in self.steps_at(&Phase::PrOpen) {
-            let Some(url) = step.track.evidence.pr.clone() else {
+        for tracked in self.tracks_at(&Phase::PrOpen) {
+            let target = tracked.name();
+            let Some(url) = tracked.track.evidence.pr.clone() else {
                 continue;
+            };
+            let head_of = |pull: &Read<Pull>| match pull {
+                Ok(pull) => pull.head.as_ref().map(ToString::to_string),
+                Err(_) => None,
             };
             let Some(read) = self.pull(&url) else {
                 continue;
             };
+            if let Some(head) = head_of(&read) {
+                self.heads.insert(target.clone(), head);
+            }
             match read {
                 Ok(Pull {
                     state: PullState::Merged,
@@ -264,9 +404,20 @@ impl<'a> Run<'a> {
                     base,
                     ..
                 }) => {
-                    if self.gate_holds(&target, &step, &url, head.as_ref(), base.as_ref()) {
+                    if let Some(used) = self.gate_holds(
+                        &tracked.target,
+                        &tracked.step,
+                        &url,
+                        head.as_ref(),
+                        base.as_ref(),
+                    ) {
+                        self.notes.extend(
+                            used.into_iter()
+                                .map(|line| (String::new(), format!("{line} ({target})"))),
+                        );
                         self.advance(
-                            &target,
+                            &tracked.target,
+                            tracked.part.as_deref(),
                             Phase::Merged,
                             Evidence {
                                 sha: Some(sha.to_string()),
@@ -343,6 +494,7 @@ impl<'a> Run<'a> {
                     None => {}
                     Some(Ok(true)) => self.advance(
                         &target,
+                        None,
                         Phase::Released,
                         Evidence {
                             tag: Some(tag.to_string()),
@@ -395,11 +547,12 @@ impl<'a> Run<'a> {
 
     fn released(&mut self) {
         let releases = self.releases(&Phase::Released);
-        'steps: for (target, step) in self.steps_at(&Phase::Merged) {
-            if Release::of_target(&target).is_some() {
+        'steps: for tracked in self.tracks_at(&Phase::Merged) {
+            let target = tracked.name();
+            if Release::of_target(&tracked.target).is_some() {
                 continue;
             }
-            let Some((repo, sha)) = merge_of(&step.track.evidence) else {
+            let Some((repo, sha)) = merge_of(&tracked.track.evidence) else {
                 continue;
             };
             let mut found: Option<&Shipped> = None;
@@ -433,7 +586,8 @@ impl<'a> Run<'a> {
             }
             if let Some(shipped) = found {
                 self.advance(
-                    &target,
+                    &tracked.target,
+                    tracked.part.as_deref(),
                     Phase::Released,
                     Evidence {
                         tag: Some(shipped.tag.to_string()),
@@ -444,17 +598,45 @@ impl<'a> Run<'a> {
         }
     }
 
+    fn watched(&mut self, target: &str, step: &Step) -> bool {
+        let held: Vec<String> = step
+            .unresolved_watches(self.root)
+            .map(|watch| {
+                format!(
+                    "#{} {} ({}, deadline {})",
+                    watch.id,
+                    watch.status(self.now, self.root).name(),
+                    watch.signal,
+                    watch.deadline
+                )
+            })
+            .collect();
+        if held.is_empty() {
+            return false;
+        }
+        self.violations.push(Violation::new(
+            target,
+            "watch-open",
+            format!(
+                "its release deployed, but it stays released until watch {} resolves with evidence",
+                held.join(", ")
+            ),
+        ));
+        true
+    }
+
     fn deployed(&mut self) {
         let released = self.releases(&Phase::Released);
         let deployed = self.releases(&Phase::Deployed);
-        for (target, step) in self.steps_at(&Phase::Released) {
-            if Release::of_target(&target).is_some() {
+        for tracked in self.tracks_at(&Phase::Released) {
+            let target = tracked.name();
+            if Release::of_target(&tracked.target).is_some() {
                 continue;
             }
-            let Some((repo, sha)) = merge_of(&step.track.evidence) else {
+            let Some((repo, sha)) = merge_of(&tracked.track.evidence) else {
                 continue;
             };
-            let Some(tag) = step
+            let Some(tag) = tracked
                 .track
                 .evidence
                 .tag
@@ -490,8 +672,12 @@ impl<'a> Run<'a> {
                 }
             }
             if let Some(digest) = found.and_then(|shipped| shipped.digest.clone()) {
+                if tracked.part.is_none() && self.watched(&target, &tracked.step) {
+                    continue;
+                }
                 self.advance(
-                    &target,
+                    &tracked.target,
+                    tracked.part.as_deref(),
                     Phase::Deployed,
                     Evidence {
                         digest: Some(digest),
@@ -515,12 +701,12 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
     if !found.is_empty() {
         return Ok(Outcome::refused(found));
     }
-    let at = stamp(host.now());
+    let now = host.now();
     let mut read = Run::new(
         root,
         Some(forge),
         Reads::default(),
-        at.clone(),
+        now,
         plan::load_units(root)?,
     );
     read.walk();
@@ -529,7 +715,7 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
     if !found.is_empty() {
         return Ok(Outcome::refused(found));
     }
-    let mut run = Run::new(root, None, read.reads, at, plan::load_units(root)?);
+    let mut run = Run::new(root, None, read.reads, now, plan::load_units(root)?);
     run.walk();
     for name in &run.dirty {
         write_unit(&root.join(name), &run.units[name])?;
@@ -541,9 +727,8 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
         // its step still rests at pr-open on it.
         for (url, observed) in seen {
             let failed = !matches!(run.reads.pulls.get(&url), Some(Ok(_)));
-            let current = plan::step(&run.units, &observed.target).is_some_and(|step| {
-                step.track.state == Phase::PrOpen
-                    && step.track.evidence.pr.as_deref() == Some(url.as_str())
+            let current = plan::track(&run.units, &observed.target).is_some_and(|track| {
+                track.state == Phase::PrOpen && track.evidence.pr.as_deref() == Some(url.as_str())
             });
             if failed && current {
                 open.entry(url).or_insert(observed);
@@ -552,8 +737,8 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
     }
     store::write_json(&plan::pulls_path(root), &open)?;
     let mut outcome = Outcome::refused(std::mem::take(&mut run.violations));
-    if !run.moves.is_empty() {
-        let body: String = run
+    if !run.moves.is_empty() || !run.notes.is_empty() {
+        let mut body: String = run
             .moves
             .iter()
             .map(|moved| {
@@ -566,6 +751,11 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
                 )
             })
             .collect();
+        for (_, note) in &run.notes {
+            body.push_str(note);
+            body.push('\n');
+            outcome.line(note.trim_start_matches("- ").to_owned());
+        }
         let title = format!("cm sync: {} move(s) from GitHub", run.moves.len());
         journal::append(root, &journal::entry(&run.at, &title, Some(&body)))?;
         outcome.field("journal", journal::heading(&run.at, &title));

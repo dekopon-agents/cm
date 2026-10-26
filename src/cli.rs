@@ -123,7 +123,7 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         evidence: PathBuf,
     },
-    /// Change a drafted or launched step's declaration: mark it a study, move its lane or add or remove gates.
+    /// Change a drafted or launched step's declaration: mark it a study, move its lane or add or remove gates. --part alone also amends a step that moved on.
     Amend {
         /// <NN-name>/<unit>/<step>
         #[arg(value_parser = step_target)]
@@ -140,6 +140,9 @@ enum Commands {
         /// A gate to remove, as `cm init --after` takes it. Repeat for each.
         #[arg(long, value_name = "AFTER")]
         drop_after: Vec<String>,
+        /// A required part (one PR) of a multipart step; the step moves to a state only once every part has. On a step past launched, the first new part takes the step's state and evidence and the step rests at launched. Repeat for each.
+        #[arg(long, value_name = "NAME")]
+        part: Vec<String>,
     },
     /// Show, claim or extend a remote launch's attempt record; every external action is recorded before the next.
     Attempt {
@@ -183,9 +186,41 @@ enum Commands {
         /// A codex step's merge gate: a campaign file showing green CI at the head, taken only when GitHub cannot be read.
         #[arg(long, value_name = "PATH")]
         ci_verified: Option<PathBuf>,
-        /// Waive a codex step's merge gate with a non-empty campaign file saying why; journaled with what it waived.
+        /// Discouraged: waive a codex step's whole merge gate with a non-empty campaign file saying why; journaled with what it waived. For a red check, record `cm known-red` instead; lint warns on an override of a red check no exception names.
         #[arg(long = "override", value_name = "PATH")]
         waiver: Option<PathBuf>,
+        /// Move this part of a multipart step; the step follows once every part has.
+        #[arg(long, value_name = "NAME")]
+        part: Option<String>,
+    },
+    /// Record a known-red exception: the step's merge gate accepts this one check failing at this one commit until the closing condition holds. Refused for a check that is cancelled, timed out or unrun, or green at the PR's base.
+    KnownRed {
+        /// <NN-name>/<unit>/<step>
+        #[arg(value_parser = step_target)]
+        target: Target,
+        /// The PR head the check failed at, all 40 hex digits.
+        #[arg(long, value_name = "SHA")]
+        commit: String,
+        /// The check's exact name as GitHub reports it.
+        #[arg(long, value_name = "NAME")]
+        check: String,
+        /// Why it is red by design, one line.
+        #[arg(long)]
+        reason: String,
+        /// Who answers for the exception.
+        #[arg(long)]
+        owner: String,
+        /// The closing condition, as `cm init --after` takes it: <step> (merged), pr-open:<step>, tag:<line>@<version> or deployed:<line>@<version>.
+        #[arg(long, value_name = "AFTER")]
+        until: String,
+    },
+    /// Hold a step below deployed until a live read lands: `add` records the stored signal and its deadline, `resolve` closes it with evidence. Past the deadline it reads expired: unresolved, never a pass.
+    Watch {
+        /// <NN-name>/<unit>/<step>
+        #[arg(value_parser = step_target)]
+        target: Target,
+        #[command(subcommand)]
+        act: WatchAct,
     },
     /// Append an entry, or a follow-up to one, to FEEDBACK.md under the next FB-<sequence>-NNN id.
     Feedback {
@@ -219,6 +254,12 @@ enum Commands {
         /// A file holding the body; `-` reads stdin.
         #[arg(long, value_name = "FILE")]
         body_file: PathBuf,
+        /// Pin the evidence to the commit it was produced against: <step>[@<sha>], the step's open PR head when the sha is left out. `cm sync` marks it stale when that head moves.
+        #[arg(long, value_name = "STEP[@SHA]")]
+        candidate: Option<String>,
+        /// Pin the evidence to the harness it ran under, as --candidate takes it.
+        #[arg(long, value_name = "STEP[@SHA]", requires = "candidate")]
+        harness: Option<String>,
     },
     /// Append one review row to REVIEW-OFF.md, rendered from `.cm/reviews.json`; --import adopts the hand-written rows once. `record` and `resolve` keep computed verdicts.
     #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
@@ -281,6 +322,24 @@ enum Commands {
     Lint {
         /// A folder inside the campaign; defaults to --root or the current directory.
         dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum WatchAct {
+    /// Record a pending read of a stored signal: span:<query>, log:<query> or metric:<query>.
+    Add {
+        #[arg(long)]
+        signal: String,
+        /// An RFC 3339 instant, e.g. 2026-10-27T06:00Z.
+        #[arg(long)]
+        deadline: String,
+    },
+    /// Close a watch with the evidence that shows its signal.
+    Resolve {
+        id: u32,
+        #[arg(long, value_name = "PATH")]
+        evidence: PathBuf,
     },
 }
 
@@ -461,6 +520,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             lane,
             after,
             drop_after,
+            part,
         } => commands::amend(
             host,
             &root()?,
@@ -470,6 +530,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 lane: *lane,
                 after: after.clone(),
                 drop_after: drop_after.clone(),
+                parts: part.clone(),
             },
         ),
         Commands::Attempt { target, claim, act } => {
@@ -507,6 +568,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             head,
             ci_verified,
             waiver,
+            part,
         } => {
             let evidence = Evidence {
                 sha: sha.clone(),
@@ -532,10 +594,39 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                     given: &evidence,
                     file: file.as_deref(),
                     repo: repo.as_deref(),
+                    part: part.as_deref(),
                 },
                 &gate,
             )
         }
+        Commands::KnownRed {
+            target,
+            commit,
+            check,
+            reason,
+            owner,
+            until,
+        } => crate::holds::known_red(
+            host,
+            &crate::forge::Gh::default(),
+            &root()?,
+            target,
+            &crate::holds::KnownRedArgs {
+                commit,
+                check,
+                reason,
+                owner,
+                until,
+            },
+        ),
+        Commands::Watch {
+            target,
+            act: WatchAct::Add { signal, deadline },
+        } => crate::holds::watch_add(host, &root()?, target, signal, deadline),
+        Commands::Watch {
+            target,
+            act: WatchAct::Resolve { id, evidence },
+        } => crate::holds::watch_resolve(host, &root()?, target, *id, &under_root(cli, evidence)),
         Commands::Feedback {
             title,
             urgency,
@@ -575,9 +666,15 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             target,
             name,
             body_file,
+            candidate,
+            harness,
         } => {
             let body = read_body(body_file)?;
-            crate::ledger::evidence(host, &root()?, target, name, &body)
+            let pin = crate::ledger::PinArgs {
+                candidate: candidate.as_deref(),
+                harness: harness.as_deref(),
+            };
+            crate::ledger::evidence_pinned(host, &root()?, target, name, &body, &pin)
         }
         Commands::Review {
             act:
@@ -661,7 +758,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 (None, Some(root)) => root.clone(),
                 (None, None) => std::env::current_dir()?,
             };
-            lint::lint(&start)
+            lint::lint_at(&start, host.now())
         }
     }
 }
@@ -680,6 +777,8 @@ fn name(command: &Commands) -> &'static str {
         Commands::Amend { .. } => "amend",
         Commands::Attempt { .. } => "attempt",
         Commands::Advance { .. } => "advance",
+        Commands::KnownRed { .. } => "known-red",
+        Commands::Watch { .. } => "watch",
         Commands::Feedback { .. } => "feedback",
         Commands::OwnerQueue { .. } => "owner-queue",
         Commands::Evidence { .. } => "evidence",

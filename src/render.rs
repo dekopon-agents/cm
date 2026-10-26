@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::plan::{Next, Units};
-use crate::state::{Lane, Phase, UnitState, Work};
+use crate::state::{Lane, Phase, Step, UnitState, Work};
 use crate::sync::Moved;
 
 fn cell(text: &str) -> String {
@@ -69,6 +69,36 @@ pub fn unit(state: &UnitState) -> String {
         }
         out.push('\n');
     }
+    if state.steps.values().any(|step| !step.parts.is_empty()) {
+        out.push_str(
+            "## Parts\n\n| Step | Part | State | Since | Evidence |\n|---|---|---|---|---|\n",
+        );
+        for (name, step) in &state.steps {
+            for (part, track) in &step.parts {
+                out.push_str(&format!(
+                    "| {} | {} | {} | {} | {} |\n",
+                    cell(name),
+                    cell(part),
+                    cell(&track.state.to_string()),
+                    track.since,
+                    cell(&track.evidence.summary()),
+                ));
+            }
+        }
+        out.push('\n');
+    }
+    let holds: Vec<String> = state
+        .steps
+        .iter()
+        .flat_map(|(name, step)| holds(name, step))
+        .collect();
+    if !holds.is_empty() {
+        out.push_str("## Holds\n\n");
+        for line in holds {
+            out.push_str(&format!("- {line}\n"));
+        }
+        out.push('\n');
+    }
     out.push_str("## History\n\n");
     if state.history.is_empty() {
         out.push_str("No moves yet.\n");
@@ -86,6 +116,52 @@ pub fn unit(state: &UnitState) -> String {
         }
     }
     out
+}
+
+fn holds(name: &str, step: &Step) -> Vec<String> {
+    let pins = step.pins.iter().map(|pin| {
+        format!(
+            "{name}: evidence `{}` pinned to {}{}{}",
+            pin.file,
+            pin.candidate,
+            pin.harness
+                .as_ref()
+                .map(|harness| format!(" under {harness}"))
+                .unwrap_or_default(),
+            pin.stale
+                .as_ref()
+                .map(|stale| format!("; stale: {stale}"))
+                .unwrap_or_default()
+        )
+    });
+    let exceptions = step.known_red.iter().map(|exception| {
+        format!(
+            "{name}: known-red `{}` at {} until {}, owner {}: {}",
+            exception.check, exception.commit, exception.until, exception.owner, exception.reason
+        )
+    });
+    let waived = step.waived.iter().map(|waived| {
+        format!(
+            "{name}: `{}` at {} waived by --override {}",
+            waived.check, waived.commit, waived.file
+        )
+    });
+    let watches = step.watches.iter().map(|watch| {
+        let status = match (&watch.resolved, &watch.expired) {
+            (Some(resolved), _) => format!("resolved {} by {}", resolved.at, resolved.evidence),
+            (None, Some(at)) => format!("expired: unresolved since {at}"),
+            (None, None) => "open".to_owned(),
+        };
+        format!(
+            "{name}#{}: watch {} by {}, {status}",
+            watch.id, watch.signal, watch.deadline
+        )
+    });
+    pins.chain(exceptions)
+        .chain(waived)
+        .chain(watches)
+        .map(|line| cell(&line))
+        .collect()
 }
 
 pub fn card(at: &str, name: &str, units: &Units, next: &Next, moves: &[Moved]) -> String {

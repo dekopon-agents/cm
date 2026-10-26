@@ -16,6 +16,7 @@ use crate::ledger::{
     QueueItem, add_queue_item, declared, evidence_dir, guard, journal_line, one_line, read_existing,
 };
 use crate::outcome::{Outcome, Violation};
+use crate::state::same_commit;
 use crate::state::{Evidence, Phase};
 use crate::store::{
     self, CM_DIR, Target, create_new, read_json, relative, write_atomic, write_json,
@@ -1264,11 +1265,6 @@ fn receipts(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
-}
-
-fn same_commit(a: &str, b: &str) -> bool {
-    let (a, b) = (a.to_lowercase(), b.to_lowercase());
-    a.len().min(b.len()) >= 7 && (a.starts_with(&b) || b.starts_with(&a))
 }
 
 /// Why a receipt does not show a review that happened, as `astra-review.sh collect` judges it

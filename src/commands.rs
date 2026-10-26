@@ -15,7 +15,8 @@ use crate::plan::{self, Units};
 use crate::render;
 use crate::state::{
     After, Attempt, CampaignState, DEFAULT_TAG, Evidence, FLAGS, Finish, Flag, JournalMark, Kind,
-    Lane, Move, Phase, RELEASES, Release, SCHEMA, Step, Track, UnitState, Work, evidence_for,
+    Lane, Move, Phase, RELEASES, Release, SCHEMA, Step, Track, UnitState, Waived, Work,
+    evidence_for,
 };
 use crate::store::{
     self, JOURNAL, Target, UNIT_STATE, absolute, create_new, find_root, lock, parse_target,
@@ -483,15 +484,12 @@ fn init_step(
     unit.steps.insert(
         step_name.to_owned(),
         Step {
-            track: Track::new(&at),
-            worktree: String::new(),
-            launches: 0,
             lane: Some(lane),
             after: parsed.clone(),
             github: ships.github.clone(),
             tag: tag.clone(),
             work,
-            attempt: None,
+            ..Step::new(&at)
         },
     );
     write_unit(&dir, &unit)?;
@@ -832,17 +830,7 @@ pub fn launch_remote(
         .as_ref()
         .map(|worktree| worktree.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let mut step = existing.unwrap_or_else(|| Step {
-        track: Track::new(&at),
-        worktree: worktree_text.clone(),
-        launches: 0,
-        lane: None,
-        after: Vec::new(),
-        github: None,
-        tag: None,
-        work: Work::Code,
-        attempt: None,
-    });
+    let mut step = existing.unwrap_or_else(|| Step::new(&at));
     let from = step.track.state.clone();
     step.track.apply(Phase::Launched, &at, &Evidence::default());
     step.worktree = worktree_text.clone();
@@ -1013,6 +1001,7 @@ struct GithubRead {
     head: String,
     base: Option<String>,
     checks: Result<Vec<CheckState>, String>,
+    base_checks: Option<Vec<CheckState>>,
     /// `--head` disagreed with GitHub's head.
     mismatch: Option<String>,
 }
@@ -1056,27 +1045,76 @@ fn read_github(gate: &MergeGate, pr: &str, recorded: Option<&str>) -> GithubRead
             .map_err(|error| format!("cannot read CI at {head}: {error}")),
         (None, _, _) => Err(format!("cannot read CI for {pr}")),
     };
+    let failed = checks
+        .as_ref()
+        .is_ok_and(|checks| checks.iter().any(|check| !check.green()));
+    let base_checks = match (failed, gate.forge, GithubRepo::of_pr(pr), &base) {
+        (true, Some(forge), Some(repo), Some(base)) => {
+            forge.checks(&repo, &CommitSha::new(base.clone())).ok()
+        }
+        _ => None,
+    };
     GithubRead {
         pr: pr.to_owned(),
         head,
         base,
         checks,
+        base_checks,
         mismatch,
     }
 }
 
+struct GateRead {
+    gaps: Vec<String>,
+    lines: Vec<String>,
+    head: String,
+    red: Vec<String>,
+}
+
+pub(crate) fn red_checks(
+    exceptions: &[crate::state::KnownRed],
+    units: &Units,
+    head: &str,
+    checks: &[CheckState],
+    base: Option<&[CheckState]>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut accepted = Vec::new();
+    let mut refused = Vec::new();
+    for check in checks.iter().filter(|check| !check.green()) {
+        match crate::holds::cover(exceptions, units, head, check, base) {
+            Ok(exception) => accepted.push(crate::holds::used_line(head, exception)),
+            Err(crate::holds::Uncovered::NoException) => {
+                refused.push((
+                    check.name.clone(),
+                    format!("{} {}", check.name, check.state),
+                ));
+            }
+            Err(why) => refused.push((
+                check.name.clone(),
+                format!("{} {} ({why})", check.name, check.state),
+            )),
+        }
+    }
+    (accepted, refused)
+}
+
+struct Gated<'a> {
+    track: &'a Track,
+    exceptions: &'a [crate::state::KnownRed],
+}
+
 /// The codex merge gate: (a) an Astra receipt and (b) a cleared review at the PR head from the
 /// step's evidence and `.cm/verdicts.json`, (c) green CI at that head from GitHub or
-/// `--ci-verified`. Returns the unmet conditions and the lines the move journals.
+/// `--ci-verified`, where an open known-red exception may accept a failing check.
 fn merge_gate(
     root: &Path,
     target: &Target,
-    track: &Track,
+    gated: Gated,
     gate: &MergeGate,
     read: Option<GithubRead>,
     repo: Option<&Path>,
     violations: &mut Vec<Violation>,
-) -> Result<(Vec<String>, Vec<String>)> {
+) -> Result<GateRead> {
     let full = format!(
         "{}/{}",
         target.unit,
@@ -1084,9 +1122,16 @@ fn merge_gate(
     );
     let mut gaps = Vec::new();
     let mut lines = Vec::new();
+    let Gated { track, exceptions } = gated;
+    let mut red = Vec::new();
     let Some(pr) = track.evidence.pr.clone() else {
         gaps.push("no PR is recorded; the gate reads the PR's head".to_owned());
-        return Ok((gaps, lines));
+        return Ok(GateRead {
+            gaps,
+            lines,
+            head: String::new(),
+            red,
+        });
     };
     let read = match read.filter(|read| read.pr == pr) {
         Some(read) => read,
@@ -1095,10 +1140,15 @@ fn merge_gate(
     if let Some(mismatch) = &read.mismatch {
         violations.push(Violation::new(&full, "merge-head", mismatch.clone()));
     }
-    let head = read.head;
+    let head = read.head.clone();
     if head.is_empty() {
         gaps.push("the PR head is unknown; pass --head <sha>".to_owned());
-        return Ok((gaps, lines));
+        return Ok(GateRead {
+            gaps,
+            lines,
+            head,
+            red,
+        });
     }
     lines.push(format!("- merge gate at {pr} @{head}"));
     let lineage = repo.map(|repo| crate::verdict::Lineage {
@@ -1116,17 +1166,22 @@ fn merge_gate(
         Ok(checks) if ci_green(&checks) => {
             lines.push(format!("- CI green at {head} ({} check(s))", checks.len()));
         }
+        Ok(checks) if checks.is_empty() => gaps.push(format!("GitHub reports no CI at {head}")),
         Ok(checks) => {
-            let red: Vec<String> = checks
-                .iter()
-                .filter(|check| !check.green())
-                .map(|check| format!("{} {}", check.name, check.state))
-                .collect();
-            gaps.push(if checks.is_empty() {
-                format!("GitHub reports no CI at {head}")
+            let units = plan::load_units(root)?;
+            let (accepted, refused) =
+                red_checks(exceptions, &units, &head, &checks, read.base_checks.as_deref());
+            lines.extend(accepted);
+            if refused.is_empty() {
+                lines.push(format!(
+                    "- CI green at {head} but for known-red check(s) ({} check(s))",
+                    checks.len()
+                ));
             } else {
-                format!("CI is not green at {head}: {}", red.join(", "))
-            });
+                let named: Vec<&str> = refused.iter().map(|(_, text)| text.as_str()).collect();
+                gaps.push(format!("CI is not green at {head}: {}", named.join(", ")));
+                red = refused.into_iter().map(|(name, _)| name).collect();
+            }
         }
         Err(why) => match &gate.ci_verified {
             Some(file) => match CampaignFile::resolve(root, file) {
@@ -1140,7 +1195,12 @@ fn merge_gate(
             )),
         },
     }
-    Ok((gaps, lines))
+    Ok(GateRead {
+        gaps,
+        lines,
+        head,
+        red,
+    })
 }
 
 pub fn advance(
@@ -1161,6 +1221,7 @@ pub fn advance(
             given,
             file,
             repo,
+            part: None,
         },
         &MergeGate::default(),
     )
@@ -1172,6 +1233,7 @@ pub struct Advance<'a> {
     pub given: &'a Evidence,
     pub file: Option<&'a Path>,
     pub repo: Option<&'a Path>,
+    pub part: Option<&'a str>,
 }
 
 pub fn advance_gated(
@@ -1186,10 +1248,15 @@ pub fn advance_gated(
         given,
         file,
         repo,
+        part,
     } = advance;
-    let full = match &target.step {
+    let step_full = match &target.step {
         Some(step) => format!("{}/{step}", target.unit),
         None => target.unit.clone(),
+    };
+    let full = match part {
+        Some(part) => format!("{step_full}#{part}"),
+        None => step_full.clone(),
     };
     // GitHub is read before the lock, as `cm sync` reads it; the gate re-reads under the lock
     // only if the step's PR changed meanwhile.
@@ -1199,8 +1266,12 @@ pub fn advance_gated(
         .and_then(|unit| unit.steps.get(target.step.as_deref()?).cloned())
         .filter(|step| step.lane == Some(Lane::Codex))
         .and_then(|step| {
-            let pr = step.track.evidence.pr.as_deref()?;
-            Some(read_github(gate, pr, step.track.evidence.sha.as_deref()))
+            let track = match part {
+                Some(part) => step.parts.get(part)?,
+                None => &step.track,
+            };
+            let pr = track.evidence.pr.as_deref()?;
+            Some(read_github(gate, pr, track.evidence.sha.as_deref()))
         });
     let _lock = lock(root)?;
     let campaign = store::load_campaign(root)?;
@@ -1224,7 +1295,20 @@ pub fn advance_gated(
     let track = match &target.step {
         None => unit.track.clone(),
         Some(step) => match unit.steps.get(step) {
-            Some(step) => step.track.clone(),
+            Some(step) => match part {
+                None => step.track.clone(),
+                Some(part) => match step.parts.get(part) {
+                    Some(track) => track.clone(),
+                    None => {
+                        violations.push(Violation::new(
+                            &full,
+                            "part-unknown",
+                            format!("{step_full} declares no part `{part}`; `cm amend {step_full} --part {part}` adds one"),
+                        ));
+                        return Ok(Outcome::refused(violations));
+                    }
+                },
+            },
             None => {
                 violations.push(Violation::new(
                     &full,
@@ -1236,6 +1320,69 @@ pub fn advance_gated(
         },
     };
     let finish = declared.as_ref().map_or(Finish::Shipped, Step::finish);
+    if let (Some(name), Some(step)) = (part, &declared) {
+        match to {
+            Phase::PrOpen | Phase::Merged | Phase::Released | Phase::Deployed => {}
+            Phase::Drafted
+            | Phase::Launched
+            | Phase::Done
+            | Phase::Superseded
+            | Phase::Blocked(_) => violations.push(Violation::new(
+                &full,
+                "part-state",
+                format!("a part moves to pr-open, merged, released or deployed; {to} belongs to {step_full}"),
+            )),
+        }
+        if *step.track.resting() == Phase::Drafted {
+            violations.push(Violation::new(
+                &full,
+                "part-step-drafted",
+                format!("{step_full} has not launched; `cm launch` it before part {name} moves"),
+            ));
+        }
+    } else if let Some(step) = &declared {
+        let short = step.short_parts(to);
+        if !short.is_empty() {
+            let named: Vec<String> = short
+                .iter()
+                .map(|(name, state)| format!("{name} ({state})"))
+                .collect();
+            violations.push(Violation::new(
+                &full,
+                "part-short",
+                format!(
+                    "{full} moves to {to} only when every part has; short: {}. Move each with `--part <name>`",
+                    named.join(", ")
+                ),
+            ));
+        }
+    }
+    let watched = match to {
+        Phase::Deployed | Phase::Done => part.is_none(),
+        Phase::Drafted
+        | Phase::Launched
+        | Phase::PrOpen
+        | Phase::Merged
+        | Phase::Released
+        | Phase::Superseded
+        | Phase::Blocked(_) => false,
+    };
+    if watched && let Some(step) = &declared {
+        for watch in step.unresolved_watches(root) {
+            violations.push(Violation::new(
+                &full,
+                "watch-open",
+                format!(
+                    "{full}#{} ({}, deadline {}) is {}; resolve it with `cm watch {full} resolve {} --evidence <path>`",
+                    watch.id,
+                    watch.signal,
+                    watch.deadline,
+                    watch.status(host.now(), root).name(),
+                    watch.id
+                ),
+            ));
+        }
+    }
     let single = (*to == Phase::Done && finish == Finish::Evidence && file.is_none())
         .then(|| crate::ledger::single_evidence(root, target))
         .flatten();
@@ -1314,7 +1461,26 @@ pub fn advance_gated(
     evidence.file = None;
     if let Some(file) = file {
         match CampaignFile::resolve(root, file) {
-            Ok(found) => evidence.file = Some(found),
+            Ok(found) => {
+                let units = plan::load_units(root)?;
+                if let Some(pin) = units
+                    .values()
+                    .flat_map(|unit| unit.steps.values())
+                    .flat_map(|step| step.pins.iter())
+                    .find(|pin| pin.file == found && pin.stale.is_some())
+                {
+                    violations.push(Violation::new(
+                        &full,
+                        "evidence-stale",
+                        format!(
+                            "{found} was pinned to {} and is stale: {}",
+                            pin.candidate,
+                            pin.stale.as_deref().unwrap_or_default()
+                        ),
+                    ));
+                }
+                evidence.file = Some(found);
+            }
             Err(error) => {
                 violations.push(Violation::new(&full, "evidence-file", error.to_string()))
             }
@@ -1422,11 +1588,24 @@ pub fn advance_gated(
         && !resuming
         && declared.as_ref().and_then(|step| step.lane) == Some(Lane::Codex);
     let mut gate_lines = Vec::new();
+    let mut waived = Vec::new();
     if gated {
-        let (gaps, lines) = merge_gate(
+        let exceptions = declared
+            .as_ref()
+            .map(|step| step.known_red.as_slice())
+            .unwrap_or_default();
+        let GateRead {
+            gaps,
+            lines,
+            head,
+            red,
+        } = merge_gate(
             root,
             target,
-            &track,
+            Gated {
+                track: &track,
+                exceptions,
+            },
             gate,
             read,
             repos.first().map(PathBuf::as_path),
@@ -1438,6 +1617,15 @@ pub fn advance_gated(
                 Ok(found) => {
                     gate_lines.push(format!("- merge gate overridden by {found}"));
                     gate_lines.extend(gaps.iter().map(|gap| format!("- waived: {gap}")));
+                    waived = red
+                        .into_iter()
+                        .map(|check| Waived {
+                            commit: head.clone(),
+                            check,
+                            file: found.clone(),
+                            at: stamp(host.now()),
+                        })
+                        .collect();
                 }
                 Err(error) => {
                     violations.push(Violation::new(&full, "evidence-file", error.to_string()))
@@ -1463,11 +1651,19 @@ pub fn advance_gated(
     }
     let at = stamp(host.now());
     let from = track.state.clone();
+    let mut rolled = Vec::new();
     match &target.step {
         None => unit.track.apply(to.clone(), &at, &evidence),
         Some(step) => {
             if let Some(step) = unit.steps.get_mut(step) {
-                step.track.apply(to.clone(), &at, &evidence);
+                match part.and_then(|part| step.parts.get_mut(part)) {
+                    Some(track) => {
+                        track.apply(to.clone(), &at, &evidence);
+                        rolled = step.roll_up_all(&at, &evidence, root);
+                    }
+                    None => step.track.apply(to.clone(), &at, &evidence),
+                }
+                step.waived.append(&mut waived);
             }
         }
     }
@@ -1478,8 +1674,24 @@ pub fn advance_gated(
         to: to.clone(),
         evidence: evidence.clone(),
     });
+    for (from, to) in &rolled {
+        unit.history.push(Move {
+            at: at.clone(),
+            target: step_full.clone(),
+            from: from.clone(),
+            to: to.clone(),
+            evidence: evidence.clone(),
+        });
+    }
     write_unit(&unit_dir, &unit)?;
     let mut body = format!("- evidence: {}\n", evidence.summary());
+    let rolled_lines: Vec<String> = rolled
+        .iter()
+        .map(|(from, to)| format!("{step_full}: {from} → {to}, every part has reached {to}"))
+        .collect();
+    for line in &rolled_lines {
+        body.push_str(&format!("- {line}\n"));
+    }
     for line in &gate_lines {
         body.push_str(line);
         body.push('\n');
@@ -1487,6 +1699,10 @@ pub fn advance_gated(
     let heading = record(root, &at, &format!("advance {full}: {from} → {to}"), &body)?;
     let mut outcome = Outcome::default();
     outcome.line(format!("{full}: {from} → {to}"));
+    outcome.lines.extend(rolled_lines.iter().cloned());
+    if !rolled_lines.is_empty() {
+        outcome.field("rolled_up", rolled_lines);
+    }
     outcome.lines.extend(
         gate_lines
             .iter()
@@ -1663,6 +1879,81 @@ pub struct Amendment {
     pub lane: Option<Lane>,
     pub after: Vec<String>,
     pub drop_after: Vec<String>,
+    pub parts: Vec<String>,
+}
+
+fn add_parts(
+    full: &str,
+    names: &[String],
+    step: &mut Step,
+    at: &str,
+    changes: &mut Vec<String>,
+    violations: &mut Vec<Violation>,
+) {
+    if Release::of_target(full).is_some() {
+        violations.push(Violation::new(
+            full,
+            "part-target",
+            "a release step ships one prep PR and one tag; it has no parts",
+        ));
+        return;
+    }
+    let launched = Track {
+        state: Phase::Launched,
+        since: at.to_owned(),
+        blocked_from: None,
+        evidence: Evidence::default(),
+    };
+    let advanced = step.parts.is_empty()
+        && step
+            .track
+            .resting()
+            .rank()
+            .zip(Phase::Launched.rank())
+            .is_some_and(|(at, launched)| at > launched);
+    for (index, name) in names.iter().enumerate() {
+        if !crate::store::is_name(name) || step.parts.contains_key(name) {
+            violations.push(Violation::new(
+                full,
+                "part-name",
+                format!("`{name}` is not a new part name of letters, digits, `.`, `_` and `-`"),
+            ));
+            continue;
+        }
+        let part = if advanced && index == 0 {
+            Track {
+                state: step.track.resting().clone(),
+                blocked_from: None,
+                ..step.track.clone()
+            }
+        } else {
+            launched.clone()
+        };
+        changes.push(format!(
+            "- part: + {name} ({}; {})",
+            part.state,
+            part.evidence.summary()
+        ));
+        step.parts.insert(name.clone(), part);
+    }
+    let reach = step.parts_reach().and_then(|reach| reach.rank());
+    let resting = step.track.resting().rank();
+    if let (Some(reach), Some(resting)) = (reach.max(Phase::Launched.rank()), resting)
+        && resting > reach
+    {
+        let to = crate::state::ORDER[reach].clone();
+        changes.push(format!(
+            "- rests: {} → {to}; the step moves on only when every part has",
+            step.track.state
+        ));
+        if step.track.blocked_from.is_some() {
+            step.track.blocked_from = Some(to);
+        } else {
+            step.track.state = to;
+        }
+        step.track.since = at.to_owned();
+        step.track.evidence = Evidence::default();
+    }
 }
 
 fn reaches(units: &Units, from: &str, to: &str) -> bool {
@@ -1714,18 +2005,44 @@ pub fn amend(
             "the step was launched without a declaration; only a declared step is amended",
         ));
     }
-    if !matches!(step.track.resting(), Phase::Drafted | Phase::Launched) {
+    let only_parts = !amendment.study
+        && amendment.lane.is_none()
+        && amendment.after.is_empty()
+        && amendment.drop_after.is_empty()
+        && !amendment.parts.is_empty();
+    let early = match step.track.resting() {
+        Phase::Drafted | Phase::Launched => true,
+        Phase::PrOpen
+        | Phase::Merged
+        | Phase::Released
+        | Phase::Deployed
+        | Phase::Done
+        | Phase::Superseded
+        | Phase::Blocked(_) => false,
+    };
+    if step.track.state.is_final() || (!early && !only_parts) {
         violations.push(Violation::new(
             &full,
             "amend-state",
             format!(
-                "{full} is {}; only a drafted or launched step is amended",
+                "{full} is {}; only a drafted or launched step is amended, and --part alone amends any step short of done",
                 step.track.state
             ),
         ));
     }
     let mut changes = Vec::new();
     let mut next = step.clone();
+    if !amendment.parts.is_empty() {
+        let at = stamp(host.now());
+        add_parts(
+            &full,
+            &amendment.parts,
+            &mut next,
+            &at,
+            &mut changes,
+            &mut violations,
+        );
+    }
     if amendment.study && step.work.is_code() {
         if Release::of_target(&full).is_some() {
             violations.push(Violation::new(
@@ -1794,13 +2111,29 @@ pub fn amend(
         violations.push(Violation::new(
             &full,
             "amend-empty",
-            "nothing changes; pass --study, a new --lane, --after or --drop-after",
+            "nothing changes; pass --study, a new --lane, --after, --drop-after or --part",
+        ));
+    }
+    if !next.parts.is_empty() && next.finish() == Finish::Evidence {
+        violations.push(Violation::new(
+            &full,
+            "part-target",
+            "parts are PRs: a study or owner-lane step finishes with evidence and has none",
         ));
     }
     if !violations.is_empty() {
         return Ok(Outcome::refused(violations));
     }
     let at = stamp(host.now());
+    if next.track.state != step.track.state {
+        unit.history.push(Move {
+            at: at.clone(),
+            target: full.clone(),
+            from: step.track.state.clone(),
+            to: next.track.state.clone(),
+            evidence: Evidence::default(),
+        });
+    }
     unit.steps.insert(step_name.to_owned(), next);
     write_unit(&root.join(&target.unit), &unit)?;
     let body: String = changes.iter().map(|line| format!("{line}\n")).collect();

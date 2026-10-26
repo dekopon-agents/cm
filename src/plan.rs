@@ -31,10 +31,18 @@ pub fn step<'a>(units: &'a Units, target: &str) -> Option<&'a Step> {
     units.get(unit)?.steps.get(name)
 }
 
+pub fn track<'a>(units: &'a Units, target: &str) -> Option<&'a Track> {
+    match target.split_once('#') {
+        Some((name, part)) => step(units, name)?.parts.get(part),
+        None => step(units, target).map(|step| &step.track),
+    }
+}
+
 pub struct Gate {
     pub after: After,
     pub track: Option<Track>,
     pub finish: Finish,
+    pub stale: Vec<String>,
 }
 
 impl Gate {
@@ -43,9 +51,11 @@ impl Gate {
     }
 
     pub fn met(&self) -> bool {
-        self.track
-            .as_ref()
-            .is_some_and(|track| self.after.met_by(track, self.finish))
+        self.stale.is_empty()
+            && self
+                .track
+                .as_ref()
+                .is_some_and(|track| self.after.met_by(track, self.finish))
     }
 
     pub fn describe(&self) -> String {
@@ -53,7 +63,12 @@ impl Gate {
             || "not declared".to_owned(),
             |track| track.state.to_string(),
         );
-        format!("{} (needs {}, is {state})", self.after, self.needs())
+        let stale = if self.stale.is_empty() {
+            String::new()
+        } else {
+            format!("; its pinned evidence is stale: {}", self.stale.join(", "))
+        };
+        format!("{} (needs {}, is {state}{stale})", self.after, self.needs())
     }
 
     pub fn to_json(&self) -> Value {
@@ -67,18 +82,53 @@ impl Gate {
     }
 }
 
+pub fn gate(units: &Units, after: &After) -> Gate {
+    let target = step(units, &after.target());
+    Gate {
+        after: after.clone(),
+        track: target.map(|step| step.track.clone()),
+        finish: target.map_or(Finish::Shipped, Step::finish),
+        stale: target
+            .map(|step| {
+                stale_evidence(units, step)
+                    .iter()
+                    .map(|pin| pin.file.to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// The stale pins a step stands on, one per file: for each file it pinned or finished on, a stale
+/// pin of that file, anywhere in the campaign, that no fresh pin of the step renews.
+pub fn stale_evidence<'a>(units: &'a Units, step: &Step) -> Vec<&'a crate::state::Pin> {
+    let mut files: Vec<&crate::evidence::CampaignFile> =
+        step.pins.iter().map(|pin| &pin.file).collect();
+    files.extend(&step.track.evidence.file);
+    files.dedup();
+    let mut out: Vec<&crate::state::Pin> = Vec::new();
+    for file in files {
+        if out.iter().any(|pin| pin.file == *file) {
+            continue;
+        }
+        if let Some(pin) = units
+            .values()
+            .flat_map(|unit| unit.steps.values())
+            .flat_map(|holder| holder.pins.iter())
+            .find(|pin| {
+                pin.file == *file
+                    && pin.stale.is_some()
+                    && !step.pins.iter().any(|fresh| fresh.renews(pin))
+            })
+        {
+            out.push(pin);
+        }
+    }
+    out
+}
+
 pub fn gates(units: &Units, step: &Step) -> Vec<Gate> {
-    step.after
-        .iter()
-        .map(|after| {
-            let target = self::step(units, &after.target());
-            Gate {
-                after: after.clone(),
-                track: target.map(|step| step.track.clone()),
-                finish: target.map_or(Finish::Shipped, Step::finish),
-            }
-        })
-        .collect()
+    step.after.iter().map(|after| gate(units, after)).collect()
 }
 
 pub fn unmet(target: &str, gates: &[Gate]) -> Vec<Violation> {
@@ -321,9 +371,9 @@ pub fn dirty(root: &Path, units: &Units) -> Vec<(String, Observed)> {
                 Some(MergeableState::Other(_)) | None => false,
             };
             dirty
-                && step(units, &observed.target).is_some_and(|step| {
-                    step.track.state == Phase::PrOpen
-                        && step.track.evidence.pr.as_deref() == Some(url.as_str())
+                && track(units, &observed.target).is_some_and(|track| {
+                    track.state == Phase::PrOpen
+                        && track.evidence.pr.as_deref() == Some(url.as_str())
                 })
         })
         .collect()
@@ -509,6 +559,10 @@ pub fn next_at(
     for (url, observed) in &dirty {
         outcome.line(dirty_line(url, observed));
     }
+    let held = crate::holds::held(&units, now, root);
+    outcome.lines.extend(held.lines);
+    outcome.field("watches", held.watches);
+    outcome.field("stale", held.stale);
     outcome.field(
         "stalled",
         stalled
