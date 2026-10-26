@@ -458,6 +458,23 @@ pub fn evidence(
     name: &str,
     body: &str,
 ) -> Result<Outcome> {
+    evidence_pinned(host, root, target, name, body, &PinArgs::default())
+}
+
+#[derive(Default)]
+pub struct PinArgs<'a> {
+    pub candidate: Option<&'a str>,
+    pub harness: Option<&'a str>,
+}
+
+pub fn evidence_pinned(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    name: &str,
+    body: &str,
+    pin: &PinArgs,
+) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
     let full = format!(
         "{}/{}",
@@ -490,6 +507,16 @@ pub fn evidence(
             "evidence is written once; pick a new --name",
         ));
     }
+    let units = crate::plan::load_units(root)?;
+    let mut revision = |flag: &str, text: Option<&str>| {
+        text.and_then(|text| {
+            crate::holds::revision(root, &units, &target.unit, flag, text)
+                .map_err(|refused| violations.push(refused))
+                .ok()
+        })
+    };
+    let candidate = revision("--candidate", pin.candidate);
+    let harness = revision("--harness", pin.harness);
     if !violations.is_empty() {
         return Ok(Outcome::refused(violations));
     }
@@ -504,13 +531,31 @@ pub fn evidence(
         )]));
     }
     let at = stamp(host.now());
-    let journal = journal_line(
-        root,
-        &at,
-        &format!("evidence {full}"),
-        &format!("- written: `{rel}`\n"),
-    )?;
+    let mut body = format!("- written: `{rel}`\n");
     let mut outcome = Outcome::default();
+    if let Some(candidate) = candidate {
+        let file = crate::evidence::CampaignFile::resolve(root, &path)?;
+        let dir = root.join(&target.unit);
+        let mut unit = store::load_unit(&dir)?;
+        if let Some(step) = unit
+            .steps
+            .get_mut(target.step.as_deref().unwrap_or_default())
+        {
+            body.push_str(&format!(
+                "- pinned: candidate {candidate}{}\n",
+                harness
+                    .as_ref()
+                    .map(|harness| format!(", harness {harness}"))
+                    .unwrap_or_default()
+            ));
+            outcome.field("candidate", candidate.to_string());
+            outcome.field("harness", harness.as_ref().map(ToString::to_string));
+            step.pins
+                .push(crate::holds::pin(file, candidate, harness, &at));
+            crate::commands::write_unit(&dir, &unit)?;
+        }
+    }
+    let journal = journal_line(root, &at, &format!("evidence {full}"), &body)?;
     outcome.line(format!("wrote {rel}"));
     outcome.field("path", rel);
     outcome.field("journal", journal);

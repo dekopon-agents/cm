@@ -1743,3 +1743,344 @@ fn a_pr_backed_release_still_uses_its_prep_repository() {
     assert_eq!(state(&c, "01-a/u/S1"), Phase::Released);
     assert!(lint(&c.root).unwrap().ok());
 }
+
+fn advance_part(
+    host: &Fake,
+    c: &Campaign,
+    target: &str,
+    part: &str,
+    to: &str,
+    evidence: Evidence,
+) -> Outcome {
+    commands::advance_gated(
+        host,
+        &c.root,
+        &parse_target(target, true).unwrap(),
+        commands::Advance {
+            to: &to.parse().unwrap(),
+            given: &evidence,
+            file: None,
+            repo: None,
+            part: Some(part),
+        },
+        &commands::MergeGate::default(),
+    )
+    .unwrap()
+}
+
+fn open(head: &str) -> Pull {
+    Pull {
+        state: PullState::Open,
+        merge_commit: None,
+        head: Some(CommitSha::new(head)),
+        base: None,
+        mergeable_state: None,
+    }
+}
+
+fn part_state(c: &Campaign, target: &str, part: &str) -> Phase {
+    let (unit, step) = target.rsplit_once('/').unwrap();
+    store::load_unit(&c.root.join(unit)).unwrap().steps[step].parts[part]
+        .state
+        .clone()
+}
+
+/// A deployed release 0.49.0 whose tag holds `shas`, so sync deploys the steps that merged them.
+fn deployed_release(host: &Fake, c: &Campaign, forge: &mut FakeForge, shas: &[&str]) {
+    let release = "00-release/dekopon/0.49.0";
+    let prep = "https://github.com/dekopon-agents/dekopon/pull/799";
+    assert!(declare(host, c, release, Lane::Pi, &[]).ok());
+    kickoff(c, release);
+    open_pr(host, c, release, prep);
+    forge.pulls.insert(prep.into(), merged("rrr1"));
+    let mut tagged: BTreeSet<String> = shas.iter().map(|sha| (*sha).to_owned()).collect();
+    tagged.insert("rrr1".into());
+    forge
+        .tags
+        .insert(("dekopon-agents/dekopon".into(), "v0.49.0".into()), tagged);
+    sync(host, forge, &c.root).unwrap();
+    assert_eq!(state(c, release), Phase::Released);
+    let deployed = advance(
+        host,
+        c,
+        release,
+        "deployed",
+        Evidence {
+            digest: Some(format!("sha256:{}", "d".repeat(64))),
+            ..Evidence::default()
+        },
+    );
+    assert!(deployed.ok(), "{:?}", deployed.violations);
+}
+
+#[test]
+fn a_multipart_step_reaches_merged_and_deployed_only_when_every_part_has() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/events";
+    assert!(declare(&host, &c, step, Lane::Pi, &[]).ok());
+    assert!(declare(&host, &c, "02-b/v/consumer", Lane::Pi, &[step]).ok());
+    kickoff(&c, step);
+    kickoff(&c, "02-b/v/consumer");
+    let worktree = c.root.parent().unwrap().join("wt");
+    fs::create_dir_all(&worktree).unwrap();
+    git(&worktree, &["init", "-q"]);
+    git(&worktree, &["commit", "-q", "--allow-empty", "-m", "head"]);
+    let launched = commands::launch(
+        &host,
+        &c.root,
+        &parse_target(step, true).unwrap(),
+        Some(&worktree),
+    )
+    .unwrap();
+    assert!(launched.ok(), "{:?}", launched.violations);
+    let amended = commands::amend(
+        &host,
+        &c.root,
+        &parse_target(step, true).unwrap(),
+        &commands::Amendment {
+            parts: vec!["pr1".into(), "pr2".into(), "pr3".into()],
+            ..commands::Amendment::default()
+        },
+    )
+    .unwrap();
+    assert!(amended.ok(), "{:?}", amended.violations);
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+    let prs: Vec<String> = (700..703)
+        .map(|n| format!("https://github.com/dekopon-agents/dekopon/pull/{n}"))
+        .collect();
+    for (part, pr) in ["pr1", "pr2", "pr3"].iter().zip(&prs) {
+        assert_eq!(state(&c, step), Phase::Launched);
+        let opened = advance_part(
+            &host,
+            &c,
+            step,
+            part,
+            "pr-open",
+            Evidence {
+                pr: Some(pr.clone()),
+                sha: Some(head.clone()),
+                ..Evidence::default()
+            },
+        );
+        assert!(opened.ok(), "{:?}", opened.violations);
+    }
+    assert_eq!(state(&c, step), Phase::PrOpen);
+    let early = advance(
+        &host,
+        &c,
+        step,
+        "merged",
+        Evidence {
+            sha: Some(head.clone()),
+            ..Evidence::default()
+        },
+    );
+    assert_eq!(rules(&early), vec!["part-short"]);
+
+    let mut forge = FakeForge::default();
+    forge.pulls.insert(prs[0].clone(), merged("aaa1"));
+    forge.pulls.insert(prs[1].clone(), open(&head));
+    forge.pulls.insert(prs[2].clone(), open(&head));
+    deployed_release(&host, &c, &mut forge, &["aaa1"]);
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(part_state(&c, step, "pr1"), Phase::Deployed);
+    assert_eq!(
+        state(&c, step),
+        Phase::PrOpen,
+        "one shipped part leaves the step short"
+    );
+    assert_eq!(rules(&next_one(&c, "02-b/v/consumer")), vec!["after-unmet"]);
+    assert_eq!(
+        rules(&advance(
+            &host,
+            &c,
+            step,
+            "deployed",
+            Evidence {
+                digest: Some(format!("sha256:{}", "d".repeat(64))),
+                ..Evidence::default()
+            }
+        )),
+        vec!["advance-refused", "part-short"]
+    );
+
+    forge.pulls.insert(prs[1].clone(), merged("bbb2"));
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(state(&c, step), Phase::PrOpen);
+    forge.pulls.insert(prs[2].clone(), merged("ccc3"));
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(state(&c, step), Phase::Merged);
+    assert!(next_one(&c, "02-b/v/consumer").ok());
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    assert!(
+        journal.contains("- 01-a/u/events: pr-open → merged (sha ccc3)"),
+        "{journal}"
+    );
+    let lint = lint(&c.root).unwrap();
+    assert!(lint.ok(), "{:#?}", lint.violations);
+}
+
+#[test]
+fn evidence_pinned_to_a_candidate_or_harness_head_goes_stale_when_that_head_moves() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host);
+    let (candidate, harness, study) = ("01-a/u/feature", "01-a/u/harness", "01-a/u/run");
+    assert!(declare(&host, &c, candidate, Lane::Pi, &[]).ok());
+    assert!(declare(&host, &c, harness, Lane::Pi, &[]).ok());
+    assert!(declare_work(&host, &c, study, Lane::Coordinator, &[], Work::Study).ok());
+    assert!(declare(&host, &c, "02-b/v/consumer", Lane::Pi, &[study]).ok());
+    for target in [candidate, harness, study, "02-b/v/consumer"] {
+        kickoff(&c, target);
+    }
+    let (feature_pr, harness_pr) = (
+        "https://github.com/dekopon-agents/dekopon/pull/759",
+        "https://github.com/dekopon-agents/dekopon/pull/705",
+    );
+    open_pr(&host, &c, candidate, feature_pr);
+    open_pr(&host, &c, harness, harness_pr);
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    let head = |name: &str| unit.steps[name].track.evidence.sha.clone().unwrap();
+    let (candidate_head, harness_head) = (head("feature"), head("harness"));
+    let pin = |name: &str, candidate: &str| {
+        cm::ledger::evidence_pinned(
+            &host,
+            &c.root,
+            &parse_target(study, true).unwrap(),
+            name,
+            "Lab run: 6 of 7 scenarios pass.\n",
+            &cm::ledger::PinArgs {
+                candidate: Some(candidate),
+                harness: Some("harness"),
+            },
+        )
+        .unwrap()
+    };
+    let first = pin("run-1", "feature");
+    assert!(first.ok(), "{:?}", first.violations);
+    assert_eq!(
+        first.fields["candidate"],
+        format!("{candidate}@{candidate_head}")
+    );
+    assert_eq!(first.fields["harness"], format!("{harness}@{harness_head}"));
+    let evidence = c.root.join(study).join("evidence/run-1.md");
+    assert!(finish(&c, study, Some(&evidence)).ok());
+    assert!(next_one(&c, "02-b/v/consumer").ok());
+
+    let moved = "1".repeat(40);
+    let mut forge = FakeForge::default();
+    forge.pulls.insert(feature_pr.into(), open(&moved));
+    forge.pulls.insert(harness_pr.into(), open(&harness_head));
+    let synced = sync(&host, &forge, &c.root).unwrap();
+    assert!(
+        synced
+            .lines
+            .iter()
+            .any(|line| line.contains("run-1.md of 01-a/u/run is stale")),
+        "{:?}",
+        synced.lines
+    );
+    assert_eq!(rules(&lint(&c.root).unwrap()), vec!["evidence-stale"]);
+    assert_eq!(rules(&next_one(&c, "02-b/v/consumer")), vec!["after-unmet"]);
+    let next = plan::next(&c.root, None, None).unwrap();
+    assert_eq!(
+        next.fields["stale"][0]["file"],
+        "01-a/u/run/evidence/run-1.md"
+    );
+    let old = pin("run-x", &format!("feature@{candidate_head}"));
+    assert_eq!(rules(&old), vec!["pin-revision"]);
+
+    assert!(pin("run-2", "feature").ok());
+    assert!(lint(&c.root).unwrap().ok());
+    assert!(next_one(&c, "02-b/v/consumer").ok());
+
+    forge.pulls.insert(harness_pr.into(), open(&"2".repeat(40)));
+    sync(&host, &forge, &c.root).unwrap();
+    let stale = lint(&c.root).unwrap();
+    assert_eq!(rules(&stale), vec!["evidence-stale"]);
+    assert!(
+        stale.violations[0].message.contains("run-2.md"),
+        "{:?}",
+        stale.violations
+    );
+}
+
+#[test]
+fn a_watch_past_its_deadline_without_evidence_stays_unresolved_and_holds_the_step_below_deployed() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/mapping";
+    assert!(declare(&host, &c, step, Lane::Pi, &[]).ok());
+    kickoff(&c, step);
+    let pr = "https://github.com/dekopon-agents/dekopon/pull/315";
+    open_pr(&host, &c, step, pr);
+    let target = parse_target(step, true).unwrap();
+    let watch = |signal: &str, deadline: &str| {
+        cm::holds::watch_add(&host, &c.root, &target, signal, deadline).unwrap()
+    };
+    assert_eq!(
+        rules(&watch("broker.decision", "2026-10-27T06:00Z")),
+        vec!["watch-signal"]
+    );
+    assert_eq!(
+        rules(&watch("log:broker.decision", "2026-10-26T07:00Z")),
+        vec!["watch-deadline"]
+    );
+    assert_eq!(
+        rules(&watch("log:broker.decision", "tomorrow")),
+        vec!["watch-deadline"]
+    );
+    let added = watch(
+        "log:broker.decision conversation=1548494886146150451",
+        "2026-10-27T06:00Z",
+    );
+    assert!(added.ok(), "{:?}", added.violations);
+
+    let mut forge = FakeForge::default();
+    forge.pulls.insert(pr.into(), merged("aaa1"));
+    deployed_release(&host, &c, &mut forge, &["aaa1"]);
+    let held = sync(&at("2026-10-26T09:00:00Z"), &forge, &c.root).unwrap();
+    assert!(
+        rules(&held).contains(&"watch-open"),
+        "{:?}",
+        held.violations
+    );
+    assert_eq!(state(&c, step), Phase::Released);
+
+    let late = at("2026-10-27T07:00:00Z");
+    sync(&late, &forge, &c.root).unwrap();
+    sync(&at("2026-10-27T08:00:00Z"), &forge, &c.root).unwrap();
+    assert_eq!(state(&c, step), Phase::Released);
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    assert_eq!(
+        journal.matches("expired: unresolved").count(),
+        1,
+        "{journal}"
+    );
+    let next = plan::next_at(&c.root, None, None, late.now).unwrap();
+    assert_eq!(next.fields["watches"][0]["status"], "expired: unresolved");
+    let linted = cm::lint::lint_at(&c.root, late.now).unwrap();
+    assert!(linted.ok(), "{:?}", linted.violations);
+    assert_eq!(linted.fields["warnings"].as_array().unwrap().len(), 1);
+    let digest = format!("sha256:{}", "d".repeat(64));
+    let refused = advance(
+        &late,
+        &c,
+        step,
+        "deployed",
+        Evidence {
+            digest: Some(digest.clone()),
+            ..Evidence::default()
+        },
+    );
+    assert_eq!(rules(&refused), vec!["watch-open"]);
+
+    let read = c.root.join(step).join("evidence/decision.md");
+    fs::create_dir_all(read.parent().unwrap()).unwrap();
+    fs::write(&read, "1 broker.decision record at 2026-10-27T06:40Z.\n").unwrap();
+    let resolved = cm::holds::watch_resolve(&late, &c.root, &target, 1, &read).unwrap();
+    assert!(resolved.ok(), "{:?}", resolved.violations);
+    sync(&late, &forge, &c.root).unwrap();
+    assert_eq!(state(&c, step), Phase::Deployed);
+    assert!(lint(&c.root).unwrap().ok());
+}

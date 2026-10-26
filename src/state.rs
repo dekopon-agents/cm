@@ -634,6 +634,203 @@ pub struct Step {
     pub work: Work,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt: Option<Attempt>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parts: BTreeMap<String, Track>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pins: Vec<Pin>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub known_red: Vec<KnownRed>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waived: Vec<Waived>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watches: Vec<Watch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revision {
+    pub step: String,
+    pub sha: String,
+}
+
+impl fmt::Display for Revision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}", self.step, self.sha)
+    }
+}
+
+pub fn same_commit(a: &str, b: &str) -> bool {
+    let (a, b) = (a.to_ascii_lowercase(), b.to_ascii_lowercase());
+    let (short, long) = if a.len() <= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    short.len() >= 7 && long.starts_with(short.as_str())
+}
+
+pub fn is_commit(text: &str) -> bool {
+    (7..=40).contains(&text.len()) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pin {
+    pub file: CampaignFile,
+    pub candidate: Revision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<Revision>,
+    pub at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<String>,
+}
+
+impl Pin {
+    fn supersedes(&self, older: &Pin) -> bool {
+        self.candidate.step == older.candidate.step
+            && self.harness.as_ref().map(|rev| &rev.step)
+                == older.harness.as_ref().map(|rev| &rev.step)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnownRed {
+    pub commit: String,
+    pub check: String,
+    pub reason: String,
+    pub owner: String,
+    pub until: After,
+    pub at: String,
+}
+
+/// A red check an `--override` waived, kept so lint can name the ones no exception covers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Waived {
+    pub commit: String,
+    pub check: String,
+    pub file: CampaignFile,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalKind {
+    Span,
+    Log,
+    Metric,
+}
+
+impl SignalKind {
+    fn name(self) -> &'static str {
+        match self {
+            SignalKind::Span => "span",
+            SignalKind::Log => "log",
+            SignalKind::Metric => "metric",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Signal {
+    pub kind: SignalKind,
+    pub query: String,
+}
+
+impl std::str::FromStr for Signal {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let shape = || {
+            format!(
+                "`{text}` is not span:<query>, log:<query> or metric:<query>; a watch reads a stored signal, never a stdout-only line"
+            )
+        };
+        let (kind, query) = text.split_once(':').ok_or_else(shape)?;
+        let kind = [SignalKind::Span, SignalKind::Log, SignalKind::Metric]
+            .into_iter()
+            .find(|candidate| candidate.name() == kind)
+            .ok_or_else(shape)?;
+        if query.trim().is_empty() {
+            return Err(shape());
+        }
+        Ok(Signal {
+            kind,
+            query: query.trim().to_owned(),
+        })
+    }
+}
+
+impl fmt::Display for Signal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.kind.name(), self.query)
+    }
+}
+
+impl TryFrom<String> for Signal {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<Signal> for String {
+    fn from(signal: Signal) -> String {
+        signal.to_string()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resolved {
+    pub at: String,
+    pub evidence: CampaignFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Watch {
+    pub id: u32,
+    pub signal: Signal,
+    pub deadline: String,
+    pub added: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<Resolved>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expired: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchStatus {
+    Open,
+    Expired,
+    Resolved,
+}
+
+impl WatchStatus {
+    pub fn name(self) -> &'static str {
+        match self {
+            WatchStatus::Open => "open",
+            WatchStatus::Expired => "expired: unresolved",
+            WatchStatus::Resolved => "resolved",
+        }
+    }
+}
+
+impl Watch {
+    pub fn status(&self, now: jiff::Timestamp) -> WatchStatus {
+        let past = crate::plan::instant(&self.deadline).is_some_and(|deadline| deadline <= now);
+        match (&self.resolved, &self.expired) {
+            (Some(_), _) => WatchStatus::Resolved,
+            (None, Some(_)) => WatchStatus::Expired,
+            (None, None) if past => WatchStatus::Expired,
+            (None, None) => WatchStatus::Open,
+        }
+    }
+}
+
+pub fn part_needs(to: &Phase) -> Option<Phase> {
+    match to {
+        Phase::PrOpen | Phase::Merged | Phase::Released | Phase::Deployed => Some(to.clone()),
+        Phase::Done => Some(Phase::Deployed),
+        Phase::Drafted | Phase::Launched | Phase::Superseded | Phase::Blocked(_) => None,
+    }
 }
 
 /// A remote launch's record: what cm knows reached the runtime, so a replacement coordinator
@@ -730,6 +927,77 @@ impl Work {
 }
 
 impl Step {
+    pub fn new(at: &str) -> Self {
+        Step {
+            track: Track::new(at),
+            worktree: String::new(),
+            launches: 0,
+            lane: None,
+            after: Vec::new(),
+            github: None,
+            tag: None,
+            work: Work::Code,
+            attempt: None,
+            parts: BTreeMap::new(),
+            pins: Vec::new(),
+            known_red: Vec::new(),
+            waived: Vec::new(),
+            watches: Vec::new(),
+        }
+    }
+
+    pub fn short_parts(&self, to: &Phase) -> Vec<(String, Phase)> {
+        let Some(need) = part_needs(to).and_then(|need| need.rank()) else {
+            return Vec::new();
+        };
+        self.parts
+            .iter()
+            .filter(|(_, part)| part.resting().rank().is_none_or(|at| at < need))
+            .map(|(name, part)| (name.clone(), part.state.clone()))
+            .collect()
+    }
+
+    /// The least advanced part's state, which the step's own track never passes.
+    pub fn parts_reach(&self) -> Option<Phase> {
+        self.parts
+            .values()
+            .filter_map(|part| part.resting().rank())
+            .min()
+            .and_then(|rank| ORDER.get(rank).cloned())
+    }
+
+    pub fn unresolved_watches(&self) -> impl Iterator<Item = &Watch> {
+        self.watches.iter().filter(|watch| watch.resolved.is_none())
+    }
+
+    pub fn stale_pins(&self) -> Vec<&Pin> {
+        self.pins
+            .iter()
+            .enumerate()
+            .filter(|(at, pin)| {
+                pin.stale.is_some()
+                    && !self.pins[at + 1..]
+                        .iter()
+                        .any(|later| later.supersedes(pin))
+            })
+            .map(|(_, pin)| pin)
+            .collect()
+    }
+
+    pub fn roll_up(&mut self, at: &str, evidence: &Evidence) -> Option<(Phase, Phase)> {
+        let reach = self.parts_reach()?;
+        let from = self.track.state.clone();
+        if self.track.resting().successor().as_ref() != Some(&reach)
+            || self.track.blocked_from.is_some()
+            || self.track.check(&reach, self.finish()).is_err()
+            || (reach == Phase::Deployed && self.unresolved_watches().next().is_some())
+        {
+            return None;
+        }
+        self.track.apply(reach.clone(), at, evidence);
+        Some((from, reach))
+    }
+
     pub fn finish(&self) -> Finish {
         match (self.work, self.lane) {
             (Work::Study, _) | (Work::Code, Some(Lane::Owner)) => Finish::Evidence,

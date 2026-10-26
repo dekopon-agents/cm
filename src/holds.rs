@@ -1,0 +1,629 @@
+use std::collections::BTreeMap;
+use std::fmt;
+use std::path::Path;
+
+use anyhow::Result;
+use serde_json::{Value, json};
+
+use crate::commands::write_unit;
+use crate::evidence::CampaignFile;
+use crate::forge::{CheckState, CommitSha, Conclusion, Forge, GithubRepo};
+use crate::host::{Host, stamp};
+use crate::ledger::{guard, journal_line, one_line};
+use crate::outcome::{Outcome, Violation};
+use crate::plan::{self, Units};
+use crate::state::{
+    After, KnownRed, Phase, Pin, Resolved, Revision, Signal, Step, Watch, WatchStatus, is_commit,
+    same_commit,
+};
+use crate::store::{self, Target};
+
+fn full(target: &Target) -> String {
+    format!(
+        "{}/{}",
+        target.unit,
+        target.step.as_deref().unwrap_or_default()
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Uncovered {
+    NoException,
+    NotAFailure(Conclusion),
+    GreenAtBase,
+    BaseUnknown,
+    Closed(After),
+}
+
+impl fmt::Display for Uncovered {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Uncovered::NoException => f.write_str("no known-red exception names it"),
+            Uncovered::NotAFailure(state) => write!(
+                f,
+                "`{state}` is not a test failure; an exception never covers a cancelled, timed-out or unrun check"
+            ),
+            Uncovered::GreenAtBase => f.write_str(
+                "it passes at the PR's base, so this change broke it; an exception never covers a regression",
+            ),
+            Uncovered::BaseUnknown => f.write_str(
+                "its state at the PR's base is unknown, so it may be a regression",
+            ),
+            Uncovered::Closed(until) => write!(f, "its exception closed when {until} held"),
+        }
+    }
+}
+
+pub fn verify(check: &CheckState, base: Option<&[CheckState]>) -> Result<(), Uncovered> {
+    match check.state {
+        Conclusion::Failure => {}
+        Conclusion::Success | Conclusion::Neutral | Conclusion::Skipped | Conclusion::Other(_) => {
+            return Err(Uncovered::NotAFailure(check.state.clone()));
+        }
+    }
+    let base = base.ok_or(Uncovered::BaseUnknown)?;
+    if base
+        .iter()
+        .any(|before| before.name == check.name && before.green())
+    {
+        return Err(Uncovered::GreenAtBase);
+    }
+    Ok(())
+}
+
+pub fn is_open(units: &Units, exception: &KnownRed) -> bool {
+    !plan::gate(units, &exception.until).met()
+}
+
+pub fn cover<'a>(
+    exceptions: &'a [KnownRed],
+    units: &Units,
+    head: &str,
+    check: &CheckState,
+    base: Option<&[CheckState]>,
+) -> Result<&'a KnownRed, Uncovered> {
+    let named: Vec<&KnownRed> = exceptions
+        .iter()
+        .filter(|exception| {
+            exception.commit.eq_ignore_ascii_case(head) && exception.check == check.name
+        })
+        .collect();
+    let first = named.first().ok_or(Uncovered::NoException)?;
+    verify(check, base)?;
+    named
+        .iter()
+        .copied()
+        .find(|exception| is_open(units, exception))
+        .ok_or_else(|| Uncovered::Closed(first.until.clone()))
+}
+
+pub fn used_line(head: &str, exception: &KnownRed) -> String {
+    format!(
+        "- known-red: {} failed at {head}, accepted by the exception owned by {} until {} ({})",
+        exception.check, exception.owner, exception.until, exception.reason
+    )
+}
+
+pub struct KnownRedArgs<'a> {
+    pub commit: &'a str,
+    pub check: &'a str,
+    pub reason: &'a str,
+    pub owner: &'a str,
+    pub until: &'a str,
+}
+
+fn pull_requests(step: &Step) -> Vec<String> {
+    step.track
+        .evidence
+        .pr
+        .iter()
+        .chain(
+            step.parts
+                .values()
+                .filter_map(|part| part.evidence.pr.as_ref()),
+        )
+        .cloned()
+        .collect()
+}
+
+fn red_on_github(
+    forge: &dyn Forge,
+    full: &str,
+    step: &Step,
+    commit: &str,
+    check: &str,
+) -> Vec<Violation> {
+    let prs = pull_requests(step);
+    let mut unread = Vec::new();
+    let found = prs.iter().find_map(|url| match forge.pull(url) {
+        Ok(pull) => pull
+            .head
+            .filter(|head| same_commit(head.as_str(), commit))
+            .and_then(|_| Some((GithubRepo::of_pr(url)?, pull.base))),
+        Err(error) => {
+            unread.push(format!("{url}: {error}"));
+            None
+        }
+    });
+    let Some((repo, base)) = found else {
+        let message = if prs.is_empty() {
+            format!("{full} records no PR; the exception names a PR head")
+        } else if unread.is_empty() {
+            format!("`{commit}` is not the head of {}", prs.join(", "))
+        } else {
+            format!("cannot verify `{commit}` on GitHub: {}", unread.join("; "))
+        };
+        return vec![Violation::new(full, "known-red-commit", message)];
+    };
+    let checks = match forge.checks(&repo, &CommitSha::new(commit)) {
+        Ok(checks) => checks,
+        Err(error) => {
+            return vec![Violation::new(
+                full,
+                "known-red-unverified",
+                format!("cannot read CI at {commit}: {error}"),
+            )];
+        }
+    };
+    let Some(named) = checks.iter().find(|found| found.name == check) else {
+        return vec![Violation::new(
+            full,
+            "known-red-check",
+            format!("GitHub reports no check `{check}` at {commit}"),
+        )];
+    };
+    let before = base.and_then(|base| forge.checks(&repo, &base).ok());
+    match verify(named, before.as_deref()) {
+        Ok(()) => Vec::new(),
+        Err(why) => vec![Violation::new(
+            full,
+            "known-red-refused",
+            format!("`{check}` at {commit}: {why}"),
+        )],
+    }
+}
+
+pub fn known_red(
+    host: &dyn Host,
+    forge: &dyn Forge,
+    root: &Path,
+    target: &Target,
+    args: &KnownRedArgs,
+) -> Result<Outcome> {
+    let full = full(target);
+    let units = plan::load_units(root)?;
+    let mut violations = Vec::new();
+    for (field, text) in [
+        ("--check", args.check),
+        ("--reason", args.reason),
+        ("--owner", args.owner),
+    ] {
+        one_line(field, text, &mut violations, &full);
+    }
+    if !(args.commit.len() == 40 && is_commit(args.commit)) {
+        violations.push(Violation::new(
+            &full,
+            "known-red-commit",
+            format!(
+                "`{}` is not an exact commit: an exception names all 40 hex digits",
+                args.commit
+            ),
+        ));
+    }
+    let until = match After::parse(args.until, &target.unit) {
+        Ok(until) => Some(until),
+        Err(message) => {
+            violations.push(Violation::new(&full, "after-parse", message));
+            None
+        }
+    };
+    if let Some(until) = &until {
+        if plan::step(&units, &until.target()).is_none() {
+            violations.push(Violation::new(
+                &full,
+                "after-unknown",
+                format!(
+                    "`{until}` names {}, which is not declared; the closing condition is a cm-checkable event",
+                    until.target()
+                ),
+            ));
+        } else if plan::gate(&units, until).met() {
+            violations.push(Violation::new(
+                &full,
+                "known-red-closed",
+                format!("the closing condition {until} already holds"),
+            ));
+        }
+    }
+    match plan::step(&units, &full) {
+        None => violations.push(Violation::new(
+            &full,
+            "step-unknown",
+            "the step is not declared",
+        )),
+        Some(step) if step.track.state.is_final() => violations.push(Violation::new(
+            &full,
+            "known-red-state",
+            format!("{full} is {}", step.track.state),
+        )),
+        Some(step) if violations.is_empty() => violations.extend(red_on_github(
+            forge,
+            &full,
+            step,
+            &args.commit.to_ascii_lowercase(),
+            args.check,
+        )),
+        Some(_) => {}
+    }
+    if !violations.is_empty() {
+        return Ok(Outcome::refused(violations));
+    }
+    let Some(until) = until else {
+        return Ok(Outcome::refused(violations));
+    };
+    let (_lock, violations) = guard(root)?;
+    if !violations.is_empty() {
+        return Ok(Outcome::refused(violations));
+    }
+    let dir = root.join(&target.unit);
+    let mut unit = store::load_unit(&dir)?;
+    let at = stamp(host.now());
+    let exception = KnownRed {
+        commit: args.commit.to_ascii_lowercase(),
+        check: args.check.trim().to_owned(),
+        reason: args.reason.trim().to_owned(),
+        owner: args.owner.trim().to_owned(),
+        until,
+        at: at.clone(),
+    };
+    let Some(step) = unit
+        .steps
+        .get_mut(target.step.as_deref().unwrap_or_default())
+    else {
+        return Ok(Outcome::refused(vec![Violation::new(
+            &full,
+            "step-unknown",
+            "the step is not declared",
+        )]));
+    };
+    step.known_red.push(exception.clone());
+    write_unit(&dir, &unit)?;
+    let body = format!(
+        "- check: {}\n- commit: {}\n- reason: {}\n- owner: {}\n- closes when: {}\n",
+        exception.check, exception.commit, exception.reason, exception.owner, exception.until
+    );
+    let journal = journal_line(root, &at, &format!("known-red {full}"), &body)?;
+    let mut outcome = Outcome::default();
+    outcome.line(format!(
+        "{full}: known-red {} at {} until {}",
+        exception.check, exception.commit, exception.until
+    ));
+    outcome.field("target", full);
+    outcome.field("exception", serde_json::to_value(&exception)?);
+    outcome.field("journal", journal);
+    Ok(outcome)
+}
+
+pub fn watch_add(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    signal: &str,
+    deadline: &str,
+) -> Result<Outcome> {
+    let full = full(target);
+    let (_lock, mut violations) = guard(root)?;
+    let signal = signal
+        .parse::<Signal>()
+        .map_err(|message| violations.push(Violation::new(&full, "watch-signal", message)))
+        .ok();
+    let now = host.now();
+    let deadline = match plan::instant(deadline) {
+        Some(instant) if instant > now => Some(instant),
+        Some(_) => {
+            violations.push(Violation::new(
+                &full,
+                "watch-deadline",
+                format!("the deadline {deadline} has already passed"),
+            ));
+            None
+        }
+        None => {
+            violations.push(Violation::new(
+                &full,
+                "watch-deadline",
+                format!("`{deadline}` is not an RFC 3339 instant such as 2026-10-27T06:00Z"),
+            ));
+            None
+        }
+    };
+    let dir = root.join(&target.unit);
+    let mut unit = store::load_unit(&dir)?;
+    let step = unit
+        .steps
+        .get_mut(target.step.as_deref().unwrap_or_default());
+    match &step {
+        None => violations.push(Violation::new(
+            &full,
+            "step-unknown",
+            "the step is not declared",
+        )),
+        Some(step) if step.track.state.is_final() => violations.push(Violation::new(
+            &full,
+            "watch-state",
+            format!("{full} is {}", step.track.state),
+        )),
+        Some(_) => {}
+    }
+    let (Some(step), Some(signal), Some(deadline), true) =
+        (step, signal, deadline, violations.is_empty())
+    else {
+        return Ok(Outcome::refused(violations));
+    };
+    let at = stamp(now);
+    let id = step.watches.iter().map(|watch| watch.id).max().unwrap_or(0) + 1;
+    let watch = Watch {
+        id,
+        signal,
+        deadline: stamp(deadline),
+        added: at.clone(),
+        resolved: None,
+        expired: None,
+    };
+    step.watches.push(watch.clone());
+    write_unit(&dir, &unit)?;
+    let body = format!(
+        "- signal: {}\n- deadline: {}\n- holds {full} below deployed until `cm watch {full} resolve {id} --evidence <path>`\n",
+        watch.signal, watch.deadline
+    );
+    let journal = journal_line(root, &at, &format!("watch {full}#{id}"), &body)?;
+    let mut outcome = Outcome::default();
+    outcome.line(format!(
+        "{full}#{id}: watching {} until {}",
+        watch.signal, watch.deadline
+    ));
+    outcome.field("target", full);
+    outcome.field("id", id);
+    outcome.field("deadline", watch.deadline);
+    outcome.field("journal", journal);
+    Ok(outcome)
+}
+
+pub fn watch_resolve(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    id: u32,
+    file: &Path,
+) -> Result<Outcome> {
+    let full = full(target);
+    let (_lock, mut violations) = guard(root)?;
+    let evidence = CampaignFile::resolve(root, file)
+        .map_err(|error| violations.push(Violation::new(&full, "evidence-file", error.to_string())))
+        .ok();
+    let dir = root.join(&target.unit);
+    let mut unit = store::load_unit(&dir)?;
+    let now = host.now();
+    let watch = unit
+        .steps
+        .get_mut(target.step.as_deref().unwrap_or_default())
+        .and_then(|step| step.watches.iter_mut().find(|watch| watch.id == id));
+    let status = watch.as_ref().map(|watch| watch.status(now));
+    match status {
+        None => violations.push(Violation::new(
+            &full,
+            "watch-unknown",
+            format!("{full} has no watch {id}"),
+        )),
+        Some(WatchStatus::Resolved) => violations.push(Violation::new(
+            &full,
+            "watch-resolved",
+            format!("{full}#{id} is already resolved"),
+        )),
+        Some(WatchStatus::Open | WatchStatus::Expired) => {}
+    }
+    let (Some(watch), Some(evidence), true) = (watch, evidence, violations.is_empty()) else {
+        return Ok(Outcome::refused(violations));
+    };
+    let at = stamp(now);
+    watch.resolved = Some(Resolved {
+        at: at.clone(),
+        evidence: evidence.clone(),
+    });
+    let late = match status {
+        Some(WatchStatus::Expired) => format!(
+            "- landed after its deadline {}; it was expired: unresolved until now\n",
+            watch.deadline
+        ),
+        Some(WatchStatus::Open | WatchStatus::Resolved) | None => String::new(),
+    };
+    let body = format!("- signal: {}\n- evidence: {evidence}\n{late}", watch.signal);
+    write_unit(&dir, &unit)?;
+    let journal = journal_line(root, &at, &format!("watch {full}#{id} resolved"), &body)?;
+    let mut outcome = Outcome::default();
+    outcome.line(format!("{full}#{id}: resolved by {evidence}"));
+    outcome.field("target", full);
+    outcome.field("id", id);
+    outcome.field("evidence", evidence.to_string());
+    outcome.field("journal", journal);
+    Ok(outcome)
+}
+
+pub fn head(root: &Path, units: &Units, target: &str) -> Option<String> {
+    let step = plan::step(units, target)?;
+    let at_pr = match step.track.resting() {
+        Phase::PrOpen => step.parts.is_empty(),
+        Phase::Drafted
+        | Phase::Launched
+        | Phase::Merged
+        | Phase::Released
+        | Phase::Deployed
+        | Phase::Done
+        | Phase::Superseded
+        | Phase::Blocked(_) => false,
+    };
+    if !at_pr {
+        return None;
+    }
+    let observed = step.track.evidence.pr.as_deref().and_then(|pr| {
+        store::read_json::<BTreeMap<String, plan::Observed>>(&plan::pulls_path(root))
+            .ok()?
+            .remove(pr)?
+            .head
+    });
+    observed.or_else(|| step.track.evidence.sha.clone())
+}
+
+pub fn revision(
+    root: &Path,
+    units: &Units,
+    unit: &str,
+    flag: &str,
+    text: &str,
+) -> Result<Revision, Violation> {
+    let (name, sha) = match text.rsplit_once('@') {
+        Some((name, sha)) => (name, Some(sha)),
+        None => (text, None),
+    };
+    let refuse = |message: String| Violation::new(flag, "pin-revision", message);
+    let step = match After::parse(name, unit) {
+        Ok(After::Merged(step)) => step,
+        Ok(After::PrOpen(_) | After::Tag(_) | After::Deployed(_)) | Err(_) => {
+            return Err(refuse(format!(
+                "`{text}` is not <step>[@<sha>] or <NN-name>/<unit>/<step>[@<sha>]"
+            )));
+        }
+    };
+    if plan::step(units, &step).is_none() {
+        return Err(refuse(format!("{step} is not declared")));
+    }
+    let current = head(root, units, &step);
+    match (sha, current) {
+        (Some(sha), _) if !is_commit(sha) => Err(refuse(format!("`{sha}` is not a commit"))),
+        (Some(sha), Some(current)) if !same_commit(sha, &current) => Err(refuse(format!(
+            "`{sha}` is not {step}'s head {current}; pin evidence to the head it was produced at"
+        ))),
+        (Some(sha), _) => Ok(Revision {
+            step,
+            sha: sha.to_ascii_lowercase(),
+        }),
+        (None, Some(current)) => Ok(Revision { step, sha: current }),
+        (None, None) => Err(refuse(format!(
+            "{step} has no open PR head; name the commit as {step}@<sha>"
+        ))),
+    }
+}
+
+pub fn pin(file: CampaignFile, candidate: Revision, harness: Option<Revision>, at: &str) -> Pin {
+    Pin {
+        file,
+        candidate,
+        harness,
+        at: at.to_owned(),
+        stale: None,
+    }
+}
+
+pub fn mark_stale(
+    units: &mut Units,
+    heads: &BTreeMap<String, String>,
+    at: &str,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (unit_name, unit) in units.iter_mut() {
+        for (name, step) in unit.steps.iter_mut() {
+            for pin in step.pins.iter_mut().filter(|pin| pin.stale.is_none()) {
+                let moved = std::iter::once(&pin.candidate)
+                    .chain(pin.harness.as_ref())
+                    .find_map(|revision| {
+                        let now = heads.get(&revision.step)?;
+                        (!same_commit(now, &revision.sha)).then(|| {
+                            format!("{} moved from {} to {now}", revision.step, revision.sha)
+                        })
+                    });
+                if let Some(moved) = moved {
+                    out.push((
+                        unit_name.clone(),
+                        format!(
+                            "- evidence {} of {unit_name}/{name} is stale: {moved}",
+                            pin.file
+                        ),
+                    ));
+                    pin.stale = Some(format!("{moved} at {at}"));
+                }
+            }
+        }
+    }
+    out
+}
+
+pub fn mark_expired(units: &mut Units, now: jiff::Timestamp, at: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (unit_name, unit) in units.iter_mut() {
+        for (name, step) in unit.steps.iter_mut() {
+            for watch in step.watches.iter_mut() {
+                let first = watch.expired.is_none() && watch.status(now) == WatchStatus::Expired;
+                if first {
+                    watch.expired = Some(at.to_owned());
+                    out.push((
+                        unit_name.clone(),
+                        format!(
+                            "- watch {unit_name}/{name}#{} expired: unresolved ({}, deadline {})",
+                            watch.id, watch.signal, watch.deadline
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+pub struct Held {
+    pub watches: Vec<Value>,
+    pub stale: Vec<Value>,
+    pub lines: Vec<String>,
+}
+
+pub fn held(units: &Units, now: jiff::Timestamp) -> Held {
+    let mut held = Held {
+        watches: Vec::new(),
+        stale: Vec::new(),
+        lines: Vec::new(),
+    };
+    for (unit_name, unit) in units {
+        for (name, step) in &unit.steps {
+            let target = format!("{unit_name}/{name}");
+            for watch in step.unresolved_watches() {
+                let status = watch.status(now);
+                held.lines.push(format!(
+                    "watch {target}#{} {}: {} (deadline {})",
+                    watch.id,
+                    status.name(),
+                    watch.signal,
+                    watch.deadline
+                ));
+                held.watches.push(json!({
+                    "target": target,
+                    "id": watch.id,
+                    "signal": watch.signal.to_string(),
+                    "deadline": watch.deadline,
+                    "status": status.name(),
+                }));
+            }
+            for pin in step.stale_pins() {
+                let why = pin.stale.clone().unwrap_or_default();
+                held.lines
+                    .push(format!("stale {target}: {} ({why})", pin.file));
+                held.stale.push(json!({
+                    "target": target,
+                    "file": pin.file.to_string(),
+                    "candidate": pin.candidate.to_string(),
+                    "harness": pin.harness.as_ref().map(ToString::to_string),
+                    "stale": why,
+                }));
+            }
+        }
+    }
+    held
+}

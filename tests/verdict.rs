@@ -54,6 +54,7 @@ struct FakeForge {
     checks: Vec<(&'static str, &'static str)>,
     down: bool,
     base: Option<String>,
+    base_checks: Vec<(&'static str, &'static str)>,
 }
 
 impl FakeForge {
@@ -65,6 +66,7 @@ impl FakeForge {
             checks: checks.to_vec(),
             down: false,
             base: None,
+            base_checks: Vec::new(),
         }
     }
 }
@@ -88,9 +90,17 @@ impl Forge for FakeForge {
         if self.down {
             return Err(ForgeError::Exit(Some(1)));
         }
-        assert_eq!(sha.as_str(), self.head, "CI is read at the PR head");
-        Ok(self
-            .checks
+        let checks = if self.base.as_deref() == Some(sha.as_str()) {
+            &self.base_checks
+        } else {
+            assert_eq!(
+                sha.as_str(),
+                self.head,
+                "CI is read at the PR head or its base"
+            );
+            &self.checks
+        };
+        Ok(checks
             .iter()
             .map(|(name, state)| CheckState {
                 name: (*name).to_owned(),
@@ -276,6 +286,7 @@ impl Campaign {
                 },
                 file: None,
                 repo: Some(&self.repo),
+                part: None,
             },
             gate,
         )
@@ -1461,4 +1472,236 @@ fn a_base_that_already_contains_the_head_takes_no_clean_update() {
         refused.violations
     );
     assert_eq!(c.state(), Phase::PrOpen);
+}
+
+fn red_at_head(head: &str, lab: &'static str, base_lab: &'static str) -> FakeForge {
+    FakeForge {
+        base: Some("b".repeat(40)),
+        base_checks: vec![("quality", "success"), ("lab", base_lab)],
+        ..FakeForge::open(head, &[("quality", "success"), ("lab", lab)])
+    }
+}
+
+fn known_red(
+    host: &Fake,
+    c: &Campaign,
+    forge: &FakeForge,
+    commit: &str,
+    reason: &str,
+    until: &str,
+) -> Outcome {
+    cm::holds::known_red(
+        host,
+        forge,
+        &c.root,
+        &target(),
+        &cm::holds::KnownRedArgs {
+            commit,
+            check: "lab",
+            reason,
+            owner: "coordinator",
+            until,
+        },
+    )
+    .unwrap()
+}
+
+fn accepted(host: &Fake, c: &Campaign) {
+    let head = c.head();
+    let accept = c.report("astra-review-7", &head, &[], "ACCEPT");
+    c.receipt("astra-review-7", &head, "gpt-6-astra", "xhigh");
+    assert!(record(host, c, &accept, "astra").ok());
+    let fix = Declaration {
+        lane: Some(Lane::Coordinator),
+        work: cm::state::Work::Study,
+        ..Declaration::default()
+    };
+    assert!(
+        commands::declare(host, &c.root.join("01-a/u/build"), &fix)
+            .unwrap()
+            .ok()
+    );
+}
+
+#[test]
+fn a_known_red_exception_covers_only_its_failing_check_at_its_head_until_it_closes() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host, true);
+    accepted(&host, &c);
+    let head = c.head();
+    let red = red_at_head(&head, "failure", "failure");
+    let why = "red by design until build lands";
+    assert_eq!(
+        rules(&known_red(&host, &c, &red, &head, "", "build")),
+        vec!["ledger-field"]
+    );
+    assert_eq!(
+        rules(&known_red(&host, &c, &red, &head[..12], why, "build")),
+        vec!["known-red-commit"]
+    );
+    assert_eq!(
+        rules(&known_red(&host, &c, &red, &"e".repeat(40), why, "build")),
+        vec!["known-red-commit"]
+    );
+    assert_eq!(
+        rules(&known_red(&host, &c, &red, &head, why, "nowhere")),
+        vec!["after-unknown"]
+    );
+    let cancelled = red_at_head(&head, "cancelled", "failure");
+    assert_eq!(
+        rules(&known_red(&host, &c, &cancelled, &head, why, "build")),
+        vec!["known-red-refused"]
+    );
+    let regression = red_at_head(&head, "failure", "success");
+    let refused = known_red(&host, &c, &regression, &head, why, "build");
+    assert_eq!(rules(&refused), vec!["known-red-refused"]);
+    assert!(
+        refused.violations[0].message.contains("regression"),
+        "{:?}",
+        refused.violations
+    );
+    let added = known_red(&host, &c, &red, &head, why, "build");
+    assert!(added.ok(), "{:?}", added.violations);
+
+    let gate = |forge: &FakeForge| {
+        c.merge(
+            &host,
+            &MergeGate {
+                forge: Some(forge),
+                ..MergeGate::default()
+            },
+        )
+    };
+    let other = FakeForge {
+        base: Some("b".repeat(40)),
+        base_checks: vec![("lab", "failure")],
+        ..FakeForge::open(&head, &[("quality", "failure"), ("lab", "failure")])
+    };
+    let refused = gate(&other);
+    assert_eq!(rules(&refused), vec!["merge-gate"]);
+    assert!(
+        refused.violations[0].message.contains("quality failure"),
+        "{:?}",
+        refused.violations
+    );
+    assert!(
+        !refused.violations[0].message.contains("lab"),
+        "{:?}",
+        refused.violations
+    );
+    let timed_out = gate(&red_at_head(&head, "timed_out", "failure"));
+    assert_eq!(rules(&timed_out), vec!["merge-gate"]);
+    assert!(
+        timed_out.violations[0].message.contains("lab timed_out"),
+        "{:?}",
+        timed_out.violations
+    );
+    assert_eq!(
+        rules(&gate(&red_at_head(&head, "failure", "success"))),
+        vec!["merge-gate"]
+    );
+
+    let merged = gate(&red);
+    assert!(merged.ok(), "{:?}", merged.violations);
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    assert!(
+        journal.contains(&format!("- known-red: lab failed at {head}")),
+        "{journal}"
+    );
+    assert!(lint(&c.root).unwrap().ok());
+
+    let synced = campaign(&host, true);
+    accepted(&host, &synced);
+    let head = synced.head();
+    let red = FakeForge {
+        state: PullState::Merged,
+        ..red_at_head(&head, "failure", "failure")
+    };
+    assert!(known_red(&host, &synced, &red, &head, why, "build").ok());
+    let moved = sync(&host, &red, &synced.root).unwrap();
+    assert!(moved.ok(), "{:?}", moved.violations);
+    assert_eq!(synced.state(), Phase::Merged);
+    let journal = fs::read_to_string(synced.root.join("JOURNAL.md")).unwrap();
+    assert!(
+        journal.contains(&format!("- known-red: lab failed at {head}")),
+        "{journal}"
+    );
+
+    let closing = campaign(&host, true);
+    accepted(&host, &closing);
+    let head = closing.head();
+    let red = red_at_head(&head, "failure", "failure");
+    assert!(known_red(&host, &closing, &red, &head, why, "build").ok());
+    let built = closing.write("01-a/u/build/evidence/built.md", "Build merged.\n");
+    let done = commands::advance(
+        &host,
+        &closing.root,
+        &parse_target("01-a/u/build", true).unwrap(),
+        &Phase::Done,
+        &Evidence::default(),
+        Some(&built),
+        None,
+    )
+    .unwrap();
+    assert!(done.ok(), "{:?}", done.violations);
+    let closed = closing.merge(
+        &host,
+        &MergeGate {
+            forge: Some(&red),
+            ..MergeGate::default()
+        },
+    );
+    assert_eq!(rules(&closed), vec!["merge-gate"]);
+    assert!(
+        closed.violations[0].message.contains("exception closed"),
+        "{:?}",
+        closed.violations
+    );
+
+    let waiver = closing.write("waiver.md", "Owner: merge anyway.\n");
+    let waived = closing.merge(
+        &host,
+        &MergeGate {
+            forge: Some(&red_at_head(&head, "failure", "success")),
+            waiver: Some(waiver),
+            ..MergeGate::default()
+        },
+    );
+    assert!(waived.ok(), "{:?}", waived.violations);
+    let linted = lint(&closing.root).unwrap();
+    assert!(linted.ok(), "{:?}", linted.violations);
+    assert_eq!(
+        linted.fields["warnings"].as_array().unwrap().len(),
+        0,
+        "an exception names lab at this head"
+    );
+}
+
+#[test]
+fn lint_warns_on_an_override_of_a_red_check_no_exception_names() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host, true);
+    accepted(&host, &c);
+    let head = c.head();
+    let waiver = c.write("waiver.md", "Owner: merge anyway.\n");
+    let waived = c.merge(
+        &host,
+        &MergeGate {
+            forge: Some(&red_at_head(&head, "failure", "failure")),
+            waiver: Some(waiver),
+            ..MergeGate::default()
+        },
+    );
+    assert!(waived.ok(), "{:?}", waived.violations);
+    let linted = lint(&c.root).unwrap();
+    assert!(linted.ok(), "{:?}", linted.violations);
+    let warnings = linted.fields["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0]
+            .as_str()
+            .unwrap()
+            .contains("waived red check `lab`"),
+        "{warnings:?}"
+    );
 }

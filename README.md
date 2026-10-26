@@ -59,19 +59,21 @@ error.
 | `cm launch <NN-name>/<unit>/<step> [--worktree PATH] [--coordinator LABEL] [--cap-min N]` | Runs the launch checks and reports every failure: `LIMITS.toml` not paused; a declared step's every `--after` met (`after-unmet`); for the local `pi` lane and undeclared steps, free disk on `disk_volume` minus `kache_headroom_gib` over `min_free_disk_gib`, live heavy builds (top-level `cargo` processes) under `max_heavy_builds` and the worktree, which they require; the step folder has `kickoff.md`; every path its packet names exists. The `--after` check runs on every launch, a blocked step's relaunch among them. Then it marks the step (and a drafted unit) launched, journals the launch and, for a local step, prints the command; every other lane (`owner` and `coordinator` among them) prints only the step and its prompt and records its attempt (see [Attempts](#attempts)). It spawns nothing. A step whose last attempt has not ended does not launch again (`attempt-open`). |
 | `cm attempt <NN-name>/<unit>/<step> [--claim TOKEN] [claim --coordinator L --expect G \| begin KIND \| record KIND ID \| end complete\|partial\|unknown [--evidence PATH]]` | Shows a remote attempt and what to do next from committed state alone, or extends it; each change is journaled. See [Attempts](#attempts). |
 | `cm unblock <NN-name>/<unit>[/<step>] --evidence PATH` | Releases a `blocked:<reason>` track to the state it was blocked from, with the evidence that cleared it (a campaign file, as for `done`), journaled like any move. A step that rests at `drafted` or `launched` still waits on every `--after`: `cm next` and `cm launch` check them again, and the move lists what is still unmet. |
-| `cm amend <NN-name>/<unit>/<step> [--study] [--lane L] [--after A]… [--drop-after A]…` | Changes a declared step that rests at `drafted` or `launched`: marks it a study, moves its lane, or removes gates with `--drop-after` before adding gates with `--after` (each declared, never closing a cycle: `after-cycle`). Removing a gate it lacks is `after-absent`. Journals the change; a change that changes nothing is `amend-empty`. |
-| `cm advance <NN-name>/<unit>[/<step>] <state> [--sha S] [--pr URL] [--tag T] [--digest D] [--evidence PATH] [--repo PATH] [--head SHA] [--ci-verified PATH] [--override PATH]` | Moves one state along `drafted → launched → pr-open → merged → released → deployed → done`, or to `blocked:<reason>`; an `owner`-lane or study step moves to `done` from `drafted` or `launched` with `--evidence` (see [Finishing](#finishing)). `superseded --evidence PATH` retires a step replaced by other work from any state short of final; it meets no gate, so its consumers are amended. A release step moves to `released --tag T` from `drafted` or `launched` when the tag was cut without a prep PR (tag-only). Refuses a skipped state and a state without its evidence, journals the move and re-renders `STATE.md`. A `codex`-lane step moves to `merged` only through its merge gate (see [Merge gate](#merge-gate)). |
+| `cm amend <NN-name>/<unit>/<step> [--study] [--lane L] [--after A]… [--drop-after A]… [--part NAME]…` | Changes a declared step that rests at `drafted` or `launched`: marks it a study, moves its lane, or removes gates with `--drop-after` before adding gates with `--after` (each declared, never closing a cycle: `after-cycle`). Removing a gate it lacks is `after-absent`. `--part` declares required parts (see [Parts](#parts)); given alone it also amends a step that has moved on, short of final. Journals the change; a change that changes nothing is `amend-empty`. |
+| `cm advance <NN-name>/<unit>[/<step>] <state> [--sha S] [--pr URL] [--tag T] [--digest D] [--evidence PATH] [--repo PATH] [--head SHA] [--ci-verified PATH] [--override PATH] [--part NAME]` | Moves one state along `drafted → launched → pr-open → merged → released → deployed → done`, or to `blocked:<reason>`; an `owner`-lane or study step moves to `done` from `drafted` or `launched` with `--evidence` (see [Finishing](#finishing)). `superseded --evidence PATH` retires a step replaced by other work from any state short of final; it meets no gate, so its consumers are amended. A release step moves to `released --tag T` from `drafted` or `launched` when the tag was cut without a prep PR (tag-only). Refuses a skipped state and a state without its evidence, journals the move and re-renders `STATE.md`. A `codex`-lane step moves to `merged` only through its merge gate (see [Merge gate](#merge-gate)). `--part NAME` moves one part of a multipart step (see [Parts](#parts)). A step with an unresolved watch does not move to `deployed` or `done` (`watch-open`, see [Watches](#watches)), and `done --evidence` refuses a stale pinned file (`evidence-stale`). |
+| `cm known-red <step> --commit SHA --check NAME --reason T --owner WHO --until A` | Records a known-red exception for the step's merge gate (see [Known-red exceptions](#known-red-exceptions)) and journals it. |
+| `cm watch <step> add --signal span:Q\|log:Q\|metric:Q --deadline T`, `cm watch <step> resolve ID --evidence PATH` | Records a pending live read that holds the step below `deployed`, or closes it with evidence (see [Watches](#watches)). |
 | `cm close` | Seals the campaign. Refuses, listing every gap, while `OWNER-QUEUE.md` has an open item or any unit or step is short of `done` or `blocked:<reason>`. Then it stamps `closed` in `.cm/state.json` and journals the close. From there unit `cm init`, `cm launch`, `cm advance` and a second `cm close` refuse with `campaign-closed`; `cm journal` stays open for follow-up observations. |
 | `cm feedback "<title>" --urgency urgent\|queued --body-file F` | Appends `### FB-<sequence>-NNN · <urgency> · <title>` and the body to `FEEDBACK.md`, numbering on from the highest id of the letter in `EPOCH.md`'s `sequence:`, and journals a line naming it; an empty body is `feedback-empty`. `--follow-up <id> --disposition proposed\|accepted\|applied\|deferred\|rejected` appends `### <id> follow-up · <disposition>: <title>` to an existing id. Hand-written entries (dated `##` sections, `FB-` sub-entries) still parse. Log feedback whenever a file would otherwise be appended by hand. |
 | `cm owner-queue add "<title>" --context T --question T --recommendation T` | Appends `## N. <title>` (numbering on from the highest item), its `Context:` line, the question, a `Recommendation:` line and an empty `Answer:` to `OWNER-QUEUE.md`; refuses an empty field or a RESUME.md with no `>` banner (`resume-banner`), sets RESUME.md's banner to `OWNER-QUEUE not drained: /loop withheld` and journals the item. |
-| `cm evidence <NN-name>/<unit>/<step> --name NAME --body-file F` | Writes `<step>/evidence/<NAME>.md` once from a non-empty body and journals the path. `cm advance <step> done` without `--evidence` takes the step's one evidence file when it has exactly one. |
+| `cm evidence <NN-name>/<unit>/<step> --name NAME --body-file F [--candidate STEP[@SHA] [--harness STEP[@SHA]]]` | Writes `<step>/evidence/<NAME>.md` once from a non-empty body and journals the path. `cm advance <step> done` without `--evidence` takes the step's one evidence file when it has exactly one. `--candidate` and `--harness` pin the file to the commits it was produced against (see [Pinned evidence](#pinned-evidence)). |
 | `cm review <step> --pr URL --head SHA --model ID --effort E --verdict accept\|fix-required --findings C/F --cost USD --wall MIN [--delta FROM_SHA]`, `cm review --import` | Appends one row to the review ledger `.cm/reviews.json` and renders `REVIEW-OFF.md` from it, rows in PR order with a delta review under its PR, and journals the row. The rows a hand-written `REVIEW-OFF.md` already holds are imported once, kept cell for cell, and the text before and after the table (per-PR adjudications, rules) is kept byte for byte (`--import`, or the first `cm review`). The step must be declared (`step-unknown`); an imported delta row is the one whose `#` cell carries `Δ`. After that a hand edit is `review-hand-edit`, as for `STATE.md`. |
 | `cm review record <step> <report-file> [--reviewer KIND]` | Parses the `cm-review` block that ends the report (see [Review verdicts](#review-verdicts)), computes the verdict, copies the report to `<step>/evidence/reviews/R<n>[-KIND].md` and records the review in `.cm/verdicts.json` as `R<n>`, its findings as `R<n>.<id>`. Refuses a report with no block or a malformed one (`review-block`, one per problem, with its line), an undeclared step and a report already recorded for the step (`review-duplicate`). A report whose own verdict line disagrees with the computed one is recorded with the computed verdict and the disagreement printed and journaled. The step's third FIX REQUIRED round blocks it (see [Rounds](#rounds)). |
 | `cm review resolve <step> <finding> --by <commit\|ruling-file>` | Records what resolved a blocking finding: `R<n>.<id>`, or `<id>` in the step's latest review holding it; an id whose `R<n>` is not a review number names no finding (`finding-unknown`). `--by` is a ruling file in the campaign when that path exists, else a commit SHA. A follow-up is `resolve-not-blocking`; a second resolution is `resolve-done`. |
 | `cm ruling <step> "<text>"` | Appends `- YYYY-MM-DD: <text>` to `<step>/evidence/coordinator-scope.md`, creating it with `# Scope and coordinator rulings: <step>` when it is missing, and journals the line. |
 | `cm brief <step>` | Prints the step's `kickoff.md`, then `## Coordinator scope and rulings` and the step's `evidence/coordinator-scope.md` (or a line saying none is recorded): the brief for `astra-review.sh start` and review packets. `--json` puts it in `brief`. Refuses a step with no `kickoff.md`. |
 | `cm followups [--epoch]`, `cm followups close <id> --by <commit\|reason>` | Lists every non-blocking finding `cm review record` kept, across steps: id, step, PR, type, origin, `file:line`, summary and status (`open` or `closed`). `--epoch` lists only the open ones, grouped by repository as Markdown checklist lines, for the epoch's cleanup PR. `close` closes one with the commit that fixed it or the reason it stays, and journals it; a blocking finding is `followup-blocking`, a closed one `followup-closed`. |
-| `cm lint [DIR]` | Template conformance, cm-owned files against `.cm/state.json`, the journal against git, `.cm/JOURNAL.md` and `.cm/lock` out of git (`cm-tracked`), the path check for every drafted or launched packet, a unit or step folder git ignores (`git-ignored`, or `git-ignored-unknown` when `git check-ignore` cannot answer, as outside a repository), and a unit folder holding `STATE.md` but no `.cm/state.json` (`unit-state-json-missing`), which is never counted as a smaller campaign; unique `FEEDBACK.md` ids whose follow-ups name existing ones; `REVIEW-OFF.md` against its ledger. In a closed campaign, also an empty owner queue and every track done or blocked; its packets are no longer checked, since nothing launches there. |
+| `cm lint [DIR]` | Template conformance, cm-owned files against `.cm/state.json`, the journal against git, `.cm/JOURNAL.md` and `.cm/lock` out of git (`cm-tracked`), the path check for every drafted or launched packet, a unit or step folder git ignores (`git-ignored`, or `git-ignored-unknown` when `git check-ignore` cannot answer, as outside a repository), and a unit folder holding `STATE.md` but no `.cm/state.json` (`unit-state-json-missing`), which is never counted as a smaller campaign; unique `FEEDBACK.md` ids whose follow-ups name existing ones; `REVIEW-OFF.md` against its ledger; stale pinned evidence (`evidence-stale`). It warns, without failing, on an expired watch and on an `--override` of a red check no known-red exception names. In a closed campaign, also an empty owner queue and every track done or blocked; its packets are no longer checked, since nothing launches there. |
 
 ## The folder
 
@@ -319,8 +321,55 @@ When cm cannot read the PR or its checks from GitHub, (c) refuses unless `--ci-v
 names a campaign file showing green CI; the head is then `--head`, else the SHA recorded at
 `pr-open`. Given while GitHub answers, `--head` must match its head (`merge-head`).
 `--override <path>` waives the gate with a non-empty campaign file; the move's journal entry names
-the file and every gap it waived. The gate's flags on any other move are `evidence-unexpected`.
-Steps in other lanes merge as before.
+the file and every gap it waived. It is discouraged for a red check: a red check it waives is kept
+in state, and `cm lint` warns while no known-red exception names that check at that commit.
+The gate's flags on any other move are `evidence-unexpected`. Steps in other lanes merge as before.
+
+### Known-red exceptions
+
+`cm known-red <step> --commit SHA --check NAME --reason T --owner WHO --until A` lets (c) accept
+one failing check at one commit. Every field is required: the commit is all 40 hex digits and must
+be the head of a PR the step (or one of its parts) records; `--until` is a gate as `--after` takes
+it, naming a declared step or release, and must not already hold. cm reads GitHub before it
+records the exception and refuses one whose check is absent, is anything but `failure` (an
+infrastructure failure: cancelled, timed out, never run), or is green at the PR's base (a
+regression this change made). The merge gate, in `cm advance` and `cm sync`, applies the same
+test at merge time: an exception covers a red check only at its exact commit, for its exact check
+name, while the check still fails and was not green at the base, and until its closing condition
+holds; every other check must still be green. The move journals each exception it used.
+
+### Parts
+
+`cm amend <step> --part pr1 --part pr2 --part pr3` declares a step's required parts, one PR each.
+Each part moves on its own (`cm advance <step> pr-open --part pr1 --pr URL --sha S`, and `cm sync`
+moves parts through merged, released and deployed as it moves steps); the step's own state rolls
+up behind them, moving to a state only once every part rests there, so a gate on the step stays
+closed until the last part arrives. Moving the step itself past `launched` names the short parts
+(`part-short`). Declaring parts on a step that already moved on hands the step's state and
+evidence to the first new part and rests the step at `launched`. A release step, a study and an
+owner-lane step have no parts.
+
+### Pinned evidence
+
+`cm evidence <step> --name N --body-file F --candidate S [--harness H]` pins the evidence to the
+commits it was produced against: `S` and `H` are declared steps, each with an optional `@<sha>`;
+without one cm takes the step's open PR head (the head `cm sync` last saw, else the one recorded at
+`pr-open`), and a sha given for a step whose PR is open must be that head. When `cm sync` sees the
+candidate's or the harness's PR head move off the pinned commit, it marks the pin stale and
+journals it. A stale pin fails `cm lint` (`evidence-stale`), closes every gate on the step that
+holds it, is listed by `cm next` under `stale`, and refuses `done --evidence`, until a later pin
+of the same candidate and harness steps supersedes it.
+
+### Watches
+
+`cm watch <step> add --signal log:<query> --deadline 2026-10-27T06:00Z` records a live check the
+coordinator cannot cause: the signal is a stored span event, log record or metric
+(`span:`, `log:` or `metric:`), never a stdout-only line, and the deadline lies ahead. While a
+watch is unresolved the step does not move to `deployed` or `done`, in `cm advance` or `cm sync`.
+`cm watch <step> resolve <id> --evidence <path>` closes it. Past its deadline an unresolved watch
+reads `expired: unresolved`: never a pass, journaled once by the next `cm sync`, warned by
+`cm lint`, and listed by `cm next` under `watches` with every open one, so the coordinator reads
+it from state instead of polling it.
 
 ### Releases
 

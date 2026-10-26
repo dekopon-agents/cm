@@ -5,6 +5,7 @@ pub mod commands;
 pub mod epoch;
 pub mod evidence;
 pub mod forge;
+pub mod holds;
 pub mod host;
 pub mod journal;
 pub mod ledger;

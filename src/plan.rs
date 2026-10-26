@@ -35,6 +35,7 @@ pub struct Gate {
     pub after: After,
     pub track: Option<Track>,
     pub finish: Finish,
+    pub stale: Vec<String>,
 }
 
 impl Gate {
@@ -43,9 +44,11 @@ impl Gate {
     }
 
     pub fn met(&self) -> bool {
-        self.track
-            .as_ref()
-            .is_some_and(|track| self.after.met_by(track, self.finish))
+        self.stale.is_empty()
+            && self
+                .track
+                .as_ref()
+                .is_some_and(|track| self.after.met_by(track, self.finish))
     }
 
     pub fn describe(&self) -> String {
@@ -53,7 +56,12 @@ impl Gate {
             || "not declared".to_owned(),
             |track| track.state.to_string(),
         );
-        format!("{} (needs {}, is {state})", self.after, self.needs())
+        let stale = if self.stale.is_empty() {
+            String::new()
+        } else {
+            format!("; its pinned evidence is stale: {}", self.stale.join(", "))
+        };
+        format!("{} (needs {}, is {state}{stale})", self.after, self.needs())
     }
 
     pub fn to_json(&self) -> Value {
@@ -67,18 +75,25 @@ impl Gate {
     }
 }
 
+pub fn gate(units: &Units, after: &After) -> Gate {
+    let target = step(units, &after.target());
+    Gate {
+        after: after.clone(),
+        track: target.map(|step| step.track.clone()),
+        finish: target.map_or(Finish::Shipped, Step::finish),
+        stale: target
+            .map(|step| {
+                step.stale_pins()
+                    .iter()
+                    .map(|pin| pin.file.to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
 pub fn gates(units: &Units, step: &Step) -> Vec<Gate> {
-    step.after
-        .iter()
-        .map(|after| {
-            let target = self::step(units, &after.target());
-            Gate {
-                after: after.clone(),
-                track: target.map(|step| step.track.clone()),
-                finish: target.map_or(Finish::Shipped, Step::finish),
-            }
-        })
-        .collect()
+    step.after.iter().map(|after| gate(units, after)).collect()
 }
 
 pub fn unmet(target: &str, gates: &[Gate]) -> Vec<Violation> {
@@ -509,6 +524,10 @@ pub fn next_at(
     for (url, observed) in &dirty {
         outcome.line(dirty_line(url, observed));
     }
+    let held = crate::holds::held(&units, now);
+    outcome.lines.extend(held.lines);
+    outcome.field("watches", held.watches);
+    outcome.field("stale", held.stale);
     outcome.field(
         "stalled",
         stalled

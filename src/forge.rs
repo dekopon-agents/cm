@@ -225,6 +225,7 @@ pub enum Conclusion {
     Success,
     Neutral,
     Skipped,
+    Failure,
     Other(String),
 }
 
@@ -234,6 +235,7 @@ impl Conclusion {
             Conclusion::Success => "success",
             Conclusion::Neutral => "neutral",
             Conclusion::Skipped => "skipped",
+            Conclusion::Failure => "failure",
             Conclusion::Other(state) => state,
         }
     }
@@ -245,6 +247,7 @@ impl From<String> for Conclusion {
             "success" => Conclusion::Success,
             "neutral" => Conclusion::Neutral,
             "skipped" => Conclusion::Skipped,
+            "failure" => Conclusion::Failure,
             _ => Conclusion::Other(state),
         }
     }
@@ -272,7 +275,7 @@ impl CheckState {
     pub fn green(&self) -> bool {
         match self.state {
             Conclusion::Success | Conclusion::Neutral | Conclusion::Skipped => true,
-            Conclusion::Other(_) => false,
+            Conclusion::Failure | Conclusion::Other(_) => false,
         }
     }
 }
