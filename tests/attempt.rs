@@ -441,3 +441,123 @@ fn an_ended_attempt_stays_ended_past_its_deadline() {
     let overrun = at("2026-10-19T09:30:30Z");
     assert_eq!(status(&overrun, &c.root).fields["plan"], "ended");
 }
+
+fn restart(host: &Fake, root: &Path, token: &str, file: Option<PathBuf>) -> Outcome {
+    act(
+        host,
+        root,
+        token,
+        Act::Restart {
+            lane: Lane::Codex,
+            file,
+        },
+    )
+}
+
+#[test]
+fn restart_archives_unknown_and_dispatches_under_the_same_claim_and_cap() {
+    for pending in [false, true] {
+        let host = at("2026-10-19T09:00:00Z");
+        let c = campaign(&host);
+        let token = launched(&host, &c, Some(30));
+        if pending {
+            assert!(begin(&host, &c.root, &token, "thread").ok());
+        }
+        assert_eq!(
+            rules(&restart(&host, &c.root, &token, None)),
+            vec!["attempt-restart"]
+        );
+        assert!(end(&host, &c.root, &token, AttemptOutcome::Unknown, None).ok());
+        let before = status(&host, &c.root).fields["attempt"].clone();
+        let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+        let notes = note(&c, "relane.md");
+        let restarted = restart(&host, &c.root, &token, Some(notes));
+        assert!(restarted.ok(), "{:?}", restarted.violations);
+        let current = status(&host, &c.root);
+        assert_eq!(current.fields["plan"], "dispatch");
+        assert_eq!(current.fields["attempt"]["id"], "01-a/u/S1#2");
+        assert_eq!(current.fields["attempt"]["lane"], "codex");
+        for field in [
+            "generation",
+            "claim",
+            "deadline",
+            "coordinator",
+            "claimed_at",
+        ] {
+            assert_eq!(current.fields["attempt"][field], before[field], "{field}");
+        }
+        let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+        let step = &unit.steps["S1"];
+        assert_eq!(step.launches, 2);
+        assert_eq!(step.lane, Some(Lane::ClaudeCloud));
+        let archived = &step.attempt_history[0];
+        assert_eq!(archived.id, "01-a/u/S1#1");
+        assert_eq!(archived.actions.len(), usize::from(pending));
+        assert_eq!(
+            archived.ended.as_ref().unwrap().outcome,
+            AttemptOutcome::Relaned
+        );
+        assert!(archived.ended.as_ref().unwrap().evidence.is_some());
+        assert_eq!(
+            fs::read_to_string(c.root.join("JOURNAL.md"))
+                .unwrap()
+                .strip_prefix(&journal)
+                .unwrap()
+                .trim(),
+            "## 2026-10-19T09:00Z — attempt 01-a/u/S1: relaned 01-a/u/S1#1 → 01-a/u/S1#2 (codex)"
+        );
+        assert!(lint(&c.root).unwrap().ok());
+    }
+}
+
+#[test]
+fn restart_fences_a_stale_claim_and_refuses_an_expired_cap() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    let stale = launched(&host, &c, Some(30));
+    let token = claim(&host, &c.root, "session_b", 1).unwrap();
+    assert!(end(&host, &c.root, &token, AttemptOutcome::Unknown, None).ok());
+    assert_eq!(
+        rules(&restart(&host, &c.root, &stale, None)),
+        vec!["attempt-fenced"]
+    );
+    let late = at("2026-10-19T09:30:00Z");
+    assert_eq!(
+        rules(&restart(&late, &c.root, &token, None)),
+        vec!["attempt-deadline"]
+    );
+    assert_eq!(
+        status(&host, &c.root).fields["attempt"]["id"],
+        "01-a/u/S1#1"
+    );
+}
+
+#[test]
+fn begin_and_record_each_journal_one_line_with_every_action_field() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    let token = launched(&host, &c, None);
+    for (result, expected) in [
+        (
+            begin(&host, &c.root, &token, "thread"),
+            "## 2026-10-19T09:00Z — attempt 01-a/u/S1: 01-a/u/S1#1 begins thread (generation 1)",
+        ),
+        (
+            record(&host, &c.root, &token, "thread", "t1"),
+            "## 2026-10-19T09:00Z — attempt 01-a/u/S1: 01-a/u/S1#1 thread t1 (generation 1)",
+        ),
+    ] {
+        assert!(result.ok());
+        assert_eq!(result.fields["journal"], expected);
+    }
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    let tail: Vec<_> = journal.lines().rev().take(3).collect();
+    assert_eq!(
+        tail,
+        vec![
+            "## 2026-10-19T09:00Z — attempt 01-a/u/S1: 01-a/u/S1#1 thread t1 (generation 1)",
+            "",
+            "## 2026-10-19T09:00Z — attempt 01-a/u/S1: 01-a/u/S1#1 begins thread (generation 1)",
+        ]
+    );
+}

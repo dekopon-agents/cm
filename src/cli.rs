@@ -362,6 +362,13 @@ enum WatchAct {
 
 #[derive(Subcommand)]
 enum AttemptAct {
+    /// End an unknown attempt as relaned and dispatch its successor under the same claim and cap.
+    Restart {
+        #[arg(long)]
+        lane: crate::state::Lane,
+        #[arg(long, value_name = "PATH")]
+        evidence: Option<PathBuf>,
+    },
     /// Fence the generation that holds the attempt and take it over; --expect is that generation.
     Claim {
         #[arg(long, value_name = "LABEL")]
@@ -564,6 +571,10 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 }) => Act::Claim {
                     coordinator: coordinator.clone(),
                     expect: *expect,
+                },
+                Some(AttemptAct::Restart { lane, evidence }) => Act::Restart {
+                    lane: *lane,
+                    file: evidence.as_deref().map(|file| under_root(cli, file)),
                 },
                 Some(AttemptAct::Begin { kind }) => Act::Begin { kind: kind.clone() },
                 Some(AttemptAct::Record { kind, id }) => Act::Record {
