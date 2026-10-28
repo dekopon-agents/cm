@@ -1250,6 +1250,20 @@ pub fn advance_gated(
         repo,
         part,
     } = advance;
+    let normalized;
+    let to = if let Phase::Blocked(reason) = to {
+        if let Some(condition) = reason.strip_prefix("until:") {
+            normalized = Phase::Blocked(format!(
+                "until:{}",
+                plan::block_condition(condition, &target.unit).map_err(anyhow::Error::msg)?
+            ));
+            &normalized
+        } else {
+            to
+        }
+    } else {
+        to
+    };
     let step_full = match &target.step {
         Some(step) => format!("{}/{step}", target.unit),
         None => target.unit.clone(),

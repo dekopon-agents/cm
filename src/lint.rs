@@ -284,6 +284,32 @@ struct Seen<'a> {
 fn lint_holds(root: &Path, unit: &UnitState, seen: &mut Seen, out: &mut Vec<Violation>) {
     for (name, step) in &unit.steps {
         let target = format!("{}/{name}", unit.unit);
+        if let Phase::Blocked(reason) = &step.track.state
+            && !reason.starts_with("until:")
+            && crate::plan::instant(&step.track.since)
+                .is_some_and(|since| seen.now.duration_since(since).as_secs() > 24 * 3600)
+        {
+            let mentioned = fs::read_to_string(root.join(JOURNAL))
+                .unwrap_or_default()
+                .lines()
+                .any(|line| {
+                    line.strip_prefix("## ")
+                        .and_then(|line| line.split_once(" — "))
+                        .is_some_and(|(at, title)| {
+                            crate::plan::instant(at)
+                                .zip(crate::plan::instant(&step.track.since))
+                                .is_some_and(|(at, since)| at > since)
+                                && title
+                                    .split(|c: char| {
+                                        !(c.is_ascii_alphanumeric() || "/._-".contains(c))
+                                    })
+                                    .any(|word| word == target)
+                        })
+                });
+            if !mentioned {
+                seen.warnings.push(format!("block-stale: {target} has been blocked:{reason} for more than 24 h with no later journal title naming it"));
+            }
+        }
         for pin in &step.pins {
             if let Err(error) = pin.file.check(root) {
                 out.push(Violation::new(

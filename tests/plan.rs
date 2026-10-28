@@ -2416,3 +2416,93 @@ fn a_fresh_pin_of_one_part_never_renews_a_stale_pin_of_its_sibling() {
     );
     assert_eq!(rules(&next_one(&c, "02-b/v/consumer")), vec!["after-unmet"]);
 }
+
+#[test]
+fn blocked_until_tag_is_reported_once_and_stays_blocked() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let release = "00-release/guest/0.7.0";
+    let target = "01-a/u/S1";
+    assert!(declare_release(&host, &c, release, "xrl/vm-runner", "guest-v{version}").ok());
+    kickoff(&c, release);
+    open_pr(
+        &host,
+        &c,
+        release,
+        "https://github.com/xrl/vm-runner/pull/5",
+    );
+    assert!(declare(&host, &c, target, Lane::Codex, &[]).ok());
+    assert!(
+        advance(
+            &host,
+            &c,
+            target,
+            "blocked:until:tag:guest@0.7.0",
+            Evidence::default()
+        )
+        .ok()
+    );
+    let mut forge = FakeForge::default();
+    forge.pulls.insert(
+        "https://github.com/xrl/vm-runner/pull/5".into(),
+        merged("m1"),
+    );
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(
+        plan::next(&c.root, None, None).unwrap().fields["unblock_now"],
+        serde_json::json!([])
+    );
+    forge.tags.insert(
+        ("xrl/vm-runner".into(), "guest-v0.7.0".into()),
+        ["m1".to_owned()].into(),
+    );
+    let observed = sync(&host, &forge, &c.root).unwrap();
+    assert!(observed.fields.contains_key("journal"));
+    let next = plan::next(&c.root, None, None).unwrap();
+    assert_eq!(next.fields["unblock_now"][0]["target"], target);
+    assert_eq!(
+        next.fields["unblock_now"][0]["condition"],
+        "tag:guest@0.7.0"
+    );
+    assert_eq!(
+        state(&c, target),
+        Phase::Blocked("until:tag:guest@0.7.0".into())
+    );
+    assert!(
+        !sync(&host, &forge, &c.root)
+            .unwrap()
+            .fields
+            .contains_key("journal")
+    );
+}
+
+#[test]
+fn free_text_block_is_stale_after_25_hours_unless_later_title_names_step() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let target = "01-a/u/S1";
+    assert!(declare(&host, &c, target, Lane::Codex, &[]).ok());
+    assert!(advance(&host, &c, target, "blocked:plan-gate", Evidence::default()).ok());
+    let later = at("2026-10-18T09:00:00Z");
+    let warnings = cm::lint::lint_at(&c.root, later.now).unwrap().fields["warnings"].clone();
+    assert!(
+        warnings
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().starts_with("block-stale:"))
+    );
+    cm::journal::append(
+        &c.root,
+        &cm::journal::entry("2026-10-18T08:00Z", &format!("checked {target}"), None),
+    )
+    .unwrap();
+    let warnings = cm::lint::lint_at(&c.root, later.now).unwrap().fields["warnings"].clone();
+    assert!(
+        !warnings
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().starts_with("block-stale:"))
+    );
+}

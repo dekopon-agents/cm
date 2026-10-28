@@ -191,6 +191,15 @@ was declared with (`release-tag`), and its `pr-open --pr` must be in its reposit
 
 ### Order
 
+`cm advance <step> blocked:until:<condition>` records a checkable block. Conditions
+are the same as `--after` (`<step>`, `pr-open:<step>`, `tag:<line>@<version>`,
+`deployed:<line>@<version>`), plus `epoch:WORKING` and `owner-queue:<n>` (item
+heading removed from OWNER-QUEUE.md). `cm next` lists satisfied blocks under
+`unblock now` (`unblock_now` in JSON). `cm sync` journals the first observation;
+it leaves the step blocked for an explicit resume. CARD shows whether the condition
+holds. Lint warns `block-stale` for free-text blocks older than 24 hours without a
+later journal title naming the step.
+
 A declared step is handed out by `cm next`, and launched by `cm launch`, only once every gate is
 met. `--after` takes:
 

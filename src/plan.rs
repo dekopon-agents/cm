@@ -559,6 +559,18 @@ pub fn next_at(
     for (url, observed) in &dirty {
         outcome.line(dirty_line(url, observed));
     }
+    let unblock = unblock_now(root, &units, lane);
+    if !unblock.is_empty() {
+        outcome.line("unblock now");
+    }
+    for item in &unblock {
+        outcome.line(format!(
+            "  {}: {} holds",
+            item["target"].as_str().unwrap(),
+            item["condition"].as_str().unwrap()
+        ));
+    }
+    outcome.field("unblock_now", unblock);
     let held = crate::holds::held(&units, now, root);
     outcome.lines.extend(held.lines);
     outcome.field("watches", held.watches);
@@ -606,4 +618,56 @@ pub fn next_at(
             .collect::<Vec<_>>(),
     );
     Ok(outcome)
+}
+
+/// Normalize blocked-until conditions using the same parser as order gates.
+pub(crate) fn block_condition(text: &str, unit: &str) -> Result<String, String> {
+    if text == "epoch:WORKING" {
+        return Ok(text.into());
+    }
+    if let Some(number) = text.strip_prefix("owner-queue:") {
+        let n: u64 = number
+            .parse()
+            .map_err(|_| "owner-queue condition needs a positive item number")?;
+        if n == 0 {
+            return Err("owner-queue condition needs a positive item number".into());
+        }
+        return Ok(format!("owner-queue:{n}"));
+    }
+    After::parse(text, unit).map(|after| after.to_string())
+}
+
+pub(crate) fn block_met(root: &Path, units: &Units, unit: &str, condition: &str) -> bool {
+    if condition == "epoch:WORKING" {
+        return fs::read_to_string(root.join("EPOCH.md")).is_ok_and(|text| {
+            text.strip_prefix("---\n")
+                .and_then(|s| s.split_once("\n---"))
+                .is_some_and(|(front, _)| {
+                    front.lines().any(|l| {
+                        l.split_once(':')
+                            .is_some_and(|(k, v)| k == "status" && v.trim() == "WORKING")
+                    })
+                })
+        });
+    }
+    if let Some(number) = condition.strip_prefix("owner-queue:") {
+        return fs::read_to_string(root.join("OWNER-QUEUE.md")).is_ok_and(|text| {
+            !crate::markdown::headings(&text).iter().any(|h| {
+                h.level == 2
+                    && h.text
+                        .split_once('.')
+                        .is_some_and(|(n, _)| n.parse::<u64>().ok() == number.parse::<u64>().ok())
+            })
+        });
+    }
+    After::parse(condition, unit).is_ok_and(|after| gate(units, &after).met())
+}
+
+pub(crate) fn unblock_now(root: &Path, units: &Units, lane: Option<Lane>) -> Vec<Value> {
+    units.iter().flat_map(|(unit, state)| state.steps.iter().filter_map(move |(name, step)| {
+        let Phase::Blocked(reason) = &step.track.state else { return None; };
+        let condition = reason.strip_prefix("until:")?;
+        (lane.is_none_or(|l| step.lane == Some(l)) && block_met(root, units, unit, condition))
+            .then(|| json!({"target": format!("{unit}/{name}"), "condition": condition, "since": step.track.since}))
+    })).collect()
 }

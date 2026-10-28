@@ -737,6 +737,27 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
     }
     store::write_json(&plan::pulls_path(root), &open)?;
     let mut outcome = Outcome::refused(std::mem::take(&mut run.violations));
+    let marker_path = root.join(store::CM_DIR).join("unblock-notified.json");
+    let mut notified: BTreeSet<String> = if marker_path.exists() {
+        store::read_json(&marker_path)?
+    } else {
+        BTreeSet::new()
+    };
+    let mut changed = false;
+    for item in plan::unblock_now(root, &run.units, None) {
+        let key = serde_json::to_string(&item)?;
+        if notified.insert(key) {
+            changed = true;
+            run.notes.push((
+                String::new(),
+                format!(
+                    "- unblock now {}: {} holds; still blocked",
+                    item["target"].as_str().unwrap(),
+                    item["condition"].as_str().unwrap()
+                ),
+            ));
+        }
+    }
     if !run.moves.is_empty() || !run.notes.is_empty() {
         let mut body: String = run
             .moves
@@ -760,12 +781,15 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
         journal::append(root, &journal::entry(&run.at, &title, Some(&body)))?;
         outcome.field("journal", journal::heading(&run.at, &title));
     }
+    if changed {
+        store::write_json(&marker_path, &notified)?;
+    }
     let next = plan::summary(root, &run.units);
     let name = root
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let card = render::card(&run.at, &name, &run.units, &next, &run.moves);
+    let card = render::card(root, &run.at, &name, &run.units, &next, &run.moves);
     write_atomic(&root.join(CARD), card.as_bytes())?;
     for moved in &run.moves {
         outcome.line(format!(
