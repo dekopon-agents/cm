@@ -2503,6 +2503,32 @@ fn init_parts_use_amend_semantics_and_allow_launch() {
 }
 
 #[test]
+fn init_retries_reject_duplicate_parts_and_accept_reordered_parts() {
+    let host = at("2026-10-28T09:00:00Z");
+    let c = campaign(&host);
+    let target = c.root.join("01-a/u/S1");
+    let mut declaration = Declaration {
+        lane: Some(Lane::Codex),
+        parts: vec!["a".into(), "b".into()],
+        ..Default::default()
+    };
+    assert!(
+        commands::declare(&host, &target, &declaration)
+            .unwrap()
+            .ok()
+    );
+    declaration.parts = vec!["b".into(), "a".into()];
+    assert!(
+        commands::declare(&host, &target, &declaration)
+            .unwrap()
+            .ok()
+    );
+    declaration.parts = vec!["a".into(), "a".into()];
+    let refused = commands::declare(&host, &target, &declaration).unwrap();
+    assert_eq!(rules(&refused), vec!["part-name"]);
+}
+
+#[test]
 fn init_rejects_invalid_parts_before_writing_state() {
     let host = at("2026-10-28T09:00:00Z");
     let c = campaign(&host);

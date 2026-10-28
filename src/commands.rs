@@ -446,6 +446,15 @@ fn init_step(
         ));
     }
     if let Some(step) = existing.as_ref().and_then(|unit| unit.steps.get(step_name)) {
+        let requested_parts: std::collections::BTreeSet<_> = declaration.parts.iter().collect();
+        if requested_parts.len() != declaration.parts.len() {
+            violations.push(Violation::new(
+                &full,
+                "part-name",
+                "part names must be unique; repeat each --part only once",
+            ));
+            return Ok(Outcome::refused(violations));
+        }
         let same_tag = match (Release::of_target(&full), &tag) {
             (Some(release), Some(tag)) => step.release_tag(&release) == *tag,
             _ => step.tag.is_none(),
@@ -454,12 +463,7 @@ fn init_step(
             && step.after == parsed
             && step.github == ships.github
             && step.work == work
-            && (declaration.parts.is_empty()
-                || (step.parts.len() == declaration.parts.len()
-                    && declaration
-                        .parts
-                        .iter()
-                        .all(|name| step.parts.contains_key(name))))
+            && (declaration.parts.is_empty() || step.parts.keys().eq(requested_parts))
             && same_tag
             && violations.is_empty()
         {
