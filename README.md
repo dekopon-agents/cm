@@ -341,9 +341,11 @@ holds; every other check must still be green. The move journals each exception i
 
 Use `--standing` instead of `--commit SHA` to cover any PR head of the step.
 Add `--scope campaign` to cover any step in the campaign (`--scope step` is the default).
-Standing exceptions use the same live GitHub check read at the latest base-branch tip:
-the named check must still be `failure` there and at the PR head. Green, absent,
-pending or unread base checks refuse the exception. The same closing condition and
+Standing exceptions use the named check's latest completed run on the base branch.
+cm walks the base tip's first-parent history, skipping commits where that check is
+absent or still pending. Only a completed `failure` qualifies; a completed green
+result or unavailable evidence refuses the exception. The PR head must still fail.
+Per-commit exceptions continue to require failure at the current base tip. The same closing condition and
 journaling apply; every other check still gates.
 
 ### Parts
