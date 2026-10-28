@@ -59,6 +59,7 @@ pub struct Ships {
 
 #[derive(Debug, Clone, Default)]
 pub struct Declaration {
+    pub parts: Vec<String>,
     pub lane: Option<Lane>,
     pub after: Vec<String>,
     pub ships: Ships,
@@ -67,7 +68,11 @@ pub struct Declaration {
 
 impl Declaration {
     fn given(&self) -> bool {
-        self.lane.is_some() || !self.after.is_empty() || self.ships.given() || !self.work.is_code()
+        self.lane.is_some()
+            || !self.parts.is_empty()
+            || !self.after.is_empty()
+            || self.ships.given()
+            || !self.work.is_code()
     }
 }
 
@@ -449,6 +454,12 @@ fn init_step(
             && step.after == parsed
             && step.github == ships.github
             && step.work == work
+            && (declaration.parts.is_empty()
+                || (step.parts.len() == declaration.parts.len()
+                    && declaration
+                        .parts
+                        .iter()
+                        .all(|name| step.parts.contains_key(name))))
             && same_tag
             && violations.is_empty()
         {
@@ -478,20 +489,40 @@ fn init_step(
         return Ok(Outcome::refused(violations));
     }
     let at = stamp(host.now());
+    let mut new_step = Step {
+        lane: Some(lane),
+        after: parsed.clone(),
+        github: ships.github.clone(),
+        tag: tag.clone(),
+        work,
+        ..Step::new(&at)
+    };
+    let mut part_changes = Vec::new();
+    if !declaration.parts.is_empty() {
+        if new_step.finish() == Finish::Evidence {
+            violations.push(Violation::new(
+                &full,
+                "part-target",
+                "a study or owner-lane step has no parts",
+            ));
+        } else {
+            add_parts(
+                &full,
+                &declaration.parts,
+                &mut new_step,
+                &at,
+                &mut part_changes,
+                &mut violations,
+            );
+        }
+    }
+    if !violations.is_empty() {
+        return Ok(Outcome::refused(violations));
+    }
     fs::create_dir_all(dir.join(store::CM_DIR))?;
     fs::create_dir_all(dir.join(step_name))?;
     let mut unit = existing.unwrap_or_else(|| UnitState::new(unit_name, &at));
-    unit.steps.insert(
-        step_name.to_owned(),
-        Step {
-            lane: Some(lane),
-            after: parsed.clone(),
-            github: ships.github.clone(),
-            tag: tag.clone(),
-            work,
-            ..Step::new(&at)
-        },
-    );
+    unit.steps.insert(step_name.to_owned(), new_step);
     write_unit(&dir, &unit)?;
     let shown: Vec<String> = parsed.iter().map(After::to_string).collect();
     let mut body = format!(
@@ -511,6 +542,7 @@ fn init_step(
     if !work.is_code() {
         body.push_str("- study: finishes with `cm advance <step> done --evidence <path>`\n");
     }
+    body.push_str(&part_changes.join("\n"));
     let heading = record(root, &at, &format!("init step {full}"), &body)?;
     let mut outcome = Outcome::default();
     outcome.line(match work {
@@ -660,6 +692,7 @@ fn launch_checks(host: &dyn Host, limits: &Limits, report: &mut Vec<String>) -> 
 /// What a remote launch records in its attempt.
 #[derive(Debug, Clone, Default)]
 pub struct Remote {
+    pub no_parts: Option<String>,
     pub coordinator: Option<String>,
     pub cap_min: Option<u32>,
 }
@@ -693,6 +726,17 @@ pub fn launch_remote(
     let mut violations = journal::check(root, &campaign);
     violations.extend(closed(root, &campaign));
     let units = plan::load_units(root)?;
+    if let Some(reason) = &remote.no_parts {
+        if reason.trim().is_empty() || reason.contains(['\n', '\r']) {
+            violations.push(Violation::new(
+                &full,
+                "parts-undeclared",
+                "--no-parts requires a nonempty, single-line reason",
+            ));
+        }
+    } else if let Some(step) = plan::step(&units, &full) {
+        violations.extend(lint::undeclared_parts(root, &full, step)?);
+    }
     let declared = plan::step(&units, &full).and_then(|step| step.lane);
     let local = declared.is_none_or(Lane::is_local);
     let mut report = Vec::new();
@@ -889,6 +933,9 @@ pub fn launch_remote(
         )
     });
     let mut body: String = report.iter().map(|line| format!("- {line}\n")).collect();
+    if let Some(reason) = &remote.no_parts {
+        body.push_str(&format!("- no-parts: {reason}\n"));
+    }
     if let Some(lane) = declared {
         body.push_str(&format!("- lane: {lane}\n"));
     }
