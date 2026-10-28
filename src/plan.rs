@@ -629,7 +629,7 @@ pub(crate) fn block_condition(text: &str, unit: &str) -> Result<String, String> 
         let n: u64 = number
             .parse()
             .map_err(|_| "owner-queue condition needs a positive item number")?;
-        if n == 0 {
+        if n == 0 || !number.bytes().all(|b| b.is_ascii_digit()) {
             return Err("owner-queue condition needs a positive item number".into());
         }
         return Ok(format!("owner-queue:{n}"));
@@ -655,7 +655,7 @@ pub(crate) fn block_met(root: &Path, units: &Units, unit: &str, condition: &str)
             !crate::markdown::headings(&text).iter().any(|h| {
                 h.level == 2
                     && h.text
-                        .split_once('.')
+                        .split_once(". ")
                         .is_some_and(|(n, _)| n.parse::<u64>().ok() == number.parse::<u64>().ok())
             })
         });

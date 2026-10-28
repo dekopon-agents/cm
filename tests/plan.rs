@@ -2506,3 +2506,85 @@ fn free_text_block_is_stale_after_25_hours_unless_later_title_names_step() {
             .any(|w| w.as_str().unwrap().starts_with("block-stale:"))
     );
 }
+
+#[test]
+fn blocked_until_epoch_and_removed_owner_heading_use_current_files() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    for (target, condition) in [
+        ("01-a/u/epoch", "epoch:WORKING"),
+        ("01-a/u/owner", "owner-queue:2"),
+    ] {
+        assert!(declare(&host, &c, target, Lane::Codex, &[]).ok());
+        assert!(
+            advance(
+                &host,
+                &c,
+                target,
+                &format!("blocked:until:{condition}"),
+                Evidence::default()
+            )
+            .ok()
+        );
+    }
+    fs::write(c.root.join("EPOCH.md"), "---\nstatus: PLANNING\n---\n").unwrap();
+    fs::write(
+        c.root.join("OWNER-QUEUE.md"),
+        "# Owner queue\n\n## 2. Decision\n",
+    )
+    .unwrap();
+    assert_eq!(
+        plan::next(&c.root, None, None).unwrap().fields["unblock_now"],
+        serde_json::json!([])
+    );
+    fs::write(c.root.join("EPOCH.md"), "---\nstatus: WORKING\n---\n").unwrap();
+    fs::write(
+        c.root.join("OWNER-QUEUE.md"),
+        "# Owner queue\n\n## 20. Other decision\n",
+    )
+    .unwrap();
+    let next = plan::next(&c.root, None, None).unwrap();
+    assert_eq!(next.fields["unblock_now"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        plan::next(&c.root, None, Some(Lane::Pi)).unwrap().fields["unblock_now"],
+        serde_json::json!([])
+    );
+    fs::remove_file(c.root.join("OWNER-QUEUE.md")).unwrap();
+    assert_eq!(
+        plan::next(&c.root, None, None).unwrap().fields["unblock_now"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn blocked_until_short_step_resolves_against_its_unit() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/S1", Lane::Codex, &[]).ok());
+    assert!(declare(&host, &c, "01-a/u/S2", Lane::Codex, &[]).ok());
+    assert!(
+        advance(
+            &host,
+            &c,
+            "01-a/u/S2",
+            "blocked:until:pr-open:S1",
+            Evidence::default()
+        )
+        .ok()
+    );
+    assert_eq!(
+        state(&c, "01-a/u/S2"),
+        Phase::Blocked("until:pr-open:01-a/u/S1".into())
+    );
+    for invalid in [
+        "blocked:until:",
+        "blocked:until:epoch:OPEN",
+        "blocked:until:owner-queue:0",
+        "blocked:until:owner-queue:+2",
+    ] {
+        assert!(invalid.parse::<Phase>().is_err(), "{invalid}");
+    }
+}
