@@ -84,6 +84,10 @@ impl std::str::FromStr for Phase {
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         if let Some(reason) = text.strip_prefix("blocked:") {
+            if let Some(condition) = reason.strip_prefix("until:") {
+                crate::plan::block_condition(condition, "01-placeholder/unit")?;
+                return Ok(Phase::Blocked(reason.to_owned()));
+            }
             if reason.is_empty()
                 || !reason
                     .chars()

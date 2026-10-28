@@ -2419,6 +2419,258 @@ fn a_fresh_pin_of_one_part_never_renews_a_stale_pin_of_its_sibling() {
 }
 
 #[test]
+fn blocked_until_tag_is_listed_and_stays_blocked() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let release = "00-release/guest/0.7.0";
+    let target = "01-a/u/S1";
+    assert!(declare_release(&host, &c, release, "xrl/vm-runner", "guest-v{version}").ok());
+    kickoff(&c, release);
+    open_pr(
+        &host,
+        &c,
+        release,
+        "https://github.com/xrl/vm-runner/pull/5",
+    );
+    assert!(declare(&host, &c, target, Lane::Codex, &[]).ok());
+    assert!(
+        advance(
+            &host,
+            &c,
+            target,
+            "blocked:until:tag:guest@0.7.0",
+            Evidence::default()
+        )
+        .ok()
+    );
+    let mut forge = FakeForge::default();
+    forge.pulls.insert(
+        "https://github.com/xrl/vm-runner/pull/5".into(),
+        merged("m1"),
+    );
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(
+        plan::next(&c.root, None, None).unwrap().fields["unblock_now"],
+        serde_json::json!([])
+    );
+    forge.tags.insert(
+        ("xrl/vm-runner".into(), "guest-v0.7.0".into()),
+        ["m1".to_owned()].into(),
+    );
+    sync(&host, &forge, &c.root).unwrap();
+    let next = plan::next(&c.root, None, None).unwrap();
+    assert_eq!(next.fields["unblock_now"][0]["target"], target);
+    assert_eq!(
+        next.fields["unblock_now"][0]["condition"],
+        "tag:guest@0.7.0"
+    );
+    assert_eq!(
+        state(&c, target),
+        Phase::Blocked("until:tag:guest@0.7.0".into())
+    );
+}
+
+#[test]
+fn free_text_block_is_stale_after_25_hours_unless_later_title_names_step() {
+    let host = at("2026-10-17T08:00:00Z");
+    for (target, mention) in [
+        ("01-a/u/S1", "01-a/u/S1"),
+        ("01-a/u/S1", "01-a/u/S1."),
+        ("01-a/u/S1", "01-a/u/S1..."),
+        ("01-a/u/S1.", "`01-a/u/S1.`"),
+        ("01-a/u/S1.", "`01-a/u/S1.`."),
+        ("01-a/u/S1.", "01-a/u/S1.."),
+        ("01-a/u/S1.", "01-a/u/S1...."),
+    ] {
+        let c = campaign(&host);
+        assert!(declare(&host, &c, target, Lane::Codex, &[]).ok());
+        assert!(advance(&host, &c, target, "blocked:plan-gate", Evidence::default()).ok());
+        let later = at("2026-10-18T09:00:00Z");
+        cm::journal::append(
+            &c.root,
+            &cm::journal::entry(
+                "2026-10-18T07:00Z",
+                &format!("checked {target}.other."),
+                None,
+            ),
+        )
+        .unwrap();
+        let warnings = cm::lint::lint_at(&c.root, later.now).unwrap().fields["warnings"].clone();
+        assert!(
+            warnings
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w.as_str().unwrap().starts_with("block-stale:"))
+        );
+        cm::journal::append(
+            &c.root,
+            &cm::journal::entry("2026-10-18T08:00Z", &format!("checked {mention}"), None),
+        )
+        .unwrap();
+        let warnings = cm::lint::lint_at(&c.root, later.now).unwrap().fields["warnings"].clone();
+        assert!(
+            !warnings
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w.as_str().unwrap().starts_with("block-stale:"))
+        );
+    }
+}
+
+#[test]
+fn blocked_until_epoch_reads_crlf_and_requires_an_exact_closing_delimiter() {
+    let host = at("2026-10-17T08:00:00Z");
+    for (manifest, met) in [
+        ("---\r\nstatus: WORKING\r\n---\r\n", true),
+        ("---\nstatus: WORKING\n---invalid\n", false),
+    ] {
+        let c = campaign(&host);
+        let target = "01-a/u/S1";
+        assert!(declare(&host, &c, target, Lane::Codex, &[]).ok());
+        assert!(
+            advance(
+                &host,
+                &c,
+                target,
+                "blocked:until:epoch:WORKING",
+                Evidence::default()
+            )
+            .ok()
+        );
+        fs::write(c.root.join("EPOCH.md"), manifest).unwrap();
+        let next = plan::next(&c.root, None, None).unwrap();
+        assert_eq!(
+            next.fields["unblock_now"].as_array().unwrap().len(),
+            usize::from(met)
+        );
+        let forge = FakeForge::default();
+        let journal_before = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+        let first = sync(&host, &forge, &c.root).unwrap();
+        assert!(first.ok(), "{:?}", first.violations);
+        assert_eq!(first.fields["moves"], serde_json::json!([]));
+        let journal_after = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+        let appended = journal_after.strip_prefix(&journal_before).unwrap();
+        if met {
+            let expected = cm::journal::entry(
+                "2026-10-17T08:00Z",
+                "cm sync: 0 move(s) from GitHub",
+                Some("- unblock now 01-a/u/S1: epoch:WORKING holds; still blocked"),
+            );
+            assert_eq!(appended.trim_start_matches('\n'), expected);
+        } else {
+            assert_eq!(appended, "");
+        }
+        let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+        let blocked = card
+            .split_once("## Blocked\n")
+            .unwrap()
+            .1
+            .split("\n## ")
+            .next()
+            .unwrap();
+        assert_eq!(
+            blocked.trim(),
+            format!(
+                "- `{target}` blocked:until:epoch:WORKING since 2026-10-17T08:00Z; condition {}",
+                if met { "holds" } else { "does not hold" }
+            )
+        );
+        let second = sync(&host, &forge, &c.root).unwrap();
+        assert!(second.ok(), "{:?}", second.violations);
+        assert_eq!(second.fields["moves"], serde_json::json!([]));
+        assert!(!second.fields.contains_key("journal"));
+        assert_eq!(
+            fs::read_to_string(c.root.join("JOURNAL.md")).unwrap(),
+            journal_after
+        );
+    }
+}
+
+#[test]
+fn blocked_until_epoch_and_removed_owner_heading_use_current_files() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    for (target, condition) in [
+        ("01-a/u/epoch", "epoch:WORKING"),
+        ("01-a/u/owner", "owner-queue:2"),
+    ] {
+        assert!(declare(&host, &c, target, Lane::Codex, &[]).ok());
+        assert!(
+            advance(
+                &host,
+                &c,
+                target,
+                &format!("blocked:until:{condition}"),
+                Evidence::default()
+            )
+            .ok()
+        );
+    }
+    fs::write(c.root.join("EPOCH.md"), "---\nstatus: PLANNING\n---\n").unwrap();
+    fs::write(
+        c.root.join("OWNER-QUEUE.md"),
+        "# Owner queue\n\n## 2. Decision\n",
+    )
+    .unwrap();
+    assert_eq!(
+        plan::next(&c.root, None, None).unwrap().fields["unblock_now"],
+        serde_json::json!([])
+    );
+    fs::write(c.root.join("EPOCH.md"), "---\nstatus: WORKING\n---\n").unwrap();
+    fs::write(
+        c.root.join("OWNER-QUEUE.md"),
+        "# Owner queue\n\n## 20. Other decision\n",
+    )
+    .unwrap();
+    let next = plan::next(&c.root, None, None).unwrap();
+    assert_eq!(next.fields["unblock_now"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        plan::next(&c.root, None, Some(Lane::Pi)).unwrap().fields["unblock_now"],
+        serde_json::json!([])
+    );
+    fs::remove_file(c.root.join("OWNER-QUEUE.md")).unwrap();
+    assert_eq!(
+        plan::next(&c.root, None, None).unwrap().fields["unblock_now"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn blocked_until_short_step_resolves_against_its_unit() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/S1", Lane::Codex, &[]).ok());
+    assert!(declare(&host, &c, "01-a/u/S2", Lane::Codex, &[]).ok());
+    assert!(
+        advance(
+            &host,
+            &c,
+            "01-a/u/S2",
+            "blocked:until:pr-open:S1",
+            Evidence::default()
+        )
+        .ok()
+    );
+    assert_eq!(
+        state(&c, "01-a/u/S2"),
+        Phase::Blocked("until:pr-open:01-a/u/S1".into())
+    );
+    for invalid in [
+        "blocked:until:",
+        "blocked:until:epoch:OPEN",
+        "blocked:until:owner-queue:0",
+        "blocked:until:owner-queue:+2",
+    ] {
+        assert!(invalid.parse::<Phase>().is_err(), "{invalid}");
+    }
+}
+
+#[test]
 fn kickoff_parts_require_declaration_or_a_journaled_exception() {
     let host = at("2026-10-28T09:00:00Z");
     for label in ["Parts", "Slices"] {

@@ -164,7 +164,14 @@ fn holds(name: &str, step: &Step) -> Vec<String> {
         .collect()
 }
 
-pub fn card(at: &str, name: &str, units: &Units, next: &Next, moves: &[Moved]) -> String {
+pub fn card(
+    root: &std::path::Path,
+    at: &str,
+    name: &str,
+    units: &Units,
+    next: &Next,
+    moves: &[Moved],
+) -> String {
     let mut out = format!(
         "Last run: {at}\n\n# {name} card\n\nRendered by `cm sync` from cm state after reading GitHub; the next sync overwrites it.\n\n"
     );
@@ -194,8 +201,23 @@ pub fn card(at: &str, name: &str, units: &Units, next: &Next, moves: &[Moved]) -
                         .unwrap_or_default()
                 )),
                 Phase::Blocked(_) => blocked.push(format!(
-                    "- `{target}` {} since {}",
-                    step.track.state, step.track.since
+                    "- `{target}` {} since {}{}",
+                    step.track.state,
+                    step.track.since,
+                    match &step.track.state {
+                        Phase::Blocked(reason) => reason
+                            .strip_prefix("until:")
+                            .map(|condition| format!(
+                                "; condition {}",
+                                if crate::plan::block_met(root, units, unit, condition) {
+                                    "holds"
+                                } else {
+                                    "does not hold"
+                                }
+                            ))
+                            .unwrap_or_default(),
+                        _ => String::new(),
+                    }
                 )),
                 _ => {}
             }
