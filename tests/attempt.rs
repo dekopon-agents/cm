@@ -97,6 +97,7 @@ fn advance(host: &Fake, c: &Campaign, step: &str, to: &str, file: Option<&Path>)
 
 fn launch(host: &Fake, c: &Campaign, step: &str, cap_min: Option<u32>) -> Outcome {
     let remote = Remote {
+        no_parts: None,
         coordinator: Some("session_a".into()),
         cap_min,
     };

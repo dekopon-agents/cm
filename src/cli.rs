@@ -48,6 +48,9 @@ enum Commands {
     },
     /// Write a campaign folder, a unit folder (<NN-name>/<unit>) inside one, or declare a step (<NN-name>/<unit>/<step> --lane …) in a unit. Never overwrites.
     Init {
+        /// Required parts, one PR each. Repeat for each part.
+        #[arg(long)]
+        part: Vec<String>,
         /// The folder to initialize.
         #[arg(default_value = ".")]
         dir: PathBuf,
@@ -101,6 +104,9 @@ enum Commands {
     },
     /// Run the launch checks for a step, mark it launched and print the launch command. Spawns nothing.
     Launch {
+        /// Launch despite kickoff parts not declared in state; journal the reason.
+        #[arg(long, value_name = "REASON")]
+        no_parts: Option<String>,
         /// <NN-name>/<unit>/<step>
         #[arg(value_parser = step_target)]
         target: Target,
@@ -459,6 +465,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
         ),
         Commands::Close => commands::close(host, &root()?),
         Commands::Init {
+            part,
             dir,
             lane,
             study,
@@ -467,6 +474,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             tag,
         } => {
             let declaration = commands::Declaration {
+                parts: part.clone(),
                 lane: *lane,
                 after: after.clone(),
                 ships: commands::Ships {
@@ -497,6 +505,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             commands::journal(host, &root()?, title, body.as_deref())
         }
         Commands::Launch {
+            no_parts,
             target,
             worktree,
             coordinator,
@@ -507,6 +516,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             target,
             worktree.as_deref(),
             &commands::Remote {
+                no_parts: no_parts.clone(),
                 coordinator: coordinator.clone(),
                 cap_min: *cap_min,
             },
