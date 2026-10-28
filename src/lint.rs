@@ -310,6 +310,47 @@ fn journal_mentions(root: &Path) -> BTreeMap<String, jiff::Timestamp> {
     mentions
 }
 
+pub(crate) fn undeclared_parts(
+    root: &Path,
+    target: &str,
+    step: &crate::state::Step,
+) -> Result<Vec<Violation>> {
+    let path = root.join(target).join("kickoff.md");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut named = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(parts) = line
+            .strip_prefix("Parts:")
+            .or_else(|| line.strip_prefix("Slices:"))
+        {
+            named.extend(
+                parts
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty()),
+            );
+        }
+    }
+    Ok(if step.parts.len() < named.len() {
+        vec![Violation::new(
+            target,
+            "parts-undeclared",
+            format!(
+                "kickoff names {} parts, but {} are declared; use --part or launch --no-parts REASON",
+                named.len(),
+                step.parts.len()
+            ),
+        )]
+    } else {
+        Vec::new()
+    })
+}
+
 fn lint_holds(root: &Path, unit: &UnitState, seen: &mut Seen, out: &mut Vec<Violation>) {
     for (name, step) in &unit.steps {
         let target = format!("{}/{name}", unit.unit);
@@ -326,6 +367,18 @@ fn lint_holds(root: &Path, unit: &UnitState, seen: &mut Seen, out: &mut Vec<Viol
             if !mentioned {
                 seen.warnings.push(format!("block-stale: {target} has been blocked:{reason} for more than 24 h with no later journal title naming it"));
             }
+        }
+        match undeclared_parts(root, &target, step) {
+            Ok(found) => seen.warnings.extend(
+                found
+                    .iter()
+                    .map(|v| format!("parts-undeclared: {target}: {}", v.message)),
+            ),
+            Err(error) => out.push(Violation::new(
+                &target,
+                "packet-unreadable",
+                error.to_string(),
+            )),
         }
         for pin in &step.pins {
             if let Err(error) = pin.file.check(root) {

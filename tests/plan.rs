@@ -94,6 +94,7 @@ fn declare_work(
         lane: Some(lane),
         after: after.iter().map(|text| (*text).to_owned()).collect(),
         ships: Ships::default(),
+        parts: Vec::new(),
         work,
     };
     commands::declare(host, &c.root.join(target), &declaration).unwrap()
@@ -2664,5 +2665,168 @@ fn blocked_until_short_step_resolves_against_its_unit() {
         "blocked:until:owner-queue:+2",
     ] {
         assert!(invalid.parse::<Phase>().is_err(), "{invalid}");
+    }
+}
+
+#[test]
+fn kickoff_parts_require_declaration_or_a_journaled_exception() {
+    let host = at("2026-10-28T09:00:00Z");
+    for label in ["Parts", "Slices"] {
+        let c = campaign(&host);
+        let target = "01-a/u/S1";
+        assert!(declare(&host, &c, target, Lane::Codex, &[]).ok());
+        kickoff(&c, target);
+        fs::write(
+            c.root.join(target).join("kickoff.md"),
+            format!("{label}: b1, b2, b3\n"),
+        )
+        .unwrap();
+        let parsed = parse_target(target, false).unwrap();
+        let before = store::load_unit(&c.root.join("01-a/u")).unwrap();
+        let refused = commands::launch(&host, &c.root, &parsed, None).unwrap();
+        assert_eq!(rules(&refused), vec!["parts-undeclared"]);
+        assert_eq!(store::load_unit(&c.root.join("01-a/u")).unwrap(), before);
+        for reason in ["", "   ", "reason\nforged entry"] {
+            let remote = commands::Remote {
+                no_parts: Some(reason.into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                rules(&commands::launch_remote(&host, &c.root, &parsed, None, &remote).unwrap()),
+                vec!["parts-undeclared"]
+            );
+        }
+        let remote = commands::Remote {
+            no_parts: Some("kickoff lists alternatives".into()),
+            ..Default::default()
+        };
+        let launched = commands::launch_remote(&host, &c.root, &parsed, None, &remote).unwrap();
+        assert!(launched.ok(), "{:?}", launched.violations);
+        let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+        assert!(
+            journal
+                .lines()
+                .any(|line| line == "- no-parts: kickoff lists alternatives")
+        );
+    }
+}
+
+#[test]
+fn init_parts_use_amend_semantics_and_allow_launch() {
+    let host = at("2026-10-28T09:00:00Z");
+    let c = campaign(&host);
+    let target = "01-a/u/S1";
+    let declaration = Declaration {
+        lane: Some(Lane::Codex),
+        parts: vec!["b1".into(), "b2".into(), "b3".into()],
+        ..Default::default()
+    };
+    assert!(
+        commands::declare(&host, &c.root.join(target), &declaration)
+            .unwrap()
+            .ok()
+    );
+    kickoff(&c, target);
+    fs::write(
+        c.root.join(target).join("kickoff.md"),
+        "Parts: b1, b2, b3\n",
+    )
+    .unwrap();
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    assert_eq!(unit.steps["S1"].parts.len(), 3);
+    assert!(
+        unit.steps["S1"]
+            .parts
+            .values()
+            .all(|part| part.state == Phase::Launched)
+    );
+    assert!(
+        commands::declare(&host, &c.root.join(target), &declaration)
+            .unwrap()
+            .ok()
+    );
+    assert!(
+        commands::launch(&host, &c.root, &parse_target(target, false).unwrap(), None)
+            .unwrap()
+            .ok()
+    );
+}
+
+#[test]
+fn init_retries_reject_duplicate_parts_and_accept_reordered_parts() {
+    let host = at("2026-10-28T09:00:00Z");
+    let c = campaign(&host);
+    let target = c.root.join("01-a/u/S1");
+    let mut declaration = Declaration {
+        lane: Some(Lane::Codex),
+        parts: vec!["a".into(), "b".into()],
+        ..Default::default()
+    };
+    assert!(
+        commands::declare(&host, &target, &declaration)
+            .unwrap()
+            .ok()
+    );
+    declaration.parts = vec!["b".into(), "a".into()];
+    assert!(
+        commands::declare(&host, &target, &declaration)
+            .unwrap()
+            .ok()
+    );
+    declaration.parts = vec!["a".into(), "a".into()];
+    let refused = commands::declare(&host, &target, &declaration).unwrap();
+    assert_eq!(rules(&refused), vec!["part-name"]);
+}
+
+#[test]
+fn init_rejects_invalid_parts_before_writing_state() {
+    let host = at("2026-10-28T09:00:00Z");
+    let c = campaign(&host);
+    for (target, lane, work, parts, rule) in [
+        (
+            "01-a/u/S1",
+            Lane::Codex,
+            Work::Code,
+            vec!["a", "a"],
+            "part-name",
+        ),
+        (
+            "01-a/u/S2",
+            Lane::Codex,
+            Work::Code,
+            vec!["bad/name"],
+            "part-name",
+        ),
+        (
+            "01-a/u/S3",
+            Lane::Owner,
+            Work::Code,
+            vec!["a"],
+            "part-target",
+        ),
+        (
+            "01-a/u/S4",
+            Lane::Codex,
+            Work::Study,
+            vec!["a"],
+            "part-target",
+        ),
+        (
+            "00-release/cm/0.8.0",
+            Lane::Codex,
+            Work::Code,
+            vec!["a"],
+            "part-target",
+        ),
+    ] {
+        let declaration = Declaration {
+            lane: Some(lane),
+            work,
+            parts: parts.into_iter().map(str::to_owned).collect(),
+            ..Default::default()
+        };
+        let outcome = commands::declare(&host, &c.root.join(target), &declaration).unwrap();
+        assert_eq!(rules(&outcome), vec![rule]);
+        assert!(!c.root.join(target).exists());
     }
 }
