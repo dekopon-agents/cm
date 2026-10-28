@@ -348,6 +348,11 @@ journaling apply; every other check still gates.
 
 ### Parts
 
+`cm init <step> --lane codex --part pr1 --part pr2 --part pr3` declares parts at step
+declaration time. In kickoff.md, write `Parts: pr1, pr2, pr3` (or `Slices:`). Lint warns
+`parts-undeclared` when fewer parts are declared; launch refuses unless
+`--no-parts "reason"` records an explicit exception in the journal.
+
 `cm amend <step> --part pr1 --part pr2 --part pr3` declares a step's required parts, one PR each.
 Each part moves on its own (`cm advance <step> pr-open --part pr1 --pr URL --sha S`, and `cm sync`
 moves parts through merged, released and deployed as it moves steps); the step's own state rolls

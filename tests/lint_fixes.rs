@@ -144,3 +144,46 @@ fn lint_cannot_clear_ignored_folders_outside_git() {
     assert_eq!(rules(&linted), vec!["git-ignored-unknown"]);
     assert!(linted.lines[0].contains("1 violation"));
 }
+
+#[test]
+fn lint_warns_when_kickoff_names_more_parts_than_declared() {
+    let host = at("2026-10-28T09:00:00Z");
+    for label in ["Parts", "Slices"] {
+        let c = campaign(&host);
+        let target = "01-a/u/S1";
+        assert!(declare(&host, &c, target, Lane::Codex, &[]).ok());
+        fs::write(
+            c.root.join(target).join("kickoff.md"),
+            format!("{label}: b1, b2, b3\n"),
+        )
+        .unwrap();
+        for count in 0..=3 {
+            let outcome = lint(&c.root).unwrap();
+            assert!(outcome.ok(), "{:?}", outcome.violations);
+            let warnings = outcome.fields["warnings"].as_array().unwrap();
+            assert_eq!(
+                warnings
+                    .iter()
+                    .filter(|warning| warning.as_str().unwrap().starts_with("parts-undeclared:"))
+                    .count(),
+                usize::from(count < 3)
+            );
+            if count < 3 {
+                let amendment = commands::Amendment {
+                    parts: vec![format!("b{}", count + 1)],
+                    ..Default::default()
+                };
+                assert!(
+                    commands::amend(
+                        &host,
+                        &c.root,
+                        &cm::store::parse_target(target, false).unwrap(),
+                        &amendment
+                    )
+                    .unwrap()
+                    .ok()
+                );
+            }
+        }
+    }
+}

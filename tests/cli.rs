@@ -253,3 +253,49 @@ fn review_record_ruling_and_brief_run_beside_the_review_row() {
     );
     assert_eq!(cm(root, &["lint"]).status.code(), Some(0));
 }
+
+#[test]
+fn init_part_and_launch_no_parts_flags_reach_the_commands() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(cm(root, &["init"]).status.success());
+    for (step, flags) in [
+        ("01-a/u/S1", vec!["--part", "a", "--part", "b"]),
+        ("01-a/u/S2", vec![]),
+    ] {
+        let mut args = vec!["init", step, "--lane", "codex"];
+        args.extend(flags);
+        let output = cm(root, &args);
+        assert!(output.status.success(), "{output:?}");
+        fs::write(root.join(step).join("kickoff.md"), "Parts: a, b\n").unwrap();
+    }
+    assert!(cm(root, &["launch", "01-a/u/S1"]).status.success());
+    assert!(!cm(root, &["launch", "01-a/u/S2"]).status.success());
+    assert!(
+        !cm(root, &["launch", "01-a/u/S2", "--no-parts"])
+            .status
+            .success()
+    );
+    assert!(
+        cm(
+            root,
+            &["launch", "01-a/u/S2", "--no-parts", "alternatives only"]
+        )
+        .status
+        .success()
+    );
+    let journal = fs::read_to_string(root.join("JOURNAL.md")).unwrap();
+    assert!(
+        journal
+            .lines()
+            .any(|line| line == "- no-parts: alternatives only")
+    );
+}

@@ -174,6 +174,7 @@ fn campaign(host: &Fake, pr: bool) -> Campaign {
     );
     fs::write(root.join(STEP).join("kickoff.md"), "Build the thing.\n").unwrap();
     let remote = Remote {
+        no_parts: None,
         coordinator: Some("session_a".into()),
         cap_min: None,
     };
