@@ -838,6 +838,7 @@ pub fn launch_remote(
     let launches = step.launches;
     if !local {
         step.attempt = Some(Attempt {
+            lane: step.lane,
             id: format!("{full}#{launches}"),
             generation: 1,
             coordinator: remote.coordinator.clone().unwrap_or_else(|| "—".to_owned()),

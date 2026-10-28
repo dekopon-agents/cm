@@ -8,12 +8,16 @@ use crate::evidence::CampaignFile;
 use crate::host::{Host, stamp};
 use crate::journal;
 use crate::outcome::{Outcome, Violation};
-use crate::state::{Attempt, AttemptOutcome, Ended, External};
+use crate::state::{Attempt, AttemptOutcome, Ended, External, Lane};
 use crate::store::{self, Target, is_name, lock};
 
 #[derive(Debug, Clone)]
 pub enum Act {
     Status,
+    Restart {
+        lane: Lane,
+        file: Option<PathBuf>,
+    },
     Claim {
         coordinator: String,
         expect: u32,
@@ -163,6 +167,31 @@ pub fn attempt(
     let ended = attempt.ended.is_some();
     let title = match act {
         Act::Status => None,
+        Act::Restart { lane, .. } => {
+            if attempt
+                .ended
+                .as_ref()
+                .is_none_or(|end| end.outcome != AttemptOutcome::Unknown)
+            {
+                violations.push(Violation::new(
+                    &full,
+                    "attempt-restart",
+                    "only `end unknown` permits restart",
+                ));
+            }
+            if expired(&attempt, now) {
+                violations.push(Violation::new(
+                    &full,
+                    "attempt-deadline",
+                    plan(&attempt, now).1,
+                ));
+            }
+            let launches = unit.steps[&step_name].launches + 1;
+            Some(format!(
+                "relaned {} → {full}#{launches} ({lane})",
+                attempt.id
+            ))
+        }
         Act::Claim {
             coordinator,
             expect,
@@ -205,7 +234,10 @@ pub fn attempt(
                     plan(&attempt, now).1,
                 ));
             }
-            Some(format!("{} begins {kind}", attempt.id))
+            Some(format!(
+                "{} begins {kind} (generation {})",
+                attempt.id, attempt.generation
+            ))
         }
         Act::Record { kind, id } => {
             if pending.is_none_or(|action| action.kind != *kind) {
@@ -218,7 +250,10 @@ pub fn attempt(
             if id.is_empty() || id.contains(char::is_whitespace) {
                 violations.push(Violation::new(&full, "attempt-record", "an id is one word"));
             }
-            Some(format!("{} {kind} {id}", attempt.id))
+            Some(format!(
+                "{} {kind} {id} (generation {})",
+                attempt.id, attempt.generation
+            ))
         }
         Act::End { outcome, .. } => {
             if let Some(action) = pending.filter(|_| *outcome != AttemptOutcome::Unknown) {
@@ -245,7 +280,7 @@ pub fn attempt(
             )),
         }
     }
-    if ended && !matches!(act, Act::Status) {
+    if ended && !matches!(act, Act::Status | Act::Restart { .. }) {
         violations.push(Violation::new(
             &full,
             "attempt-ended",
@@ -253,20 +288,26 @@ pub fn attempt(
         ));
     }
     let mut evidence = None;
-    if let Act::End { outcome, file } = act {
-        match (file, outcome) {
+    if let Act::End { file, .. } | Act::Restart { file, .. } = act {
+        match (file, act) {
             (Some(file), _) => match CampaignFile::resolve(root, file) {
                 Ok(found) => evidence = Some(found),
                 Err(error) => {
                     violations.push(Violation::new(&full, "evidence-file", error.to_string()))
                 }
             },
-            (None, AttemptOutcome::Partial) => violations.push(Violation::new(
+            (
+                None,
+                Act::End {
+                    outcome: AttemptOutcome::Partial,
+                    ..
+                },
+            ) => violations.push(Violation::new(
                 &full,
                 "evidence-missing",
                 "a partial attempt keeps its partial results: pass --evidence <file>",
             )),
-            (None, AttemptOutcome::Complete | AttemptOutcome::Unknown) => {}
+            (None, _) => {}
         }
     }
     if !violations.is_empty() {
@@ -274,6 +315,22 @@ pub fn attempt(
     }
     match act {
         Act::Status => {}
+        Act::Restart { lane, .. } => {
+            attempt.ended = Some(Ended {
+                at: at.clone(),
+                outcome: AttemptOutcome::Relaned,
+                evidence: evidence
+                    .clone()
+                    .or_else(|| attempt.ended.as_ref().and_then(|end| end.evidence.clone())),
+            });
+            let step = unit.steps.get_mut(&step_name).expect("attempt has a step");
+            step.attempt_history.push(attempt.clone());
+            step.launches += 1;
+            attempt.id = format!("{full}#{}", step.launches);
+            attempt.lane = Some(*lane);
+            attempt.actions.clear();
+            attempt.ended = None;
+        }
         Act::Claim { coordinator, .. } => {
             attempt.generation += 1;
             attempt.coordinator.clone_from(coordinator);
@@ -315,7 +372,18 @@ pub fn attempt(
         let heading = journal::heading(&at, &format!("attempt {full}: {title}"));
         journal::append(
             root,
-            &journal::entry(&at, &format!("attempt {full}: {title}"), Some(&body)),
+            &journal::entry(
+                &at,
+                &format!("attempt {full}: {title}"),
+                if matches!(
+                    act,
+                    Act::Begin { .. } | Act::Record { .. } | Act::Restart { .. }
+                ) {
+                    None
+                } else {
+                    Some(&body)
+                },
+            ),
         )?;
         outcome.field("journal", heading);
     }

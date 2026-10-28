@@ -634,6 +634,8 @@ pub struct Step {
     pub work: Work,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt: Option<Attempt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempt_history: Vec<Attempt>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub parts: BTreeMap<String, Track>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -848,6 +850,8 @@ pub fn part_needs(to: &Phase) -> Option<Phase> {
 /// resumes one execution or names an unknown outcome instead of dispatching again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attempt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<Lane>,
     pub id: String,
     pub generation: u32,
     pub coordinator: String,
@@ -887,6 +891,7 @@ pub enum AttemptOutcome {
     Complete,
     Partial,
     Unknown,
+    Relaned,
 }
 
 impl Attempt {
@@ -916,6 +921,7 @@ impl fmt::Display for AttemptOutcome {
             AttemptOutcome::Complete => "complete",
             AttemptOutcome::Partial => "partial",
             AttemptOutcome::Unknown => "unknown",
+            AttemptOutcome::Relaned => "relaned",
         })
     }
 }
@@ -949,6 +955,7 @@ impl Step {
             tag: None,
             work: Work::Code,
             attempt: None,
+            attempt_history: Vec::new(),
             parts: BTreeMap::new(),
             pins: Vec::new(),
             known_red: Vec::new(),
