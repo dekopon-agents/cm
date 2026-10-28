@@ -328,7 +328,7 @@ The gate's flags on any other move are `evidence-unexpected`. Steps in other lan
 ### Known-red exceptions
 
 `cm known-red <step> --commit SHA --check NAME --reason T --owner WHO --until A` lets (c) accept
-one failing check at one commit. Every field is required: the commit is all 40 hex digits and must
+one failing check at one commit. In this form every field is required: the commit is all 40 hex digits and must
 be the head of a PR the step (or one of its parts) records; `--until` is a gate as `--after` takes
 it, naming a declared step or release, and must not already hold. cm reads GitHub before it
 records the exception and refuses one whose check is absent, is anything but `failure` (an

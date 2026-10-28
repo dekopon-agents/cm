@@ -1795,3 +1795,69 @@ fn standing_known_red_accepts_a_new_head_only_while_the_base_check_fails() {
         .ok()
     );
 }
+
+#[test]
+fn campaign_standing_exception_covers_another_step_in_advance_sync_and_lint() {
+    let host = at("2026-10-26T08:00:00Z");
+    for syncing in [false, true] {
+        let c = campaign(&host, true);
+        accepted(&host, &c);
+        let head = c.head();
+        let red = red_at_head(&head, "failure", "failure");
+        assert!(known_red(&host, &c, &red, "", "red by design", "build").ok());
+        let dir = c.root.join("01-a/u");
+        let mut unit = store::load_unit(&dir).unwrap();
+        let exception = unit.steps.get_mut("S1").unwrap().known_red.remove(0);
+        unit.steps
+            .get_mut("build")
+            .unwrap()
+            .known_red
+            .push(exception);
+        commands::write_unit(&dir, &unit).unwrap();
+        assert_eq!(
+            rules(&c.merge(
+                &host,
+                &MergeGate {
+                    forge: Some(&red),
+                    ..MergeGate::default()
+                }
+            )),
+            vec!["merge-gate"]
+        );
+        unit.steps.get_mut("build").unwrap().known_red[0].campaign = true;
+        commands::write_unit(&dir, &unit).unwrap();
+        // A historical override at another head is covered by the campaign exception.
+        let waiver = c.write("waiver.md", "Owner: red by design.\n");
+        unit.steps
+            .get_mut("S1")
+            .unwrap()
+            .waived
+            .push(cm::state::Waived {
+                commit: "e".repeat(40),
+                check: "lab".into(),
+                file: cm::evidence::CampaignFile::resolve(&c.root, &waiver).unwrap(),
+                at: "2026-10-26T08:00:00Z".into(),
+            });
+        commands::write_unit(&dir, &unit).unwrap();
+        let linted = lint(&c.root).unwrap();
+        assert_eq!(linted.fields["warnings"].as_array().unwrap().len(), 0);
+        if syncing {
+            let merged = FakeForge {
+                state: PullState::Merged,
+                ..red
+            };
+            let result = sync(&host, &merged, &c.root).unwrap();
+            assert!(result.ok(), "{:?}", result.violations);
+        } else {
+            let result = c.merge(
+                &host,
+                &MergeGate {
+                    forge: Some(&red),
+                    ..MergeGate::default()
+                },
+            );
+            assert!(result.ok(), "{:?}", result.violations);
+        }
+        assert_eq!(c.state(), Phase::Merged);
+    }
+}

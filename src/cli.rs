@@ -193,7 +193,7 @@ enum Commands {
         #[arg(long, value_name = "NAME")]
         part: Option<String>,
     },
-    /// Record a known-red exception: the step's merge gate accepts this one check failing at this one commit until the closing condition holds. Refused for a check that is cancelled, timed out or unrun, or green at the PR's base.
+    /// Record a known-red exception: the merge gate accepts this check failing at one commit or, with --standing, across PR heads until the closing condition holds. Refused for a check that is cancelled, timed out or unrun, or green at the PR's base.
     KnownRed {
         /// <NN-name>/<unit>/<step>
         #[arg(value_parser = step_target)]

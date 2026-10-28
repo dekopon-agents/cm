@@ -105,7 +105,7 @@ pub fn mark_closed(units: &mut Units, at: &str) -> Vec<(String, String)> {
                         unit_name.clone(),
                         format!(
                             "- known-red {unit_name}/{name}: `{}` at {} closed, {} holds; the check blocks again",
-                            exception.check, exception.commit, exception.until
+                            exception.check, if exception.standing { "any head" } else { &exception.commit }, exception.until
                         ),
                     ));
                 }
@@ -340,7 +340,15 @@ pub fn known_red(
     write_unit(&dir, &unit)?;
     let mut body = format!(
         "- check: {}\n- commit: {}\n- reason: {}\n- owner: {}\n- closes when: {}\n",
-        exception.check, exception.commit, exception.reason, exception.owner, exception.until
+        exception.check,
+        if exception.standing {
+            "any head"
+        } else {
+            &exception.commit
+        },
+        exception.reason,
+        exception.owner,
+        exception.until
     );
     if exception.standing {
         body.push_str(&format!(
@@ -356,7 +364,13 @@ pub fn known_red(
     let mut outcome = Outcome::default();
     outcome.line(format!(
         "{full}: known-red {} at {} until {}",
-        exception.check, exception.commit, exception.until
+        exception.check,
+        if exception.standing {
+            "any head"
+        } else {
+            &exception.commit
+        },
+        exception.until
     ));
     outcome.field("target", full);
     outcome.field("exception", serde_json::to_value(&exception)?);
