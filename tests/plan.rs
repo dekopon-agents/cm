@@ -2473,13 +2473,19 @@ fn blocked_until_tag_is_listed_and_stays_blocked() {
 #[test]
 fn free_text_block_is_stale_after_25_hours_unless_later_title_names_step() {
     let host = at("2026-10-17T08:00:00Z");
-    let target = "01-a/u/S1";
-    for punctuation in ["", ".", "..."] {
+    for (target, mention) in [
+        ("01-a/u/S1", "01-a/u/S1"),
+        ("01-a/u/S1", "01-a/u/S1."),
+        ("01-a/u/S1", "01-a/u/S1..."),
+        ("01-a/u/S1.", "`01-a/u/S1.`"),
+        ("01-a/u/S1.", "`01-a/u/S1.`."),
+        ("01-a/u/S1.", "01-a/u/S1.."),
+        ("01-a/u/S1.", "01-a/u/S1...."),
+    ] {
         let c = campaign(&host);
         assert!(declare(&host, &c, target, Lane::Codex, &[]).ok());
         assert!(advance(&host, &c, target, "blocked:plan-gate", Evidence::default()).ok());
         let later = at("2026-10-18T09:00:00Z");
-        // A different dotted identifier in a later title must not count as a mention.
         cm::journal::append(
             &c.root,
             &cm::journal::entry(
@@ -2499,11 +2505,7 @@ fn free_text_block_is_stale_after_25_hours_unless_later_title_names_step() {
         );
         cm::journal::append(
             &c.root,
-            &cm::journal::entry(
-                "2026-10-18T08:00Z",
-                &format!("checked {target}{punctuation}"),
-                None,
-            ),
+            &cm::journal::entry("2026-10-18T08:00Z", &format!("checked {mention}"), None),
         )
         .unwrap();
         let warnings = cm::lint::lint_at(&c.root, later.now).unwrap().fields["warnings"].clone();

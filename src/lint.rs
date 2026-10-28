@@ -297,14 +297,15 @@ fn journal_mentions(root: &Path) -> BTreeMap<String, jiff::Timestamp> {
             continue;
         };
         for word in title.split(|c: char| !(c.is_ascii_alphanumeric() || "/._-".contains(c))) {
-            let word = word.trim_end_matches('.');
-            if store::parse_target(word, true).is_err() {
-                continue;
+            for candidate in std::iter::successors(Some(word), |word| word.strip_suffix('.')) {
+                if store::parse_target(candidate, true).is_err() {
+                    continue;
+                }
+                mentions
+                    .entry(candidate.to_owned())
+                    .and_modify(|last: &mut jiff::Timestamp| *last = (*last).max(at))
+                    .or_insert(at);
             }
-            mentions
-                .entry(word.to_owned())
-                .and_modify(|last: &mut jiff::Timestamp| *last = (*last).max(at))
-                .or_insert(at);
         }
     }
     mentions
