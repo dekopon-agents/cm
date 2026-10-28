@@ -55,6 +55,7 @@ struct FakeForge {
     down: bool,
     base: Option<String>,
     base_checks: Vec<(&'static str, &'static str)>,
+    parts: std::collections::BTreeMap<String, FakeForge>,
 }
 
 impl FakeForge {
@@ -67,12 +68,16 @@ impl FakeForge {
             down: false,
             base: None,
             base_checks: Vec::new(),
+            parts: Default::default(),
         }
     }
 }
 
 impl Forge for FakeForge {
-    fn pull(&self, _: &str) -> Result<Pull, ForgeError> {
+    fn pull(&self, url: &str) -> Result<Pull, ForgeError> {
+        if let Some(part) = self.parts.get(url) {
+            return part.pull(url);
+        }
         if self.down {
             return Err(ForgeError::Exit(Some(1)));
         }
@@ -86,7 +91,10 @@ impl Forge for FakeForge {
         })
     }
 
-    fn checks(&self, _: &GithubRepo, sha: &CommitSha) -> Result<Vec<CheckState>, ForgeError> {
+    fn checks(&self, _repo: &GithubRepo, sha: &CommitSha) -> Result<Vec<CheckState>, ForgeError> {
+        if let Some(part) = self.parts.values().find(|part| part.head == sha.as_str()) {
+            return part.checks(_repo, sha);
+        }
         if self.down {
             return Err(ForgeError::Exit(Some(1)));
         }
@@ -104,6 +112,29 @@ impl Forge for FakeForge {
             .iter()
             .map(|(name, state)| CheckState {
                 name: (*name).to_owned(),
+                state: (*state).to_owned().into(),
+            })
+            .collect())
+    }
+
+    fn latest_completed_checks(
+        &self,
+        _: &GithubRepo,
+        _: &CommitSha,
+        names: &[String],
+    ) -> Result<Vec<CheckState>, ForgeError> {
+        if self.down {
+            return Err(ForgeError::Exit(Some(1)));
+        }
+        Ok(self
+            .base_checks
+            .iter()
+            .filter(|(name, state)| {
+                names.iter().any(|wanted| wanted == name)
+                    && !["pending", "in_progress", "queued"].contains(state)
+            })
+            .map(|(name, state)| CheckState {
+                name: (*name).into(),
                 state: (*state).to_owned().into(),
             })
             .collect())
@@ -1486,7 +1517,7 @@ fn red_at_head(head: &str, lab: &'static str, base_lab: &'static str) -> FakeFor
 fn known_red(
     host: &Fake,
     c: &Campaign,
-    forge: &FakeForge,
+    forge: &dyn Forge,
     commit: &str,
     reason: &str,
     until: &str,
@@ -1498,6 +1529,8 @@ fn known_red(
         &target(),
         &cm::holds::KnownRedArgs {
             commit,
+            standing: commit.is_empty(),
+            campaign: false,
             check: "lab",
             reason,
             owner: "coordinator",
@@ -1740,4 +1773,277 @@ fn lint_warns_on_an_override_of_a_red_check_no_exception_names() {
             .contains("waived red check `lab`"),
         "{warnings:?}"
     );
+}
+
+#[test]
+fn standing_known_red_accepts_a_new_head_only_while_the_base_check_fails() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host, true);
+    accepted(&host, &c);
+    let head = c.head();
+    let red = red_at_head(&head, "failure", "failure");
+    assert!(known_red(&host, &c, &red, "", "red by design", "build").ok());
+    let units = cm::plan::load_units(&c.root).unwrap();
+    let exceptions = &units["01-a/u"].steps["S1"].known_red;
+    let changed = "e".repeat(40);
+    let check = cm::forge::CheckState {
+        name: "lab".into(),
+        state: cm::forge::Conclusion::Failure,
+    };
+    assert!(
+        cm::holds::cover(
+            exceptions,
+            &units,
+            &changed,
+            &check,
+            Some(std::slice::from_ref(&check)),
+            Some(std::slice::from_ref(&check))
+        )
+        .is_ok()
+    );
+    let green = cm::forge::CheckState {
+        name: "lab".into(),
+        state: cm::forge::Conclusion::Success,
+    };
+    assert_eq!(
+        cm::holds::cover(exceptions, &units, &changed, &check, None, Some(&[green])),
+        Err(cm::holds::Uncovered::GreenAtBase)
+    );
+    let refused = c.merge(
+        &host,
+        &MergeGate {
+            forge: Some(&red_at_head(&head, "failure", "success")),
+            ..MergeGate::default()
+        },
+    );
+    assert_eq!(rules(&refused), vec!["merge-gate"]);
+    assert!(
+        c.merge(
+            &host,
+            &MergeGate {
+                forge: Some(&red),
+                ..MergeGate::default()
+            }
+        )
+        .ok()
+    );
+}
+
+#[test]
+fn campaign_standing_exception_covers_another_step_in_advance_sync_and_lint() {
+    let host = at("2026-10-26T08:00:00Z");
+    for syncing in [false, true] {
+        let c = campaign(&host, true);
+        accepted(&host, &c);
+        let head = c.head();
+        let red = red_at_head(&head, "failure", "failure");
+        assert!(known_red(&host, &c, &red, "", "red by design", "build").ok());
+        let dir = c.root.join("01-a/u");
+        let mut unit = store::load_unit(&dir).unwrap();
+        let exception = unit.steps.get_mut("S1").unwrap().known_red.remove(0);
+        unit.steps
+            .get_mut("build")
+            .unwrap()
+            .known_red
+            .push(exception);
+        commands::write_unit(&dir, &unit).unwrap();
+        assert_eq!(
+            rules(&c.merge(
+                &host,
+                &MergeGate {
+                    forge: Some(&red),
+                    ..MergeGate::default()
+                }
+            )),
+            vec!["merge-gate"]
+        );
+        unit.steps.get_mut("build").unwrap().known_red[0].campaign = true;
+        commands::write_unit(&dir, &unit).unwrap();
+        let waiver = c.write("waiver.md", "Owner: red by design.\n");
+        unit.steps
+            .get_mut("S1")
+            .unwrap()
+            .waived
+            .push(cm::state::Waived {
+                commit: "e".repeat(40),
+                check: "lab".into(),
+                file: cm::evidence::CampaignFile::resolve(&c.root, &waiver).unwrap(),
+                at: "2026-10-26T08:00:00Z".into(),
+            });
+        commands::write_unit(&dir, &unit).unwrap();
+        let linted = lint(&c.root).unwrap();
+        assert_eq!(linted.fields["warnings"].as_array().unwrap().len(), 0);
+        if syncing {
+            let merged = FakeForge {
+                state: PullState::Merged,
+                ..red
+            };
+            let result = sync(&host, &merged, &c.root).unwrap();
+            assert!(result.ok(), "{:?}", result.violations);
+        } else {
+            let result = c.merge(
+                &host,
+                &MergeGate {
+                    forge: Some(&red),
+                    ..MergeGate::default()
+                },
+            );
+            assert!(result.ok(), "{:?}", result.violations);
+        }
+        assert_eq!(c.state(), Phase::Merged);
+    }
+}
+
+#[test]
+fn standing_registration_and_both_merge_gates_use_the_latest_completed_base_check() {
+    let host = at("2026-10-26T08:00:00Z");
+    for syncing in [false, true] {
+        let c = campaign(&host, true);
+        accepted(&host, &c);
+        let head = c.head();
+        let base = "b".repeat(40);
+        let earlier = "c".repeat(40);
+        let gh = support::FakeGh::new(&format!(
+            r#"case "$2" in
+  repos/o/r/pulls/7) cat "$FAKE_GH/pull.json" ;;
+  repos/o/r/commits/{head}/check-runs\?*) cat "$FAKE_GH/head.json" ;;
+  repos/o/r/commits/{base}/check-runs\?status=*) echo '{{"total_count":0,"check_runs":[]}}' ;;
+  repos/o/r/commits/{base}/check-runs\?*) echo '{{"total_count":1,"check_runs":[{{"name":"lab","status":"in_progress","conclusion":null}}]}}' ;;
+  repos/o/r/commits/{base}) echo '{{"parents":[{{"sha":"{earlier}"}},{{"sha":"side"}}]}}' ;;
+  repos/o/r/commits/{earlier}/check-runs\?status=*) cat "$FAKE_GH/earlier.json" ;;
+  */statuses\?*) echo '[]' ;;
+  */status\?*) echo '{{"total_count":0,"statuses":[]}}' ;;
+  *) exit 1 ;;
+esac
+"#
+        ));
+        let pull = serde_json::json!({ "state": "open", "merged": false, "head": {"sha": head}, "base": {"sha": base} });
+        fs::write(gh.fixture().join("pull.json"), pull.to_string()).unwrap();
+        fs::write(gh.fixture().join("head.json"), r#"{"total_count":1,"check_runs":[{"name":"lab","status":"completed","conclusion":"failure"}]}"#).unwrap();
+        let completed = |state| {
+            serde_json::json!({"total_count": 2, "check_runs": [
+                {"id": 1, "name": "lab", "status": "completed", "conclusion": "failure"},
+                {"id": 2, "name": "lab", "status": "completed", "conclusion": state}
+            ]})
+            .to_string()
+        };
+        let forge = Gh {
+            program: gh.program(),
+            timeout: Duration::from_secs(10),
+        };
+        let previous = gh.fixture().join("earlier.json");
+        fs::write(&previous, completed("success")).unwrap();
+        assert_eq!(
+            rules(&known_red(&host, &c, &forge, "", "red by design", "build")),
+            vec!["known-red-refused"]
+        );
+        fs::write(&previous, completed("failure")).unwrap();
+        assert_eq!(
+            rules(&known_red(
+                &host,
+                &c,
+                &forge,
+                &head,
+                "red by design",
+                "build"
+            )),
+            vec!["known-red-refused"]
+        );
+        let registered = known_red(&host, &c, &forge, "", "red by design", "build");
+        assert!(registered.ok(), "{:?}", registered.violations);
+        if syncing {
+            let mut merged = pull.clone();
+            merged["merged"] = true.into();
+            merged["merge_commit_sha"] = head.clone().into();
+            fs::write(gh.fixture().join("pull.json"), merged.to_string()).unwrap();
+        }
+        let gate = || {
+            if syncing {
+                sync(&host, &forge, &c.root).unwrap()
+            } else {
+                c.merge(
+                    &host,
+                    &MergeGate {
+                        forge: Some(&forge),
+                        ..MergeGate::default()
+                    },
+                )
+            }
+        };
+        for state in ["success", "cancelled", "timed_out"] {
+            fs::write(&previous, completed(state)).unwrap();
+            assert_eq!(rules(&gate()), vec!["merge-gate"], "{state}");
+            assert_eq!(c.state(), Phase::PrOpen);
+        }
+        fs::write(&previous, "unavailable").unwrap();
+        assert_eq!(rules(&gate()), vec!["merge-gate"]);
+        fs::write(&previous, completed("failure")).unwrap();
+        let merged = gate();
+        assert!(merged.ok(), "{:?}", merged.violations);
+        assert_eq!(c.state(), Phase::Merged);
+    }
+}
+
+#[test]
+fn standing_registration_tries_each_parts_pr_without_changing_commit_selection() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host, true);
+    accepted(&host, &c);
+    let amendment = commands::Amendment {
+        parts: vec!["one".into(), "two".into()],
+        ..Default::default()
+    };
+    assert!(
+        commands::amend(&host, &c.root, &target(), &amendment)
+            .unwrap()
+            .ok()
+    );
+    let second_pr = "https://github.com/o/r/pull/8";
+    let head = c.head();
+    let second_head = commit(&c.repo, "second.txt", "second part\n");
+    let opened = commands::advance_gated(
+        &host,
+        &c.root,
+        &target(),
+        commands::Advance {
+            to: &Phase::PrOpen,
+            given: &Evidence {
+                pr: Some(second_pr.into()),
+                sha: Some(second_head.clone()),
+                ..Default::default()
+            },
+            file: None,
+            repo: Some(&c.repo),
+            part: Some("two"),
+        },
+        &MergeGate::default(),
+    )
+    .unwrap();
+    assert!(opened.ok(), "{:?}", opened.violations);
+    let mut forge = red_at_head(&head, "success", "failure");
+    forge.parts.insert(
+        second_pr.into(),
+        red_at_head(&second_head, "failure", "failure"),
+    );
+    assert_eq!(
+        rules(&known_red(
+            &host,
+            &c,
+            &forge,
+            &head,
+            "red by design",
+            "build"
+        )),
+        vec!["known-red-refused"]
+    );
+    assert!(known_red(&host, &c, &forge, &second_head, "red by design", "build").ok());
+    let registered = known_red(&host, &c, &forge, "", "red by design", "build");
+    assert!(registered.ok(), "{:?}", registered.violations);
+    assert_eq!(registered.fields["exception"]["standing"], true);
+    let mut green = red_at_head(&head, "success", "failure");
+    green.parts.insert(
+        second_pr.into(),
+        red_at_head(&second_head, "success", "failure"),
+    );
+    assert!(!known_red(&host, &c, &green, "", "red by design", "build").ok());
 }

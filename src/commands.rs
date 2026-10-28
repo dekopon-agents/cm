@@ -1054,11 +1054,17 @@ struct GithubRead {
     base: Option<String>,
     checks: Result<Vec<CheckState>, String>,
     base_checks: Option<Vec<CheckState>>,
+    standing_base_checks: Option<Vec<CheckState>>,
     /// `--head` disagreed with GitHub's head.
     mismatch: Option<String>,
 }
 
-fn read_github(gate: &MergeGate, pr: &str, recorded: Option<&str>) -> GithubRead {
+fn read_github(
+    gate: &MergeGate,
+    pr: &str,
+    recorded: Option<&str>,
+    standing: &[String],
+) -> GithubRead {
     let pull = match gate.forge {
         Some(forge) => forge.pull(pr).map_err(|error| error.to_string()),
         None => Err("no GitHub reader".to_owned()),
@@ -1106,12 +1112,26 @@ fn read_github(gate: &MergeGate, pr: &str, recorded: Option<&str>) -> GithubRead
         }
         _ => None,
     };
+    let standing_base_checks = match (failed, gate.forge, GithubRepo::of_pr(pr), &base, &checks) {
+        (true, Some(forge), Some(repo), Some(base), Ok(checks)) => {
+            let names: Vec<_> = checks
+                .iter()
+                .filter(|check| !check.green() && standing.contains(&check.name))
+                .map(|check| check.name.clone())
+                .collect();
+            forge
+                .latest_completed_checks(&repo, &CommitSha::new(base.clone()), &names)
+                .ok()
+        }
+        _ => None,
+    };
     GithubRead {
         pr: pr.to_owned(),
         head,
         base,
         checks,
         base_checks,
+        standing_base_checks,
         mismatch,
     }
 }
@@ -1129,11 +1149,21 @@ pub(crate) fn red_checks(
     head: &str,
     checks: &[CheckState],
     base: Option<&[CheckState]>,
+    standing_base: Option<&[CheckState]>,
 ) -> (Vec<String>, Vec<(String, String)>) {
+    let mut exceptions = exceptions.to_vec();
+    exceptions.extend(
+        units
+            .values()
+            .flat_map(|unit| unit.steps.values())
+            .flat_map(|step| &step.known_red)
+            .filter(|exception| exception.standing && exception.campaign)
+            .cloned(),
+    );
     let mut accepted = Vec::new();
     let mut refused = Vec::new();
     for check in checks.iter().filter(|check| !check.green()) {
-        match crate::holds::cover(exceptions, units, head, check, base) {
+        match crate::holds::cover(&exceptions, units, head, check, base, standing_base) {
             Ok(exception) => accepted.push(crate::holds::used_line(head, exception)),
             Err(crate::holds::Uncovered::NoException) => {
                 refused.push((
@@ -1187,7 +1217,11 @@ fn merge_gate(
     };
     let read = match read.filter(|read| read.pr == pr) {
         Some(read) => read,
-        None => read_github(gate, &pr, track.evidence.sha.as_deref()),
+        None => {
+            let units = plan::load_units(root)?;
+            let standing = crate::holds::standing_names(&units, exceptions);
+            read_github(gate, &pr, track.evidence.sha.as_deref(), &standing)
+        }
     };
     if let Some(mismatch) = &read.mismatch {
         violations.push(Violation::new(&full, "merge-head", mismatch.clone()));
@@ -1222,7 +1256,7 @@ fn merge_gate(
         Ok(checks) => {
             let units = plan::load_units(root)?;
             let (accepted, refused) =
-                red_checks(exceptions, &units, &head, &checks, read.base_checks.as_deref());
+                red_checks(exceptions, &units, &head, &checks, read.base_checks.as_deref(), read.standing_base_checks.as_deref());
             lines.extend(accepted);
             if refused.is_empty() {
                 lines.push(format!(
@@ -1337,7 +1371,14 @@ pub fn advance_gated(
                 None => &step.track,
             };
             let pr = track.evidence.pr.as_deref()?;
-            Some(read_github(gate, pr, track.evidence.sha.as_deref()))
+            let units = plan::load_units(root).ok()?;
+            let standing = crate::holds::standing_names(&units, &step.known_red);
+            Some(read_github(
+                gate,
+                pr,
+                track.evidence.sha.as_deref(),
+                &standing,
+            ))
         });
     let _lock = lock(root)?;
     let campaign = store::load_campaign(root)?;

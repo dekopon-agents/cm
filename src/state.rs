@@ -702,7 +702,12 @@ impl Pin {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KnownRed {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub commit: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub standing: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub campaign: bool,
     pub check: String,
     pub reason: String,
     pub owner: String,

@@ -105,7 +105,7 @@ pub fn mark_closed(units: &mut Units, at: &str) -> Vec<(String, String)> {
                         unit_name.clone(),
                         format!(
                             "- known-red {unit_name}/{name}: `{}` at {} closed, {} holds; the check blocks again",
-                            exception.check, exception.commit, exception.until
+                            exception.check, if exception.standing { "any head" } else { &exception.commit }, exception.until
                         ),
                     ));
                 }
@@ -121,20 +121,46 @@ pub fn cover<'a>(
     head: &str,
     check: &CheckState,
     base: Option<&[CheckState]>,
+    standing_base: Option<&[CheckState]>,
 ) -> Result<&'a KnownRed, Uncovered> {
     let named: Vec<&KnownRed> = exceptions
         .iter()
         .filter(|exception| {
-            exception.commit.eq_ignore_ascii_case(head) && exception.check == check.name
+            (exception.standing || exception.commit.eq_ignore_ascii_case(head))
+                && exception.check == check.name
         })
         .collect();
-    let first = named.first().ok_or(Uncovered::NoException)?;
-    verify(check, base)?;
-    named
+    let mut why = Uncovered::NoException;
+    for exception in named {
+        match verify(
+            check,
+            if exception.standing {
+                standing_base
+            } else {
+                base
+            },
+        ) {
+            Err(error) => why = error,
+            Ok(()) if is_open(units, exception) => return Ok(exception),
+            Ok(()) => why = Uncovered::Closed(exception.until.clone()),
+        }
+    }
+    Err(why)
+}
+
+pub(crate) fn standing_names(units: &Units, exceptions: &[KnownRed]) -> Vec<String> {
+    exceptions
         .iter()
-        .copied()
-        .find(|exception| is_open(units, exception))
-        .ok_or_else(|| Uncovered::Closed(first.until.clone()))
+        .chain(
+            units
+                .values()
+                .flat_map(|unit| unit.steps.values())
+                .flat_map(|step| &step.known_red)
+                .filter(|exception| exception.campaign),
+        )
+        .filter(|exception| exception.standing && is_open(units, exception))
+        .map(|exception| exception.check.clone())
+        .collect()
 }
 
 pub fn used_line(head: &str, exception: &KnownRed) -> String {
@@ -146,6 +172,8 @@ pub fn used_line(head: &str, exception: &KnownRed) -> String {
 
 pub struct KnownRedArgs<'a> {
     pub commit: &'a str,
+    pub standing: bool,
+    pub campaign: bool,
     pub check: &'a str,
     pub reason: &'a str,
     pub owner: &'a str,
@@ -175,33 +203,67 @@ fn red_on_github(
 ) -> Vec<Violation> {
     let prs = pull_requests(step);
     let mut unread = Vec::new();
-    let found = prs.iter().find_map(|url| match forge.pull(url) {
-        Ok(pull) => pull
-            .head
-            .filter(|head| same_commit(head.as_str(), commit))
-            .and_then(|_| Some((GithubRepo::of_pr(url)?, pull.base))),
-        Err(error) => {
-            unread.push(format!("{url}: {error}"));
-            None
-        }
-    });
-    let Some((repo, base)) = found else {
-        let message = if prs.is_empty() {
-            format!("{full} records no PR; the exception names a PR head")
-        } else if unread.is_empty() {
-            format!("`{commit}` is not the head of {}", prs.join(", "))
-        } else {
-            format!("cannot verify `{commit}` on GitHub: {}", unread.join("; "))
+    let mut refused = Vec::new();
+    for url in &prs {
+        let pull = match forge.pull(url) {
+            Ok(pull) => pull,
+            Err(error) => {
+                unread.push(format!("{url}: {error}"));
+                continue;
+            }
         };
-        return vec![Violation::new(full, "known-red-commit", message)];
+        let Some(head) = pull
+            .head
+            .filter(|head| commit.is_empty() || same_commit(head.as_str(), commit))
+        else {
+            continue;
+        };
+        let Some(repo) = GithubRepo::of_pr(url) else {
+            continue;
+        };
+        let violations = red_at_head(
+            forge,
+            full,
+            &repo,
+            &head,
+            pull.base.as_ref(),
+            check,
+            commit.is_empty(),
+        );
+        if violations.is_empty() || !commit.is_empty() {
+            return violations;
+        }
+        refused.extend(violations);
+    }
+    if !refused.is_empty() {
+        return refused;
+    }
+    let message = if prs.is_empty() {
+        format!("{full} records no PR; the exception names a PR head")
+    } else if unread.is_empty() {
+        format!("`{commit}` is not the head of {}", prs.join(", "))
+    } else {
+        format!("cannot verify `{commit}` on GitHub: {}", unread.join("; "))
     };
-    let checks = match forge.checks(&repo, &CommitSha::new(commit)) {
+    vec![Violation::new(full, "known-red-commit", message)]
+}
+
+fn red_at_head(
+    forge: &dyn Forge,
+    full: &str,
+    repo: &GithubRepo,
+    head: &CommitSha,
+    base: Option<&CommitSha>,
+    check: &str,
+    standing: bool,
+) -> Vec<Violation> {
+    let checks = match forge.checks(repo, head) {
         Ok(checks) => checks,
         Err(error) => {
             return vec![Violation::new(
                 full,
                 "known-red-unverified",
-                format!("cannot read CI at {commit}: {error}"),
+                format!("cannot read CI at {head}: {error}"),
             )];
         }
     };
@@ -209,16 +271,24 @@ fn red_on_github(
         return vec![Violation::new(
             full,
             "known-red-check",
-            format!("GitHub reports no check `{check}` at {commit}"),
+            format!("GitHub reports no check `{check}` at {head}"),
         )];
     };
-    let before = base.and_then(|base| forge.checks(&repo, &base).ok());
+    let before = base.and_then(|base| {
+        if standing {
+            forge
+                .latest_completed_checks(repo, base, &[check.to_owned()])
+                .ok()
+        } else {
+            forge.checks(repo, base).ok()
+        }
+    });
     match verify(named, before.as_deref()) {
         Ok(()) => Vec::new(),
         Err(why) => vec![Violation::new(
             full,
             "known-red-refused",
-            format!("`{check}` at {commit}: {why}"),
+            format!("`{check}` at {head}: {why}"),
         )],
     }
 }
@@ -240,12 +310,15 @@ pub fn known_red(
     ] {
         one_line(field, text, &mut violations, &full);
     }
-    if !(args.commit.len() == 40 && is_commit(args.commit)) {
+    if (args.standing && !args.commit.is_empty())
+        || (!args.standing && !(args.commit.len() == 40 && is_commit(args.commit)))
+        || (args.campaign && !args.standing)
+    {
         violations.push(Violation::new(
             &full,
             "known-red-commit",
             format!(
-                "`{}` is not an exact commit: an exception names all 40 hex digits",
+                "`{}`: use --commit with all 40 hex digits, or --standing without --commit; campaign scope requires --standing",
                 args.commit
             ),
         ));
@@ -310,6 +383,8 @@ pub fn known_red(
     let at = stamp(host.now());
     let exception = KnownRed {
         commit: args.commit.to_ascii_lowercase(),
+        standing: args.standing,
+        campaign: args.campaign,
         check: args.check.trim().to_owned(),
         reason: args.reason.trim().to_owned(),
         owner: args.owner.trim().to_owned(),
@@ -329,15 +404,39 @@ pub fn known_red(
     };
     step.known_red.push(exception.clone());
     write_unit(&dir, &unit)?;
-    let body = format!(
+    let mut body = format!(
         "- check: {}\n- commit: {}\n- reason: {}\n- owner: {}\n- closes when: {}\n",
-        exception.check, exception.commit, exception.reason, exception.owner, exception.until
+        exception.check,
+        if exception.standing {
+            "any head"
+        } else {
+            &exception.commit
+        },
+        exception.reason,
+        exception.owner,
+        exception.until
     );
+    if exception.standing {
+        body.push_str(&format!(
+            "- standing: true\n- scope: {}\n",
+            if exception.campaign {
+                "campaign"
+            } else {
+                "step"
+            }
+        ));
+    }
     let journal = journal_line(root, &at, &format!("known-red {full}"), &body)?;
     let mut outcome = Outcome::default();
     outcome.line(format!(
         "{full}: known-red {} at {} until {}",
-        exception.check, exception.commit, exception.until
+        exception.check,
+        if exception.standing {
+            "any head"
+        } else {
+            &exception.commit
+        },
+        exception.until
     ));
     outcome.field("target", full);
     outcome.field("exception", serde_json::to_value(&exception)?);

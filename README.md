@@ -337,7 +337,7 @@ The gate's flags on any other move are `evidence-unexpected`. Steps in other lan
 ### Known-red exceptions
 
 `cm known-red <step> --commit SHA --check NAME --reason T --owner WHO --until A` lets (c) accept
-one failing check at one commit. Every field is required: the commit is all 40 hex digits and must
+one failing check at one commit. In this form every field is required: the commit is all 40 hex digits and must
 be the head of a PR the step (or one of its parts) records; `--until` is a gate as `--after` takes
 it, naming a declared step or release, and must not already hold. cm reads GitHub before it
 records the exception and refuses one whose check is absent, is anything but `failure` (an
@@ -347,6 +347,15 @@ test at merge time: an exception covers a red check only at its exact commit, fo
 name, while the check still fails and also failed at the base, and until its closing condition
 holds; every other check must still be green. The move journals each exception it used, and
 `cm sync` journals once when an exception's closing condition first holds; it stays closed.
+
+Use `--standing` instead of `--commit SHA` to cover any PR head of the step.
+Add `--scope campaign` to cover any step in the campaign (`--scope step` is the default).
+Standing exceptions use the named check's latest completed run on the base branch.
+cm walks the base tip's first-parent history, skipping commits where that check is
+absent or still pending. Only a completed `failure` qualifies; a completed green
+result or unavailable evidence refuses the exception. The PR head must still fail.
+Per-commit exceptions continue to require failure at the current base tip. The same closing condition and
+journaling apply; every other check still gates.
 
 ### Parts
 
