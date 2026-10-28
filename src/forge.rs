@@ -288,6 +288,16 @@ pub trait Forge {
     fn pull(&self, url: &str) -> Result<Pull, ForgeError>;
     /// Every check run and commit status GitHub reports on `sha`.
     fn checks(&self, repo: &GithubRepo, sha: &CommitSha) -> Result<Vec<CheckState>, ForgeError>;
+    /// The named checks' latest completed results along the base branch's first-parent history.
+    /// Unavailable history is an error, never evidence that a check failed.
+    fn latest_completed_checks(
+        &self,
+        _repo: &GithubRepo,
+        _base: &CommitSha,
+        _names: &[String],
+    ) -> Result<Vec<CheckState>, ForgeError> {
+        Err(ForgeError::Json)
+    }
     fn tag_exists(&self, repo: &GithubRepo, tag: &TagName) -> Result<bool, ForgeError>;
     fn tag_contains(
         &self,
@@ -317,6 +327,96 @@ impl Default for Gh {
 const MAX_PAGES: usize = 50;
 
 impl Gh {
+    fn read_checks(
+        &self,
+        repo: &GithubRepo,
+        sha: &CommitSha,
+        completed: bool,
+    ) -> Result<Vec<CheckState>, ForgeError> {
+        #[derive(Deserialize)]
+        struct Runs {
+            total_count: usize,
+            check_runs: Vec<Run>,
+        }
+        #[derive(Deserialize)]
+        struct Run {
+            #[serde(default)]
+            id: u64,
+            name: String,
+            status: String,
+            conclusion: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Combined {
+            total_count: usize,
+            statuses: Vec<Status>,
+        }
+        #[derive(Deserialize)]
+        struct Status {
+            #[serde(default)]
+            id: u64,
+            context: String,
+            state: String,
+        }
+        let mut runs = self.pages(
+            &format!(
+                "repos/{repo}/commits/{sha}/check-runs{}",
+                if completed {
+                    "?status=completed&filter=all"
+                } else {
+                    ""
+                }
+            ),
+            |page: Runs| (page.total_count, page.check_runs),
+        )?;
+        let mut statuses = if completed {
+            let mut statuses = Vec::new();
+            for page in 1..=MAX_PAGES {
+                let items: Vec<Status> = self.json(&[
+                    "api",
+                    &format!("repos/{repo}/commits/{sha}/statuses?per_page=100&page={page}"),
+                ])?;
+                let done = items.len() < 100;
+                statuses.extend(items);
+                if done {
+                    break;
+                }
+                if page == MAX_PAGES {
+                    return Err(ForgeError::Json);
+                }
+            }
+            statuses
+        } else {
+            self.pages(
+                &format!("repos/{repo}/commits/{sha}/status"),
+                |page: Combined| (page.total_count, page.statuses),
+            )?
+        };
+        if completed {
+            runs.retain(|run| run.status == "completed");
+            runs.sort_by_key(|run| std::cmp::Reverse(run.id));
+            let mut names = std::collections::BTreeSet::new();
+            runs.retain(|run| names.insert(run.name.clone()));
+            statuses.retain(|status| status.state != "pending");
+            statuses.sort_by_key(|status| std::cmp::Reverse(status.id));
+            let mut names = std::collections::BTreeSet::new();
+            statuses.retain(|status| names.insert(status.context.clone()));
+        }
+        let runs = runs.into_iter().map(|run| CheckState {
+            state: match (run.status.as_str(), run.conclusion) {
+                ("completed", Some(conclusion)) => conclusion.to_lowercase(),
+                (status, _) => status.to_lowercase(),
+            }
+            .into(),
+            name: run.name,
+        });
+        let statuses = statuses.into_iter().map(|status| CheckState {
+            name: status.context,
+            state: status.state.to_lowercase().into(),
+        });
+        Ok(runs.chain(statuses).collect())
+    }
+
     /// Every item of a paginated list endpoint whose pages report `total_count`: page after page
     /// until the total is read. A page that cannot be read, or that ends the list short of its
     /// total, is an error, never a shorter list.
@@ -327,8 +427,13 @@ impl Gh {
     ) -> Result<Vec<T>, ForgeError> {
         let mut out = Vec::new();
         for page in 1..=MAX_PAGES {
-            let (total, items) =
-                split(self.json(&["api", &format!("{path}?per_page=100&page={page}")])?);
+            let (total, items) = split(self.json(&[
+                "api",
+                &format!(
+                    "{path}{}per_page=100&page={page}",
+                    if path.contains('?') { '&' } else { '?' }
+                ),
+            ])?);
             let empty = items.is_empty();
             out.extend(items);
             if out.len() >= total {
@@ -425,48 +530,46 @@ impl Forge for Gh {
     }
 
     fn checks(&self, repo: &GithubRepo, sha: &CommitSha) -> Result<Vec<CheckState>, ForgeError> {
+        self.read_checks(repo, sha, false)
+    }
+
+    fn latest_completed_checks(
+        &self,
+        repo: &GithubRepo,
+        base: &CommitSha,
+        names: &[String],
+    ) -> Result<Vec<CheckState>, ForgeError> {
         #[derive(Deserialize)]
-        struct Runs {
-            total_count: usize,
-            check_runs: Vec<Run>,
+        struct Commit {
+            parents: Vec<Parent>,
         }
         #[derive(Deserialize)]
-        struct Run {
-            name: String,
-            status: String,
-            conclusion: Option<String>,
+        struct Parent {
+            sha: String,
         }
-        #[derive(Deserialize)]
-        struct Combined {
-            total_count: usize,
-            statuses: Vec<Status>,
-        }
-        #[derive(Deserialize)]
-        struct Status {
-            context: String,
-            state: String,
-        }
-        let runs = self.pages(
-            &format!("repos/{repo}/commits/{sha}/check-runs"),
-            |page: Runs| (page.total_count, page.check_runs),
-        )?;
-        let statuses = self.pages(
-            &format!("repos/{repo}/commits/{sha}/status"),
-            |page: Combined| (page.total_count, page.statuses),
-        )?;
-        let runs = runs.into_iter().map(|run| CheckState {
-            state: match (run.status.as_str(), run.conclusion) {
-                ("completed", Some(conclusion)) => conclusion.to_lowercase(),
-                (status, _) => status.to_lowercase(),
+        let mut remaining: std::collections::BTreeSet<_> = names.iter().cloned().collect();
+        let mut found = Vec::new();
+        let mut sha = base.clone();
+        while !remaining.is_empty() {
+            let checks = self.read_checks(repo, &sha, true)?;
+            let named: Vec<_> = checks
+                .into_iter()
+                .filter(|check| remaining.contains(&check.name))
+                .collect();
+            for check in &named {
+                remaining.remove(&check.name);
             }
-            .into(),
-            name: run.name,
-        });
-        let statuses = statuses.into_iter().map(|status| CheckState {
-            name: status.context,
-            state: status.state.to_lowercase().into(),
-        });
-        Ok(runs.chain(statuses).collect())
+            found.extend(named);
+            if remaining.is_empty() {
+                break;
+            }
+            let commit: Commit = self.json(&["api", &format!("repos/{repo}/commits/{sha}")])?;
+            let Some(parent) = commit.parents.first() else {
+                break;
+            };
+            sha = CommitSha::new(parent.sha.clone());
+        }
+        Ok(found)
     }
 
     fn tag_exists(&self, repo: &GithubRepo, tag: &TagName) -> Result<bool, ForgeError> {

@@ -33,6 +33,7 @@ struct Reads {
     tags: BTreeMap<(GithubRepo, TagName), Read<bool>>,
     contains: BTreeMap<(GithubRepo, TagName, CommitSha), Read<bool>>,
     checks: BTreeMap<(GithubRepo, CommitSha), Read<Vec<CheckState>>>,
+    completed_checks: BTreeMap<(GithubRepo, CommitSha, Vec<String>), Read<Vec<CheckState>>>,
 }
 
 fn cached<K: Ord, T: Clone>(
@@ -294,6 +295,25 @@ impl<'a> Run<'a> {
         })
     }
 
+    fn completed_checks(
+        &mut self,
+        repo: &GithubRepo,
+        base: &CommitSha,
+        checks: &[CheckState],
+        step: &Step,
+    ) -> Option<Read<Vec<CheckState>>> {
+        let standing = crate::holds::standing_names(&self.units, &step.known_red);
+        let names: Vec<_> = checks
+            .iter()
+            .filter(|check| !check.green() && standing.contains(&check.name))
+            .map(|check| check.name.clone())
+            .collect();
+        let key = (repo.clone(), base.clone(), names.clone());
+        cached(&mut self.reads.completed_checks, key, self.forge, |forge| {
+            forge.latest_completed_checks(repo, base, &names)
+        })
+    }
+
     /// A codex step merged on GitHub moves to merged only when its merge gate holds at the PR
     /// head, as `cm advance` requires; otherwise it stays at pr-open with a `merge-gate`.
     fn gate_holds(
@@ -352,12 +372,16 @@ impl<'a> Run<'a> {
                     },
                     None => None,
                 };
+                let completed = base
+                    .and_then(|base| self.completed_checks(&repo, base, &checks, step))
+                    .and_then(Result::ok);
                 let (accepted, refused) = crate::commands::red_checks(
                     &step.known_red,
                     &self.units,
                     head.as_str(),
                     &checks,
                     before.as_deref(),
+                    completed.as_deref(),
                 );
                 if refused.is_empty() {
                     used = accepted;

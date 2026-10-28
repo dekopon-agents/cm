@@ -199,14 +199,25 @@ enum Commands {
         #[arg(long, value_name = "NAME")]
         part: Option<String>,
     },
-    /// Record a known-red exception: the step's merge gate accepts this one check failing at this one commit until the closing condition holds. Refused for a check that is cancelled, timed out or unrun, or green at the PR's base.
+    /// Record a known-red exception: the merge gate accepts this check failing at one commit or, with --standing, across PR heads until the closing condition holds. Refused for a check that is cancelled, timed out or unrun, or green at the PR's base.
     KnownRed {
         /// <NN-name>/<unit>/<step>
         #[arg(value_parser = step_target)]
         target: Target,
         /// The PR head the check failed at, all 40 hex digits.
-        #[arg(long, value_name = "SHA")]
-        commit: String,
+        #[arg(
+            long,
+            value_name = "SHA",
+            required_unless_present = "standing",
+            conflicts_with = "standing"
+        )]
+        commit: Option<String>,
+        /// Cover any PR head until the closing condition holds.
+        #[arg(long)]
+        standing: bool,
+        /// Apply a standing exception to this step or the whole campaign.
+        #[arg(long, value_parser = ["step", "campaign"], default_value = "step")]
+        scope: String,
         /// The check's exact name as GitHub reports it.
         #[arg(long, value_name = "NAME")]
         check: String,
@@ -623,6 +634,8 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
         Commands::KnownRed {
             target,
             commit,
+            standing,
+            scope,
             check,
             reason,
             owner,
@@ -633,7 +646,9 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             &root()?,
             target,
             &crate::holds::KnownRedArgs {
-                commit,
+                commit: commit.as_deref().unwrap_or_default(),
+                standing: *standing,
+                campaign: scope == "campaign",
                 check,
                 reason,
                 owner,

@@ -137,7 +137,19 @@ fn holds(name: &str, step: &Step) -> Vec<String> {
     let exceptions = step.known_red.iter().map(|exception| {
         format!(
             "{name}: known-red `{}` at {} until {}, owner {}: {}",
-            exception.check, exception.commit, exception.until, exception.owner, exception.reason
+            exception.check,
+            if exception.standing {
+                if exception.campaign {
+                    "any head (campaign)"
+                } else {
+                    "any head (step)"
+                }
+            } else {
+                &exception.commit
+            },
+            exception.until,
+            exception.owner,
+            exception.reason
         )
     });
     let waived = step.waived.iter().map(|waived| {
