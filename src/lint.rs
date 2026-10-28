@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -279,6 +280,34 @@ struct Seen<'a> {
     warnings: Vec<String>,
     now: jiff::Timestamp,
     units: crate::plan::Units,
+    mentions: BTreeMap<String, jiff::Timestamp>,
+}
+
+fn journal_mentions(root: &Path) -> BTreeMap<String, jiff::Timestamp> {
+    let mut mentions = BTreeMap::new();
+    let text = fs::read_to_string(root.join(JOURNAL)).unwrap_or_default();
+    for line in text.lines() {
+        let Some((at, title)) = line
+            .strip_prefix("## ")
+            .and_then(|line| line.split_once(" — "))
+        else {
+            continue;
+        };
+        let Some(at) = crate::plan::instant(at) else {
+            continue;
+        };
+        for word in title.split(|c: char| !(c.is_ascii_alphanumeric() || "/._-".contains(c))) {
+            let word = word.trim_end_matches('.');
+            if store::parse_target(word, true).is_err() {
+                continue;
+            }
+            mentions
+                .entry(word.to_owned())
+                .and_modify(|last: &mut jiff::Timestamp| *last = (*last).max(at))
+                .or_insert(at);
+        }
+    }
+    mentions
 }
 
 fn lint_holds(root: &Path, unit: &UnitState, seen: &mut Seen, out: &mut Vec<Violation>) {
@@ -289,23 +318,11 @@ fn lint_holds(root: &Path, unit: &UnitState, seen: &mut Seen, out: &mut Vec<Viol
             && crate::plan::instant(&step.track.since)
                 .is_some_and(|since| seen.now.duration_since(since).as_secs() > 24 * 3600)
         {
-            let mentioned = fs::read_to_string(root.join(JOURNAL))
-                .unwrap_or_default()
-                .lines()
-                .any(|line| {
-                    line.strip_prefix("## ")
-                        .and_then(|line| line.split_once(" — "))
-                        .is_some_and(|(at, title)| {
-                            crate::plan::instant(at)
-                                .zip(crate::plan::instant(&step.track.since))
-                                .is_some_and(|(at, since)| at > since)
-                                && title
-                                    .split(|c: char| {
-                                        !(c.is_ascii_alphanumeric() || "/._-".contains(c))
-                                    })
-                                    .any(|word| word == target)
-                        })
-                });
+            let mentioned = seen
+                .mentions
+                .get(&target)
+                .zip(crate::plan::instant(&step.track.since))
+                .is_some_and(|(at, since)| *at > since);
             if !mentioned {
                 seen.warnings.push(format!("block-stale: {target} has been blocked:{reason} for more than 24 h with no later journal title naming it"));
             }
@@ -577,6 +594,7 @@ pub fn lint_at(start: &Path, now: jiff::Timestamp) -> Result<Outcome> {
         warnings: Vec::new(),
         now,
         units: crate::plan::load_units(&root).unwrap_or_default(),
+        mentions: journal_mentions(&root),
     };
     for dir in &units {
         violations.extend(lint_unit(&root, dir, &mut seen));

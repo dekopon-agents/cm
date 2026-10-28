@@ -2418,7 +2418,7 @@ fn a_fresh_pin_of_one_part_never_renews_a_stale_pin_of_its_sibling() {
 }
 
 #[test]
-fn blocked_until_tag_is_reported_once_and_stays_blocked() {
+fn blocked_until_tag_is_listed_and_stays_blocked() {
     let host = at("2026-10-17T08:00:00Z");
     let c = campaign(&host);
     let release = "00-release/guest/0.7.0";
@@ -2456,8 +2456,7 @@ fn blocked_until_tag_is_reported_once_and_stays_blocked() {
         ("xrl/vm-runner".into(), "guest-v0.7.0".into()),
         ["m1".to_owned()].into(),
     );
-    let observed = sync(&host, &forge, &c.root).unwrap();
-    assert!(observed.fields.contains_key("journal"));
+    sync(&host, &forge, &c.root).unwrap();
     let next = plan::next(&c.root, None, None).unwrap();
     assert_eq!(next.fields["unblock_now"][0]["target"], target);
     assert_eq!(
@@ -2468,43 +2467,122 @@ fn blocked_until_tag_is_reported_once_and_stays_blocked() {
         state(&c, target),
         Phase::Blocked("until:tag:guest@0.7.0".into())
     );
-    assert!(
-        !sync(&host, &forge, &c.root)
-            .unwrap()
-            .fields
-            .contains_key("journal")
-    );
 }
 
 #[test]
 fn free_text_block_is_stale_after_25_hours_unless_later_title_names_step() {
     let host = at("2026-10-17T08:00:00Z");
-    let c = campaign(&host);
     let target = "01-a/u/S1";
-    assert!(declare(&host, &c, target, Lane::Codex, &[]).ok());
-    assert!(advance(&host, &c, target, "blocked:plan-gate", Evidence::default()).ok());
-    let later = at("2026-10-18T09:00:00Z");
-    let warnings = cm::lint::lint_at(&c.root, later.now).unwrap().fields["warnings"].clone();
-    assert!(
-        warnings
-            .as_array()
+    for punctuation in ["", ".", "..."] {
+        let c = campaign(&host);
+        assert!(declare(&host, &c, target, Lane::Codex, &[]).ok());
+        assert!(advance(&host, &c, target, "blocked:plan-gate", Evidence::default()).ok());
+        let later = at("2026-10-18T09:00:00Z");
+        // A different dotted identifier in a later title must not count as a mention.
+        cm::journal::append(
+            &c.root,
+            &cm::journal::entry(
+                "2026-10-18T07:00Z",
+                &format!("checked {target}.other."),
+                None,
+            ),
+        )
+        .unwrap();
+        let warnings = cm::lint::lint_at(&c.root, later.now).unwrap().fields["warnings"].clone();
+        assert!(
+            warnings
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w.as_str().unwrap().starts_with("block-stale:"))
+        );
+        cm::journal::append(
+            &c.root,
+            &cm::journal::entry(
+                "2026-10-18T08:00Z",
+                &format!("checked {target}{punctuation}"),
+                None,
+            ),
+        )
+        .unwrap();
+        let warnings = cm::lint::lint_at(&c.root, later.now).unwrap().fields["warnings"].clone();
+        assert!(
+            !warnings
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w.as_str().unwrap().starts_with("block-stale:"))
+        );
+    }
+}
+
+#[test]
+fn blocked_until_epoch_reads_crlf_and_requires_an_exact_closing_delimiter() {
+    let host = at("2026-10-17T08:00:00Z");
+    for (manifest, met) in [
+        ("---\r\nstatus: WORKING\r\n---\r\n", true),
+        ("---\nstatus: WORKING\n---invalid\n", false),
+    ] {
+        let c = campaign(&host);
+        let target = "01-a/u/S1";
+        assert!(declare(&host, &c, target, Lane::Codex, &[]).ok());
+        assert!(
+            advance(
+                &host,
+                &c,
+                target,
+                "blocked:until:epoch:WORKING",
+                Evidence::default()
+            )
+            .ok()
+        );
+        fs::write(c.root.join("EPOCH.md"), manifest).unwrap();
+        let next = plan::next(&c.root, None, None).unwrap();
+        assert_eq!(
+            next.fields["unblock_now"].as_array().unwrap().len(),
+            usize::from(met)
+        );
+        let forge = FakeForge::default();
+        let journal_before = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+        let first = sync(&host, &forge, &c.root).unwrap();
+        assert!(first.ok(), "{:?}", first.violations);
+        assert_eq!(first.fields["moves"], serde_json::json!([]));
+        let journal_after = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+        let appended = journal_after.strip_prefix(&journal_before).unwrap();
+        if met {
+            let expected = cm::journal::entry(
+                "2026-10-17T08:00Z",
+                "cm sync: 0 move(s) from GitHub",
+                Some("- unblock now 01-a/u/S1: epoch:WORKING holds; still blocked"),
+            );
+            assert_eq!(appended.trim_start_matches('\n'), expected);
+        } else {
+            assert_eq!(appended, "");
+        }
+        let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+        let blocked = card
+            .split_once("## Blocked\n")
             .unwrap()
-            .iter()
-            .any(|w| w.as_str().unwrap().starts_with("block-stale:"))
-    );
-    cm::journal::append(
-        &c.root,
-        &cm::journal::entry("2026-10-18T08:00Z", &format!("checked {target}"), None),
-    )
-    .unwrap();
-    let warnings = cm::lint::lint_at(&c.root, later.now).unwrap().fields["warnings"].clone();
-    assert!(
-        !warnings
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w.as_str().unwrap().starts_with("block-stale:"))
-    );
+            .1
+            .split("\n## ")
+            .next()
+            .unwrap();
+        assert_eq!(
+            blocked.trim(),
+            format!(
+                "- `{target}` blocked:until:epoch:WORKING since 2026-10-17T08:00Z; condition {}",
+                if met { "holds" } else { "does not hold" }
+            )
+        );
+        let second = sync(&host, &forge, &c.root).unwrap();
+        assert!(second.ok(), "{:?}", second.violations);
+        assert_eq!(second.fields["moves"], serde_json::json!([]));
+        assert!(!second.fields.contains_key("journal"));
+        assert_eq!(
+            fs::read_to_string(c.root.join("JOURNAL.md")).unwrap(),
+            journal_after
+        );
+    }
 }
 
 #[test]

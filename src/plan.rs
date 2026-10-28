@@ -620,7 +620,6 @@ pub fn next_at(
     Ok(outcome)
 }
 
-/// Normalize blocked-until conditions using the same parser as order gates.
 pub(crate) fn block_condition(text: &str, unit: &str) -> Result<String, String> {
     if text == "epoch:WORKING" {
         return Ok(text.into());
@@ -639,17 +638,10 @@ pub(crate) fn block_condition(text: &str, unit: &str) -> Result<String, String> 
 
 pub(crate) fn block_met(root: &Path, units: &Units, unit: &str, condition: &str) -> bool {
     if condition == "epoch:WORKING" {
-        return fs::read_to_string(root.join("EPOCH.md")).is_ok_and(|text| {
-            text.strip_prefix("---\n")
-                .and_then(|s| s.split_once("\n---"))
-                .is_some_and(|(front, _)| {
-                    front.lines().any(|l| {
-                        l.split_once(':')
-                            .is_some_and(|(k, v)| k == "status" && v.trim() == "WORKING")
-                    })
-                })
-        });
+        return fs::read_to_string(root.join(crate::epoch::EPOCH))
+            .is_ok_and(|text| crate::epoch::status(&text) == Some(crate::epoch::Status::Working));
     }
+
     if let Some(number) = condition.strip_prefix("owner-queue:") {
         return fs::read_to_string(root.join("OWNER-QUEUE.md")).is_ok_and(|text| {
             !crate::markdown::headings(&text).iter().any(|h| {
