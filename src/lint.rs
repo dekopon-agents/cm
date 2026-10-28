@@ -333,10 +333,21 @@ fn lint_holds(root: &Path, unit: &UnitState, seen: &mut Seen, out: &mut Vec<Viol
             }
         }
         for waived in &step.waived {
-            let named = step.known_red.iter().any(|exception| {
-                crate::state::same_commit(&exception.commit, &waived.commit)
-                    && exception.check == waived.check
-            });
+            let named = step
+                .known_red
+                .iter()
+                .chain(
+                    seen.units
+                        .values()
+                        .flat_map(|unit| unit.steps.values())
+                        .flat_map(|step| &step.known_red)
+                        .filter(|exception| exception.standing && exception.campaign),
+                )
+                .any(|exception| {
+                    (crate::state::same_commit(&exception.commit, &waived.commit)
+                        || (exception.standing && crate::holds::is_open(&seen.units, exception)))
+                        && exception.check == waived.check
+                });
             if !named {
                 seen.warnings.push(format!(
                     "{target}: --override {} waived red check `{}` at {} with no known-red exception; record one with `cm known-red`",

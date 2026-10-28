@@ -339,6 +339,13 @@ name, while the check still fails and also failed at the base, and until its clo
 holds; every other check must still be green. The move journals each exception it used, and
 `cm sync` journals once when an exception's closing condition first holds; it stays closed.
 
+Use `--standing` instead of `--commit SHA` to cover any PR head of the step.
+Add `--scope campaign` to cover any step in the campaign (`--scope step` is the default).
+Standing exceptions use the same live GitHub check read at the latest base-branch tip:
+the named check must still be `failure` there and at the PR head. Green, absent,
+pending or unread base checks refuse the exception. The same closing condition and
+journaling apply; every other check still gates.
+
 ### Parts
 
 `cm amend <step> --part pr1 --part pr2 --part pr3` declares a step's required parts, one PR each.

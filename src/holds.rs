@@ -125,7 +125,8 @@ pub fn cover<'a>(
     let named: Vec<&KnownRed> = exceptions
         .iter()
         .filter(|exception| {
-            exception.commit.eq_ignore_ascii_case(head) && exception.check == check.name
+            (exception.standing || exception.commit.eq_ignore_ascii_case(head))
+                && exception.check == check.name
         })
         .collect();
     let first = named.first().ok_or(Uncovered::NoException)?;
@@ -146,6 +147,8 @@ pub fn used_line(head: &str, exception: &KnownRed) -> String {
 
 pub struct KnownRedArgs<'a> {
     pub commit: &'a str,
+    pub standing: bool,
+    pub campaign: bool,
     pub check: &'a str,
     pub reason: &'a str,
     pub owner: &'a str,
@@ -178,14 +181,14 @@ fn red_on_github(
     let found = prs.iter().find_map(|url| match forge.pull(url) {
         Ok(pull) => pull
             .head
-            .filter(|head| same_commit(head.as_str(), commit))
-            .and_then(|_| Some((GithubRepo::of_pr(url)?, pull.base))),
+            .filter(|head| commit.is_empty() || same_commit(head.as_str(), commit))
+            .and_then(|head| Some((GithubRepo::of_pr(url)?, pull.base, head))),
         Err(error) => {
             unread.push(format!("{url}: {error}"));
             None
         }
     });
-    let Some((repo, base)) = found else {
+    let Some((repo, base, head)) = found else {
         let message = if prs.is_empty() {
             format!("{full} records no PR; the exception names a PR head")
         } else if unread.is_empty() {
@@ -195,6 +198,7 @@ fn red_on_github(
         };
         return vec![Violation::new(full, "known-red-commit", message)];
     };
+    let commit = head.as_str();
     let checks = match forge.checks(&repo, &CommitSha::new(commit)) {
         Ok(checks) => checks,
         Err(error) => {
@@ -240,12 +244,15 @@ pub fn known_red(
     ] {
         one_line(field, text, &mut violations, &full);
     }
-    if !(args.commit.len() == 40 && is_commit(args.commit)) {
+    if (args.standing && !args.commit.is_empty())
+        || (!args.standing && !(args.commit.len() == 40 && is_commit(args.commit)))
+        || (args.campaign && !args.standing)
+    {
         violations.push(Violation::new(
             &full,
             "known-red-commit",
             format!(
-                "`{}` is not an exact commit: an exception names all 40 hex digits",
+                "`{}`: use --commit with all 40 hex digits, or --standing without --commit; campaign scope requires --standing",
                 args.commit
             ),
         ));
@@ -310,6 +317,8 @@ pub fn known_red(
     let at = stamp(host.now());
     let exception = KnownRed {
         commit: args.commit.to_ascii_lowercase(),
+        standing: args.standing,
+        campaign: args.campaign,
         check: args.check.trim().to_owned(),
         reason: args.reason.trim().to_owned(),
         owner: args.owner.trim().to_owned(),
@@ -329,10 +338,20 @@ pub fn known_red(
     };
     step.known_red.push(exception.clone());
     write_unit(&dir, &unit)?;
-    let body = format!(
+    let mut body = format!(
         "- check: {}\n- commit: {}\n- reason: {}\n- owner: {}\n- closes when: {}\n",
         exception.check, exception.commit, exception.reason, exception.owner, exception.until
     );
+    if exception.standing {
+        body.push_str(&format!(
+            "- standing: true\n- scope: {}\n",
+            if exception.campaign {
+                "campaign"
+            } else {
+                "step"
+            }
+        ));
+    }
     let journal = journal_line(root, &at, &format!("known-red {full}"), &body)?;
     let mut outcome = Outcome::default();
     outcome.line(format!(

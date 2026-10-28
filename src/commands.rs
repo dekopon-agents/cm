@@ -1078,10 +1078,19 @@ pub(crate) fn red_checks(
     checks: &[CheckState],
     base: Option<&[CheckState]>,
 ) -> (Vec<String>, Vec<(String, String)>) {
+    let mut exceptions = exceptions.to_vec();
+    exceptions.extend(
+        units
+            .values()
+            .flat_map(|unit| unit.steps.values())
+            .flat_map(|step| &step.known_red)
+            .filter(|exception| exception.standing && exception.campaign)
+            .cloned(),
+    );
     let mut accepted = Vec::new();
     let mut refused = Vec::new();
     for check in checks.iter().filter(|check| !check.green()) {
-        match crate::holds::cover(exceptions, units, head, check, base) {
+        match crate::holds::cover(&exceptions, units, head, check, base) {
             Ok(exception) => accepted.push(crate::holds::used_line(head, exception)),
             Err(crate::holds::Uncovered::NoException) => {
                 refused.push((

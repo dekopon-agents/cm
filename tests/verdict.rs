@@ -1497,6 +1497,8 @@ fn known_red(
         &target(),
         &cm::holds::KnownRedArgs {
             commit,
+            standing: commit.is_empty(),
+            campaign: false,
             check: "lab",
             reason,
             owner: "coordinator",
@@ -1738,5 +1740,58 @@ fn lint_warns_on_an_override_of_a_red_check_no_exception_names() {
             .unwrap()
             .contains("waived red check `lab`"),
         "{warnings:?}"
+    );
+}
+
+#[test]
+fn standing_known_red_accepts_a_new_head_only_while_the_base_check_fails() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host, true);
+    accepted(&host, &c);
+    let head = c.head();
+    let red = red_at_head(&head, "failure", "failure");
+    assert!(known_red(&host, &c, &red, "", "red by design", "build").ok());
+    let units = cm::plan::load_units(&c.root).unwrap();
+    let exceptions = &units["01-a/u"].steps["S1"].known_red;
+    let changed = "e".repeat(40);
+    let check = cm::forge::CheckState {
+        name: "lab".into(),
+        state: cm::forge::Conclusion::Failure,
+    };
+    assert!(
+        cm::holds::cover(
+            exceptions,
+            &units,
+            &changed,
+            &check,
+            Some(std::slice::from_ref(&check))
+        )
+        .is_ok()
+    );
+    let green = cm::forge::CheckState {
+        name: "lab".into(),
+        state: cm::forge::Conclusion::Success,
+    };
+    assert_eq!(
+        cm::holds::cover(exceptions, &units, &changed, &check, Some(&[green])),
+        Err(cm::holds::Uncovered::GreenAtBase)
+    );
+    let refused = c.merge(
+        &host,
+        &MergeGate {
+            forge: Some(&red_at_head(&head, "failure", "success")),
+            ..MergeGate::default()
+        },
+    );
+    assert_eq!(rules(&refused), vec!["merge-gate"]);
+    assert!(
+        c.merge(
+            &host,
+            &MergeGate {
+                forge: Some(&red),
+                ..MergeGate::default()
+            }
+        )
+        .ok()
     );
 }
