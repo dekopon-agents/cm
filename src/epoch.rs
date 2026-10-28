@@ -123,6 +123,12 @@ fn value<'a>(lines: &'a [String], front: &Front, key: &str) -> Option<&'a str> {
     })
 }
 
+pub(crate) fn status(text: &str) -> Option<Status> {
+    let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let front = front(&lines)?;
+    Status::of_label(value(&lines, &front, "status")?)
+}
+
 fn set(lines: &mut Vec<String>, front: &mut Front, key: &str, text: &str) {
     let line = format!("{key}: {text}");
     match (front.start..front.end).find(|index| {
@@ -198,7 +204,7 @@ pub fn epoch(
     let current = value(&lines, &front, "status")
         .unwrap_or_default()
         .to_owned();
-    match Status::of_label(&current) {
+    match status(&text) {
         None => violations.push(Violation::new(
             EPOCH,
             "epoch-status",
