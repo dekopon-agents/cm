@@ -120,7 +120,7 @@ pub fn declare(host: &dyn Host, dir: &Path, declaration: &Declaration) -> Result
         return Ok(Outcome::refused(vec![Violation::new(
             dir.to_string_lossy(),
             "init-target",
-            "--lane, --after, --study, --github and --tag declare a step inside a campaign; no campaign holds this folder",
+            "--lane, --part, --after, --study, --github and --tag declare a step inside a campaign; no campaign holds this folder",
         )]));
     }
     init_campaign(host, &dir)
@@ -466,6 +466,7 @@ fn init_step(
             return repair(host, root, &dir, existing.as_ref(), step_name, &full);
         }
         if let (Some(mut unit), Some(tag)) = (existing.clone(), &tag)
+            && declaration.parts.is_empty()
             && step.tag.is_none()
             && step.github.is_none()
             && step.lane == Some(lane)
