@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -272,6 +273,8 @@ pub fn unit_state_file(root: &Path, dir: &Path, unit: &UnitState) -> Vec<Violati
     }
 }
 
+type JournalMentions = BTreeMap<String, BTreeMap<usize, jiff::Timestamp>>;
+
 struct Seen<'a> {
     home: Option<&'a Path>,
     sealed: bool,
@@ -279,6 +282,53 @@ struct Seen<'a> {
     warnings: Vec<String>,
     now: jiff::Timestamp,
     units: crate::plan::Units,
+    mentions: JournalMentions,
+}
+
+fn journal_mentions(root: &Path) -> JournalMentions {
+    let mut mentions = JournalMentions::new();
+    let text = fs::read_to_string(root.join(JOURNAL)).unwrap_or_default();
+    for line in text.lines() {
+        let Some((at, title)) = line
+            .strip_prefix("## ")
+            .and_then(|line| line.split_once(" — "))
+        else {
+            continue;
+        };
+        let Some(at) = crate::plan::instant(at) else {
+            continue;
+        };
+        for word in title.split(|c: char| !(c.is_ascii_alphanumeric() || "/._-".contains(c))) {
+            let target = word.trim_end_matches('.');
+            if store::parse_target(target, true).is_err() {
+                continue;
+            }
+            mentions
+                .entry(target.to_owned())
+                .or_default()
+                .entry(word.len() - target.len())
+                .and_modify(|last| *last = (*last).max(at))
+                .or_insert(at);
+        }
+    }
+    for counts in mentions.values_mut() {
+        let mut latest = jiff::Timestamp::MIN;
+        for at in counts.values_mut().rev() {
+            latest = latest.max(*at);
+            *at = latest;
+        }
+    }
+    mentions
+}
+
+fn latest_mention(mentions: &JournalMentions, target: &str) -> Option<jiff::Timestamp> {
+    let trimmed = target.trim_end_matches('.');
+    let count = target.len() - trimmed.len();
+    mentions
+        .get(trimmed)?
+        .range(count..)
+        .next()
+        .map(|(_, at)| *at)
 }
 
 pub(crate) fn undeclared_parts(
@@ -325,6 +375,18 @@ pub(crate) fn undeclared_parts(
 fn lint_holds(root: &Path, unit: &UnitState, seen: &mut Seen, out: &mut Vec<Violation>) {
     for (name, step) in &unit.steps {
         let target = format!("{}/{name}", unit.unit);
+        if let Phase::Blocked(reason) = &step.track.state
+            && !reason.starts_with("until:")
+            && crate::plan::instant(&step.track.since)
+                .is_some_and(|since| seen.now.duration_since(since).as_secs() > 24 * 3600)
+        {
+            let mentioned = latest_mention(&seen.mentions, &target)
+                .zip(crate::plan::instant(&step.track.since))
+                .is_some_and(|(at, since)| at > since);
+            if !mentioned {
+                seen.warnings.push(format!("block-stale: {target} has been blocked:{reason} for more than 24 h with no later journal title naming it"));
+            }
+        }
         match undeclared_parts(root, &target, step) {
             Ok(found) => seen.warnings.extend(
                 found
@@ -604,6 +666,7 @@ pub fn lint_at(start: &Path, now: jiff::Timestamp) -> Result<Outcome> {
         warnings: Vec::new(),
         now,
         units: crate::plan::load_units(&root).unwrap_or_default(),
+        mentions: journal_mentions(&root),
     };
     for dir in &units {
         violations.extend(lint_unit(&root, dir, &mut seen));
@@ -634,6 +697,38 @@ pub fn lint_at(start: &Path, now: jiff::Timestamp) -> Result<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_period_mentions_use_the_latest_timestamp_at_or_above_the_query_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let long = format!("01-a/u/S1{}", ".".repeat(32_000));
+        let mut journal = String::new();
+        for (at, target) in [
+            ("2026-10-18T08:00Z", "01-a/u/S1."),
+            ("2026-10-18T09:00Z", "01-a/u/S1"),
+            ("2026-10-18T07:00Z", long.as_str()),
+            ("2026-10-18T06:00Z", long.as_str()),
+        ] {
+            let title = format!("checked {target}");
+            journal::validate(&title, None).unwrap();
+            journal.push_str(&journal::entry(at, &title, None));
+        }
+        fs::write(temp.path().join(JOURNAL), journal).unwrap();
+        let mentions = journal_mentions(temp.path());
+        for (target, expected) in [
+            ("01-a/u/S1", Some("2026-10-18T09:00Z")),
+            ("01-a/u/S1.", Some("2026-10-18T08:00Z")),
+            ("01-a/u/S1..", Some("2026-10-18T07:00Z")),
+            (long.as_str(), Some("2026-10-18T07:00Z")),
+            (format!("{long}.").as_str(), None),
+            ("01-a/u/S1.other", None),
+        ] {
+            assert_eq!(
+                latest_mention(&mentions, target),
+                expected.and_then(crate::plan::instant)
+            );
+        }
+    }
 
     #[test]
     fn packet_paths_resolve_against_the_repository() {
