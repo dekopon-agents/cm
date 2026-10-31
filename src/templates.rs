@@ -9,6 +9,7 @@ pub const RESUME: &str = include_str!("../templates/RESUME.md");
 pub const JOURNAL: &str = include_str!("../templates/JOURNAL.md");
 pub const LIMITS: &str = include_str!("../templates/LIMITS.toml");
 pub const OWNER_QUEUE: &str = include_str!("../templates/OWNER-QUEUE.md");
+pub const MAC_LANE: &str = include_str!("../templates/MAC-LANE.md");
 
 pub const ROOT_FILES: [(&str, &str); 4] = [
     ("RESUME.md", RESUME),
@@ -25,6 +26,8 @@ pub const RESUME_HEADINGS: [&str; 4] = [
 ];
 
 pub const QUEUE_FILE: &str = "OWNER-QUEUE.md";
+
+pub const MAC_LANE_FILE: &str = "MAC-LANE.md";
 
 pub const QUEUE_FIELDS: [&str; 3] = ["Context:", "Recommendation:", "Answer:"];
 

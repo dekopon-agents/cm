@@ -13,7 +13,7 @@ use crate::state::{CampaignState, Phase, Track, UnitState};
 use crate::store::{
     self, JOURNAL, UNIT_STATE, find_root, is_name, is_subcampaign_name, relative, state_path,
 };
-use crate::templates::{self, Banner, QUEUE_FILE, ROOT_FILES};
+use crate::templates::{self, Banner, MAC_LANE_FILE, QUEUE_FILE, ROOT_FILES};
 
 pub fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
@@ -626,6 +626,16 @@ pub fn unsealed(root: &Path) -> Vec<Violation> {
             "OWNER-QUEUE.md has an open item; answer it or move it to the successor before the campaign closes",
         ));
     }
+    if let Some(item) = crate::ledger::mac_lane_open(root).first() {
+        out.push(
+            Violation::new(
+                MAC_LANE_FILE,
+                "closed-mac-lane",
+                "MAC-LANE.md has an open item; finish it or move it to the successor before the campaign closes",
+            )
+            .at(item.line),
+        );
+    }
     for dir in unit_dirs(root) {
         let Ok(unit) = store::load_unit(&dir) else {
             continue;
@@ -667,6 +677,7 @@ pub fn lint_at(start: &Path, now: jiff::Timestamp) -> Result<Outcome> {
     violations.extend(root_files(&root, state.as_ref()));
     let units = unit_dirs(&root);
     violations.extend(crate::ledger::lint_feedback(&root));
+    violations.extend(crate::ledger::lint_mac_lane(&root));
     violations.extend(crate::review::lint_reviews(&root));
     violations.extend(orphan_units(&root));
     violations.extend(ignored(&root, &units));

@@ -709,3 +709,188 @@ fn an_interrupted_first_review_journal_entry_can_be_recovered() {
     assert_eq!(review_entries(&root), 1);
     assert!(lint(&root).unwrap().ok());
 }
+
+const MAC_FIXTURE: &str = include_str!("fixtures/mac-lane/MAC-LANE.md");
+
+fn mac_lane(root: &Path) -> String {
+    fs::read_to_string(root.join("MAC-LANE.md")).unwrap()
+}
+
+fn card(root: &Path) -> String {
+    let next = cm::plan::Next {
+        paused: false,
+        ready: Vec::new(),
+        waiting: Vec::new(),
+    };
+    cm::render::card(
+        root,
+        "2026-10-23T03:10Z",
+        "c",
+        &Default::default(),
+        &next,
+        &[],
+    )
+}
+
+#[test]
+fn mac_lane_add_numbers_on_and_indents_the_body() {
+    let (_temp, root) = campaign();
+    assert_eq!(
+        rules(&ledger::mac_lane_add(&Fake, &root, " ", "").unwrap()),
+        vec!["ledger-field"]
+    );
+    assert_eq!(
+        rules(&ledger::mac_lane_add(&Fake, &root, "a **b**", "").unwrap()),
+        vec!["mac-lane-title"]
+    );
+    assert!(!root.join("MAC-LANE.md").exists());
+    let added = ledger::mac_lane_add(&Fake, &root, "Mint the key", "").unwrap();
+    assert!(added.ok(), "{:?}", added.violations);
+    assert_eq!(added.fields["item"], 1);
+    let added = ledger::mac_lane_add(
+        &Fake,
+        &root,
+        "Re-save the script",
+        "Paste it.\n- Read back its sha256.\n\n- Update the State row.\n",
+    )
+    .unwrap();
+    assert_eq!(added.fields["item"], 2);
+    let text = mac_lane(&root);
+    assert!(text.starts_with("# Mac lane queue\n\n"));
+    assert!(text.ends_with(
+        ".\n\n1. **Mint the key**\n2. **Re-save the script** Paste it.\n    - Read back its sha256.\n\n    - Update the State row.\n"
+    ));
+    let journal = fs::read_to_string(root.join("JOURNAL.md")).unwrap();
+    assert!(journal.contains("mac-lane add 2. Re-save the script"));
+    fs::write(root.join("MAC-LANE.md"), MAC_FIXTURE).unwrap();
+    let added = ledger::mac_lane_add(&Fake, &root, "Next", "").unwrap();
+    assert_eq!(added.fields["item"], 8);
+    assert_eq!(mac_lane(&root), format!("{MAC_FIXTURE}8. **Next**\n"));
+    assert!(lint(&root).unwrap().ok());
+}
+
+#[test]
+fn mac_lane_done_replaces_an_open_status_and_refuses_a_second_done() {
+    let (_temp, root) = campaign();
+    assert_eq!(
+        rules(&ledger::mac_lane_done(&Fake, &root, 1, "r").unwrap()),
+        vec!["mac-lane-item"]
+    );
+    fs::write(root.join("MAC-LANE.md"), MAC_FIXTURE).unwrap();
+    for (number, rule) in [
+        (1, "mac-lane-closed"),
+        (2, "mac-lane-closed"),
+        (9, "mac-lane-item"),
+    ] {
+        assert_eq!(
+            rules(&ledger::mac_lane_done(&Fake, &root, number, "r").unwrap()),
+            vec![rule]
+        );
+    }
+    assert_eq!(
+        rules(&ledger::mac_lane_done(&Fake, &root, 5, "a\nb").unwrap()),
+        vec!["ledger-field"]
+    );
+    assert_eq!(mac_lane(&root), MAC_FIXTURE);
+    let done = ledger::mac_lane_done(&Fake, &root, 5, "script landed as abc1234").unwrap();
+    assert!(done.ok(), "{:?}", done.violations);
+    let held = "5. **HELD 2026-10-31; owner kept it held the same day** (starts";
+    let stamped = "5. **DONE 2026-10-23** (script landed as abc1234). (starts";
+    assert_eq!(mac_lane(&root), MAC_FIXTURE.replace(held, stamped));
+    assert_eq!(
+        rules(&ledger::mac_lane_done(&Fake, &root, 5, "again").unwrap()),
+        vec!["mac-lane-closed"]
+    );
+    for number in [4, 6, 7] {
+        assert!(
+            ledger::mac_lane_done(&Fake, &root, number, "r")
+                .unwrap()
+                .ok()
+        );
+    }
+    let text = mac_lane(&root);
+    assert!(
+        text.contains("\n4. **DONE 2026-10-23** (r). The checks would never run. **At the restart")
+    );
+    assert!(text.contains("\n6. **DONE 2026-10-23** (r). (owner go 17:44Z). **Second scored"));
+    assert!(text.ends_with(
+        "\n7. **DONE 2026-10-23** (r). **Re-save the setup script with the one-queue rule** (owner, 2026-10-31). Same steps as item 1.\n"
+    ));
+    let journal = fs::read_to_string(root.join("JOURNAL.md")).unwrap();
+    assert!(journal.contains("mac-lane done 5. Build `tools/example.sh`"));
+    assert!(lint(&root).unwrap().ok());
+}
+
+#[test]
+fn mac_lane_list_shows_open_items_with_their_state() {
+    let (_temp, root) = campaign();
+    let empty = ledger::mac_lane_list(&root).unwrap();
+    assert_eq!(empty.lines, vec!["no open Mac lane item"]);
+    fs::write(root.join("MAC-LANE.md"), MAC_FIXTURE).unwrap();
+    let listed = ledger::mac_lane_list(&root).unwrap();
+    assert_eq!(
+        listed.lines,
+        vec![
+            "4. At the restart (after the live check) (held)",
+            "5. Build `tools/example.sh` (held)",
+            "6. Second scored example matrix (running)",
+            "7. Re-save the setup script with the one-queue rule (open)",
+        ]
+    );
+    assert_eq!(
+        listed.to_json("mac-lane")["items"][1],
+        serde_json::json!({"item": 5, "state": "held", "title": "Build `tools/example.sh`"})
+    );
+}
+
+#[test]
+fn the_card_lists_open_mac_lane_items_only_when_there_are_some() {
+    let (_temp, root) = campaign();
+    assert!(!card(&root).contains("## Mac lane"));
+    fs::write(root.join("MAC-LANE.md"), MAC_FIXTURE).unwrap();
+    assert!(card(&root).contains(
+        "\n## Mac lane\n\n- 4. At the restart (after the live check) (held)\n- 5. Build `tools/example.sh` (held)\n- 6. Second scored example matrix (running)\n- 7. Re-save the setup script with the one-queue rule (open)\n\n## Next\n"
+    ));
+    let done = MAC_FIXTURE.split("\n4. ").next().unwrap().to_owned() + "\n";
+    fs::write(root.join("MAC-LANE.md"), done).unwrap();
+    assert!(!card(&root).contains("## Mac lane"));
+}
+
+#[test]
+fn close_refuses_an_open_mac_lane_item() {
+    let (_temp, root) = campaign();
+    assert!(
+        ledger::mac_lane_add(&Fake, &root, "Tick the setting", "")
+            .unwrap()
+            .ok()
+    );
+    assert_eq!(
+        rules(&commands::close(&Fake, &root).unwrap()),
+        vec!["closed-mac-lane"]
+    );
+    assert!(
+        ledger::mac_lane_done(&Fake, &root, 1, "ticked")
+            .unwrap()
+            .ok()
+    );
+    assert!(commands::close(&Fake, &root).unwrap().ok());
+}
+
+#[test]
+fn lint_checks_mac_lane_numbering_only() {
+    let (_temp, root) = campaign();
+    fs::write(root.join("MAC-LANE.md"), MAC_FIXTURE).unwrap();
+    assert!(lint(&root).unwrap().ok());
+    fs::write(
+        root.join("MAC-LANE.md"),
+        "# Mac lane queue\n\nIntro.\n\n2. **A**\n3. **B**\n3. **C**\n5. **D**\n6. anything at all\n",
+    )
+    .unwrap();
+    let linted = lint(&root).unwrap();
+    assert_eq!(
+        rules(&linted),
+        vec!["mac-lane-number", "mac-lane-number", "mac-lane-number"]
+    );
+    let lines: Vec<_> = linted.violations.iter().map(|v| v.line).collect();
+    assert_eq!(lines, vec![Some(5), Some(7), Some(8)]);
+}
