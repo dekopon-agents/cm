@@ -282,6 +282,13 @@ pub fn card(
             )
         })
         .collect();
+    let mac: Vec<String> = crate::ledger::mac_lane_open(root)
+        .iter()
+        .map(|item| format!("- {}. {} ({})", item.number, item.title, item.state.name()))
+        .collect();
+    if !mac.is_empty() {
+        section(&mut out, "Mac lane", &mac, "");
+    }
     section(&mut out, "Next", &ready, "Nothing is launchable.");
     section(&mut out, "Waiting", &waiting, "Nothing waits.");
     section(&mut out, "In flight", &flight, "Nothing is in flight.");
