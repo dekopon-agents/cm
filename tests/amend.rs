@@ -13,8 +13,13 @@ use cm::state::{Evidence, Lane, Phase, Work};
 use cm::store::{self, parse_target};
 use jiff::Timestamp;
 
+#[allow(dead_code)]
+#[path = "support/campaign.rs"]
+mod campaign_fixture;
 #[path = "support/kickoff.rs"]
 mod kickoff_fixture;
+
+use campaign_fixture::{Campaign, campaign};
 
 struct Fake {
     now: Timestamp,
@@ -44,26 +49,6 @@ fn rules(outcome: &Outcome) -> Vec<&'static str> {
     let mut rules: Vec<_> = outcome.violations.iter().map(|v| v.rule).collect();
     rules.sort_unstable();
     rules
-}
-
-struct Campaign {
-    _temp: tempfile::TempDir,
-    root: PathBuf,
-}
-
-fn campaign(host: &Fake) -> Campaign {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("campaign");
-    assert!(commands::init(host, &root).unwrap().ok());
-    let git = std::process::Command::new("git")
-        .args(["init", "-q"])
-        .arg(&root)
-        .status();
-    assert!(
-        git.unwrap().success(),
-        "a campaign lives in a git repository"
-    );
-    Campaign { _temp: temp, root }
 }
 
 fn declare(host: &Fake, c: &Campaign, target: &str, lane: Lane, after: &[&str]) -> Outcome {

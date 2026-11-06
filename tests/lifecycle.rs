@@ -12,8 +12,13 @@ use cm::state::{Evidence, Phase, UnitState};
 use cm::store::{self, Target, parse_target};
 use jiff::Timestamp;
 
+#[allow(dead_code)]
+#[path = "support/campaign.rs"]
+mod campaign_fixture;
 #[path = "support/kickoff.rs"]
 mod kickoff_fixture;
+
+use campaign_fixture::{Campaign, campaign};
 
 struct Fake {
     now: Timestamp,
@@ -74,27 +79,6 @@ fn repo(dir: &Path) -> (PathBuf, String) {
     git(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
     let sha = git(&repo, &["rev-parse", "HEAD"]);
     (repo, sha)
-}
-
-struct Campaign {
-    _temp: tempfile::TempDir,
-    root: PathBuf,
-}
-
-fn campaign(host: &Fake) -> Campaign {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("campaign");
-    let outcome = commands::init(host, &root).unwrap();
-    assert!(outcome.ok(), "{:?}", outcome.violations);
-    let git = std::process::Command::new("git")
-        .args(["init", "-q"])
-        .arg(&root)
-        .status();
-    assert!(
-        git.unwrap().success(),
-        "a campaign lives in a git repository"
-    );
-    Campaign { _temp: temp, root }
 }
 
 fn unit_with_step(c: &Campaign, host: &Fake, kickoff: &str) {
