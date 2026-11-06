@@ -13,7 +13,7 @@ use crate::ledger::{guard, journal_line, one_line};
 use crate::outcome::{Outcome, Violation};
 use crate::plan::{self, Units};
 use crate::state::{
-    After, Evidence, KnownRed, Move, Phase, Pin, Resolved, Revision, Signal, Step, Watch,
+    After, Evidence, KnownRed, Move, Phase, Pin, Release, Resolved, Revision, Signal, Step, Watch,
     WatchStatus, is_commit, same_commit,
 };
 use crate::store::{self, Target};
@@ -583,7 +583,12 @@ pub fn watch_resolve(
         .steps
         .get_mut(target.step.as_deref().unwrap_or_default())
     {
-        rolled = step.roll_up_all(&at, &Evidence::default(), root);
+        rolled = step.roll_up_all(
+            Release::of_target(&full).is_some(),
+            &at,
+            &Evidence::default(),
+            root,
+        );
     }
     for (from, to) in &rolled {
         body.push_str(&format!(

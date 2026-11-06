@@ -551,11 +551,21 @@ fn begin_and_record_each_journal_one_line_with_every_action_field() {
 fn launch_and_claim_default_to_the_remote_session_unless_a_label_is_given() {
     let host = at("2026-10-08T07:00:00Z");
     for (session, label, expected) in [
-        (Some("session_cloud"), None, "session_cloud"),
-        (None, None, "—"),
-        (Some(""), None, "—"),
-        (Some("session_cloud"), Some("explicit"), "explicit"),
-        (None, Some("explicit"), "explicit"),
+        (Some("session_cloud"), None, Some("session_cloud")),
+        (Some("cse_cloud"), None, Some("session_cloud")),
+        (Some(" \tcse_cloud\n"), None, Some("session_cloud")),
+        (Some(" session_cloud "), None, Some("session_cloud")),
+        (Some(" custom "), None, Some("custom")),
+        (None, None, None),
+        (Some(""), None, None),
+        (Some(" \t\n"), None, None),
+        (Some("cse_cloud"), Some("explicit"), Some("explicit")),
+        (
+            Some("cse_cloud"),
+            Some("cse_explicit"),
+            Some("cse_explicit"),
+        ),
+        (None, Some("explicit"), Some("explicit")),
     ] {
         let c = campaign(&host);
         let step = "01-a/u/S1";
@@ -579,13 +589,19 @@ fn launch_and_claim_default_to_the_remote_session_unless_a_label_is_given() {
                 command.args(["--coordinator", label]);
             }
             let output = command.output().unwrap();
+            if args[0] == "attempt" && expected.is_none() {
+                assert_eq!(output.status.code(), Some(2), "{output:?}");
+                let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+                assert_eq!(unit.steps["S1"].attempt.as_ref().unwrap().generation, 1);
+                continue;
+            }
             assert!(output.status.success(), "{args:?}: {output:?}");
             let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(report["ok"], true, "{report}");
             let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
             assert_eq!(
                 unit.steps["S1"].attempt.as_ref().unwrap().coordinator,
-                expected
+                expected.unwrap_or("—")
             );
         }
     }

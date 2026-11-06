@@ -504,21 +504,20 @@ fn init_step(
     };
     let mut part_changes = Vec::new();
     if !declaration.parts.is_empty() {
-        if new_step.finish() == Finish::Evidence {
+        add_parts(
+            &full,
+            &declaration.parts,
+            &mut new_step,
+            &at,
+            &mut part_changes,
+            &mut violations,
+        );
+        if new_step.finish(Release::of_target(&full).is_some()) == Finish::Evidence {
             violations.push(Violation::new(
                 &full,
                 "part-target",
-                "a study or owner-lane step has no parts",
+                "a step that finishes with evidence has no PR parts",
             ));
-        } else {
-            add_parts(
-                &full,
-                &declaration.parts,
-                &mut new_step,
-                &at,
-                &mut part_changes,
-                &mut violations,
-            );
         }
     }
     if !violations.is_empty() {
@@ -1427,7 +1426,9 @@ pub fn advance_gated(
             }
         },
     };
-    let finish = declared.as_ref().map_or(Finish::Shipped, Step::finish);
+    let finish = declared.as_ref().map_or(Finish::Shipped, |step| {
+        step.finish(Release::of_target(&step_full).is_some())
+    });
     if let (Some(name), Some(step)) = (part, &declared) {
         match to {
             Phase::PrOpen | Phase::Merged | Phase::Released | Phase::Deployed => {}
@@ -1501,7 +1502,7 @@ pub fn advance_gated(
             &full,
             "done-code-step",
             format!(
-                "{full} is a code step: it finishes at deployed, or merged where it has no release; `done --evidence <path>` finishes an owner-lane step, a non-release coordinator-lane step or one declared with --study"
+                "{full} is a code step: it finishes at deployed, or merged where it has no release; `done --evidence <path>` finishes an owner-lane step, a non-release coordinator-lane step without a PR, SHA or declared parts or one declared with --study"
             ),
         )
     };
@@ -1767,7 +1768,12 @@ pub fn advance_gated(
                 match part.and_then(|part| step.parts.get_mut(part)) {
                     Some(track) => {
                         track.apply(to.clone(), &at, &evidence);
-                        rolled = step.roll_up_all(&at, &evidence, root);
+                        rolled = step.roll_up_all(
+                            Release::of_target(&step_full).is_some(),
+                            &at,
+                            &evidence,
+                            root,
+                        );
                     }
                     None => step.track.apply(to.clone(), &at, &evidence),
                 }
@@ -1857,16 +1863,21 @@ pub(crate) fn block_step(
         | Phase::Done
         | Phase::Superseded => false,
     };
-    if blocked || step.track.check(&to, step.finish()).is_err() {
-        return Ok(None);
-    }
-    let from = step.track.state.clone();
-    step.track.apply(to.clone(), at, evidence);
     let full = format!(
         "{}/{}",
         target.unit,
         target.step.as_deref().unwrap_or_default()
     );
+    if blocked
+        || step
+            .track
+            .check(&to, step.finish(Release::of_target(&full).is_some()))
+            .is_err()
+    {
+        return Ok(None);
+    }
+    let from = step.track.state.clone();
+    step.track.apply(to.clone(), at, evidence);
     unit.history.push(Move {
         at: at.to_owned(),
         target: full.clone(),
@@ -2222,11 +2233,13 @@ pub fn amend(
             "nothing changes; pass --study, a new --lane, --after, --drop-after or --part",
         ));
     }
-    if !next.parts.is_empty() && next.finish() == Finish::Evidence {
+    if !next.parts.is_empty()
+        && next.finish(Release::of_target(&full).is_some()) == Finish::Evidence
+    {
         violations.push(Violation::new(
             &full,
             "part-target",
-            "parts are PRs: a study or owner-lane step finishes with evidence and has none",
+            "parts are PRs: a step that finishes with evidence has none",
         ));
     }
     if !violations.is_empty() {

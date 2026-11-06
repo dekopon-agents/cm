@@ -31,6 +31,24 @@ pub fn campaign(host: &dyn Host) -> Campaign {
 }
 
 impl Campaign {
+    /// A synthetic release declaration from before release tags were persisted.
+    #[allow(dead_code)] // Shared with suites that do not exercise legacy releases.
+    pub fn legacy_release(&self, host: &dyn Host, full: &str) {
+        let target = cm::store::parse_target(full, true).unwrap();
+        assert!(cm::state::Release::of_target(full).is_some());
+        let at = cm::host::stamp(host.now());
+        let mut unit = cm::state::UnitState::new(&target.unit, &at);
+        unit.schema = 1;
+        let mut step = cm::state::Step::new(&at);
+        step.lane = Some(cm::state::Lane::Pi);
+        unit.steps.insert(target.step.unwrap(), step);
+        let dir = self.root.join(target.unit);
+        fs::create_dir_all(dir.join(cm::store::CM_DIR)).unwrap();
+        fs::create_dir_all(self.root.join(full)).unwrap();
+        cm::store::write_json(&cm::store::state_path(&dir), &unit).unwrap();
+        fs::write(dir.join(cm::store::UNIT_STATE), cm::render::unit(&unit)).unwrap();
+    }
+
     pub fn kickoff(&self, target: &str, text: &str) {
         fs::write(self.root.join(target).join("kickoff.md"), text).unwrap();
     }

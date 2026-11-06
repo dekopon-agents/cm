@@ -7,7 +7,7 @@ use cm::commands;
 use cm::host::Host;
 use cm::lint::lint;
 use cm::outcome::Outcome;
-use cm::state::{Evidence, Lane, Phase, UnitState};
+use cm::state::{After, Evidence, Lane, Phase, UnitState};
 use cm::store::{self, Target, parse_target};
 use jiff::Timestamp;
 
@@ -663,7 +663,7 @@ fn close_seals_the_campaign() {
 }
 
 #[test]
-fn coordinator_steps_finish_with_evidence_from_drafted_and_launched() {
+fn coordinator_steps_without_a_pr_finish_with_evidence_from_drafted_and_launched() {
     let host = Fake::at("2026-10-08T07:00:00Z");
     for launched in [false, true] {
         let c = campaign(&host);
@@ -719,24 +719,42 @@ fn coordinator_steps_finish_with_evidence_from_drafted_and_launched() {
 #[test]
 fn coordinator_release_and_codex_steps_keep_the_code_completion_ladder() {
     let host = Fake::at("2026-10-08T07:00:00Z");
-    for (step, lane) in [
-        ("00-release/cm/1.0.0", Lane::Coordinator),
-        ("01-first/alpha/BUILD", Lane::Codex),
+    for (step, lane, legacy) in [
+        ("00-release/cm/1.0.0", Lane::Coordinator, false),
+        ("00-release/cm/1.0.0", Lane::Coordinator, true),
+        ("01-first/alpha/BUILD", Lane::Codex, false),
     ] {
         for launched in [false, true] {
             let c = campaign(&host);
-            assert!(
-                commands::declare(
+            if legacy {
+                c.legacy_release(&host, step);
+                let amended = commands::amend(
                     &host,
-                    &c.root.join(step),
-                    &commands::Declaration {
+                    &c.root,
+                    &target(step),
+                    &commands::Amendment {
                         lane: Some(lane),
-                        ..commands::Declaration::default()
+                        ..commands::Amendment::default()
                     },
                 )
-                .unwrap()
-                .ok()
-            );
+                .unwrap();
+                assert!(amended.ok(), "{:?}", amended.violations);
+                let unit = store::load_unit(&c.root.join(target(step).unit)).unwrap();
+                assert!(unit.steps["1.0.0"].tag.is_none());
+            } else {
+                assert!(
+                    commands::declare(
+                        &host,
+                        &c.root.join(step),
+                        &commands::Declaration {
+                            lane: Some(lane),
+                            ..commands::Declaration::default()
+                        },
+                    )
+                    .unwrap()
+                    .ok()
+                );
+            }
             c.kickoff(step, "Go.\n");
             if launched {
                 assert!(
@@ -771,4 +789,154 @@ fn coordinator_release_and_codex_steps_keep_the_code_completion_ladder() {
             );
         }
     }
+}
+
+#[test]
+fn coordinator_pr_steps_keep_their_ladder_and_gates() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let (repo, sha) = repo(c.root.parent().unwrap());
+    let step = "01-first/alpha/BUILD";
+    assert!(
+        commands::declare(
+            &host,
+            &c.root.join(step),
+            &commands::Declaration {
+                lane: Some(Lane::Coordinator),
+                ..commands::Declaration::default()
+            },
+        )
+        .unwrap()
+        .ok()
+    );
+    c.kickoff(step, "Go.\n");
+    assert!(
+        commands::launch(&host, &c.root, &target(step), Some(&repo))
+            .unwrap()
+            .ok()
+    );
+    let units = cm::plan::load_units(&c.root).unwrap();
+    let gate = cm::plan::gate(&units, &After::Merged(step.into()));
+    assert_eq!(gate.needs(), Phase::Done);
+    assert!(!gate.met());
+    assert!(
+        advance(
+            &host,
+            &c,
+            step,
+            "pr-open",
+            Evidence {
+                pr: Some("https://github.com/o/r/pull/7".into()),
+                sha: Some(sha.clone()),
+                ..Evidence::default()
+            }
+        )
+        .ok()
+    );
+    let units = cm::plan::load_units(&c.root).unwrap();
+    let gate = cm::plan::gate(&units, &After::PrOpen(step.into()));
+    assert_eq!(gate.needs(), Phase::PrOpen);
+    assert!(gate.met());
+    assert!(
+        advance(
+            &host,
+            &c,
+            step,
+            "merged",
+            Evidence {
+                sha: Some(sha),
+                ..Evidence::default()
+            }
+        )
+        .ok()
+    );
+    for (keep_pr, keep_sha) in [(true, false), (false, true), (true, true)] {
+        let mut units = cm::plan::load_units(&c.root).unwrap();
+        let evidence = &mut units
+            .get_mut("01-first/alpha")
+            .unwrap()
+            .steps
+            .get_mut("BUILD")
+            .unwrap()
+            .track
+            .evidence;
+        if !keep_pr {
+            evidence.pr = None;
+        }
+        if !keep_sha {
+            evidence.sha = None;
+        }
+        let gate = cm::plan::gate(&units, &After::Merged(step.into()));
+        assert_eq!(gate.needs(), Phase::Merged);
+        assert!(gate.met());
+    }
+    git(&repo, &["tag", "v0.1.0"]);
+    assert!(
+        advance(
+            &host,
+            &c,
+            step,
+            "released",
+            Evidence {
+                tag: Some("v0.1.0".into()),
+                ..Evidence::default()
+            }
+        )
+        .ok()
+    );
+    assert!(
+        advance(
+            &host,
+            &c,
+            step,
+            "deployed",
+            Evidence {
+                digest: Some(format!("sha256:{}", "a".repeat(64))),
+                ..Evidence::default()
+            }
+        )
+        .ok()
+    );
+    let done = advance(&host, &c, step, "done", Evidence::default());
+    assert!(done.ok(), "{:?}", done.violations);
+    let unit = store::load_unit(&c.root.join("01-first/alpha")).unwrap();
+    assert_eq!(unit.steps["BUILD"].track.state, Phase::Done);
+}
+
+#[test]
+fn coordinator_steps_can_declare_and_amend_pr_parts() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let step = "01-first/alpha/BUILD";
+    let declared = commands::declare(
+        &host,
+        &c.root.join(step),
+        &commands::Declaration {
+            lane: Some(Lane::Coordinator),
+            parts: vec!["first".into()],
+            ..commands::Declaration::default()
+        },
+    )
+    .unwrap();
+    assert!(declared.ok(), "{:?}", declared.violations);
+    let amended = commands::amend(
+        &host,
+        &c.root,
+        &target(step),
+        &commands::Amendment {
+            parts: vec!["second".into()],
+            ..commands::Amendment::default()
+        },
+    )
+    .unwrap();
+    assert!(amended.ok(), "{:?}", amended.violations);
+    let unit = store::load_unit(&c.root.join("01-first/alpha")).unwrap();
+    assert_eq!(
+        unit.steps["BUILD"]
+            .parts
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
 }

@@ -1004,19 +1004,26 @@ impl Step {
 
     pub fn roll_up_all(
         &mut self,
+        release: bool,
         at: &str,
         evidence: &Evidence,
         root: &Path,
     ) -> Vec<(Phase, Phase)> {
-        std::iter::from_fn(|| self.roll_up(at, evidence, root)).collect()
+        std::iter::from_fn(|| self.roll_up(release, at, evidence, root)).collect()
     }
 
-    fn roll_up(&mut self, at: &str, evidence: &Evidence, root: &Path) -> Option<(Phase, Phase)> {
+    fn roll_up(
+        &mut self,
+        release: bool,
+        at: &str,
+        evidence: &Evidence,
+        root: &Path,
+    ) -> Option<(Phase, Phase)> {
         let reach = self.parts_reach()?;
         let from = self.track.state.clone();
         if self.track.resting().successor().as_ref() != Some(&reach)
             || self.track.blocked_from.is_some()
-            || self.track.check(&reach, self.finish()).is_err()
+            || self.track.check(&reach, self.finish(release)).is_err()
             || (reach == Phase::Deployed && self.unresolved_watches(root).next().is_some())
         {
             return None;
@@ -1036,10 +1043,17 @@ impl Step {
         Some((from, reach))
     }
 
-    pub fn finish(&self) -> Finish {
+    pub fn finish(&self, release: bool) -> Finish {
         match (self.work, self.lane) {
             (Work::Study, _) | (Work::Code, Some(Lane::Owner)) => Finish::Evidence,
-            (Work::Code, Some(Lane::Coordinator)) if self.tag.is_none() => Finish::Evidence,
+            (Work::Code, Some(Lane::Coordinator))
+                if !release
+                    && self.track.evidence.pr.is_none()
+                    && self.track.evidence.sha.is_none()
+                    && self.parts.is_empty() =>
+            {
+                Finish::Evidence
+            }
             (
                 Work::Code,
                 None
