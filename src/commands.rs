@@ -330,6 +330,9 @@ fn release_checks(full: &str, unit: &UnitState, step_name: &str) -> Vec<Violatio
             ),
         )];
     };
+    if unit.steps.contains_key(step_name) {
+        return Vec::new();
+    }
     let above: Vec<String> = unit
         .steps
         .keys()
@@ -397,7 +400,7 @@ fn record_release(
 }
 
 /// The same declaration again finishes one an interrupted `cm init` left half written: the step
-/// folder and a missing or stale STATE.md. The journal is not replayed.
+/// folder, a supplied kickoff and a missing or stale STATE.md. The journal is not replayed.
 fn repair(
     host: &dyn Host,
     root: &Path,
@@ -485,16 +488,11 @@ fn init_step(
     let mut tag = None;
     if unit_name.starts_with(&format!("{RELEASES}/")) {
         let empty = UnitState::new(unit_name, "");
-        if !existing
-            .as_ref()
-            .is_some_and(|unit| unit.steps.contains_key(step_name))
-        {
-            violations.extend(release_checks(
-                &full,
-                existing.as_ref().unwrap_or(&empty),
-                step_name,
-            ));
-        }
+        violations.extend(release_checks(
+            &full,
+            existing.as_ref().unwrap_or(&empty),
+            step_name,
+        ));
         if let Some(release) = Release::of_target(&full) {
             match release.tag(ships.tag.as_deref().unwrap_or(DEFAULT_TAG)) {
                 Ok(name) => tag = Some(name),
