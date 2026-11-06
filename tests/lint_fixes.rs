@@ -173,26 +173,30 @@ fn lint_warns_when_kickoff_names_more_parts_than_declared() {
 fn kickoff_parts_split_only_at_top_level_commas() {
     let host = at("2026-10-28T09:00:00Z");
     for label in ["Parts", "Slices"] {
-        for names in [
-            "a (x, y), b",
-            "a [x, y], b",
-            "`a, x`, b",
-            "``a `, x` ``, b",
-            "a (x [y, z], w), b",
-            "a [x (y, z), w], b",
+        for (names, named) in [
+            ("a (x, y), b", 2),
+            ("a [x, y], b", 2),
+            ("`a, x`, b", 2),
+            ("``a `, x` ``, b", 2),
+            ("a (x [y, z], w), b", 2),
+            ("a [x (y, z), w], b", 2),
+            ("`pr1, pr2, pr3", 3),
+            ("pr1 (draft, pr2, pr3", 3),
+            ("pr1 [draft, pr2, pr3", 3),
+            ("pr1 `--flag, pr2, pr3", 3),
         ] {
             let c = campaign(&host);
             let target = "01-a/u/S1";
             assert!(declare(&host, &c, target, Lane::Codex, &[]).ok());
             c.kickoff(target, &format!("{label}: {names}\n"));
-            for part in ["a", "b"] {
+            for declared in 1..=named {
                 assert!(
                     commands::amend(
                         &host,
                         &c.root,
                         &cm::store::parse_target(target, false).unwrap(),
                         &commands::Amendment {
-                            parts: vec![part.to_owned()],
+                            parts: vec![format!("p{declared}")],
                             ..Default::default()
                         },
                     )
@@ -201,9 +205,9 @@ fn kickoff_parts_split_only_at_top_level_commas() {
                 );
                 let outcome = lint(&c.root).unwrap();
                 assert!(outcome.ok(), "{:?}", outcome.violations);
-                let expected = if part == "a" {
+                let expected = if declared < named {
                     vec![format!(
-                        "parts-undeclared: {target}: kickoff names 2 parts, but 1 are declared; use --part or launch --no-parts REASON"
+                        "parts-undeclared: {target}: kickoff names {named} parts, but {declared} are declared; use --part or launch --no-parts REASON"
                     )]
                 } else {
                     Vec::new()

@@ -372,7 +372,7 @@ journaling apply; every other check still gates.
 declaration time. In kickoff.md, write `Parts: pr1, pr2, pr3` (or `Slices:`). Lint warns
 `parts-undeclared` when fewer parts are declared. Names split only at top-level commas:
 commas inside parentheses, brackets, or backtick spans stay in the name, so
-`Parts: a (x, y), b` names two parts. Backtick spans close with a matching-length run.
+`Parts: a (x, y), b` names two parts. Backtick spans close with a matching-length run; an unclosed opener is literal.
 Launch refuses unless
 `--no-parts "reason"` records an explicit exception in the journal.
 

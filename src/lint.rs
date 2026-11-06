@@ -347,7 +347,13 @@ fn top_level_parts(parts: &str) -> Vec<&str> {
                 ticks += 1;
             }
             if code_ticks == 0 {
-                code_ticks = ticks;
+                // Like code_spans, only a matched run opens a backtick span.
+                if parts[at + ticks..]
+                    .split(|ch| ch != '`')
+                    .any(|run| run.len() == ticks)
+                {
+                    code_ticks = ticks;
+                }
             } else if code_ticks == ticks {
                 code_ticks = 0;
             }
@@ -367,6 +373,9 @@ fn top_level_parts(parts: &str) -> Vec<&str> {
             }
             _ => {}
         }
+    }
+    if parentheses > 0 || brackets > 0 {
+        return parts.split(',').collect();
     }
     names.push(&parts[start..]);
     names
