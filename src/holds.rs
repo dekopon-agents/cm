@@ -444,6 +444,10 @@ pub fn known_red(
     Ok(outcome)
 }
 
+fn journal_signal(signal: &Signal) -> String {
+    serde_json::to_string(&signal.to_string()).expect("a string always serializes as JSON")
+}
+
 pub fn watch_add(
     host: &dyn Host,
     root: &Path,
@@ -515,7 +519,8 @@ pub fn watch_add(
     write_unit(&dir, &unit)?;
     let body = format!(
         "- signal: {}\n- deadline: {}\n- holds {full} below deployed until `cm watch {full} resolve {id} --evidence <path>`\n",
-        watch.signal, watch.deadline
+        journal_signal(&watch.signal),
+        watch.deadline
     );
     let journal = journal_line(root, &at, &format!("watch {full}#{id}"), &body)?;
     let mut outcome = Outcome::default();
@@ -599,7 +604,10 @@ pub fn watch_withdraw(
     let at = stamp(now);
     watch.withdrawn = Some(at.clone());
     let reason = reason.trim();
-    let mut body = format!("- signal: {}\n- reason: {reason}\n", watch.signal);
+    let mut body = format!(
+        "- signal: {}\n- reason: {reason}\n",
+        journal_signal(&watch.signal)
+    );
     roll_up_watch(root, &mut unit, target, &at, &mut body);
     write_unit(&dir, &unit)?;
     let journal = journal_line(root, &at, &format!("watch {full}#{id} withdrawn"), &body)?;
@@ -637,12 +645,28 @@ pub fn watch_amend(
     let (Some(watch), Some(signal), true) = (watch, signal, violations.is_empty()) else {
         return Ok(Outcome::refused(violations));
     };
+    if watch.signal == signal {
+        return Ok(Outcome::refused(vec![Violation::new(
+            &full,
+            "watch-amend-empty",
+            "the watch already has that signal",
+        )]));
+    }
     let old_signal = std::mem::replace(&mut watch.signal, signal);
-    // An earlier resolution whose evidence no longer holds cannot resolve a new signal.
-    watch.resolved = None;
+    let cleared = watch.resolved.take();
+    let mut body = format!(
+        "- old signal: {}\n- new signal: {}\n",
+        journal_signal(&old_signal),
+        journal_signal(&watch.signal)
+    );
+    if let Some(resolved) = cleared {
+        body.push_str(&format!(
+            "- cleared stale resolution: {} by {}\n",
+            resolved.at, resolved.evidence
+        ));
+    }
     let signal = watch.signal.to_string();
     write_unit(&dir, &unit)?;
-    let body = format!("- old signal: {old_signal}\n- new signal: {signal}\n");
     let journal = journal_line(
         root,
         &stamp(now),
@@ -693,9 +717,14 @@ pub fn watch_resolve(
             "- landed after its deadline {}; it was expired: unresolved until now\n",
             watch.deadline
         ),
-        _ => String::new(),
+        Some(WatchStatus::Open | WatchStatus::Resolved | WatchStatus::Withdrawn) | None => {
+            String::new()
+        }
     };
-    let mut body = format!("- signal: {}\n- evidence: {evidence}\n{late}", watch.signal);
+    let mut body = format!(
+        "- signal: {}\n- evidence: {evidence}\n{late}",
+        journal_signal(&watch.signal)
+    );
     roll_up_watch(root, &mut unit, target, &at, &mut body);
     write_unit(&dir, &unit)?;
     let journal = journal_line(root, &at, &format!("watch {full}#{id} resolved"), &body)?;
@@ -869,7 +898,9 @@ pub fn mark_expired(
                         unit_name.clone(),
                         format!(
                             "- watch {unit_name}/{name}#{} expired: unresolved ({}, deadline {})",
-                            watch.id, watch.signal, watch.deadline
+                            watch.id,
+                            journal_signal(&watch.signal),
+                            watch.deadline
                         ),
                     ));
                 }

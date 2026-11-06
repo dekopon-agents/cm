@@ -2207,7 +2207,7 @@ fn withdrawing_a_watch_releases_advance_and_omits_it_from_next_json() {
         journal.ends_with(&cm::journal::entry(
             at,
             &format!("watch {step}#1 withdrawn"),
-            Some("- signal: log:old\n- reason: wrong signal\n"),
+            Some("- signal: \"log:old\"\n- reason: wrong signal\n"),
         )),
         "{journal}"
     );
@@ -2234,15 +2234,15 @@ fn withdrawing_a_watch_releases_advance_and_omits_it_from_next_json() {
     assert_eq!(state(&c, step), Phase::Deployed);
     assert!(advance(&host, &c, step, "done", Evidence::default()).ok());
     sync(&host, &forge, &c.root).unwrap();
-    for file in ["01-a/u/STATE.md", "CARD.md"] {
-        let rendered = fs::read_to_string(c.root.join(file)).unwrap();
-        assert!(
-            rendered.contains(&format!(
-                "check#1: watch log:old by 2026-10-27T06:00Z, withdrawn {at}"
-            )),
-            "{rendered}"
-        );
-    }
+    let rendered = fs::read_to_string(c.root.join("01-a/u/STATE.md")).unwrap();
+    assert!(
+        rendered.contains(&format!(
+            "check#1: watch log:old by 2026-10-27T06:00Z, withdrawn {at}"
+        )),
+        "{rendered}"
+    );
+    let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+    assert!(!card.contains("check#1"), "{card}");
 }
 
 #[test]
@@ -2263,6 +2263,15 @@ fn amending_a_watch_validates_the_signal_and_keeps_its_deadline() {
         let refused = cm::holds::watch_amend(&host, &c.root, &target, 1, signal).unwrap();
         assert_eq!(rules(&refused), vec!["watch-signal"]);
     }
+    let journal_before = fs::read(c.root.join("JOURNAL.md")).unwrap();
+    let state_before = fs::read(c.root.join("01-a/u/.cm/state.json")).unwrap();
+    let unchanged = cm::holds::watch_amend(&host, &c.root, &target, 1, "log:old").unwrap();
+    assert_eq!(rules(&unchanged), vec!["watch-amend-empty"]);
+    assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), journal_before);
+    assert_eq!(
+        fs::read(c.root.join("01-a/u/.cm/state.json")).unwrap(),
+        state_before
+    );
     let amended = cm::holds::watch_amend(&host, &c.root, &target, 1, "metric:requests").unwrap();
     assert!(amended.ok(), "{:?}", amended.violations);
     assert_eq!(amended.fields["old_signal"], "log:old");
@@ -2280,7 +2289,7 @@ fn amending_a_watch_validates_the_signal_and_keeps_its_deadline() {
         journal.ends_with(&cm::journal::entry(
             "2026-10-26T08:00Z",
             &format!("watch {step}#1 amended"),
-            Some("- old signal: log:old\n- new signal: metric:requests\n"),
+            Some("- old signal: \"log:old\"\n- new signal: \"metric:requests\"\n"),
         )),
         "{journal}"
     );
@@ -2479,6 +2488,11 @@ fn editing_a_reopened_watch_does_not_reuse_its_old_resolution() {
             .unwrap()
             .ok()
     );
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    assert!(journal.ends_with(&cm::journal::entry(
+        "2026-10-26T08:00Z", &format!("watch {step}#1 amended"),
+        Some("- old signal: \"log:old\"\n- new signal: \"metric:new\"\n- cleared stale resolution: 2026-10-26T08:00Z by 01-a/u/check/kickoff.md\n"),
+    )), "{journal}");
     c.kickoff(step, "Go.\n");
     let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
     assert!(unit.steps["check"].watches[0].resolved.is_none());
@@ -2494,7 +2508,6 @@ fn editing_a_reopened_watch_does_not_reuse_its_old_resolution() {
             .unwrap()
             .ok()
     );
-    // A withdrawn watch no longer depends on the missing resolution evidence.
     let linted = lint(&c.root).unwrap();
     assert!(
         !rules(&linted).contains(&"evidence-file"),
@@ -2504,6 +2517,213 @@ fn editing_a_reopened_watch_does_not_reuse_its_old_resolution() {
     c.kickoff(step, "Go.\n");
     let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
     assert_eq!(unit.steps["check"].unresolved_watches(&c.root).count(), 0);
+}
+
+#[test]
+fn multiline_watch_signals_leave_the_journal_clean() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/check";
+    assert!(declare(&host, &c, step, Lane::Pi, &[]).ok());
+    kickoff(&c, step);
+    let target = parse_target(step, true).unwrap();
+    let old = "log:old\n## unstamped old heading";
+    let new = "span:new\r\n## unstamped new heading";
+    assert!(
+        cm::holds::watch_add(&host, &c.root, &target, old, "2026-10-27T06:00Z")
+            .unwrap()
+            .ok()
+    );
+    assert!(
+        cm::holds::watch_amend(&host, &c.root, &target, 1, new)
+            .unwrap()
+            .ok()
+    );
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    assert_eq!(unit.steps["check"].watches[0].signal.to_string(), new);
+    let campaign_state = store::load_campaign(&c.root).unwrap();
+    assert!(cm::journal::check(&c.root, &campaign_state).is_empty());
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    for (prefix, expected) in [("- old signal: ", old), ("- new signal: ", new)] {
+        let encoded = journal
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap();
+        assert_eq!(serde_json::from_str::<String>(encoded).unwrap(), expected);
+    }
+    let read = c.root.join(step).join("kickoff.md");
+    assert!(
+        cm::holds::watch_resolve(&host, &c.root, &target, 1, &read)
+            .unwrap()
+            .ok()
+    );
+    assert!(
+        cm::holds::watch_add(&host, &c.root, &target, new, "2026-10-27T06:00Z")
+            .unwrap()
+            .ok()
+    );
+    assert!(
+        cm::holds::watch_withdraw(&host, &c.root, &target, 2, "wrong signal")
+            .unwrap()
+            .ok()
+    );
+    assert!(
+        cm::holds::watch_add(&host, &c.root, &target, new, "2026-10-27T06:00Z")
+            .unwrap()
+            .ok()
+    );
+    sync(&at("2026-10-27T07:00:00Z"), &FakeForge::default(), &c.root).unwrap();
+    assert!(cm::journal::check(&c.root, &campaign_state).is_empty());
+    assert!(
+        cm::holds::watch_withdraw(
+            &at("2026-10-27T07:00:00Z"),
+            &c.root,
+            &target,
+            3,
+            "wrong signal"
+        )
+        .unwrap()
+        .ok()
+    );
+}
+
+#[test]
+fn withdrawing_an_expired_watch_closes_its_hold() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/check";
+    assert!(declare(&host, &c, step, Lane::Pi, &[]).ok());
+    kickoff(&c, step);
+    let target = parse_target(step, true).unwrap();
+    assert!(
+        cm::holds::watch_add(&host, &c.root, &target, "log:old", "2026-10-27T06:00Z")
+            .unwrap()
+            .ok()
+    );
+    let late = at("2026-10-27T07:00:00Z");
+    sync(&late, &FakeForge::default(), &c.root).unwrap();
+    let before = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    assert_eq!(
+        before.steps["check"].watches[0].status(late.now, &c.root),
+        cm::state::WatchStatus::Expired
+    );
+    assert!(
+        cm::holds::watch_withdraw(&late, &c.root, &target, 1, "wrong signal")
+            .unwrap()
+            .ok()
+    );
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    assert_eq!(
+        unit.steps["check"].watches[0].status(late.now, &c.root),
+        cm::state::WatchStatus::Withdrawn
+    );
+    assert_eq!(unit.steps["check"].unresolved_watches(&c.root).count(), 0);
+    assert_eq!(
+        plan::next_at(&c.root, None, None, late.now).unwrap().fields["watches"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        cm::lint::lint_at(&c.root, late.now).unwrap().fields["warnings"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn card_watch_rows_are_short_and_only_show_relevant_live_watches() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host);
+    let live = "01-a/u/live";
+    assert!(declare(&host, &c, live, Lane::Pi, &[]).ok());
+    kickoff(&c, live);
+    let target = parse_target(live, true).unwrap();
+    let read = c.root.join(live).join("kickoff.md");
+    let long = format!("log:{}\nsecond line", "界".repeat(200));
+    for (signal, deadline) in [
+        ("log:resolved", "2026-10-29T06:00Z"),
+        ("log:withdrawn", "2026-10-29T06:00Z"),
+        (long.as_str(), "2026-10-29T06:00Z"),
+        ("log:expired", "2026-10-27T06:00Z"),
+    ] {
+        assert!(
+            cm::holds::watch_add(&host, &c.root, &target, signal, deadline)
+                .unwrap()
+                .ok()
+        );
+    }
+    assert!(
+        cm::holds::watch_resolve(&host, &c.root, &target, 1, &read)
+            .unwrap()
+            .ok()
+    );
+    assert!(
+        cm::holds::watch_withdraw(&host, &c.root, &target, 2, "wrong signal")
+            .unwrap()
+            .ok()
+    );
+    for (step, phase) in [
+        ("01-a/u/finished", "done"),
+        ("01-a/u/retired", "superseded"),
+    ] {
+        assert!(declare(&host, &c, step, Lane::Owner, &[]).ok());
+        kickoff(&c, step);
+        let target = parse_target(step, true).unwrap();
+        assert!(
+            cm::holds::watch_add(&host, &c.root, &target, "log:closed", "2026-10-29T06:00Z")
+                .unwrap()
+                .ok()
+        );
+        assert!(
+            cm::holds::watch_withdraw(&host, &c.root, &target, 1, "wrong signal")
+                .unwrap()
+                .ok()
+        );
+        let closed = commands::advance(
+            &host,
+            &c.root,
+            &target,
+            &phase.parse().unwrap(),
+            &Evidence::default(),
+            Some(&c.root.join(step).join("kickoff.md")),
+            None,
+        )
+        .unwrap();
+        assert!(closed.ok(), "{:?}", closed.violations);
+    }
+    let units = plan::load_units(&c.root).unwrap();
+    let next = plan::summary(&c.root, &units);
+    let card = cm::render::card(&c.root, "2026-10-27T07:00Z", "test", &units, &next, &[]);
+    assert!(!card.contains("live#1"), "{card}");
+    assert!(!card.contains("finished#1"), "{card}");
+    assert!(!card.contains("retired#1"), "{card}");
+    let rows: Vec<_> = card
+        .lines()
+        .filter(|line| line.starts_with("- 01-a/u/live#"))
+        .collect();
+    assert_eq!(rows.len(), 3, "{card}");
+    assert!(rows[0].starts_with("- 01-a/u/live#2: withdrawn, deadline 2026-10-29T06:00Z; "));
+    assert!(rows[1].starts_with("- 01-a/u/live#3: open, deadline 2026-10-29T06:00Z; "));
+    let preview = rows[1].split_once("; ").unwrap().1;
+    assert_eq!(preview.chars().count(), 80);
+    assert!(preview.ends_with('…'));
+    assert!(
+        rows[2].starts_with("- 01-a/u/live#4: expired: unresolved, deadline 2026-10-27T06:00Z; ")
+    );
+    let state = fs::read_to_string(c.root.join("01-a/u/STATE.md")).unwrap();
+    assert!(state.contains(&"界".repeat(200)), "{state}");
+    assert!(
+        state.contains("resolution recorded 2026-10-26T08:00Z by 01-a/u/live/kickoff.md"),
+        "{state}"
+    );
+    fs::remove_file(&read).unwrap();
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    assert!(cm::lint::unit_state_file(&c.root, &c.root.join("01-a/u"), &unit).is_empty());
+    let reopened = cm::render::card(&c.root, "2026-10-27T07:00Z", "test", &units, &next, &[]);
+    assert!(
+        reopened
+            .lines()
+            .any(|line| line.starts_with("- 01-a/u/live#1: open, deadline 2026-10-29T06:00Z; ")),
+        "{reopened}"
+    );
 }
 
 #[test]

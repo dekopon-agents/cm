@@ -226,7 +226,10 @@ campaign, in the move's evidence beside its stamp, and `cm lint` re-checks it ev
 `done --evidence` on a code step, or `done` on one short of `deployed`, is `done-code-step`. A
 release step cannot be a study.
 
-cm 0.5.0 writes every unit state, and a new campaign state, as schema 3 (it adds `superseded`).
+cm 0.9 raises SCHEMA from 3 to 4 for watch withdrawal and writes every unit state, and a new
+campaign state, as schema 4. Units written by 0.9 cannot be read by cm 0.8.x; upgrade every
+reader before writing a shared unit with 0.9. Schema 1, 2 and 3 state remains readable by 0.9.
+cm 0.5.0 introduced schema 3 for `superseded`.
 Since 0.4.0 cm refuses state from a newer schema than it knows, so cm 0.4.x refuses schema 3
 cleanly; schema 1 and 2 state from 0.3.x and 0.4.x loads unchanged. cm
 0.3.x checks no schema and drops the fields it does not know when it re-saves a unit, so a campaign
@@ -417,11 +420,16 @@ it from state instead of polling it.
 
 `cm watch <step> withdraw <id> --reason <text>` closes an unresolved watch as withdrawn and
 journals the reason. A withdrawn watch no longer holds `advance` or `sync`, is omitted from
-`cm next`'s `watches`, and remains visible as withdrawn in CARD and STATE. A resolved or already
-withdrawn watch cannot be withdrawn.
+`cm next`'s `watches`, and remains visible as withdrawn in STATE and on CARD while its step
+is live. CARD lists only open, expired-unresolved and withdrawn watches on nonfinal steps,
+with one line per watch, computed status and signals limited to 80 characters. STATE keeps
+the full signal and recorded resolution or expiry details; time passing does not change its
+canonical render. A resolved or already withdrawn watch cannot be withdrawn.
 `cm watch <step> amend <id> --signal <signal>` replaces an unresolved watch's signal using the
 same validation as `add`. It journals the old and new signals and keeps the original deadline,
-including an expired deadline. Resolved and withdrawn watches cannot be amended.
+including an expired deadline. An unchanged signal is refused as `watch-amend-empty`.
+When amendment clears a stale resolution, the journal records it. Resolved and withdrawn
+watches cannot be amended.
 
 ### Releases
 

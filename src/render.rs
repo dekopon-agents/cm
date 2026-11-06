@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::plan::{Next, Units};
-use crate::state::{Lane, Phase, Step, UnitState, Watch, Work};
+use crate::state::{Lane, Phase, Step, UnitState, Watch, WatchStatus, Work};
 use crate::sync::Moved;
 
 fn cell(text: &str) -> String {
@@ -158,7 +158,7 @@ fn holds(name: &str, step: &Step) -> Vec<String> {
             waived.check, waived.commit, waived.file
         )
     });
-    let watches = step.watches.iter().map(|watch| watch_row(name, watch));
+    let watches = step.watches.iter().map(|watch| watch_record(name, watch));
     pins.chain(exceptions)
         .chain(waived)
         .chain(watches)
@@ -166,17 +166,38 @@ fn holds(name: &str, step: &Step) -> Vec<String> {
         .collect()
 }
 
-fn watch_row(name: &str, watch: &Watch) -> String {
+fn watch_record(name: &str, watch: &Watch) -> String {
     let status = match (&watch.withdrawn, &watch.resolved, &watch.expired) {
         (Some(at), _, _) => format!("withdrawn {at}"),
-        (None, Some(resolved), _) => format!("resolved {} by {}", resolved.at, resolved.evidence),
-        (None, None, Some(at)) => format!("expired: unresolved since {at}"),
-        (None, None, None) => "open".to_owned(),
+        (None, Some(resolved), _) => format!(
+            "resolution recorded {} by {}",
+            resolved.at, resolved.evidence
+        ),
+        (None, None, Some(at)) => format!("expiry recorded {at}: unresolved"),
+        (None, None, None) => "unresolved".to_owned(),
     };
     format!(
         "{name}#{}: watch {} by {}, {status}",
         watch.id, watch.signal, watch.deadline
     )
+}
+
+fn signal_preview(watch: &Watch) -> String {
+    const MAX_CHARS: usize = 80;
+    let signal = watch.signal.to_string();
+    let mut chars = signal.chars().map(|ch| {
+        if ch.is_control() || ch.is_whitespace() {
+            ' '
+        } else {
+            ch
+        }
+    });
+    let mut preview: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        preview.pop();
+        preview.push('…');
+    }
+    preview
 }
 
 pub fn card(
@@ -289,17 +310,28 @@ pub fn card(
     section(&mut out, "Waiting", &waiting, "Nothing waits.");
     section(&mut out, "In flight", &flight, "Nothing is in flight.");
     section(&mut out, "Blocked", &blocked, "Nothing is blocked.");
-    let watches: Vec<String> = units
-        .iter()
-        .flat_map(|(unit, state)| {
-            state.steps.iter().flat_map(move |(name, step)| {
-                let target = format!("{unit}/{name}");
-                step.watches
-                    .iter()
-                    .map(move |watch| format!("- {}", cell(&watch_row(&target, watch))))
-            })
-        })
-        .collect();
+    let now = crate::plan::instant(at).expect("CARD's timestamp is an RFC 3339 instant");
+    let mut watches = Vec::new();
+    for (unit, state) in units {
+        for (name, step) in &state.steps {
+            if step.track.state.is_final() {
+                continue;
+            }
+            for watch in &step.watches {
+                let status = watch.status(now, root);
+                if status == WatchStatus::Resolved {
+                    continue;
+                }
+                watches.push(format!(
+                    "- {unit}/{name}#{}: {}, deadline {}; {}",
+                    watch.id,
+                    status.name(),
+                    watch.deadline,
+                    cell(&signal_preview(watch))
+                ));
+            }
+        }
+    }
     if !watches.is_empty() {
         section(&mut out, "Watches", &watches, "");
     }
