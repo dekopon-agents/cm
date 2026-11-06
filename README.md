@@ -119,6 +119,7 @@ entries with `cm journal`), and `rm <NN-name>/<unit>/STATE.md && cm init <NN-nam
 | `OWNER-QUEUE.md` | First heading `# Owner queue`; each `##` item has a line starting `Context:`, one starting `Recommendation:` and one starting `Answer:`. A queue written before cm 0.4 whose items lack `Context:` is reported, never rewritten. |
 | `<unit>/STATE.md` | Byte-equal to the render of the unit's `.cm/state.json`. |
 | Packets | In `kickoff.md`, `step-*.md` and `resume*.md` of a drafted or launched step, every absolute or `~/` path inside backticks exists. A span with whitespace, a glob or placeholder character (`* ? < > $ { } [ ] \|`), or a single component such as `/loop` or `//!` is not a path; a trailing `:line` or `:start-end` is dropped. Only spans that could name a file are checked: a cm id (`01-a/u/S1`, `00-release/cm/0.5.0`), a URL and a route (an absolute path with no file extension whose first directory is not on this machine, such as `/v1/sessions/abc`) are not. Fenced blocks are not read. |
+| Tracked files | Warns `ledger-size` for each tracked regular file under the campaign folder exceeding 1 MiB, excluding `JOURNAL.md` and `.cm/` at any depth. Exactly 1 MiB, untracked files, and campaigns outside git are silent. Warnings do not change the exit status. |
 
 ### State files
 
@@ -370,7 +371,10 @@ journaling apply; every other check still gates.
 
 `cm init <step> --lane codex --part pr1 --part pr2 --part pr3` declares parts at step
 declaration time. In kickoff.md, write `Parts: pr1, pr2, pr3` (or `Slices:`). Lint warns
-`parts-undeclared` when fewer parts are declared; launch refuses unless
+`parts-undeclared` when fewer parts are declared. Names split only at top-level commas:
+commas inside parentheses, brackets, or backtick spans stay in the name, so
+`Parts: a (x, y), b` names two parts. Backtick spans close with a matching-length run; an unclosed opener is literal.
+Launch refuses unless
 `--no-parts "reason"` records an explicit exception in the journal.
 
 `cm amend <step> --part pr1 --part pr2 --part pr3` declares a step's required parts, one PR each.

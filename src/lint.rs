@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -331,6 +333,54 @@ fn latest_mention(mentions: &JournalMentions, target: &str) -> Option<jiff::Time
         .map(|(_, at)| *at)
 }
 
+fn top_level_parts(parts: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    let mut start = 0;
+    let mut parentheses = 0usize;
+    let mut brackets = 0usize;
+    let mut code_ticks = 0;
+    let mut chars = parts.char_indices().peekable();
+    while let Some((at, ch)) = chars.next() {
+        if ch == '`' {
+            let mut ticks = 1;
+            while chars.next_if(|(_, next)| *next == '`').is_some() {
+                ticks += 1;
+            }
+            if code_ticks == 0 {
+                // Like code_spans, only a matched run opens a backtick span.
+                if parts[at + ticks..]
+                    .split(|ch| ch != '`')
+                    .any(|run| run.len() == ticks)
+                {
+                    code_ticks = ticks;
+                }
+            } else if code_ticks == ticks {
+                code_ticks = 0;
+            }
+            continue;
+        }
+        if code_ticks != 0 {
+            continue;
+        }
+        match ch {
+            '(' => parentheses += 1,
+            ')' => parentheses = parentheses.saturating_sub(1),
+            '[' => brackets += 1,
+            ']' => brackets = brackets.saturating_sub(1),
+            ',' if parentheses == 0 && brackets == 0 => {
+                names.push(&parts[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    if parentheses > 0 || brackets > 0 {
+        return parts.split(',').collect();
+    }
+    names.push(&parts[start..]);
+    names
+}
+
 pub(crate) fn undeclared_parts(
     root: &Path,
     target: &str,
@@ -350,8 +400,8 @@ pub(crate) fn undeclared_parts(
             .or_else(|| line.strip_prefix("Slices:"))
         {
             named.extend(
-                parts
-                    .split(',')
+                top_level_parts(parts)
+                    .into_iter()
                     .map(str::trim)
                     .filter(|name| !name.is_empty()),
             );
@@ -570,6 +620,47 @@ pub fn tracked_runtime(root: &Path) -> Vec<Violation> {
         .collect()
 }
 
+fn ledger_size(root: &Path) -> Vec<String> {
+    let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z", "--deduplicate", "--", "."])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .filter_map(|name| {
+            #[cfg(unix)]
+            let path = Path::new(std::ffi::OsStr::from_bytes(name));
+            #[cfg(not(unix))]
+            let name = String::from_utf8_lossy(name);
+            #[cfg(not(unix))]
+            let path = Path::new(name.as_ref());
+            if path.file_name().is_some_and(|leaf| leaf == JOURNAL)
+                || path
+                    .components()
+                    .any(|part| part.as_os_str() == store::CM_DIR)
+            {
+                return None;
+            }
+            let metadata = fs::symlink_metadata(root.join(path)).ok()?;
+            (metadata.is_file() && metadata.len() > (1 << 20)).then(|| {
+                format!(
+                    "ledger-size: {} exceeds 1 MiB; keep large evidence files outside the campaign",
+                    path.display()
+                )
+            })
+        })
+        .collect()
+}
+
 pub fn root_files(root: &Path, state: Option<&CampaignState>) -> Vec<Violation> {
     let mut out = tracked_runtime(root);
     let closed = state.is_some_and(|state| state.closed.is_some());
@@ -685,7 +776,7 @@ pub fn lint_at(start: &Path, now: jiff::Timestamp) -> Result<Outcome> {
         home: home.as_deref(),
         sealed: state.as_ref().is_some_and(|state| state.closed.is_some()),
         packets: 0,
-        warnings: Vec::new(),
+        warnings: ledger_size(&root),
         now,
         units: crate::plan::load_units(&root).unwrap_or_default(),
         mentions: journal_mentions(&root),
