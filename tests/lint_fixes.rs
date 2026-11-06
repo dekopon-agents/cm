@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use cm::commands::{self, Declaration};
@@ -40,25 +40,9 @@ fn rules(outcome: &Outcome) -> Vec<&'static str> {
     rules
 }
 
-struct Campaign {
-    _temp: tempfile::TempDir,
-    root: PathBuf,
-}
-
-fn campaign(host: &Fake) -> Campaign {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("campaign");
-    assert!(commands::init(host, &root).unwrap().ok());
-    let git = std::process::Command::new("git")
-        .args(["init", "-q"])
-        .arg(&root)
-        .status();
-    assert!(
-        git.unwrap().success(),
-        "a campaign lives in a git repository"
-    );
-    Campaign { _temp: temp, root }
-}
+#[path = "support/campaign.rs"]
+mod campaign_fixture;
+use campaign_fixture::{Campaign, campaign, campaign_outside_git};
 
 fn declare(host: &Fake, c: &Campaign, target: &str, lane: Lane, after: &[&str]) -> Outcome {
     let declaration = Declaration {
@@ -67,7 +51,7 @@ fn declare(host: &Fake, c: &Campaign, target: &str, lane: Lane, after: &[&str]) 
         ..Declaration::default()
     };
     let outcome = commands::declare(host, &c.root.join(target), &declaration).unwrap();
-    fs::write(c.root.join(target).join("kickoff.md"), "Go.\n").unwrap();
+    c.kickoff(target, "Go.\n");
     outcome
 }
 
@@ -134,11 +118,8 @@ fn packets_check_only_tokens_that_look_like_files() {
 #[test]
 fn lint_cannot_clear_ignored_folders_outside_git() {
     let host = at("2026-10-19T09:00:00Z");
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("campaign");
-    assert!(commands::init(&host, &root).unwrap().ok());
-    assert!(lint(&root).unwrap().ok());
-    let c = Campaign { _temp: temp, root };
+    let c = campaign_outside_git(&host);
+    assert!(lint(&c.root).unwrap().ok());
     assert!(declare(&host, &c, "01-a/u/S1", Lane::Codex, &[]).ok());
     let linted = lint(&c.root).unwrap();
     assert_eq!(rules(&linted), vec!["git-ignored-unknown"]);
@@ -186,4 +167,91 @@ fn lint_warns_when_kickoff_names_more_parts_than_declared() {
             }
         }
     }
+}
+
+#[test]
+fn kickoff_parts_split_only_at_top_level_commas() {
+    let host = at("2026-10-28T09:00:00Z");
+    for label in ["Parts", "Slices"] {
+        for names in [
+            "a (x, y), b",
+            "a [x, y], b",
+            "`a, x`, b",
+            "``a `, x` ``, b",
+            "a (x [y, z], w), b",
+            "a [x (y, z), w], b",
+        ] {
+            let c = campaign(&host);
+            let target = "01-a/u/S1";
+            assert!(declare(&host, &c, target, Lane::Codex, &[]).ok());
+            c.kickoff(target, &format!("{label}: {names}\n"));
+            for part in ["a", "b"] {
+                assert!(
+                    commands::amend(
+                        &host,
+                        &c.root,
+                        &cm::store::parse_target(target, false).unwrap(),
+                        &commands::Amendment {
+                            parts: vec![part.to_owned()],
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+                    .ok()
+                );
+                let outcome = lint(&c.root).unwrap();
+                assert!(outcome.ok(), "{:?}", outcome.violations);
+                let expected = if part == "a" {
+                    vec![format!(
+                        "parts-undeclared: {target}: kickoff names 2 parts, but 1 are declared; use --part or launch --no-parts REASON"
+                    )]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(
+                    outcome.fields["warnings"],
+                    serde_json::json!(expected),
+                    "{label}: {names}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn ledger_size_warns_only_for_large_tracked_campaign_files() {
+    let host = at("2026-10-28T09:00:00Z");
+    let c = campaign(&host);
+    for (name, bytes, tracked) in [
+        ("evidence/large.txt", (1 << 20) + 1, true),
+        ("evidence/also large.txt", 2 << 20, true),
+        ("JOURNAL.md", (1 << 20) + 1, true),
+        (".cm/evidence.bin", 2 << 20, true),
+        ("nested/.cm/evidence.bin", 2 << 20, true),
+        ("nested/JOURNAL.md", 2 << 20, true),
+        ("evidence/exact.txt", 1 << 20, true),
+        ("evidence/untracked.txt", 2 << 20, false),
+    ] {
+        c.sized_file(name, bytes, tracked);
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args(["lint", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["warnings"],
+        serde_json::json!([
+            "ledger-size: evidence/also large.txt exceeds 1 MiB; keep large evidence files outside the campaign",
+            "ledger-size: evidence/large.txt exceeds 1 MiB; keep large evidence files outside the campaign",
+        ])
+    );
+    fs::remove_dir_all(c.root.join(".git")).unwrap();
+    assert_eq!(
+        lint(&c.root).unwrap().fields["warnings"],
+        serde_json::json!([])
+    );
 }
