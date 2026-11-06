@@ -642,7 +642,7 @@ impl<'a> Run<'a> {
             target,
             "watch-open",
             format!(
-                "its release deployed, but it stays released until watch {} resolves with evidence",
+                "its release deployed, but it stays released until watch {} resolves with evidence or is withdrawn with a reason",
                 held.join(", ")
             ),
         ));

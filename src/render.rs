@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::plan::{Next, Units};
-use crate::state::{Lane, Phase, Step, UnitState, Work};
+use crate::state::{Lane, Phase, Step, UnitState, Watch, Work};
 use crate::sync::Moved;
 
 fn cell(text: &str) -> String {
@@ -158,22 +158,25 @@ fn holds(name: &str, step: &Step) -> Vec<String> {
             waived.check, waived.commit, waived.file
         )
     });
-    let watches = step.watches.iter().map(|watch| {
-        let status = match (&watch.resolved, &watch.expired) {
-            (Some(resolved), _) => format!("resolved {} by {}", resolved.at, resolved.evidence),
-            (None, Some(at)) => format!("expired: unresolved since {at}"),
-            (None, None) => "open".to_owned(),
-        };
-        format!(
-            "{name}#{}: watch {} by {}, {status}",
-            watch.id, watch.signal, watch.deadline
-        )
-    });
+    let watches = step.watches.iter().map(|watch| watch_row(name, watch));
     pins.chain(exceptions)
         .chain(waived)
         .chain(watches)
         .map(|line| cell(&line))
         .collect()
+}
+
+fn watch_row(name: &str, watch: &Watch) -> String {
+    let status = match (&watch.withdrawn, &watch.resolved, &watch.expired) {
+        (Some(at), _, _) => format!("withdrawn {at}"),
+        (None, Some(resolved), _) => format!("resolved {} by {}", resolved.at, resolved.evidence),
+        (None, None, Some(at)) => format!("expired: unresolved since {at}"),
+        (None, None, None) => "open".to_owned(),
+    };
+    format!(
+        "{name}#{}: watch {} by {}, {status}",
+        watch.id, watch.signal, watch.deadline
+    )
 }
 
 pub fn card(
@@ -286,6 +289,20 @@ pub fn card(
     section(&mut out, "Waiting", &waiting, "Nothing waits.");
     section(&mut out, "In flight", &flight, "Nothing is in flight.");
     section(&mut out, "Blocked", &blocked, "Nothing is blocked.");
+    let watches: Vec<String> = units
+        .iter()
+        .flat_map(|(unit, state)| {
+            state.steps.iter().flat_map(move |(name, step)| {
+                let target = format!("{unit}/{name}");
+                step.watches
+                    .iter()
+                    .map(move |watch| format!("- {}", cell(&watch_row(&target, watch))))
+            })
+        })
+        .collect();
+    if !watches.is_empty() {
+        section(&mut out, "Watches", &watches, "");
+    }
     section(&mut out, "Moved this run", &moved, "No moves.");
     out
 }

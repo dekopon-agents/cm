@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use cm::commands;
@@ -62,25 +62,10 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
-struct Campaign {
-    _temp: tempfile::TempDir,
-    root: PathBuf,
-}
-
-fn campaign(host: &Fake) -> Campaign {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("campaign");
-    assert!(commands::init(host, &root).unwrap().ok());
-    let git = std::process::Command::new("git")
-        .args(["init", "-q"])
-        .arg(&root)
-        .status();
-    assert!(
-        git.unwrap().success(),
-        "a campaign lives in a git repository"
-    );
-    Campaign { _temp: temp, root }
-}
+#[path = "support/campaign.rs"]
+#[allow(dead_code)] // This suite shares the campaign fixture; its lint helpers serve other suites.
+mod campaign_fixture;
+use campaign_fixture::{Campaign, campaign};
 
 fn declare_work(
     host: &Fake,
@@ -1169,7 +1154,7 @@ fn a_study_done_with_evidence_frees_its_consumer() {
     let stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(c.root.join("01-a/u/.cm/state.json")).unwrap())
             .unwrap();
-    assert_eq!(stored["schema"], 3);
+    assert_eq!(stored["schema"], cm::state::SCHEMA);
     let moved = unit.history.last().unwrap();
     assert_eq!((&moved.from, &moved.to), (&Phase::Drafted, &Phase::Done));
     assert_eq!(moved.at, track.since);
@@ -1420,19 +1405,19 @@ fn a_unit_from_a_newer_schema_is_refused() {
     let path = c.root.join("01-a/u/.cm/state.json");
     let mut stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(stored["schema"], 3);
-    stored["schema"] = 4.into();
+    assert_eq!(stored["schema"], cm::state::SCHEMA);
+    stored["schema"] = (cm::state::SCHEMA + 1).into();
     fs::write(&path, serde_json::to_string_pretty(&stored).unwrap()).unwrap();
     let error = store::load_unit(&c.root.join("01-a/u")).unwrap_err();
     let newer = error.downcast_ref::<store::NewerSchema>().unwrap();
-    assert_eq!(newer.found, 4);
+    assert_eq!(newer.found, cm::state::SCHEMA + 1);
     let linted = lint(&c.root).unwrap();
     assert_eq!(rules(&linted), vec!["state-parse"]);
-    assert!(
-        linted.violations[0]
-            .message
-            .contains("has schema 4, newer than the schema 3")
-    );
+    assert!(linted.violations[0].message.contains(&format!(
+        "has schema {}, newer than the schema {}",
+        cm::state::SCHEMA + 1,
+        cm::state::SCHEMA
+    )));
 }
 
 fn shared_release_lines(host: &Fake) -> (Campaign, FakeForge) {
@@ -2170,6 +2155,355 @@ fn a_watch_past_its_deadline_without_evidence_stays_unresolved_and_holds_the_ste
     sync(&late, &forge, &c.root).unwrap();
     assert_eq!(state(&c, step), Phase::Deployed);
     assert!(lint(&c.root).unwrap().ok());
+}
+
+#[test]
+fn withdrawing_a_watch_releases_advance_and_omits_it_from_next_json() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/check";
+    assert!(declare(&host, &c, step, Lane::Pi, &[]).ok());
+    kickoff(&c, step);
+    let pr = "https://github.com/dekopon-agents/dekopon/pull/1";
+    open_pr(&host, &c, step, pr);
+    let target = parse_target(step, true).unwrap();
+    assert!(
+        cm::holds::watch_add(&host, &c.root, &target, "log:old", "2026-10-27T06:00Z")
+            .unwrap()
+            .ok()
+    );
+    let mut forge = FakeForge::default();
+    forge.pulls.insert(pr.into(), merged("aaa1"));
+    deployed_release(&host, &c, &mut forge, &["aaa1"]);
+    sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(state(&c, step), Phase::Released);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args([
+            "--json",
+            "watch",
+            step,
+            "withdraw",
+            "1",
+            "--reason",
+            "wrong signal",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let outcome: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(outcome["reason"], "wrong signal");
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    let watch = &unit.steps["check"].watches[0];
+    assert_eq!(
+        watch.status(host.now, &c.root),
+        cm::state::WatchStatus::Withdrawn
+    );
+    let at = watch.withdrawn.as_deref().unwrap();
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    assert!(
+        journal.ends_with(&cm::journal::entry(
+            at,
+            &format!("watch {step}#1 withdrawn"),
+            Some("- signal: log:old\n- reason: wrong signal\n"),
+        )),
+        "{journal}"
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args(["next", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let next: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(next["watches"], serde_json::json!([]));
+    let deployed = advance(
+        &host,
+        &c,
+        step,
+        "deployed",
+        Evidence {
+            digest: Some(format!("sha256:{}", "d".repeat(64))),
+            ..Evidence::default()
+        },
+    );
+    assert!(deployed.ok(), "{:?}", deployed.violations);
+    assert_eq!(state(&c, step), Phase::Deployed);
+    assert!(advance(&host, &c, step, "done", Evidence::default()).ok());
+    sync(&host, &forge, &c.root).unwrap();
+    for file in ["01-a/u/STATE.md", "CARD.md"] {
+        let rendered = fs::read_to_string(c.root.join(file)).unwrap();
+        assert!(
+            rendered.contains(&format!(
+                "check#1: watch log:old by 2026-10-27T06:00Z, withdrawn {at}"
+            )),
+            "{rendered}"
+        );
+    }
+}
+
+#[test]
+fn amending_a_watch_validates_the_signal_and_keeps_its_deadline() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/check";
+    assert!(declare(&host, &c, step, Lane::Pi, &[]).ok());
+    let target = parse_target(step, true).unwrap();
+    assert!(
+        cm::holds::watch_add(&host, &c.root, &target, "log:old", "2026-10-27T06:00Z")
+            .unwrap()
+            .ok()
+    );
+    let before =
+        store::load_unit(&c.root.join("01-a/u")).unwrap().steps["check"].watches[0].clone();
+    for signal in ["stdout-only", "log:"] {
+        let refused = cm::holds::watch_amend(&host, &c.root, &target, 1, signal).unwrap();
+        assert_eq!(rules(&refused), vec!["watch-signal"]);
+    }
+    let amended = cm::holds::watch_amend(&host, &c.root, &target, 1, "metric:requests").unwrap();
+    assert!(amended.ok(), "{:?}", amended.violations);
+    assert_eq!(amended.fields["old_signal"], "log:old");
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    let watch = &unit.steps["check"].watches[0];
+    assert_eq!(watch.signal.to_string(), "metric:requests");
+    assert_eq!(watch.deadline, before.deadline);
+    assert_eq!(watch.added, before.added);
+    assert_eq!(
+        watch.status(host.now, &c.root),
+        cm::state::WatchStatus::Open
+    );
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    assert!(
+        journal.ends_with(&cm::journal::entry(
+            "2026-10-26T08:00Z",
+            &format!("watch {step}#1 amended"),
+            Some("- old signal: log:old\n- new signal: metric:requests\n"),
+        )),
+        "{journal}"
+    );
+
+    let late = at("2026-10-27T07:00:00Z");
+    sync(&late, &FakeForge::default(), &c.root).unwrap();
+    let expired = store::load_unit(&c.root.join("01-a/u")).unwrap().steps["check"].watches[0]
+        .expired
+        .clone();
+    assert!(expired.is_some());
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args([
+            "--json",
+            "watch",
+            step,
+            "amend",
+            "1",
+            "--signal",
+            "span:request",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    let watch = &unit.steps["check"].watches[0];
+    assert_eq!(watch.signal.to_string(), "span:request");
+    assert_eq!(watch.deadline, before.deadline);
+    assert_eq!(watch.expired, expired);
+    assert_eq!(
+        watch.status(late.now, &c.root),
+        cm::state::WatchStatus::Expired
+    );
+    assert_eq!(
+        plan::next_at(&c.root, None, None, late.now).unwrap().fields["watches"][0]["signal"],
+        "span:request"
+    );
+}
+
+#[test]
+fn resolved_and_withdrawn_watches_refuse_further_edits() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/check";
+    assert!(declare(&host, &c, step, Lane::Pi, &[]).ok());
+    kickoff(&c, step);
+    let target = parse_target(step, true).unwrap();
+    let read = c.root.join(step).join("kickoff.md");
+    for id in [1, 2] {
+        assert!(
+            cm::holds::watch_add(&host, &c.root, &target, "log:old", "2026-10-27T06:00Z")
+                .unwrap()
+                .ok()
+        );
+        if id == 1 {
+            assert!(
+                cm::holds::watch_resolve(&host, &c.root, &target, id, &read)
+                    .unwrap()
+                    .ok()
+            );
+        } else {
+            assert!(
+                cm::holds::watch_withdraw(&host, &c.root, &target, id, "wrong signal")
+                    .unwrap()
+                    .ok()
+            );
+        }
+        let before = fs::read(c.root.join("01-a/u/.cm/state.json")).unwrap();
+        let journal = fs::read(c.root.join("JOURNAL.md")).unwrap();
+        let rule = if id == 1 {
+            "watch-resolved"
+        } else {
+            "watch-withdrawn"
+        };
+        assert_eq!(
+            rules(&cm::holds::watch_withdraw(&host, &c.root, &target, id, "again").unwrap()),
+            vec![rule]
+        );
+        assert_eq!(
+            rules(&cm::holds::watch_amend(&host, &c.root, &target, id, "log:new").unwrap()),
+            vec![rule]
+        );
+        assert_eq!(
+            rules(&cm::holds::watch_resolve(&host, &c.root, &target, id, &read).unwrap()),
+            vec![rule]
+        );
+        assert_eq!(
+            fs::read(c.root.join("01-a/u/.cm/state.json")).unwrap(),
+            before
+        );
+        assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), journal);
+    }
+}
+
+#[test]
+fn watch_edits_refuse_unknown_ids_and_empty_withdrawal_reasons() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/check";
+    assert!(declare(&host, &c, step, Lane::Pi, &[]).ok());
+    let target = parse_target(step, true).unwrap();
+    assert_eq!(
+        rules(&cm::holds::watch_withdraw(&host, &c.root, &target, 1, "unknown").unwrap()),
+        vec!["watch-unknown"]
+    );
+    assert_eq!(
+        rules(&cm::holds::watch_amend(&host, &c.root, &target, 1, "log:new").unwrap()),
+        vec!["watch-unknown"]
+    );
+    assert!(
+        cm::holds::watch_add(&host, &c.root, &target, "log:old", "2026-10-27T06:00Z")
+            .unwrap()
+            .ok()
+    );
+    for reason in [" ", "two\nlines"] {
+        assert_eq!(
+            rules(&cm::holds::watch_withdraw(&host, &c.root, &target, 1, reason).unwrap()),
+            vec!["ledger-field"]
+        );
+    }
+    assert!(
+        store::load_unit(&c.root.join("01-a/u")).unwrap().steps["check"].watches[0]
+            .withdrawn
+            .is_none()
+    );
+}
+
+#[test]
+fn withdrawing_a_watch_releases_sync_and_multipart_rollup() {
+    for multipart_step in [false, true] {
+        let host = at("2026-10-26T08:00:00Z");
+        let c = campaign(&host);
+        let step = "01-a/u/check";
+        let prs = if multipart_step {
+            multipart(&host, &c, step, &["pr1", "pr2"]).1
+        } else {
+            assert!(declare(&host, &c, step, Lane::Pi, &[]).ok());
+            kickoff(&c, step);
+            let pr = "https://github.com/dekopon-agents/dekopon/pull/1";
+            open_pr(&host, &c, step, pr);
+            vec![pr.to_owned()]
+        };
+        let target = parse_target(step, true).unwrap();
+        assert!(
+            cm::holds::watch_add(&host, &c.root, &target, "log:old", "2026-10-27T06:00Z")
+                .unwrap()
+                .ok()
+        );
+        let mut forge = FakeForge::default();
+        for pr in prs {
+            forge.pulls.insert(pr, merged("aaa1"));
+        }
+        deployed_release(&host, &c, &mut forge, &["aaa1"]);
+        sync(&host, &forge, &c.root).unwrap();
+        assert_eq!(state(&c, step), Phase::Released);
+        let withdrawn =
+            cm::holds::watch_withdraw(&host, &c.root, &target, 1, "wrong signal").unwrap();
+        assert!(withdrawn.ok(), "{:?}", withdrawn.violations);
+        if multipart_step {
+            assert_eq!(state(&c, step), Phase::Deployed);
+        }
+        let late = at("2026-10-27T07:00:00Z");
+        let synced = sync(&late, &forge, &c.root).unwrap();
+        assert!(synced.ok(), "{:?}", synced.violations);
+        assert_eq!(state(&c, step), Phase::Deployed);
+        assert_eq!(
+            cm::lint::lint_at(&c.root, late.now).unwrap().fields["warnings"],
+            serde_json::json!([])
+        );
+    }
+}
+
+#[test]
+fn editing_a_reopened_watch_does_not_reuse_its_old_resolution() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/check";
+    assert!(declare(&host, &c, step, Lane::Pi, &[]).ok());
+    kickoff(&c, step);
+    let target = parse_target(step, true).unwrap();
+    let read = c.root.join(step).join("kickoff.md");
+    assert!(
+        cm::holds::watch_add(&host, &c.root, &target, "log:old", "2026-10-27T06:00Z")
+            .unwrap()
+            .ok()
+    );
+    assert!(
+        cm::holds::watch_resolve(&host, &c.root, &target, 1, &read)
+            .unwrap()
+            .ok()
+    );
+    fs::remove_file(&read).unwrap();
+    assert!(
+        cm::holds::watch_amend(&host, &c.root, &target, 1, "metric:new")
+            .unwrap()
+            .ok()
+    );
+    c.kickoff(step, "Go.\n");
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    assert!(unit.steps["check"].watches[0].resolved.is_none());
+    assert_eq!(unit.steps["check"].unresolved_watches(&c.root).count(), 1);
+    assert!(
+        cm::holds::watch_resolve(&host, &c.root, &target, 1, &read)
+            .unwrap()
+            .ok()
+    );
+    fs::remove_file(&read).unwrap();
+    assert!(
+        cm::holds::watch_withdraw(&host, &c.root, &target, 1, "wrong signal")
+            .unwrap()
+            .ok()
+    );
+    // A withdrawn watch no longer depends on the missing resolution evidence.
+    let linted = lint(&c.root).unwrap();
+    assert!(
+        !rules(&linted).contains(&"evidence-file"),
+        "{:?}",
+        linted.violations
+    );
+    c.kickoff(step, "Go.\n");
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    assert_eq!(unit.steps["check"].unresolved_watches(&c.root).count(), 0);
 }
 
 #[test]
