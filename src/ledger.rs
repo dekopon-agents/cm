@@ -545,9 +545,9 @@ pub fn lint_mac_lane(root: &Path) -> Vec<Violation> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    let mut last = 0;
+    let mut last = 0_u32;
     for item in mac_lane_items(&text) {
-        if item.number != last + 1 {
+        if last.checked_add(1) != Some(item.number) {
             let place = match last {
                 0 => "the first item".to_owned(),
                 last => format!("the item after {last}"),
@@ -572,11 +572,11 @@ pub fn lint_mac_lane(root: &Path) -> Vec<Violation> {
 pub fn mac_lane_add(host: &dyn Host, root: &Path, title: &str, body: &str) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
     one_line("the title", title, &mut violations, MAC_LANE_FILE);
-    if title.contains("**") {
+    if title.contains("**") || mac_status(title.trim()).is_some() {
         violations.push(Violation::new(
             MAC_LANE_FILE,
             "mac-lane-title",
-            "the title may not hold `**`, which would close its bold span",
+            "the title may not hold `**` or begin with a Mac lane status word",
         ));
     }
     if !violations.is_empty() {
@@ -585,7 +585,19 @@ pub fn mac_lane_add(host: &dyn Host, root: &Path, title: &str, body: &str) -> Re
     let path = root.join(MAC_LANE_FILE);
     let mut text = read_existing(&path)?.unwrap_or_else(|| MAC_LANE.to_owned());
     let items = mac_lane_items(&text);
-    let number = items.iter().map(|item| item.number).max().unwrap_or(0) + 1;
+    let Some(number) = items
+        .iter()
+        .map(|item| item.number)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+    else {
+        return Ok(Outcome::refused(vec![Violation::new(
+            MAC_LANE_FILE,
+            "mac-lane-number",
+            "the next item number exceeds the supported range; renumber the items first",
+        )]));
+    };
     let title = title.trim();
     let mut entry = format!("{number}. **{title}**");
     for (index, line) in body.trim().lines().enumerate() {
