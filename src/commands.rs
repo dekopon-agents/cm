@@ -126,6 +126,15 @@ fn check_kickoff(full: &str, text: Option<&str>) -> Option<Violation> {
     })
 }
 
+fn kickoff_outcome(outcome: &mut Outcome, full: &str, written: bool) {
+    let path = format!("{full}/kickoff.md");
+    outcome.field("kickoff", path.clone());
+    outcome.field("kickoff_kept", !written);
+    if !written {
+        outcome.line(format!("kept existing {path}"));
+    }
+}
+
 pub fn init(host: &dyn Host, dir: &Path) -> Result<Outcome> {
     declare(host, dir, &Declaration::default())
 }
@@ -392,15 +401,13 @@ fn record_release(
     outcome.line(format!("recorded {full}'s tag {tag}"));
     outcome.field("target", full.clone());
     outcome.field("tag", tag.to_string());
-    if written {
-        outcome.field("kickoff", format!("{full}/kickoff.md"));
+    if kickoff.is_some() {
+        kickoff_outcome(&mut outcome, &full, written);
     }
     outcome.field("journal", heading);
     Ok(outcome)
 }
 
-/// The same declaration again finishes one an interrupted `cm init` left half written: the step
-/// folder, a supplied kickoff and a missing or stale STATE.md. The journal is not replayed.
 fn repair(
     host: &dyn Host,
     root: &Path,
@@ -420,10 +427,12 @@ fn repair(
         fs::create_dir_all(dir.join(step_name))?;
         repaired.push(format!("{full}/"));
     }
-    if let Some(kickoff) = kickoff
-        && create_new(&dir.join(step_name).join("kickoff.md"), kickoff.as_bytes())?
-    {
-        repaired.push(format!("{full}/kickoff.md"));
+    if let Some(kickoff) = kickoff {
+        let written = create_new(&dir.join(step_name).join("kickoff.md"), kickoff.as_bytes())?;
+        if written {
+            repaired.push(format!("{full}/kickoff.md"));
+        }
+        kickoff_outcome(&mut outcome, full, written);
     }
     if !lint::unit_state_file(root, dir, unit).is_empty() {
         write_atomic(&dir.join(UNIT_STATE), render::unit(unit).as_bytes())?;
@@ -651,8 +660,8 @@ fn init_step(
     outcome.field("study", !work.is_code());
     outcome.field("after", shown);
     outcome.field("tag", tag.as_ref().map(ToString::to_string));
-    if kickoff {
-        outcome.field("kickoff", format!("{full}/kickoff.md"));
+    if declaration.kickoff.is_some() {
+        kickoff_outcome(&mut outcome, &full, kickoff);
     }
     outcome.field("journal", heading);
     Ok(outcome)
@@ -2210,13 +2219,17 @@ pub fn amend(
             "the step was launched without a declaration; only a declared step is amended",
         ));
     }
-    let only_parts = !amendment.study
-        && amendment.lane.is_none()
-        && amendment.after.is_empty()
-        && amendment.drop_after.is_empty()
-        && amendment.kickoff.is_none()
-        && !amendment.ships.given()
-        && !amendment.parts.is_empty();
+    let declaration_change = amendment.study
+        || amendment.lane.is_some()
+        || !amendment.after.is_empty()
+        || !amendment.drop_after.is_empty()
+        || amendment.kickoff.is_some();
+    let only_parts = !declaration_change && !amendment.ships.given() && !amendment.parts.is_empty();
+    let late_release = !declaration_change
+        && amendment.parts.is_empty()
+        && amendment.ships.given()
+        && Release::of_target(&full).is_some()
+        && matches!(step.track.resting(), Phase::PrOpen | Phase::Merged);
     let early = match step.track.resting() {
         Phase::Drafted | Phase::Launched => true,
         Phase::PrOpen
@@ -2227,12 +2240,12 @@ pub fn amend(
         | Phase::Superseded
         | Phase::Blocked(_) => false,
     };
-    if step.track.state.is_final() || (!early && !only_parts) {
+    if step.track.state.is_final() || (!early && !only_parts && !late_release) {
         violations.push(Violation::new(
             &full,
             "amend-state",
             format!(
-                "{full} is {}; only a drafted or launched step is amended, and --part alone amends any step short of done",
+                "{full} is {}; declaration changes require drafted or launched; release --github/--tag also allow pr-open or merged; --part alone amends any step short of done",
                 step.track.state
             ),
         ));
@@ -2241,6 +2254,12 @@ pub fn amend(
     let mut next = step.clone();
     violations.extend(check_kickoff(&full, amendment.kickoff.as_deref()));
     if amendment.kickoff.is_some() {
+        if !root.join(&full).is_dir() {
+            violations.push(Violation::new(
+                &full, "kickoff-file",
+                "the step folder is missing; repeat its `cm init` declaration to repair it before amending the kickoff",
+            ));
+        }
         changes.push(format!("- kickoff: {full}/kickoff.md"));
     }
     if amendment.ships.given() {

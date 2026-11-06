@@ -1,7 +1,7 @@
 use std::fs;
 use std::io;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use cm::commands;
@@ -12,13 +12,12 @@ use cm::state::{Evidence, Phase, UnitState};
 use cm::store::{self, Target, parse_target};
 use jiff::Timestamp;
 
-#[allow(dead_code)]
 #[path = "support/campaign.rs"]
 mod campaign_fixture;
 #[path = "support/kickoff.rs"]
 mod kickoff_fixture;
 
-use campaign_fixture::{Campaign, campaign};
+use campaign_fixture::{Campaign, campaign, git, repo};
 
 struct Fake {
     now: Timestamp,
@@ -58,27 +57,6 @@ fn rules(outcome: &Outcome) -> Vec<&'static str> {
 
 fn target(text: &str) -> Target {
     parse_target(text, false).unwrap()
-}
-
-fn git(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["-c", "user.name=cm", "-c", "user.email=cm@example.com"])
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "git {args:?}: {output:?}");
-    String::from_utf8(output.stdout).unwrap().trim().to_owned()
-}
-
-fn repo(dir: &Path) -> (PathBuf, String) {
-    let repo = dir.join("wt");
-    fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q"]);
-    git(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
-    let sha = git(&repo, &["rev-parse", "HEAD"]);
-    (repo, sha)
 }
 
 fn unit_with_step(c: &Campaign, host: &Fake, kickoff: &str) {
@@ -692,7 +670,11 @@ fn init_writes_a_kickoff_once_and_repairs_a_missing_kickoff() {
     );
     fs::write(file.path(), "A different file.\n").unwrap();
     let before = fs::read(c.root.join("JOURNAL.md")).unwrap();
-    assert!(init().status.success());
+    let kept = init();
+    assert!(kept.status.success(), "{kept:?}");
+    let fields: serde_json::Value = serde_json::from_slice(&kept.stdout).unwrap();
+    assert_eq!(fields["kickoff_kept"], true);
+    assert_eq!(fields["kickoff"], format!("{step}/kickoff.md"));
     assert_eq!(
         fs::read_to_string(&kickoff).unwrap(),
         "Build the feature.\n"
@@ -848,4 +830,58 @@ fn release_init_inherits_the_newest_declared_repository_and_tag_pattern() {
         other.steps["1.0.0"].tag.as_ref().unwrap().as_str(),
         "v1.0.0"
     );
+}
+
+#[test]
+fn init_reports_a_preexisting_kickoff_as_kept() {
+    let host = Fake::at("2026-10-08T07:04:00Z");
+    let c = campaign(&host);
+    let step = "01-first/alpha/BUILD";
+    c.kickoff(step, "Existing work.\n");
+    let declaration = commands::Declaration {
+        lane: Some(cm::state::Lane::Pi),
+        kickoff: Some("Different work.\n".into()),
+        ..commands::Declaration::default()
+    };
+    let outcome = commands::declare(&host, &c.root.join(step), &declaration).unwrap();
+    assert!(outcome.ok(), "{:?}", outcome.violations);
+    assert_eq!(outcome.fields["kickoff_kept"], true);
+    assert_eq!(outcome.fields["kickoff"], format!("{step}/kickoff.md"));
+    assert_eq!(
+        fs::read_to_string(c.root.join(step).join("kickoff.md")).unwrap(),
+        "Existing work.\n"
+    );
+}
+
+#[test]
+fn inherited_defaults_refuse_git_invalid_tags_saved_by_older_versions() {
+    use cm::commands::Declaration;
+    use cm::state::Lane;
+
+    let host = Fake::at("2026-10-08T07:04:00Z");
+    for tag in [
+        "release/.hidden/1.2.3",
+        "release/part.lock/1.2.3",
+        "release/1.2.3.lock",
+    ] {
+        let c = campaign(&host);
+        let declaration = Declaration {
+            lane: Some(Lane::Pi),
+            ..Declaration::default()
+        };
+        assert!(
+            commands::declare(&host, &c.root.join("00-release/widget/1.2.3"), &declaration)
+                .unwrap()
+                .ok()
+        );
+        c.legacy_release_tag("00-release/widget", "1.2.3", tag);
+        let state_path = store::state_path(&c.root.join("00-release/widget"));
+        let before = fs::read(&state_path).unwrap();
+        assert!(
+            commands::declare(&host, &c.root.join("00-release/widget/1.2.4"), &declaration)
+                .is_err()
+        );
+        assert!(!c.root.join("00-release/widget/1.2.4").exists());
+        assert_eq!(fs::read(&state_path).unwrap(), before);
+    }
 }

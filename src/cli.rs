@@ -132,7 +132,7 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         evidence: PathBuf,
     },
-    /// Change a drafted or launched step's declaration: mark it a study, move its lane or add or remove gates. --part alone also amends a step that moved on.
+    /// Change a drafted or launched step's declaration. Release --github/--tag also allow pr-open or merged. --part alone also amends a step that moved on.
     Amend {
         /// <NN-name>/<unit>/<step>
         #[arg(value_parser = step_target)]

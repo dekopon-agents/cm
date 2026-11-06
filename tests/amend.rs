@@ -13,13 +13,12 @@ use cm::state::{Evidence, Lane, Phase, Work};
 use cm::store::{self, parse_target};
 use jiff::Timestamp;
 
-#[allow(dead_code)]
 #[path = "support/campaign.rs"]
 mod campaign_fixture;
 #[path = "support/kickoff.rs"]
 mod kickoff_fixture;
 
-use campaign_fixture::{Campaign, campaign};
+use campaign_fixture::{Campaign, campaign, git, repo};
 
 struct Fake {
     now: Timestamp,
@@ -653,7 +652,14 @@ fn release_amend_changes_repository_and_tag_and_rejects_bad_patterns() {
         unit.steps["1.2.3"].tag.as_ref().unwrap().as_str(),
         "widget-1.2.3"
     );
-    for pattern in ["widget-1.2.3", "{version}-{version}", "bad:{version}"] {
+    for pattern in [
+        "widget-1.2.3",
+        "{version}-{version}",
+        "bad:{version}",
+        "release/.hidden/{version}",
+        "release/part.lock/{version}",
+        "release/{version}.lock",
+    ] {
         let before = fs::read(c.root.join("JOURNAL.md")).unwrap();
         let refused = commands::amend(
             &host,
@@ -686,24 +692,6 @@ fn release_amend_changes_repository_and_tag_and_rejects_bad_patterns() {
     )
     .unwrap();
     assert_eq!(rules(&refused), vec!["amend-empty"]);
-    let mut with_pr = unit.clone();
-    with_pr.steps.get_mut("1.2.3").unwrap().track.evidence.pr =
-        Some("https://github.com/example/project/pull/1".into());
-    commands::write_unit(&unit_dir, &with_pr).unwrap();
-    let mismatch = commands::amend(
-        &host,
-        &c.root,
-        &target(step),
-        &Amendment {
-            ships: commands::Ships {
-                github: Some("example/other".parse().unwrap()),
-                tag: None,
-            },
-            ..Amendment::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(rules(&mismatch), vec!["release-repo"]);
 }
 
 #[test]
@@ -726,4 +714,159 @@ fn ordinary_steps_refuse_release_amendments() {
     )
     .unwrap();
     assert_eq!(rules(&refused), vec!["amend-target"]);
+}
+
+#[test]
+fn release_metadata_amends_at_pr_open_and_merged_but_stops_at_released() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    let step = "00-release/widget/1.2.3";
+    assert!(declare(&host, &c, step, Lane::Coordinator, &[]).ok());
+    assert!(launch(&host, &c, step).ok());
+    let (checkout, sha) = repo(c.root.parent().unwrap());
+    let unit_dir = c.root.join("00-release/widget");
+    let move_to = |phase: &Phase, evidence: Evidence| {
+        let outcome = commands::advance(
+            &host,
+            &c.root,
+            &target(step),
+            phase,
+            &evidence,
+            None,
+            Some(&checkout),
+        )
+        .unwrap();
+        assert!(outcome.ok(), "{:?}", outcome.violations);
+    };
+    for (phase, pattern) in [
+        (Phase::PrOpen, "open-{version}"),
+        (Phase::Merged, "merged-{version}"),
+    ] {
+        move_to(
+            &phase,
+            Evidence {
+                pr: (phase == Phase::PrOpen)
+                    .then(|| "https://github.com/example/widget/pull/1".into()),
+                sha: Some(sha.clone()),
+                ..Evidence::default()
+            },
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .current_dir(&c.root)
+            .args([
+                "--json",
+                "amend",
+                step,
+                "--github",
+                "example/widget",
+                "--tag",
+                pattern,
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let fields: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(fields["journal"].is_string());
+        let unit = store::load_unit(&unit_dir).unwrap();
+        let changed = &unit.steps["1.2.3"];
+        assert_eq!(changed.track.state, phase);
+        assert_eq!(
+            changed.track.evidence.pr.as_deref(),
+            Some("https://github.com/example/widget/pull/1")
+        );
+        assert_eq!(
+            changed.github.as_ref().unwrap().to_string(),
+            "example/widget"
+        );
+        assert_eq!(
+            changed.tag.as_ref().unwrap().as_str(),
+            pattern.replace("{version}", "1.2.3")
+        );
+        let before = fs::read(c.root.join("JOURNAL.md")).unwrap();
+        let mismatch = commands::amend(
+            &host,
+            &c.root,
+            &target(step),
+            &Amendment {
+                ships: commands::Ships {
+                    github: Some("example/other".parse().unwrap()),
+                    tag: None,
+                },
+                ..Amendment::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rules(&mismatch), vec!["release-repo"]);
+        let mixed = commands::amend(
+            &host,
+            &c.root,
+            &target(step),
+            &Amendment {
+                kickoff: Some("Too late.\n".into()),
+                ships: commands::Ships {
+                    github: None,
+                    tag: Some("later-{version}".into()),
+                },
+                ..Amendment::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rules(&mixed), vec!["amend-state"]);
+        assert_eq!(
+            fs::read_to_string(c.root.join(step).join("kickoff.md")).unwrap(),
+            "Go.\n"
+        );
+        assert_eq!(store::load_unit(&unit_dir).unwrap(), unit);
+        assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), before);
+    }
+    git(&checkout, &["tag", "merged-1.2.3"]);
+    move_to(
+        &Phase::Released,
+        Evidence {
+            tag: Some("merged-1.2.3".into()),
+            ..Evidence::default()
+        },
+    );
+    let before = fs::read(c.root.join("JOURNAL.md")).unwrap();
+    let unit = store::load_unit(&unit_dir).unwrap();
+    let late = commands::amend(
+        &host,
+        &c.root,
+        &target(step),
+        &Amendment {
+            ships: commands::Ships {
+                github: Some("example/widget".parse().unwrap()),
+                tag: Some("later-{version}".into()),
+            },
+            ..Amendment::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(rules(&late), vec!["amend-state"]);
+    assert_eq!(store::load_unit(&unit_dir).unwrap(), unit);
+    assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), before);
+}
+
+#[test]
+fn kickoff_amend_refuses_a_missing_step_folder_with_a_typed_violation() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/S1";
+    assert!(declare(&host, &c, step, Lane::Codex, &[]).ok());
+    let replacement = kickoff_fixture::file("Updated work.\n");
+    fs::remove_dir_all(c.root.join(step)).unwrap();
+    let before = fs::read(c.root.join("JOURNAL.md")).unwrap();
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .current_dir(&c.root)
+        .args(["--json", "amend", step, "--kickoff-file"])
+        .arg(replacement.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let fields: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(fields["violations"][0]["rule"], "kickoff-file");
+    assert_eq!(store::load_unit(&c.root.join("01-a/u")).unwrap(), unit);
+    assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), before);
+    assert!(!c.root.join(step).exists());
 }

@@ -114,6 +114,9 @@ impl std::str::FromStr for TagName {
             && !text.contains("..")
             && !text.contains("//")
             && text
+                .split('/')
+                .all(|part| !part.starts_with('.') && !part.ends_with(".lock"))
+            && text
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c));
         if fits {
@@ -629,7 +632,20 @@ mod tests {
         for good in ["v0.7.0", "guest-v0.7.0", "release/1.0.0"] {
             assert!(good.parse::<TagName>().is_ok(), "{good}");
         }
-        for bad in ["", "-v1", "a..b", "a b", "v1/", "a//b", ".v1"] {
+        for bad in [
+            "",
+            "-v1",
+            "a..b",
+            "a b",
+            "v1/",
+            "a//b",
+            ".v1",
+            "release/.hidden/v1",
+            "release/v1/.hidden",
+            "release/part.lock/v1",
+            "release/v1.lock",
+            "v1.lock",
+        ] {
             assert!(bad.parse::<TagName>().is_err(), "{bad}");
         }
     }
