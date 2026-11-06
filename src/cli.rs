@@ -63,12 +63,15 @@ enum Commands {
         /// What the step waits on: <step> or <NN-name>/<unit>/<step> (merged), pr-open:<step>, tag:<line>@<version> or deployed:<line>@<version>. Repeat for each.
         #[arg(long, value_name = "AFTER")]
         after: Vec<String>,
-        /// A release step's repository, <owner>/<name>; its prep PR must be there. Defaults to any owner's repository named for the release line.
+        /// A release step's repository, <owner>/<name>; its prep PR must be there. With neither release flag, inherits the newest declared release; otherwise defaults to any owner's repository named for the release line.
         #[arg(long, value_name = "OWNER/NAME")]
         github: Option<GithubRepo>,
-        /// A release step's tag pattern, holding `{version}` once; cm records the one tag it names. Defaults to `v{version}`.
+        /// A release step's tag pattern, holding `{version}` once; cm records the one tag it names. With neither release flag, inherits the newest declared release; otherwise defaults to `v{version}`.
         #[arg(long, value_name = "PATTERN")]
         tag: Option<String>,
+        /// Write kickoff.md from a non-empty file, or `-` for stdin. Never overwrites an existing kickoff.
+        #[arg(long, value_name = "F")]
+        kickoff_file: Option<PathBuf>,
     },
     /// List the declared steps whose `--after` is met, or, given one, refuse it unless it is next.
     Next {
@@ -149,6 +152,15 @@ enum Commands {
         /// A required part (one PR) of a multipart step; the step moves to a state only once every part has. On a step past launched, the first new part takes the step's state and evidence and the step rests at launched. Repeat for each.
         #[arg(long, value_name = "NAME")]
         part: Vec<String>,
+        /// Replace kickoff.md from a non-empty file, or `-` for stdin.
+        #[arg(long, value_name = "F")]
+        kickoff_file: Option<PathBuf>,
+        /// A release step's new repository; its prep PR must be there.
+        #[arg(long, value_name = "OWNER/NAME")]
+        github: Option<GithubRepo>,
+        /// A release step's new tag pattern, holding `{version}` once.
+        #[arg(long, value_name = "PATTERN")]
+        tag: Option<String>,
     },
     /// Show, claim or extend a remote launch's attempt record; every external action is recorded before the next.
     Attempt {
@@ -490,6 +502,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             after,
             github,
             tag,
+            kickoff_file,
         } => {
             let declaration = commands::Declaration {
                 parts: part.clone(),
@@ -500,6 +513,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                     tag: tag.clone(),
                 },
                 work: if *study { Work::Study } else { Work::Code },
+                kickoff: kickoff_file.as_deref().map(read_body).transpose()?,
             };
             commands::declare(host, &under_root(cli, dir), &declaration)
         }
@@ -549,6 +563,9 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             after,
             drop_after,
             part,
+            kickoff_file,
+            github,
+            tag,
         } => commands::amend(
             host,
             &root()?,
@@ -559,6 +576,11 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 after: after.clone(),
                 drop_after: drop_after.clone(),
                 parts: part.clone(),
+                kickoff: kickoff_file.as_deref().map(read_body).transpose()?,
+                ships: commands::Ships {
+                    github: github.clone(),
+                    tag: tag.clone(),
+                },
             },
         ),
         Commands::Attempt { target, claim, act } => {

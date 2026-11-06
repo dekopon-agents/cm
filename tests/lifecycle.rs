@@ -1,7 +1,8 @@
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use cm::commands;
 use cm::host::Host;
@@ -10,6 +11,9 @@ use cm::outcome::Outcome;
 use cm::state::{Evidence, Phase, UnitState};
 use cm::store::{self, Target, parse_target};
 use jiff::Timestamp;
+
+#[path = "support/kickoff.rs"]
+mod kickoff_fixture;
 
 struct Fake {
     now: Timestamp,
@@ -676,4 +680,188 @@ fn close_seals_the_campaign() {
             .ok()
     );
     assert_clean(&c.root);
+}
+
+#[test]
+fn init_writes_a_kickoff_once_and_repairs_a_missing_kickoff() {
+    let host = Fake::at("2026-10-08T07:04:00Z");
+    let c = campaign(&host);
+    let step = "01-first/alpha/BUILD";
+    let file = kickoff_fixture::file("Build the feature.\n");
+    let init = || {
+        Command::new(env!("CARGO_BIN_EXE_cm"))
+            .current_dir(&c.root)
+            .args(["--json", "init", step, "--lane", "pi", "--kickoff-file"])
+            .arg(file.path())
+            .output()
+            .unwrap()
+    };
+    let first = init();
+    assert!(first.status.success(), "{first:?}");
+    let fields: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(fields["kickoff"], format!("{step}/kickoff.md"));
+    assert!(fields["journal"].is_string());
+    let kickoff = c.root.join(step).join("kickoff.md");
+    assert_eq!(
+        fs::read_to_string(&kickoff).unwrap(),
+        "Build the feature.\n"
+    );
+    fs::write(file.path(), "A different file.\n").unwrap();
+    let before = fs::read(c.root.join("JOURNAL.md")).unwrap();
+    assert!(init().status.success());
+    assert_eq!(
+        fs::read_to_string(&kickoff).unwrap(),
+        "Build the feature.\n"
+    );
+    assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), before);
+    fs::remove_dir_all(c.root.join(step)).unwrap();
+    fs::remove_file(c.root.join("01-first/alpha/STATE.md")).unwrap();
+    let repaired = init();
+    assert!(repaired.status.success(), "{repaired:?}");
+    let fields: serde_json::Value = serde_json::from_slice(&repaired.stdout).unwrap();
+    assert_eq!(
+        fields["repaired"],
+        serde_json::json!([
+            format!("{step}/"),
+            format!("{step}/kickoff.md"),
+            "01-first/alpha/STATE.md"
+        ])
+    );
+    assert_eq!(fs::read_to_string(&kickoff).unwrap(), "A different file.\n");
+    assert_clean(&c.root);
+}
+
+#[test]
+fn init_accepts_a_kickoff_on_stdin_and_rejects_empty_input() {
+    let host = Fake::at("2026-10-08T07:04:00Z");
+    let c = campaign(&host);
+    for text in ["", " \n\t", "Do the work.\n"] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .current_dir(&c.root)
+            .args([
+                "--json",
+                "init",
+                "01-first/alpha/BUILD",
+                "--lane",
+                "pi",
+                "--kickoff-file",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.success(), !text.trim().is_empty());
+        if text.trim().is_empty() {
+            assert!(!c.root.join("01-first/alpha").exists());
+            let fields: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(fields["violations"][0]["rule"], "kickoff-file");
+        }
+    }
+    assert_eq!(
+        fs::read_to_string(c.root.join("01-first/alpha/BUILD/kickoff.md")).unwrap(),
+        "Do the work.\n"
+    );
+}
+
+#[test]
+fn release_init_inherits_the_newest_declared_repository_and_tag_pattern() {
+    use cm::commands::{Declaration, Ships};
+    use cm::state::Lane;
+
+    let host = Fake::at("2026-10-08T07:04:00Z");
+    let c = campaign(&host);
+    let mut declaration = Declaration {
+        lane: Some(Lane::Pi),
+        ships: Ships {
+            github: Some("example/old".parse().unwrap()),
+            tag: Some("v{version}".into()),
+        },
+        ..Declaration::default()
+    };
+    assert!(
+        commands::declare(&host, &c.root.join("00-release/widget/1.9.0"), &declaration)
+            .unwrap()
+            .ok()
+    );
+    declaration.ships = Ships {
+        github: Some("example/project".parse().unwrap()),
+        tag: Some("cm-{version}".into()),
+    };
+    assert!(
+        commands::declare(
+            &host,
+            &c.root.join("00-release/widget/1.10.0"),
+            &declaration
+        )
+        .unwrap()
+        .ok()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .current_dir(&c.root)
+        .args(["init", "00-release/widget/1.11.0", "--lane", "pi"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let unit = store::load_unit(&c.root.join("00-release/widget")).unwrap();
+    let inherited = &unit.steps["1.11.0"];
+    assert_eq!(
+        inherited.github.as_ref().unwrap().to_string(),
+        "example/project"
+    );
+    assert_eq!(inherited.tag.as_ref().unwrap().as_str(), "cm-1.11.0");
+    let retry = Declaration {
+        lane: Some(Lane::Pi),
+        kickoff: Some("Release prep.\n".into()),
+        ..Declaration::default()
+    };
+    assert!(
+        commands::declare(&host, &c.root.join("00-release/widget/1.10.0"), &retry)
+            .unwrap()
+            .ok()
+    );
+    assert_eq!(
+        fs::read_to_string(c.root.join("00-release/widget/1.10.0/kickoff.md")).unwrap(),
+        "Release prep.\n"
+    );
+    let explicit = Declaration {
+        lane: Some(Lane::Pi),
+        ships: Ships {
+            github: Some("example/override".parse().unwrap()),
+            tag: None,
+        },
+        ..Declaration::default()
+    };
+    assert!(
+        commands::declare(&host, &c.root.join("00-release/widget/1.12.0"), &explicit)
+            .unwrap()
+            .ok()
+    );
+    let unit = store::load_unit(&c.root.join("00-release/widget")).unwrap();
+    assert_eq!(
+        unit.steps["1.12.0"].tag.as_ref().unwrap().as_str(),
+        "v1.12.0"
+    );
+    let defaults = Declaration {
+        lane: Some(Lane::Pi),
+        ..Declaration::default()
+    };
+    assert!(
+        commands::declare(&host, &c.root.join("00-release/other/1.0.0"), &defaults)
+            .unwrap()
+            .ok()
+    );
+    let other = store::load_unit(&c.root.join("00-release/other")).unwrap();
+    assert_eq!(other.steps["1.0.0"].github, None);
+    assert_eq!(
+        other.steps["1.0.0"].tag.as_ref().unwrap().as_str(),
+        "v1.0.0"
+    );
 }

@@ -1,7 +1,8 @@
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use cm::commands::{self, Amendment, Declaration};
 use cm::host::Host;
@@ -11,6 +12,9 @@ use cm::plan;
 use cm::state::{Evidence, Lane, Phase, Work};
 use cm::store::{self, parse_target};
 use jiff::Timestamp;
+
+#[path = "support/kickoff.rs"]
+mod kickoff_fixture;
 
 struct Fake {
     now: Timestamp,
@@ -543,4 +547,198 @@ fn dropping_and_readding_the_same_gate_refuses_an_unchanged_amendment() {
     let refused = commands::amend(&host, &c.root, &target("01-a/u/consumer"), &amendment).unwrap();
     assert_eq!(rules(&refused), vec!["amend-empty"]);
     assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), before);
+}
+
+#[test]
+fn kickoff_amend_replaces_drafted_and_launched_but_refuses_pr_open() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/S1";
+    assert!(declare(&host, &c, step, Lane::Codex, &[]).ok());
+    let replacement = kickoff_fixture::file("Updated work.\n");
+    let amend = || {
+        Command::new(env!("CARGO_BIN_EXE_cm"))
+            .current_dir(&c.root)
+            .args(["--json", "amend", step, "--kickoff-file"])
+            .arg(replacement.path())
+            .output()
+            .unwrap()
+    };
+    let drafted = amend();
+    assert!(drafted.status.success(), "{drafted:?}");
+    assert_eq!(
+        fs::read_to_string(c.root.join(step).join("kickoff.md")).unwrap(),
+        "Updated work.\n"
+    );
+    let fields: serde_json::Value = serde_json::from_slice(&drafted.stdout).unwrap();
+    assert_eq!(
+        fields["changes"],
+        serde_json::json!([format!("- kickoff: {step}/kickoff.md")])
+    );
+    assert!(fields["journal"].is_string());
+    assert!(launch(&host, &c, step).ok());
+    fs::write(replacement.path(), "Launched update.\n").unwrap();
+    let launched = amend();
+    assert!(launched.status.success(), "{launched:?}");
+    assert_eq!(
+        fs::read_to_string(c.root.join(step).join("kickoff.md")).unwrap(),
+        "Launched update.\n"
+    );
+    let mut unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    unit.steps.get_mut("S1").unwrap().track.state = Phase::PrOpen;
+    commands::write_unit(&c.root.join("01-a/u"), &unit).unwrap();
+    let before = fs::read(c.root.join("JOURNAL.md")).unwrap();
+    let late = amend();
+    assert!(!late.status.success());
+    let fields: serde_json::Value = serde_json::from_slice(&late.stdout).unwrap();
+    assert_eq!(fields["violations"][0]["rule"], "amend-state");
+    assert_eq!(
+        fs::read_to_string(c.root.join(step).join("kickoff.md")).unwrap(),
+        "Launched update.\n"
+    );
+    assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), before);
+}
+
+#[test]
+fn kickoff_amend_reads_stdin_and_rejects_empty_files() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/S1";
+    assert!(declare(&host, &c, step, Lane::Pi, &[]).ok());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .current_dir(&c.root)
+        .args(["amend", step, "--kickoff-file", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"From stdin.\n")
+        .unwrap();
+    assert!(child.wait_with_output().unwrap().status.success());
+    for empty in ["", " \n\t"] {
+        let file = kickoff_fixture::file(empty);
+        let before = fs::read(c.root.join("JOURNAL.md")).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .current_dir(&c.root)
+            .args(["--json", "amend", step, "--kickoff-file"])
+            .arg(file.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let fields: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(fields["violations"][0]["rule"], "kickoff-file");
+        assert_eq!(
+            fs::read_to_string(c.root.join(step).join("kickoff.md")).unwrap(),
+            "From stdin.\n"
+        );
+        assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), before);
+    }
+}
+
+#[test]
+fn release_amend_changes_repository_and_tag_and_rejects_bad_patterns() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    let step = "00-release/widget/1.2.3";
+    assert!(declare(&host, &c, step, Lane::Pi, &[]).ok());
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .current_dir(&c.root)
+        .args([
+            "amend",
+            step,
+            "--github",
+            "example/project",
+            "--tag",
+            "widget-{version}",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let unit_dir = c.root.join("00-release/widget");
+    let unit = store::load_unit(&unit_dir).unwrap();
+    assert_eq!(
+        unit.steps["1.2.3"].github.as_ref().unwrap().to_string(),
+        "example/project"
+    );
+    assert_eq!(
+        unit.steps["1.2.3"].tag.as_ref().unwrap().as_str(),
+        "widget-1.2.3"
+    );
+    for pattern in ["widget-1.2.3", "{version}-{version}", "bad:{version}"] {
+        let before = fs::read(c.root.join("JOURNAL.md")).unwrap();
+        let refused = commands::amend(
+            &host,
+            &c.root,
+            &target(step),
+            &Amendment {
+                ships: commands::Ships {
+                    github: Some("example/other".parse().unwrap()),
+                    tag: Some(pattern.into()),
+                },
+                ..Amendment::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rules(&refused), vec!["release-tag"]);
+        assert_eq!(store::load_unit(&unit_dir).unwrap(), unit);
+        assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), before);
+    }
+    let refused = commands::amend(
+        &host,
+        &c.root,
+        &target(step),
+        &Amendment {
+            ships: commands::Ships {
+                github: Some("example/project".parse().unwrap()),
+                tag: Some("widget-{version}".into()),
+            },
+            ..Amendment::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(rules(&refused), vec!["amend-empty"]);
+    let mut with_pr = unit.clone();
+    with_pr.steps.get_mut("1.2.3").unwrap().track.evidence.pr =
+        Some("https://github.com/example/project/pull/1".into());
+    commands::write_unit(&unit_dir, &with_pr).unwrap();
+    let mismatch = commands::amend(
+        &host,
+        &c.root,
+        &target(step),
+        &Amendment {
+            ships: commands::Ships {
+                github: Some("example/other".parse().unwrap()),
+                tag: None,
+            },
+            ..Amendment::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(rules(&mismatch), vec!["release-repo"]);
+}
+
+#[test]
+fn ordinary_steps_refuse_release_amendments() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/S1";
+    assert!(declare(&host, &c, step, Lane::Pi, &[]).ok());
+    let refused = commands::amend(
+        &host,
+        &c.root,
+        &target(step),
+        &Amendment {
+            ships: commands::Ships {
+                github: Some("example/project".parse().unwrap()),
+                tag: Some("v{version}".into()),
+            },
+            ..Amendment::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(rules(&refused), vec!["amend-target"]);
 }
