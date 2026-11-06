@@ -287,6 +287,277 @@ fn owner_queue_add_withholds_the_loop_banner() {
     assert!(lint(&root).unwrap().ok());
 }
 
+#[path = "support/owner_queue.rs"]
+mod queue_fixture;
+
+#[test]
+fn owner_queue_answer_removes_only_its_item_and_journals_the_body() {
+    let c = queue_fixture::campaign(&Fake);
+    let before = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    let resume = fs::read(c.root.join("RESUME.md")).unwrap();
+    let body = queue_fixture::body_file(&c.root, queue_fixture::ANSWER);
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args(["--json", "owner-queue", "answer", "7", "--body-file"])
+        .arg(body)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["item"], 7);
+    assert_eq!(json["queue_drained"], false);
+    assert_eq!(
+        fs::read_to_string(c.root.join("OWNER-QUEUE.md")).unwrap(),
+        format!(
+            "{}\n{}{}",
+            cm::templates::OWNER_QUEUE,
+            queue_fixture::FIRST,
+            queue_fixture::LAST
+        )
+    );
+    assert_eq!(fs::read(c.root.join("RESUME.md")).unwrap(), resume);
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    assert_eq!(
+        journal.strip_prefix(before.as_str()).unwrap(),
+        format!(
+            "\n{}\n\n- OWNER-QUEUE.md: `## 7. Middle`\n\nAnswer:\n{}",
+            json["journal"].as_str().unwrap(),
+            queue_fixture::ANSWER
+        )
+    );
+    assert!(lint(&c.root).unwrap().ok());
+}
+
+#[test]
+fn owner_queue_answer_stdin_drains_the_queue_and_requests_the_loop() {
+    let c = queue_fixture::campaign(&Fake);
+    assert!(
+        ledger::owner_queue_strike(&Fake, &c.root, 2, "Superseded.")
+            .unwrap()
+            .ok()
+    );
+    assert!(
+        ledger::owner_queue_strike(&Fake, &c.root, 11, "Superseded.")
+            .unwrap()
+            .ok()
+    );
+    let resume = fs::read_to_string(c.root.join("RESUME.md")).unwrap();
+    let before = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args(["owner-queue", "answer", "7", "--body-file", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(queue_fixture::ANSWER.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "owner-queue answer 7. Middle\nOWNER-QUEUE is drained. The session must print the `/loop` command that resumes the campaign.\n"
+    );
+    assert_eq!(
+        fs::read_to_string(c.root.join("OWNER-QUEUE.md")).unwrap(),
+        format!("{}\n", cm::templates::OWNER_QUEUE)
+    );
+    assert_eq!(
+        fs::read_to_string(c.root.join("RESUME.md")).unwrap(),
+        resume.replacen(&format!("> {LOOP_WITHHELD}\n"), "", 1)
+    );
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    let added = journal.strip_prefix(before.as_str()).unwrap();
+    assert_eq!(
+        added.lines().nth(1).unwrap().split_once(" — ").unwrap().1,
+        "owner-queue answer 7. Middle"
+    );
+    assert_eq!(
+        added.lines().skip(3).collect::<Vec<_>>().join("\n"),
+        format!(
+            "- OWNER-QUEUE.md: `## 7. Middle`\n\nAnswer:\n{}",
+            queue_fixture::ANSWER.trim_end()
+        )
+    );
+    let outcome = lint(&c.root).unwrap();
+    assert_eq!(rules(&outcome), vec!["resume-loop"]);
+    assert_eq!(
+        outcome.violations[0].message,
+        "OWNER-QUEUE.md has no open item, so the banner holds a fenced `/loop …` command that resumes the campaign"
+    );
+}
+
+#[test]
+fn owner_queue_strike_requires_a_reason_and_journals_it() {
+    let c = queue_fixture::campaign(&Fake);
+    let queue = fs::read(c.root.join("OWNER-QUEUE.md")).unwrap();
+    let before = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args(["owner-queue", "strike", "7"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(fs::read(c.root.join("OWNER-QUEUE.md")).unwrap(), queue);
+    assert_eq!(
+        fs::read_to_string(c.root.join("JOURNAL.md")).unwrap(),
+        before
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args([
+            "--json",
+            "owner-queue",
+            "strike",
+            "7",
+            "--reason",
+            "Superseded.",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        fs::read_to_string(c.root.join("OWNER-QUEUE.md")).unwrap(),
+        format!(
+            "{}\n{}{}",
+            cm::templates::OWNER_QUEUE,
+            queue_fixture::FIRST,
+            queue_fixture::LAST
+        )
+    );
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    assert_eq!(
+        journal.strip_prefix(before.as_str()).unwrap(),
+        format!(
+            "\n{}\n\n- OWNER-QUEUE.md: `## 7. Middle`\n\nReason: Superseded.\n",
+            json["journal"].as_str().unwrap()
+        )
+    );
+}
+
+#[test]
+fn owner_queue_edit_preserves_the_heading_and_required_fields() {
+    let c = queue_fixture::campaign(&Fake);
+    let body = queue_fixture::body_file(&c.root, queue_fixture::REPLACEMENT);
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args(["owner-queue", "edit", "7", "--body-file"])
+        .arg(body)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(c.root.join("OWNER-QUEUE.md")).unwrap(),
+        format!(
+            "{}\n{}## 7. Middle\n\n{}\n\n{}",
+            cm::templates::OWNER_QUEUE,
+            queue_fixture::FIRST,
+            queue_fixture::REPLACEMENT,
+            queue_fixture::LAST
+        )
+    );
+    let linted = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .arg("lint")
+        .output()
+        .unwrap();
+    assert!(linted.status.success(), "{linted:?}");
+}
+
+#[test]
+fn owner_queue_unknown_items_and_empty_bodies_are_refused_without_writes() {
+    let c = queue_fixture::campaign(&Fake);
+    let before: Vec<_> = ["OWNER-QUEUE.md", "RESUME.md", "JOURNAL.md"]
+        .map(|name| (name, fs::read(c.root.join(name)).unwrap()))
+        .into();
+    for outcome in [
+        ledger::owner_queue_answer(&Fake, &c.root, 99, "Yes.").unwrap(),
+        ledger::owner_queue_strike(&Fake, &c.root, 99, "Superseded.").unwrap(),
+        ledger::owner_queue_edit(&Fake, &c.root, 99, queue_fixture::REPLACEMENT).unwrap(),
+    ] {
+        assert_eq!(rules(&outcome), vec!["owner-queue-unknown"]);
+    }
+    for body in ["", " \n\n"] {
+        assert_eq!(
+            rules(&ledger::owner_queue_answer(&Fake, &c.root, 7, body).unwrap()),
+            vec!["owner-queue-empty"]
+        );
+        assert_eq!(
+            rules(&ledger::owner_queue_edit(&Fake, &c.root, 7, body).unwrap()),
+            vec!["owner-queue-empty"]
+        );
+    }
+    for (name, text) in before {
+        assert_eq!(fs::read(c.root.join(name)).unwrap(), text);
+    }
+}
+
+#[test]
+fn owner_queue_edit_refuses_missing_fields_and_section_injection() {
+    let c = queue_fixture::campaign(&Fake);
+    let before = fs::read(c.root.join("OWNER-QUEUE.md")).unwrap();
+    for field in cm::templates::QUEUE_FIELDS {
+        let body = queue_fixture::REPLACEMENT
+            .lines()
+            .filter(|line| !line.starts_with(field))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            rules(&ledger::owner_queue_edit(&Fake, &c.root, 7, &body).unwrap()),
+            vec!["owner-queue-field"]
+        );
+    }
+    for (body, rule) in [
+        (
+            format!("{}\n\n## 8. Injected", queue_fixture::REPLACEMENT),
+            "ledger-body",
+        ),
+        (
+            format!("{}\n\n```text\nunfinished", queue_fixture::REPLACEMENT),
+            "owner-queue-body-fence",
+        ),
+    ] {
+        assert_eq!(
+            rules(&ledger::owner_queue_edit(&Fake, &c.root, 7, &body).unwrap()),
+            vec![rule]
+        );
+    }
+    assert_eq!(fs::read(c.root.join("OWNER-QUEUE.md")).unwrap(), before);
+}
+
+#[test]
+fn owner_queue_add_strips_one_recommendation_prefix_in_any_case() {
+    let c = queue_fixture::campaign(&Fake);
+    for recommendation in ["Recommendation: Proceed.", "  rEcOmMeNdAtIoN: Proceed.  "] {
+        let outcome =
+            ledger::owner_queue_add(&Fake, &c.root, &queue_fixture::item("Next", recommendation))
+                .unwrap();
+        assert!(outcome.ok(), "{:?}", outcome.violations);
+        let queue = fs::read_to_string(c.root.join("OWNER-QUEUE.md")).unwrap();
+        assert_eq!(queue.lines().rev().nth(1), Some("Recommendation: Proceed."));
+    }
+    let queue = fs::read(c.root.join("OWNER-QUEUE.md")).unwrap();
+    let empty = ledger::owner_queue_add(
+        &Fake,
+        &c.root,
+        &queue_fixture::item("Empty", "Recommendation: "),
+    )
+    .unwrap();
+    assert_eq!(rules(&empty), vec!["ledger-field"]);
+    assert_eq!(fs::read(c.root.join("OWNER-QUEUE.md")).unwrap(), queue);
+}
+
 #[test]
 fn evidence_refuses_an_empty_body() {
     let (_temp, root) = campaign();
