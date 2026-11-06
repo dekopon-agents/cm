@@ -1501,7 +1501,7 @@ pub fn advance_gated(
             &full,
             "done-code-step",
             format!(
-                "{full} is a code step: it finishes at deployed, or merged where it has no release; `done --evidence <path>` finishes an owner-lane step or one declared with --study"
+                "{full} is a code step: it finishes at deployed, or merged where it has no release; `done --evidence <path>` finishes an owner-lane step, a non-release coordinator-lane step or one declared with --study"
             ),
         )
     };

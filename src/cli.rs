@@ -114,6 +114,7 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         worktree: Option<PathBuf>,
         /// A remote launch: the coordinator session that claims its attempt (generation 1).
+        /// Defaults to non-empty CLAUDE_CODE_REMOTE_SESSION_ID, else —.
         #[arg(long, value_name = "LABEL")]
         coordinator: Option<String>,
         /// A remote launch: its cap in minutes, stored as an absolute deadline a replacement inherits.
@@ -360,6 +361,17 @@ enum WatchAct {
     },
 }
 
+fn coordinator_label(given: &Option<String>) -> String {
+    given
+        .clone()
+        .or_else(|| {
+            std::env::var("CLAUDE_CODE_REMOTE_SESSION_ID")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "—".to_owned())
+}
+
 #[derive(Subcommand)]
 enum AttemptAct {
     /// End an unknown attempt as relaned and dispatch its successor under the same claim and cap.
@@ -371,8 +383,9 @@ enum AttemptAct {
     },
     /// Fence the generation that holds the attempt and take it over; --expect is that generation.
     Claim {
+        /// Defaults to non-empty CLAUDE_CODE_REMOTE_SESSION_ID, else —.
         #[arg(long, value_name = "LABEL")]
-        coordinator: String,
+        coordinator: Option<String>,
         #[arg(long, value_name = "GENERATION")]
         expect: u32,
     },
@@ -535,7 +548,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             worktree.as_deref(),
             &commands::Remote {
                 no_parts: no_parts.clone(),
-                coordinator: coordinator.clone(),
+                coordinator: Some(coordinator_label(coordinator)),
                 cap_min: *cap_min,
             },
         ),
@@ -569,7 +582,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                     coordinator,
                     expect,
                 }) => Act::Claim {
-                    coordinator: coordinator.clone(),
+                    coordinator: coordinator_label(coordinator),
                     expect: *expect,
                 },
                 Some(AttemptAct::Restart { lane, evidence }) => Act::Restart {

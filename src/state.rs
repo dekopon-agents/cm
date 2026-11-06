@@ -1039,6 +1039,7 @@ impl Step {
     pub fn finish(&self) -> Finish {
         match (self.work, self.lane) {
             (Work::Study, _) | (Work::Code, Some(Lane::Owner)) => Finish::Evidence,
+            (Work::Code, Some(Lane::Coordinator)) if self.tag.is_none() => Finish::Evidence,
             (
                 Work::Code,
                 None

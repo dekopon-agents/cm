@@ -7,7 +7,7 @@ use cm::commands;
 use cm::host::Host;
 use cm::lint::lint;
 use cm::outcome::Outcome;
-use cm::state::{Evidence, Phase, UnitState};
+use cm::state::{Evidence, Lane, Phase, UnitState};
 use cm::store::{self, Target, parse_target};
 use jiff::Timestamp;
 
@@ -72,26 +72,10 @@ fn repo(dir: &Path) -> (PathBuf, String) {
     (repo, sha)
 }
 
-struct Campaign {
-    _temp: tempfile::TempDir,
-    root: PathBuf,
-}
-
-fn campaign(host: &Fake) -> Campaign {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("campaign");
-    let outcome = commands::init(host, &root).unwrap();
-    assert!(outcome.ok(), "{:?}", outcome.violations);
-    let git = std::process::Command::new("git")
-        .args(["init", "-q"])
-        .arg(&root)
-        .status();
-    assert!(
-        git.unwrap().success(),
-        "a campaign lives in a git repository"
-    );
-    Campaign { _temp: temp, root }
-}
+#[path = "support/campaign.rs"]
+#[allow(dead_code)]
+mod campaign_fixture;
+use campaign_fixture::{Campaign, campaign};
 
 fn unit_with_step(c: &Campaign, host: &Fake, kickoff: &str) {
     let outcome = commands::init(host, &c.root.join("01-first/alpha")).unwrap();
@@ -676,4 +660,115 @@ fn close_seals_the_campaign() {
             .ok()
     );
     assert_clean(&c.root);
+}
+
+#[test]
+fn coordinator_steps_finish_with_evidence_from_drafted_and_launched() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    for launched in [false, true] {
+        let c = campaign(&host);
+        let step = "01-first/alpha/BUILD";
+        let declared = commands::declare(
+            &host,
+            &c.root.join(step),
+            &commands::Declaration {
+                lane: Some(Lane::Coordinator),
+                ..commands::Declaration::default()
+            },
+        )
+        .unwrap();
+        assert!(declared.ok(), "{:?}", declared.violations);
+        c.kickoff(step, "Go.\n");
+        if launched {
+            assert!(
+                commands::launch(&host, &c.root, &target(step), None)
+                    .unwrap()
+                    .ok()
+            );
+        }
+        let missing = advance(&host, &c, step, "done", Evidence::default());
+        assert_eq!(rules(&missing), vec!["evidence-missing"]);
+        let file = c.root.join(step).join("result.md");
+        fs::write(&file, "Completed.\n").unwrap();
+        let finished = commands::advance(
+            &host,
+            &c.root,
+            &target(step),
+            &Phase::Done,
+            &Evidence::default(),
+            Some(&file),
+            None,
+        )
+        .unwrap();
+        assert!(finished.ok(), "{:?}", finished.violations);
+        let unit = store::load_unit(&c.root.join("01-first/alpha")).unwrap();
+        assert_eq!(unit.steps["BUILD"].track.state, Phase::Done);
+        assert_eq!(
+            unit.steps["BUILD"]
+                .track
+                .evidence
+                .file
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "01-first/alpha/BUILD/result.md"
+        );
+    }
+}
+
+#[test]
+fn coordinator_release_and_codex_steps_keep_the_code_completion_ladder() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    for (step, lane) in [
+        ("00-release/cm/1.0.0", Lane::Coordinator),
+        ("01-first/alpha/BUILD", Lane::Codex),
+    ] {
+        for launched in [false, true] {
+            let c = campaign(&host);
+            assert!(
+                commands::declare(
+                    &host,
+                    &c.root.join(step),
+                    &commands::Declaration {
+                        lane: Some(lane),
+                        ..commands::Declaration::default()
+                    },
+                )
+                .unwrap()
+                .ok()
+            );
+            c.kickoff(step, "Go.\n");
+            if launched {
+                assert!(
+                    commands::launch(&host, &c.root, &target(step), None)
+                        .unwrap()
+                        .ok()
+                );
+            }
+            let file = c.root.join(step).join("result.md");
+            fs::write(&file, "Completed.\n").unwrap();
+            let refused = commands::advance(
+                &host,
+                &c.root,
+                &target(step),
+                &Phase::Done,
+                &Evidence::default(),
+                Some(&file),
+                None,
+            )
+            .unwrap();
+            assert_eq!(rules(&refused), vec!["done-code-step"], "{step}");
+            let unit = store::load_unit(&c.root.join(target(step).unit)).unwrap();
+            assert_eq!(
+                unit.steps[target(step).step.as_deref().unwrap()]
+                    .track
+                    .state,
+                if launched {
+                    Phase::Launched
+                } else {
+                    Phase::Drafted
+                }
+            );
+        }
+    }
 }

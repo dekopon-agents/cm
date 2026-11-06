@@ -41,25 +41,10 @@ fn rules(outcome: &Outcome) -> Vec<&'static str> {
     rules
 }
 
-struct Campaign {
-    _temp: tempfile::TempDir,
-    root: PathBuf,
-}
-
-fn campaign(host: &Fake) -> Campaign {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("campaign");
-    assert!(commands::init(host, &root).unwrap().ok());
-    let git = std::process::Command::new("git")
-        .args(["init", "-q"])
-        .arg(&root)
-        .status();
-    assert!(
-        git.unwrap().success(),
-        "a campaign lives in a git repository"
-    );
-    Campaign { _temp: temp, root }
-}
+#[path = "support/campaign.rs"]
+#[allow(dead_code)]
+mod campaign_fixture;
+use campaign_fixture::{Campaign, campaign};
 
 fn declare(host: &Fake, c: &Campaign, target: &str, lane: Lane, after: &[&str]) -> Outcome {
     let declaration = Declaration {
@@ -560,4 +545,48 @@ fn begin_and_record_each_journal_one_line_with_every_action_field() {
             "## 2026-10-19T09:00Z — attempt 01-a/u/S1: 01-a/u/S1#1 begins thread (generation 1)",
         ]
     );
+}
+
+#[test]
+fn launch_and_claim_default_to_the_remote_session_unless_a_label_is_given() {
+    let host = at("2026-10-08T07:00:00Z");
+    for (session, label, expected) in [
+        (Some("session_cloud"), None, "session_cloud"),
+        (None, None, "—"),
+        (Some(""), None, "—"),
+        (Some("session_cloud"), Some("explicit"), "explicit"),
+        (None, Some("explicit"), "explicit"),
+    ] {
+        let c = campaign(&host);
+        let step = "01-a/u/S1";
+        assert!(declare(&host, &c, step, Lane::ClaudeCloud, &[]).ok());
+        for args in [
+            vec!["launch", step],
+            vec!["attempt", step, "claim", "--expect", "1"],
+        ] {
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_cm"));
+            command
+                .arg("--json")
+                .arg("-C")
+                .arg(&c.root)
+                .args(&args)
+                .env_remove("CLAUDE_CODE_REMOTE_SESSION_ID")
+                .env("CLAUDE_CODE_SESSION_ID", "local_session");
+            if let Some(session) = session {
+                command.env("CLAUDE_CODE_REMOTE_SESSION_ID", session);
+            }
+            if let Some(label) = label {
+                command.args(["--coordinator", label]);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["ok"], true, "{report}");
+            let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+            assert_eq!(
+                unit.steps["S1"].attempt.as_ref().unwrap().coordinator,
+                expected
+            );
+        }
+    }
 }
