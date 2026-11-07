@@ -802,7 +802,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
         Commands::OwnerQueue {
             act: QueueAct::Answer { number, body_file },
         } => {
-            let body = read_body(body_file)?;
+            let body = read_body(body_file, None)?;
             crate::ledger::owner_queue_answer(host, &root()?, *number, &body)
         }
         Commands::OwnerQueue {
@@ -811,7 +811,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
         Commands::OwnerQueue {
             act: QueueAct::Edit { number, body_file },
         } => {
-            let body = read_body(body_file)?;
+            let body = read_body(body_file, None)?;
             crate::ledger::owner_queue_edit(host, &root()?, *number, &body)
         }
         Commands::Evidence {
