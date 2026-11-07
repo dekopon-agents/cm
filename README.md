@@ -182,14 +182,19 @@ was blocked from, or moves to that state's successor; a step blocked before its 
 | `launched` | `cm launch` only | | the launch checks |
 | `pr-open` | `--pr`, `--sha` | | URL is `https://github.com/<owner>/<repo>/pull/<n>`; the SHA resolves to a commit |
 | `merged` | `--sha` | | resolves to a commit |
-| `released` | `--tag` | `--digest` | the tag resolves locally; a release step's is its declared tag |
+| `released` | `--tag`; also `--sha` for a tag-only release from `drafted` or `launched` | `--digest` | the tag exists and contains the recorded merge SHA, or the given tag-only SHA; a release step's tag is its declared tag |
 | `deployed` | `--digest` | | `sha256:<64 hex>` |
 | `done` | `--evidence` for an `owner`-lane or study step, or a non-release `coordinator`-lane step without a recorded PR, SHA or declared parts; nothing for a code step at `deployed` | | a non-empty regular file inside the campaign, outside `.cm/`; recorded relative to it |
 | `superseded` | `--evidence` | | as for `done`; final like `done` |
 
 SHAs and tags resolve in `--repo`, else the step's worktree, else (for a unit) any step's worktree.
-A commit or tag made elsewhere needs a `git fetch` first. A release step's `--tag` must be the tag it
-was declared with (`release-tag`), and its `pr-open --pr` must be in its repository (`release-repo`).
+A commit or tag made elsewhere needs a `git fetch` first when checking locally. For `released`
+without a checkout, cm checks GitHub in the recorded PR's repository or the release's declared
+`--github` repository: the tag must exist before its containment is checked. A branch or commit
+name cannot stand in for a tag. An unread tag or ancestry check refuses the move. A tag-only
+release needs `released --tag T --sha S`, with S contained in T. A release step's `--tag` must be
+the tag it was declared with (`release-tag`), and its `pr-open --pr` must be in its repository
+(`release-repo`).
 `cm sync` reads the same evidence from GitHub instead.
 
 ### Order

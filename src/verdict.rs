@@ -1612,13 +1612,18 @@ fn git_out(repo: &Path, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn is_ancestor(repo: &Path, ancestor: &str, of: &str) -> bool {
-    Command::new("git")
+pub(crate) fn is_ancestor(repo: &Path, ancestor: &str, of: &str) -> Option<bool> {
+    let output = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(["merge-base", "--is-ancestor", ancestor, of])
-        .status()
-        .is_ok_and(|status| status.success())
+        .output()
+        .ok()?;
+    match output.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
 }
 
 /// Why a commit on the walk back from the head is not a clean update from the base branch.
@@ -1707,7 +1712,7 @@ pub fn clean_update(repo: &Path, commit: &str, base: &str) -> Result<String, Cle
             commit: commit.to_owned(),
         });
     };
-    if !is_ancestor(repo, second, base) {
+    if !is_ancestor(repo, second, base).unwrap_or(false) {
         return Err(CleanUpdateError::OffBase {
             commit: commit.to_owned(),
             parent: second.to_owned(),
@@ -1784,7 +1789,7 @@ pub fn merge_gaps(
     };
     let mut gaps = gaps;
     let mut why = CleanUpdateError::TooLong { limit: MAX_UPDATES };
-    if is_ancestor(repo, &at, base) {
+    if is_ancestor(repo, &at, base).unwrap_or(false) {
         why = CleanUpdateError::BaseContainsHead {
             head: at.clone(),
             base: base.to_owned(),

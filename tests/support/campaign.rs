@@ -138,7 +138,6 @@ pub fn repo(dir: &Path) -> (PathBuf, String) {
     (repo, sha)
 }
 
-/// Tags before and after a merge, followed by a commit neither tag contains.
 pub fn release_repo(dir: &Path) -> (PathBuf, String, String) {
     let (repo, _) = repo(dir);
     git(&repo, &["tag", "v0.1.0"]);

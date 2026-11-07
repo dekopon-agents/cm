@@ -356,6 +356,29 @@ fn a_release_tag_must_contain_the_recorded_merge() {
     );
     assert_eq!(rules(&refused), ["tag-lineage"]);
     assert_eq!(c.files(), before);
+    fs::rename(repo.join(".git"), repo.join("unreadable-git")).unwrap();
+    let unread = advance(
+        &host,
+        &c,
+        step,
+        "released",
+        Evidence {
+            tag: Some("v0.2.0".into()),
+            ..Evidence::default()
+        },
+    );
+    assert_eq!(rules(&unread), ["evidence-tag", "tag-lineage"]);
+    assert_eq!(
+        unread
+            .violations
+            .iter()
+            .find(|violation| violation.rule == "tag-lineage")
+            .unwrap()
+            .message,
+        "tag containment could not be read; pass --repo <a checkout of the repo>"
+    );
+    assert_eq!(c.files(), before);
+    fs::rename(repo.join("unreadable-git"), repo.join(".git")).unwrap();
     let released = advance(
         &host,
         &c,

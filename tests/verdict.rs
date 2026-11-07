@@ -60,9 +60,25 @@ struct FakeForge {
     base_checks: Vec<(&'static str, &'static str)>,
     parts: std::collections::BTreeMap<String, FakeForge>,
     tags: std::collections::BTreeMap<(String, String), std::collections::BTreeSet<String>>,
+    branches: std::collections::BTreeMap<(String, String), std::collections::BTreeSet<String>>,
+    campaign: Option<PathBuf>,
 }
 
 impl FakeForge {
+    fn assert_unlocked(&self) {
+        if let Some(root) = &self.campaign {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(root.join(store::CM_DIR).join(store::LOCK))
+                .unwrap();
+            assert!(
+                rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                    .is_ok(),
+                "forge read held the campaign lock"
+            );
+        }
+    }
+
     fn open(head: &str, checks: &[(&'static str, &'static str)]) -> Self {
         FakeForge {
             head: head.to_owned(),
@@ -74,6 +90,8 @@ impl FakeForge {
             base_checks: Vec::new(),
             parts: Default::default(),
             tags: Default::default(),
+            branches: Default::default(),
+            campaign: None,
         }
     }
 }
@@ -145,8 +163,12 @@ impl Forge for FakeForge {
             .collect())
     }
 
-    fn tag_exists(&self, _: &GithubRepo, _: &TagName) -> Result<bool, ForgeError> {
-        Ok(false)
+    fn tag_exists(&self, repo: &GithubRepo, tag: &TagName) -> Result<bool, ForgeError> {
+        self.assert_unlocked();
+        if self.down {
+            return Err(ForgeError::Exit(Some(1)));
+        }
+        Ok(self.tags.contains_key(&(repo.to_string(), tag.to_string())))
     }
 
     fn tag_contains(
@@ -155,12 +177,15 @@ impl Forge for FakeForge {
         tag: &TagName,
         sha: &CommitSha,
     ) -> Result<bool, ForgeError> {
+        self.assert_unlocked();
         if self.down {
             return Err(ForgeError::Exit(Some(1)));
         }
+        let key = (repo.to_string(), tag.to_string());
         Ok(self
             .tags
-            .get(&(repo.to_string(), tag.to_string()))
+            .get(&key)
+            .or_else(|| self.branches.get(&key))
             .is_some_and(|shas| shas.contains(sha.as_str())))
     }
 }
@@ -389,11 +414,15 @@ fn released_without_a_checkout_reads_tag_containment_from_the_forge() {
         )
         .unwrap()
     };
+    forge.campaign = Some(c.root.clone());
+    forge
+        .tags
+        .insert(("o/r".into(), "v1.0.0".into()), Default::default());
     let before = sha256(&store::state_path(&c.root.join("01-a/u")));
     let journal = sha256(&c.root.join("JOURNAL.md"));
     assert_eq!(rules(&release(&forge)), ["tag-lineage"]);
     forge.down = true;
-    assert_eq!(rules(&release(&forge)), ["tag-lineage"]);
+    assert_eq!(rules(&release(&forge)), ["evidence-tag"]);
     assert_eq!(sha256(&store::state_path(&c.root.join("01-a/u"))), before);
     assert_eq!(sha256(&c.root.join("JOURNAL.md")), journal);
     forge.down = false;
@@ -403,6 +432,53 @@ fn released_without_a_checkout_reads_tag_containment_from_the_forge() {
     let released = release(&forge);
     assert!(released.ok(), "{:?}", released.violations);
     assert_eq!(c.state(), Phase::Released);
+}
+
+#[test]
+fn released_without_a_checkout_refuses_a_containing_branch() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let head = c.head();
+    let mut forge = FakeForge::open(&head, &[]);
+    assert!(
+        c.merge(
+            &host,
+            &MergeGate {
+                forge: Some(&forge),
+                waiver: Some(c.write("waiver.md", "Proceed with the merge.\n")),
+                ..MergeGate::default()
+            }
+        )
+        .ok()
+    );
+    forge
+        .branches
+        .insert(("o/r".into(), "main".into()), [head].into());
+    let before = sha256(&store::state_path(&c.root.join("01-a/u")));
+    let journal = sha256(&c.root.join("JOURNAL.md"));
+    let refused = commands::advance_gated(
+        &host,
+        &c.root,
+        &target(),
+        commands::Advance {
+            to: &Phase::Released,
+            given: &Evidence {
+                tag: Some("main".into()),
+                ..Evidence::default()
+            },
+            file: None,
+            repo: None,
+            part: None,
+        },
+        &MergeGate {
+            forge: Some(&forge),
+            ..MergeGate::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(rules(&refused), ["evidence-tag"]);
+    assert_eq!(sha256(&store::state_path(&c.root.join("01-a/u"))), before);
+    assert_eq!(sha256(&c.root.join("JOURNAL.md")), journal);
 }
 
 #[test]
@@ -451,6 +527,9 @@ fn a_tag_only_release_without_a_checkout_uses_its_declared_repository() {
         )
         .unwrap()
     };
+    forge
+        .tags
+        .insert(("o/widget".into(), "v1.0.0".into()), Default::default());
     assert_eq!(rules(&release(None, &forge)), ["evidence-missing"]);
     assert_eq!(rules(&release(Some(head.clone()), &forge)), ["tag-lineage"]);
     forge
