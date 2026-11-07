@@ -55,6 +55,9 @@ error.
 | `cm next [<NN-name>/<unit>/<step>] [--lane L]` | Numbers every item with its next cm command (`command` on each JSON item), shared with CARD.md’s Next, Waiting and Blocked sections; named inputs appear as quoted placeholders (see [Order](#order)). Lists the declared `drafted` steps whose every `--after` is met and whose folder has `kickoff.md` (`steps`), the rest with what each waits on (`waiting`), and the merged release steps that wait for their tag (`tags`). It also flags (`stalled`) each `codex`-lane step at `launched` with no PR whose attempt was claimed more than `codex_stall_hours` ago (LIMITS.toml, default 2; the launch stamp for a step launched without an attempt), and (`dirty`) each `pr-open` step whose PR the last `cm sync` saw with `mergeable_state: dirty`; neither is a violation. Nothing is next while `LIMITS.toml` is paused. `tags` is in version order. Given a step, it refuses (exit 1) unless that step is next, naming every unmet gate, and lists a refused step under `waiting`, never `steps`. |
 | `cm sync` | Reads GitHub with read-only `gh api` calls, each killed after 60 seconds, without holding `.cm/lock`; then it takes the lock, reloads the state and applies the moves that still hold. It moves steps along: `pr-open` → `merged` when the PR merged (the merge commit and GitHub's optional `merged_at` are the evidence; `since` remains the sync time), a release step `merged` → `released` when its declared tag exists in its repository and contains the prep merge, any other non-rollout step `merged` → `released` by the first release of its repository whose tag contains its merge, and `released` → `deployed` once a `deployed` release of the same line contains its merge. One journal entry lists the moves and new notifications; a sync with neither journals nothing. It refreshes the marked status span in `RESUME.md` from state (step counts, newest released and deployed version per release line, and epoch status), preserving all owner prose and silently leaving files without markers alone. It rewrites `CARD.md`, whose first line is `Last run: <stamp>`, and `.cm/pulls.json` with what it saw of each open PR (head, `mergeable_state`; a PR GitHub did not answer for keeps its last observation and stamp while its step rests at `pr-open` on it), and reports `stalled` and `dirty` as `cm next` does. A `codex`-lane step whose PR merged moves to `merged` only when its merge gate holds at the PR's head; otherwise it stays `pr-open` and each unmet condition is a `merge-gate` violation. A PR closed unmerged (`pr-closed`) or an observation `gh` could not make (`sync-unknown`) exits 1 after the rest is applied. |
 | `cm epoch planning\|working\|closed [--skill-revision R] [--plan-revision S]` | Moves `EPOCH.md`'s front matter one status along `OPEN → PLANNING → WORKING → CLOSED`, stamps `planning_started_at`, `working_started_at` or `closed_at` with the date, sets the pins it is given, journals the move, and refreshes RESUME.md’s generated status span. It refuses a null pin: PLANNING needs `skill_revision`, WORKING and CLOSED also `approved_plan_revision`. `closed` follows `cm close`. |
+| `cm idea admit <id>` | Admits an idea to this epoch, appends its id to `EPOCH.md`'s `ideas:` list in admission order, and journals the action. Repeating it completes interrupted writes without duplicating entries. |
+| `cm idea move <id> <maturity>` | Moves an admitted idea forward through `captured → exploring → designed`; skipping a maturity is allowed. |
+| `cm idea outcome <id> <word> [--to EPOCH] [--by ID] [--note TEXT]` | Records one outcome per idea per epoch: `landed`, `partial`, `deferred`, `superseded` or `cancelled`, and journals the action. |
 | `cm journal "<title>" [--body-file F]` | Appends `## YYYY-MM-DDTHH:MMZ — <title>` and the body (`-` reads stdin). The only way `JOURNAL.md` grows. A body may not hold a `#` or `##` heading. |
 | `cm launch <NN-name>/<unit>/<step> [--worktree PATH] [--coordinator LABEL] [--cap-min N]` | Runs the launch checks and reports every failure: `LIMITS.toml` not paused; a declared step's every `--after` met (`after-unmet`); for the local `pi` lane and undeclared steps, free disk on `disk_volume` minus `kache_headroom_gib` over `min_free_disk_gib`, live heavy builds (top-level `cargo` processes) under `max_heavy_builds` and the worktree, which they require; the step folder has `kickoff.md`; every path its packet names exists. A drafted step, a step blocked before its PR opened, or a launched step whose last attempt has ended can launch; relaunch picks the newest `resume*.md` when present and increments `launches`. The `--after` check runs on every launch, including relaunches. Then it marks the step (and a drafted unit) launched, journals the launch and, for a local step, prints the command; every other lane (`owner` and `coordinator` among them) prints only the step and its prompt and records its attempt (see [Attempts](#attempts)). It spawns nothing. When `--coordinator` is omitted, the label defaults to trimmed `CLAUDE_CODE_REMOTE_SESSION_ID` with a leading `cse_` mapped to `session_`, else `—` when unset or whitespace-only; an explicit label wins. Launch refuses an empty or multi-line label, explicit or inherited. A step whose last attempt has not ended does not launch again (`attempt-open`). |
 | `cm attempt <NN-name>/<unit>/<step> [--claim TOKEN] [claim [--coordinator L] --expect G \| begin KIND \| record KIND ID \| restart --lane L [--evidence PATH] \| end complete\|partial\|unknown [--evidence PATH]]` | Shows a remote attempt and what to do next from committed state alone, or extends it; each change is journaled. See [Attempts](#attempts). |
@@ -75,6 +78,62 @@ error.
 | `cm brief <step>` | Prints the step's `kickoff.md`, then `## Coordinator scope and rulings` and the step's `evidence/coordinator-scope.md` (or a line saying none is recorded): the brief for `astra-review.sh start` and review packets. `--json` puts it in `brief`. Refuses a step with no `kickoff.md`. |
 | `cm followups [--epoch]`, `cm followups close <id> --by <commit\|reason>` | Lists every non-blocking finding `cm review record` kept, across steps: id, step, PR, type, origin, `file:line`, summary and status (`open` or `closed`). `--epoch` lists only the open ones, grouped by repository as Markdown checklist lines, for the epoch's cleanup PR. `close` closes one with the commit that fixed it or the reason it stays, and journals it; a blocking finding is `followup-blocking`, a closed one `followup-closed`. |
 | `cm lint [DIR]` | Template conformance, cm-owned files against `.cm/state.json`, the journal against git, `.cm/JOURNAL.md` and `.cm/lock` out of git (`cm-tracked`), the path check for every drafted or launched packet, a unit or step folder git ignores (`git-ignored`, or `git-ignored-unknown` when `git check-ignore` cannot answer, as outside a repository), and a unit folder holding `STATE.md` but no `.cm/state.json` (`unit-state-json-missing`), which is never counted as a smaller campaign; unique `FEEDBACK.md` ids whose follow-ups name existing ones; `MAC-LANE.md` items numbered 1, 2, 3… with no gap or repeat (`mac-lane-number`), nothing about their text; `REVIEW-OFF.md` against its ledger; stale pinned evidence (`evidence-stale`). It warns, without failing, on an expired watch and on an `--override` of a red check no known-red exception names. In a closed campaign, also an empty owner queue, no open Mac lane item and every track done or blocked; its packets are no longer checked, since nothing launches there. |
+
+## Ideas
+
+An idea is a Markdown file that can outlive an epoch. Set its folder explicitly in
+`EPOCH.md` front matter; `ideas_dir` is relative to the campaign folder and has no default:
+
+```yaml
+epoch: epoch-alpha
+status: PLANNING
+ideas_dir: ../ideas
+ideas: [IDEA-9003, IDEA-9001]
+```
+
+Each idea file is named `<id>.md` or `<id>-<slug>.md`. Its front matter includes
+`id: IDEA-9001` and `maturity: captured` (or `exploring` or `designed`). Admission
+sets `current_epoch: epoch-alpha`. A `## Epoch history` section must already exist, with every Markdown fence closed.
+cm changes only the `current_epoch` and `maturity` front-matter lines and appends
+history entries; other keys, sections and existing history entries keep their bytes.
+
+```sh
+cm idea admit IDEA-9001
+cm idea move IDEA-9001 exploring
+cm idea outcome IDEA-9001 partial --to epoch-beta --note 'tool-x #12 shipped'
+```
+
+Admission refuses a closed campaign or CLOSED epoch, an idea still open in another
+epoch, or an idea whose last outcome is terminal. Movement and outcomes require
+`current_epoch` to name this epoch. Maturity moves forward only. An outcome keeps
+`current_epoch` and the `ideas:` membership unchanged, including after deferral.
+
+| Outcome | Required flags | Terminal |
+|---|---|---|
+| `landed` | `--note` with evidence | yes |
+| `partial` | `--to` and `--note` describing what landed | no |
+| `deferred` | `--to` | no |
+| `superseded` | `--by` naming an existing idea | yes |
+| `cancelled` | `--note` with the reason | yes |
+
+`--to` accepts an epoch name or `unassigned`; `--note` is one non-empty line.
+Only the flags listed for each outcome are accepted. cm writes date-only history
+lines, for example ``- 2026-01-02: admitted to `epoch-alpha` (PLANNING).`` and
+``- 2026-01-09: outcome in `epoch-alpha`: deferred to unassigned.`` Only cm's exact
+formats count as state. Existing date or timestamp entries, continuation lines
+and nested bullets remain prose.
+
+`ideas:` is a flow list in admission order; block lists are refused with
+`idea-list-form`. Admission writes the idea first, then `EPOCH.md`, then `JOURNAL.md`;
+retry it after an interruption. Idea outcomes live only in the idea's history,
+so they add no `.cm` fields and do not change the state schema.
+
+When `ideas_dir` is set, `cm lint` checks duplicate ids (`idea-duplicate-id`, one
+violation per file), filenames (`idea-filename`), required front matter
+(`idea-front-matter`), maturity (`idea-maturity`) and epoch membership
+(`idea-epoch-list`). An open idea naming this epoch must appear in `ideas:`, and
+every listed id must resolve to a file naming this epoch. Commands also refuse
+ambiguous ids with `idea-duplicate-id`.
 
 ## The folder
 

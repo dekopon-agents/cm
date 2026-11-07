@@ -819,6 +819,7 @@ pub fn lint_at(start: &Path, now: jiff::Timestamp) -> Result<Outcome> {
     violations.extend(root_files(&root, state.as_ref()));
     let units = unit_dirs(&root);
     violations.extend(crate::ledger::lint_feedback(&root));
+    violations.extend(crate::idea::lint(&root));
     if !state.as_ref().is_some_and(|state| state.closed.is_some()) {
         violations.extend(crate::ledger::lint_mac_lane(&root));
     }
