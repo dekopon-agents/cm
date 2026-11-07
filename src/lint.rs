@@ -738,7 +738,16 @@ fn open_track(out: &mut Vec<Violation>, target: &str, track: &Track) {
 }
 
 pub fn unsealed(root: &Path) -> Vec<Violation> {
+    unsealed_with_ideas(root, "closed-ideas", &mut String::new())
+}
+
+pub(crate) fn unsealed_with_ideas(
+    root: &Path,
+    idea_rule: &'static str,
+    body: &mut String,
+) -> Vec<Violation> {
     let mut out = Vec::new();
+    body.push_str(&crate::idea::accounting(root, idea_rule, &mut out));
     match templates::queue_open_in(root) {
         Ok(true) => out.push(Violation::new(
             QUEUE_FILE,
@@ -819,7 +828,12 @@ pub fn lint_at(start: &Path, now: jiff::Timestamp) -> Result<Outcome> {
     violations.extend(root_files(&root, state.as_ref()));
     let units = unit_dirs(&root);
     violations.extend(crate::ledger::lint_feedback(&root));
-    violations.extend(crate::idea::lint(&root));
+    for violation in crate::idea::lint(&root) {
+        // Sealed accounting may already have reported the same malformed idea.
+        if !violations.contains(&violation) {
+            violations.push(violation);
+        }
+    }
     if !state.as_ref().is_some_and(|state| state.closed.is_some()) {
         violations.extend(crate::ledger::lint_mac_lane(&root));
     }

@@ -98,15 +98,23 @@ struct Manifest {
     ids: Vec<String>,
 }
 
-/// Existing campaigns without ideas_dir have no idea lint rules.
-fn manifest(root: &Path, required: bool, out: &mut Vec<Violation>) -> Option<Manifest> {
-    let text = match crate::ledger::read_existing(&root.join(EPOCH)) {
-        Ok(text) => text.unwrap_or_default(),
+fn read_manifest(root: &Path, out: &mut Vec<Violation>) -> Option<String> {
+    match crate::ledger::read_existing(&root.join(EPOCH)) {
+        Ok(text) => Some(text.unwrap_or_default()),
         Err(error) => {
             out.push(Violation::new(EPOCH, "idea-manifest", format!("{error:#}")));
-            return None;
+            None
         }
-    };
+    }
+}
+
+/// Existing campaigns without ideas_dir have no idea lint rules.
+fn manifest(
+    root: &Path,
+    text: String,
+    required: bool,
+    out: &mut Vec<Violation>,
+) -> Option<Manifest> {
     let Some(dir) = field(&text, "ideas_dir").filter(|value| !value.is_empty()) else {
         if required {
             out.push(Violation::new(
@@ -346,33 +354,49 @@ fn destination(text: &str) -> bool {
             .is_some_and(epoch_valid)
 }
 
-fn outcome_text(text: &str) -> Option<(&str, Word)> {
+struct RecordedOutcome<'a> {
+    epoch: &'a str,
+    word: Word,
+    target: Option<&'a str>,
+}
+
+fn outcome_text(text: &str) -> Option<RecordedOutcome<'_>> {
     let (name, text) = text.strip_prefix("outcome in `")?.split_once("`: ")?;
     let text = text.strip_suffix('.')?;
-    let word = if text
+    let (word, target) = if text
         .strip_prefix("landed; ")
         .is_some_and(|note| !note.trim().is_empty())
     {
-        Word::Landed
+        (Word::Landed, None)
     } else if text
         .strip_prefix("cancelled; ")
         .is_some_and(|note| !note.trim().is_empty())
     {
-        Word::Cancelled
-    } else if text.strip_prefix("superseded by ").is_some_and(id_valid) {
-        Word::Superseded
-    } else if text.strip_prefix("deferred to ").is_some_and(destination) {
-        Word::Deferred
-    } else if text
+        (Word::Cancelled, None)
+    } else if let Some(by) = text
+        .strip_prefix("superseded by ")
+        .filter(|by| id_valid(by))
+    {
+        (Word::Superseded, Some(by))
+    } else if let Some(to) = text
+        .strip_prefix("deferred to ")
+        .filter(|to| destination(to))
+    {
+        (Word::Deferred, Some(to.trim_matches('`')))
+    } else if let Some((to, _)) = text
         .strip_prefix("partial, remainder to ")
         .and_then(|text| text.split_once("; "))
-        .is_some_and(|(target, note)| destination(target) && !note.trim().is_empty())
+        .filter(|(target, note)| destination(target) && !note.trim().is_empty())
     {
-        Word::Partial
+        (Word::Partial, Some(to.trim_matches('`')))
     } else {
         return None;
     };
-    epoch_valid(name).then_some((name, word))
+    epoch_valid(name).then_some(RecordedOutcome {
+        epoch: name,
+        word,
+        target,
+    })
 }
 
 impl Idea {
@@ -392,6 +416,7 @@ impl Idea {
         self.entries()
             .into_iter()
             .filter_map(outcome_text)
+            .map(|outcome| (outcome.epoch, outcome.word))
             .collect()
     }
 
@@ -418,7 +443,10 @@ impl Idea {
 /// Only cm's exact history format is state; dated free prose remains untouched.
 pub(crate) fn lint(root: &Path) -> Vec<Violation> {
     let mut out = Vec::new();
-    let Some(manifest) = manifest(root, false, &mut out) else {
+    let Some(text) = read_manifest(root, &mut out) else {
+        return out;
+    };
+    let Some(manifest) = manifest(root, text, false, &mut out) else {
         return out;
     };
     let ideas = read_ideas(root, &manifest.dir, &mut out);
@@ -464,6 +492,52 @@ pub(crate) fn lint(root: &Path) -> Vec<Violation> {
         }
     }
     out
+}
+
+/// Account only for admitted ids, using their outcomes in this epoch's history.
+pub(crate) fn accounting(root: &Path, rule: &'static str, out: &mut Vec<Violation>) -> String {
+    let Some(text) = read_manifest(root, out) else {
+        return String::new();
+    };
+    if field(&text, "ideas").is_none() {
+        return String::new();
+    }
+    let Some(manifest) = manifest(root, text, true, out) else {
+        return String::new();
+    };
+    let ideas = read_ideas(root, &manifest.dir, out);
+    let mut body = String::new();
+    for id in &manifest.ids {
+        let outcome = resolve(root, &ideas, id, out).and_then(|idea| {
+            idea.entries()
+                .into_iter()
+                .filter_map(outcome_text)
+                .find(|outcome| outcome.epoch == manifest.name)
+        });
+        match outcome {
+            Some(outcome) => {
+                body.push_str(&format!("- idea: {id} {}", outcome.word.label()));
+                if let Some(target) = outcome.target {
+                    let link = if outcome.word == Word::Superseded {
+                        "by"
+                    } else {
+                        "to"
+                    };
+                    body.push_str(&format!(" {link} {target}"));
+                }
+                body.push('\n');
+            }
+            None => out.push(Violation::new(
+                EPOCH,
+                rule,
+                format!(
+                    "{id} has no outcome in `{}`; run `cm idea outcome {id} <word>`",
+                    manifest.name
+                ),
+            )),
+        }
+    }
+    body
 }
 
 fn append_history(text: &str, line: &str) -> String {
@@ -516,7 +590,10 @@ pub(crate) fn run(host: &dyn Host, root: &Path, id: &str, action: Action<'_>) ->
     let _lock = lock(root)?;
     let campaign = store::load_campaign(root)?;
     let mut violations = journal::check(root, &campaign);
-    let Some(mut manifest) = manifest(root, true, &mut violations) else {
+    let Some(text) = read_manifest(root, &mut violations) else {
+        return Ok(Outcome::refused(violations));
+    };
+    let Some(mut manifest) = manifest(root, text, true, &mut violations) else {
         return Ok(Outcome::refused(violations));
     };
     let ideas = read_ideas(root, &manifest.dir, &mut violations);

@@ -700,7 +700,11 @@ pub fn close(host: &dyn Host, root: &Path) -> Result<Outcome> {
             }
         }
     }
-    violations.extend(lint::unsealed(root));
+    violations.extend(lint::unsealed_with_ideas(
+        root,
+        "idea-outcome-missing",
+        &mut body,
+    ));
     if !violations.is_empty() {
         return Ok(Outcome::refused(violations));
     }

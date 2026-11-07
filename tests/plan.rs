@@ -61,6 +61,9 @@ fn git(repo: &Path, args: &[&str]) -> String {
 
 #[path = "support/campaign.rs"]
 mod campaign_fixture;
+#[allow(dead_code)]
+#[path = "support/idea.rs"]
+mod idea_fixture;
 use campaign_fixture::{Campaign, campaign};
 
 #[path = "support/forge.rs"]
@@ -1416,8 +1419,6 @@ fn a_release_tag_must_name_its_version() {
     assert!(right.ok(), "{:?}", right.violations);
 }
 
-const EPOCH_MD: &str = "---\nepoch: d\nstatus: OPEN\nplanning_started_at: null\nworking_started_at: null\nclosed_at: null\nskill_revision: a461b854\napproved_plan_revision: null\nideas: [IDEA-0001]\n---\n\n# D\n";
-
 #[test]
 fn epoch_moves_one_status_at_a_time_and_refuses_null_pins() {
     let host = at("2026-10-17T08:00:00Z");
@@ -1429,7 +1430,8 @@ fn epoch_moves_one_status_at_a_time_and_refuses_null_pins() {
     );
     fs::write(
         &path,
-        EPOCH_MD.replace("skill_revision: a461b854", "skill_revision: null"),
+        idea_fixture::epoch_manifest_with_outcome(&c)
+            .replace("skill_revision: a461b854", "skill_revision: null"),
     )
     .unwrap();
     assert_eq!(
