@@ -7,7 +7,7 @@ use std::process::Command;
 use cm::commands;
 use cm::commands::{Declaration, Ships};
 use cm::epoch::{self, Status};
-use cm::forge::{CommitSha, Forge, ForgeError, Gh, GithubRepo, Pull, PullState, TagName};
+use cm::forge::{CommitSha, Forge, ForgeError, Gh, Pull, PullState};
 use cm::host::Host;
 use cm::lint::lint;
 use cm::outcome::Outcome;
