@@ -218,7 +218,8 @@ met. `--after` takes:
 | `deployed:<line>@<version>` | that release step is `deployed` or later |
 
 A pin uses the latest synced open PR head, which sync also saves as the step's recorded SHA.
-After merge, that SHA is the merge commit; a pin to the old PR head then becomes stale.
+After merge, that SHA is the merge commit; a pin to the old PR head becomes stale when
+those commits differ.
 When the recorded commit differs or the source is superseded, `cm next` and CARD list the
 dependent under `waiting` as `stale pin`, with its recheck command, even after launch.
 `cm lint` warns `pin-unmet` for unmet pins. A head that has never been recorded is reported
