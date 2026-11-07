@@ -172,9 +172,16 @@ Unit `.cm/state.json`:
 
 `since` is the time cm observed or advanced the state. Optional `evidence.merged_at` is
 GitHub's merge time, recorded by `cm sync` or `cm advance <step> merged --sha <sha> --pr <url>`;
-`--pr` must match the recorded PR. An absent merge time stays absent. For merged tracks,
-`STATE.md` and `CARD.md` show `merged_at`, falling back to `since`; `cm close` lists historical
-merges in its journal entry using `merged_at`, falling back to the move's observation time.
+`--pr` must match the recorded PR when one is recorded. An absent merge time stays absent.
+For merged tracks, `STATE.md` uses `merged_at`, falling back to `since`; CARD.md's move evidence
+includes `merged_at` when present. `cm close` lists genuine historical merges using `merged_at`,
+falling back to the move's observation time. Restoring a blocked merged step does not count
+as another merge.
+A multipart step's merge time is the latest of its parts' merge times, or absent if any is unknown.
+
+A release remerge with `merged --sha <sha>` and no `--pr` keeps the track's existing `merged_at`
+for the original PR merge. The new history move has no GitHub merge time, so its close-accounting
+row uses the remerge's observation time. Each real merge has its own row.
 
 `lane` and `after` appear on declared steps (`cm init <step> --lane`); a declared step that has not
 launched has no `worktree` and `launches: 0`, and `STATE.md` adds an `Order` table. A blocked track also carries `blocked_from`. From `blocked:<reason>` a track resumes to the state it
@@ -272,7 +279,8 @@ remains required. Superseding meets no gate; amend consumers to name the replace
 
 cm 0.10 raises SCHEMA from 4 to 5 for successor references and optional merge times. It writes
 every unit state, and a new campaign state, as schema 5. Older state remains readable; missing
-successor references default to an empty list and missing merge times remain absent. Upgrade every reader before writing shared state with cm 0.10.
+successor references default to an empty list and missing merge times remain absent. Upgrade
+every reader before writing shared state with cm 0.10.
 
 cm 0.9 raises SCHEMA from 3 to 4 for watch withdrawal and writes every unit state, and a new
 campaign state, as schema 4. Units written by 0.9 cannot be read by cm 0.8.x; upgrade every

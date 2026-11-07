@@ -148,19 +148,27 @@ impl<'a> Run<'a> {
                     &Evidence::default(),
                     self.root,
                 ) {
+                    let evidence = Evidence {
+                        merged_at: if to == Phase::Merged {
+                            step.track.evidence.merged_at.clone()
+                        } else {
+                            None
+                        },
+                        ..Evidence::default()
+                    };
                     unit.history.push(Move {
                         at: self.at.clone(),
                         target: target.clone(),
                         from: from.clone(),
                         to: to.clone(),
-                        evidence: Evidence::default(),
+                        evidence: evidence.clone(),
                     });
                     self.dirty.insert(unit_name.clone());
                     self.moves.push(Moved {
                         target: target.clone(),
                         from,
                         to,
-                        evidence: Evidence::default(),
+                        evidence,
                     });
                 }
             }
@@ -252,11 +260,15 @@ impl<'a> Run<'a> {
                 &evidence,
                 self.root,
             ) {
+                let mut rolled_evidence = evidence.clone();
+                if to == Phase::Merged {
+                    rolled_evidence.merged_at = step.track.evidence.merged_at.clone();
+                }
                 moved.push(Moved {
                     target: target.to_owned(),
                     from,
                     to,
-                    evidence: evidence.clone(),
+                    evidence: rolled_evidence,
                 });
             }
         }

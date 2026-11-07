@@ -399,6 +399,7 @@ fn github_merge_time_appears_in_state_and_close_accounting() {
             ..Evidence::default()
         };
         assert!(advance(&host, &c, step, "pr-open", evidence.clone()).ok());
+        assert!(advance(&host, &c, step, "blocked:waiting", Evidence::default()).ok());
         let gh = lifecycle_fixture::merged_pull(&sha, merged_at);
         let forge = cm::forge::Gh {
             program: gh.program(),
@@ -443,6 +444,10 @@ fn github_merge_time_appears_in_state_and_close_accounting() {
             merged_at.map(|at| serde_json::json!(at)).as_ref()
         );
         assert!(advance(&later, &c, step, "blocked:carried", Evidence::default()).ok());
+        let restored =
+            commands::unblock(&later, &c.root, &target, Some(&c.unblock_file())).unwrap();
+        assert!(restored.ok(), "{:?}", restored.violations);
+        assert!(advance(&later, &c, step, "blocked:carried", Evidence::default()).ok());
         assert!(
             advance(
                 &later,
@@ -463,6 +468,73 @@ fn github_merge_time_appears_in_state_and_close_accounting() {
             ),
         );
     }
+}
+
+#[test]
+fn close_counts_real_release_remerges_once_and_preserves_the_original_pr_time() {
+    let host = Fake::at("2026-10-08T20:00:00Z");
+    let c = campaign(&host);
+    let (repo, first) = repo(c.root.parent().unwrap());
+    let step = "00-release/cm/1.0.0";
+    c.merged_step(&host, step, Lane::Coordinator, &repo, &first);
+    c.record_merge_time(step, lifecycle_fixture::MERGED_AT);
+    git(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "second merge"],
+    );
+    let second = git(&repo, &["rev-parse", "HEAD"]);
+    let later = Fake::at("2026-10-09T08:00:00Z");
+    let moved = advance(
+        &later,
+        &c,
+        step,
+        "merged",
+        Evidence {
+            sha: Some(second),
+            ..Default::default()
+        },
+    );
+    assert!(moved.ok(), "{:?}", moved.violations);
+    let unit = store::load_unit(&c.root.join("00-release/cm")).unwrap();
+    let track = &unit.steps["1.0.0"].track;
+    assert_eq!(
+        track.evidence.merged_at.as_deref(),
+        Some(lifecycle_fixture::MERGED_AT)
+    );
+    assert_eq!(track.since, cm::host::stamp(host.now()));
+    assert_eq!(unit.history.last().unwrap().evidence.merged_at, None);
+    assert!(advance(&later, &c, step, "blocked:carried", Evidence::default()).ok());
+    assert!(
+        commands::unblock(
+            &later,
+            &c.root,
+            &parse_target(step, true).unwrap(),
+            Some(&c.unblock_file())
+        )
+        .unwrap()
+        .ok()
+    );
+    assert!(advance(&later, &c, step, "blocked:carried", Evidence::default()).ok());
+    assert!(
+        advance(
+            &later,
+            &c,
+            "00-release/cm",
+            "blocked:carried",
+            Evidence::default()
+        )
+        .ok()
+    );
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    let closed = commands::close(&later, &c.root).unwrap();
+    assert!(closed.ok(), "{:?}", closed.violations);
+    assert_eq!(
+        fs::read_to_string(c.root.join("JOURNAL.md")).unwrap(),
+        format!(
+            "{journal}\n## 2026-10-09T08:00Z — cm close\n\n- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n- merged: {step} at {}\n- merged: {step} at 2026-10-09T08:00Z\n",
+            lifecycle_fixture::MERGED_AT
+        ),
+    );
 }
 
 #[test]

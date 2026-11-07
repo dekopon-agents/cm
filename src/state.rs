@@ -117,11 +117,11 @@ impl std::str::FromStr for Phase {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Evidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub merged_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1068,6 +1068,17 @@ impl Step {
             evidence
         };
         self.track.apply(reach.clone(), at, evidence);
+        let times: Option<Vec<_>> = self
+            .parts
+            .values()
+            .map(|part| {
+                let at = part.evidence.merged_at.as_ref()?;
+                Some((crate::plan::instant(at)?, at))
+            })
+            .collect();
+        self.track.evidence.merged_at = times
+            .and_then(|times| times.into_iter().max())
+            .map(|(_, at)| at.clone());
         Some((from, reach))
     }
 

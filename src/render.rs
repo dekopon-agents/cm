@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use jiff::Timestamp;
 
 use crate::plan::{Next, Units};
-use crate::state::{Lane, Phase, Release, Step, Track, UnitState, Version, Watch, WatchStatus, Work};
+use crate::state::{
+    Lane, Phase, Release, Step, Track, UnitState, Version, Watch, WatchStatus, Work,
+};
 use crate::sync::Moved;
 
 fn cell(text: &str) -> String {

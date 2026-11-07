@@ -58,3 +58,31 @@ esac
 "#
     ))
 }
+
+impl Campaign {
+    pub fn unblock_file(&self) -> std::path::PathBuf {
+        let path = self.root.join("unblock.md");
+        std::fs::write(&path, "Continue the step.\n").unwrap();
+        path
+    }
+
+    pub fn record_merge_time(&self, full: &str, merged_at: &str) {
+        let target = parse_target(full, true).unwrap();
+        let dir = self.root.join(&target.unit);
+        let mut unit = store::load_unit(&dir).unwrap();
+        let track = &mut unit
+            .steps
+            .get_mut(target.step.as_deref().unwrap())
+            .unwrap()
+            .track;
+        track.evidence.merged_at = Some(merged_at.into());
+        unit.history.push(cm::state::Move {
+            at: track.since.clone(),
+            target: full.into(),
+            from: Phase::PrOpen,
+            to: Phase::Merged,
+            evidence: track.evidence.clone(),
+        });
+        commands::write_unit(&dir, &unit).unwrap();
+    }
+}

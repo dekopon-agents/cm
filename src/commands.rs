@@ -676,16 +676,20 @@ pub fn close(host: &dyn Host, root: &Path) -> Result<Outcome> {
     );
     for dir in lint::unit_dirs(root) {
         let unit = store::load_unit(&dir)?;
-        for moved in unit
-            .history
-            .iter()
-            .filter(|moved| moved.to == Phase::Merged)
-        {
-            body.push_str(&format!(
-                "- merged: {} at {}\n",
-                moved.target,
-                moved.evidence.merged_at.as_deref().unwrap_or(&moved.at)
-            ));
+        let mut phases = std::collections::BTreeMap::new();
+        for moved in &unit.history {
+            let prior = phases.entry(&moved.target).or_insert(&moved.from);
+            let restored = matches!(moved.from, Phase::Blocked(_)) && **prior == Phase::Merged;
+            if moved.to == Phase::Merged && !restored {
+                body.push_str(&format!(
+                    "- merged: {} at {}\n",
+                    moved.target,
+                    moved.evidence.merged_at.as_deref().unwrap_or(&moved.at)
+                ));
+            }
+            if !matches!(moved.to, Phase::Blocked(_)) {
+                *prior = &moved.to;
+            }
         }
     }
     violations.extend(lint::unsealed(root));
@@ -2180,12 +2184,19 @@ pub fn advance_gated(
         evidence: evidence.clone(),
     });
     for (from, to) in &rolled {
+        let mut rolled_evidence = evidence.clone();
+        if *to == Phase::Merged {
+            rolled_evidence.merged_at = unit
+                .steps
+                .get(target.step.as_deref().unwrap_or_default())
+                .and_then(|step| step.track.evidence.merged_at.clone());
+        }
         unit.history.push(Move {
             at: at.clone(),
             target: step_full.clone(),
             from: from.clone(),
             to: to.clone(),
-            evidence: evidence.clone(),
+            evidence: rolled_evidence,
         });
     }
     write_unit(&unit_dir, &unit)?;

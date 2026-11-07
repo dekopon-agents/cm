@@ -176,7 +176,6 @@ pub enum PullState {
 pub struct Pull {
     pub state: PullState,
     pub merge_commit: Option<CommitSha>,
-    /// When GitHub reports the PR was merged.
     pub merged_at: Option<String>,
     /// The PR's head commit, as GitHub reports it.
     pub head: Option<CommitSha>,

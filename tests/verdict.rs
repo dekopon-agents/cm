@@ -1865,25 +1865,32 @@ fn sync_holds_a_codex_merge_at_pr_open_until_its_gate_holds() {
             unit.history.last().unwrap().evidence.merged_at.as_deref(),
             merged_at
         );
-        // A later sync with no moves still shows the stored merge date on the card.
+        let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+        let suffix = merged_at
+            .map(|at| format!("; merged_at {at}"))
+            .unwrap_or_default();
+        assert_eq!(
+            card.lines()
+                .find(|line| line.starts_with("- `01-a/u/S1` pr-open → merged ")),
+            Some(format!("- `{STEP}` pr-open → merged (sha {head}{suffix})").as_str()),
+        );
         assert!(sync(&later, &merged, &c.root).unwrap().ok());
         let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
         assert_eq!(
-            card.lines()
-                .find(|line| line.starts_with("- `01-a/u/S1` merged since ")),
-            Some(
-                format!(
-                    "- `{STEP}` merged since {}",
-                    merged_at.unwrap_or(&track.since)
-                )
-                .as_str()
-            ),
+            card.split("## In flight\n\n")
+                .nth(1)
+                .unwrap()
+                .split("\n## ")
+                .next()
+                .unwrap()
+                .trim(),
+            "Nothing is in flight."
         );
     }
 }
 
 #[test]
-fn advance_merged_with_pr_records_github_merge_time() {
+fn advance_merged_with_pr_records_merge_time_and_refuses_a_different_pr() {
     for (state, reported, expected) in [
         (
             PullState::Merged,
@@ -1905,28 +1912,35 @@ fn advance_merged_with_pr_records_github_merge_time() {
             ..FakeForge::open(&head, &[("test", "success")])
         };
         let later = at("2026-10-25T07:00:00Z");
-        let moved = commands::advance_gated(
-            &later,
-            &c.root,
-            &target(),
-            commands::Advance {
-                to: &Phase::Merged,
-                given: &Evidence {
-                    sha: Some(head),
-                    pr: Some(PR.into()),
-                    ..Evidence::default()
+        let advance = |pr: &str| {
+            commands::advance_gated(
+                &later,
+                &c.root,
+                &target(),
+                commands::Advance {
+                    to: &Phase::Merged,
+                    given: &Evidence {
+                        sha: Some(head.clone()),
+                        pr: Some(pr.into()),
+                        ..Evidence::default()
+                    },
+                    file: None,
+                    repo: Some(&c.repo),
+                    part: None,
+                    by: &[],
                 },
-                file: None,
-                repo: Some(&c.repo),
-                part: None,
-                by: &[],
-            },
-            &MergeGate {
-                forge: Some(&forge),
-                ..MergeGate::default()
-            },
-        )
-        .unwrap();
+                &MergeGate {
+                    forge: Some(&forge),
+                    ..MergeGate::default()
+                },
+            )
+            .unwrap()
+        };
+        let before = store::load_unit(&c.root.join("01-a/u")).unwrap();
+        let refused = advance(review_fixture::OTHER_PR);
+        assert_eq!(rules(&refused), ["evidence-pr"]);
+        assert_eq!(store::load_unit(&c.root.join("01-a/u")).unwrap(), before);
+        let moved = advance(PR);
         assert!(moved.ok(), "{:?}", moved.violations);
         let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
         assert_eq!(
@@ -1934,6 +1948,93 @@ fn advance_merged_with_pr_records_github_merge_time() {
             expected
         );
         assert_eq!(unit.steps["S1"].track.since, cm::host::stamp(later.now()));
+    }
+}
+
+#[test]
+fn multipart_merge_time_uses_latest_part_and_requires_every_time() {
+    for mode in ["sync", "advance", "settle"] {
+        for (first, second, expected) in [
+            (
+                Some(review_fixture::MERGED_AT),
+                Some(review_fixture::EARLIER_MERGED_AT),
+                Some(review_fixture::MERGED_AT),
+            ),
+            (Some(review_fixture::MERGED_AT), None, None),
+            (None, Some(review_fixture::EARLIER_MERGED_AT), None),
+        ] {
+            let host = at("2026-10-25T06:00:00Z");
+            let c = review_fixture::multipart_campaign(&host);
+            let head = c.head();
+            let mut forge = FakeForge {
+                state: PullState::Merged,
+                merged_at: first.map(str::to_owned),
+                ..FakeForge::open(&head, &[])
+            };
+            forge
+                .parts
+                .insert(review_fixture::OTHER_PR.into(), FakeForge::open(&head, &[]));
+            let advance_part = |host: &Fake, part, pr: &str, forge: &FakeForge| {
+                let moved = commands::advance_gated(
+                    host,
+                    &c.root,
+                    &target(),
+                    commands::Advance {
+                        to: &Phase::Merged,
+                        given: &Evidence {
+                            sha: Some(head.clone()),
+                            pr: Some(pr.into()),
+                            ..Default::default()
+                        },
+                        file: None,
+                        repo: Some(&c.repo),
+                        part: Some(part),
+                        by: &[],
+                    },
+                    &MergeGate {
+                        forge: Some(forge),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert!(moved.ok(), "{:?}", moved.violations);
+            };
+            match mode {
+                "sync" => assert!(sync(&host, &forge, &c.root).unwrap().ok()),
+                "advance" => advance_part(&host, "one", PR, &forge),
+                _ => review_fixture::parts_at(&c, &host, Phase::Merged, [first, second]),
+            }
+            let later = at("2026-10-25T07:00:00Z");
+            let last = forge.parts.get_mut(review_fixture::OTHER_PR).unwrap();
+            last.state = PullState::Merged;
+            last.merged_at = second.map(str::to_owned);
+            if mode == "advance" {
+                advance_part(&later, "two", review_fixture::OTHER_PR, &forge);
+            } else {
+                assert!(sync(&later, &forge, &c.root).unwrap().ok());
+            }
+            let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+            let track = &unit.steps["S1"].track;
+            assert_eq!(track.state, Phase::Merged);
+            assert_eq!(track.evidence.merged_at.as_deref(), expected, "{mode}");
+            assert_eq!(track.since, cm::host::stamp(later.now()));
+            let moved = unit
+                .history
+                .iter()
+                .find(|moved| moved.target == STEP && moved.to == Phase::Merged)
+                .unwrap();
+            assert_eq!(moved.evidence.merged_at.as_deref(), expected, "{mode}");
+            assert_eq!(moved.at, cm::host::stamp(later.now()));
+            review_fixture::parts_at(&c, &later, Phase::Released, [first, second]);
+            assert!(sync(&later, &forge, &c.root).unwrap().ok());
+            let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+            assert_eq!(unit.steps["S1"].track.state, Phase::Released);
+            assert_eq!(
+                unit.steps["S1"].track.evidence.merged_at.as_deref(),
+                expected,
+                "{mode}"
+            );
+        }
     }
 }
 
