@@ -8,12 +8,14 @@ use cm::commands;
 use cm::host::Host;
 use cm::lint::lint;
 use cm::outcome::Outcome;
-use cm::state::{After, Evidence, Lane, Phase, UnitState};
+use cm::state::{After, Evidence, Lane, Phase, UnitState, Work};
 use cm::store::{self, Target, parse_target};
 use jiff::Timestamp;
 
 #[path = "support/campaign.rs"]
 mod campaign_fixture;
+#[path = "support/forge.rs"]
+mod forge_fixture;
 #[path = "support/kickoff.rs"]
 mod kickoff_fixture;
 #[path = "support/lifecycle.rs"]
@@ -1774,4 +1776,200 @@ fn by_is_a_usage_error_outside_superseded_and_does_not_replace_evidence() {
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["violations"][0]["rule"], "evidence-missing");
     assert_eq!(c.files(), before);
+}
+
+#[test]
+fn rollout_init_persists_its_kind_and_refuses_study_or_release() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let step = "01-first/alpha/ROLLOUT";
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .current_dir(&c.root)
+        .args(["--json", "init", step, "--lane", "pi", "--kind", "rollout"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["kind"], "rollout");
+    assert_eq!(result["study"], false);
+    let dir = c.root.join("01-first/alpha");
+    let state = store::load_unit(&dir).unwrap();
+    assert_eq!(state.schema, cm::state::SCHEMA);
+    assert_eq!(state.steps["ROLLOUT"].work, Work::Rollout);
+    let json = serde_json::to_value(&state).unwrap();
+    assert_eq!(json["steps"]["ROLLOUT"]["work"], "rollout");
+    assert_eq!(serde_json::from_value::<UnitState>(json).unwrap(), state);
+    let rendered = fs::read_to_string(dir.join("STATE.md")).unwrap();
+    assert_eq!(
+        rendered
+            .lines()
+            .find(|line| line.starts_with("| ROLLOUT | pi"))
+            .unwrap(),
+        "| ROLLOUT | pi, rollout | — |"
+    );
+    let before = c.files();
+    for (target, extra) in [(step, vec!["--study"]), ("00-release/cm/1.0.0", vec![])] {
+        let refused = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .current_dir(&c.root)
+            .args([
+                "--json", "init", target, "--lane", "pi", "--kind", "rollout",
+            ])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(!refused.status.success(), "{refused:?}");
+        assert_eq!(c.files(), before);
+    }
+}
+
+#[test]
+fn rollouts_deploy_from_merged_with_a_sha_and_sync_receipt_without_a_digest() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    for lane in [Lane::Pi, Lane::Codex, Lane::Owner, Lane::Coordinator] {
+        let c = campaign(&host);
+        let (repo, sha) = repo(c.root.parent().unwrap());
+        let step = "01-first/alpha/ROLLOUT";
+        c.merged_rollout(&host, step, lane, &repo, &sha);
+        let file = c.sync_receipt(&sha);
+        let deployed = commands::advance(
+            &host,
+            &c.root,
+            &target(step),
+            &Phase::Deployed,
+            &Evidence {
+                sha: Some(sha[..10].into()),
+                ..Evidence::default()
+            },
+            Some(&file),
+            None,
+        )
+        .unwrap();
+        assert!(deployed.ok(), "{:?}", deployed.violations);
+        let state = store::load_unit(&c.root.join("01-first/alpha")).unwrap();
+        let track = &state.steps["ROLLOUT"].track;
+        assert_eq!(track.state, Phase::Deployed);
+        assert_eq!(track.evidence.sha.as_deref(), Some(sha.as_str()));
+        assert_eq!(
+            track.evidence.file.as_ref().unwrap().as_str(),
+            "sync-receipt.md"
+        );
+        assert_eq!(track.evidence.digest, None);
+        assert_eq!(track.evidence.tag, None);
+        assert_eq!(state.history.last().unwrap().from, Phase::Merged);
+        assert_clean(&c.root);
+    }
+}
+
+#[test]
+fn rollout_deployment_refuses_missing_or_invalid_receipts_and_missing_shas() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let (repo, sha) = repo(c.root.parent().unwrap());
+    let step = "01-first/alpha/ROLLOUT";
+    c.merged_rollout(&host, step, Lane::Pi, &repo, &sha);
+    let file = c.sync_receipt(&sha);
+    let missing = c.root.join("missing.md");
+    let before = c.files();
+    for (given_sha, receipt, expected) in [
+        (Some(sha.clone()), None, "evidence-missing"),
+        (Some(sha.clone()), Some(&missing), "evidence-file"),
+        (None, Some(&file), "evidence-missing"),
+    ] {
+        let refused = commands::advance(
+            &host,
+            &c.root,
+            &target(step),
+            &Phase::Deployed,
+            &Evidence {
+                sha: given_sha,
+                ..Evidence::default()
+            },
+            receipt.map(|p| p.as_path()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(rules(&refused), vec![expected]);
+        assert_eq!(c.files(), before);
+    }
+    let released = advance(&host, &c, step, "released", Evidence::default());
+    assert!(rules(&released).contains(&"advance-refused"));
+    assert_eq!(c.files(), before);
+}
+
+#[test]
+fn normal_steps_still_refuse_to_skip_released() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let (repo, sha) = repo(c.root.parent().unwrap());
+    let step = "01-first/alpha/BUILD";
+    c.merged_step(&host, step, Lane::Pi, &repo, &sha);
+    let before = c.files();
+    let refused = advance(
+        &host,
+        &c,
+        step,
+        "deployed",
+        Evidence {
+            digest: Some(format!("sha256:{}", "d".repeat(64))),
+            ..Evidence::default()
+        },
+    );
+    assert_eq!(rules(&refused), vec!["advance-refused"]);
+    assert_eq!(c.files(), before);
+}
+
+#[test]
+fn sync_leaves_rollouts_merged_even_when_a_containing_release_is_deployed() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let (repo, sha) = repo(c.root.parent().unwrap());
+    c.merged_rollout(&host, "01-first/alpha/ROLLOUT", Lane::Pi, &repo, &sha);
+    c.merged_step(&host, "01-first/alpha/BUILD", Lane::Pi, &repo, &sha);
+    c.release_receipt(&host, &repo, &sha);
+    let mut forge = forge_fixture::FakeForge::default();
+    forge
+        .tags
+        .insert(("o/cm".into(), "v1.0.0".into()), [sha].into());
+    let synced = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    assert!(synced.ok(), "{:?}", synced.violations);
+    let state = store::load_unit(&c.root.join("01-first/alpha")).unwrap();
+    assert_eq!(state.steps["ROLLOUT"].track.state, Phase::Merged);
+    assert_eq!(state.steps["ROLLOUT"].track.evidence.tag, None);
+    assert_eq!(state.steps["BUILD"].track.state, Phase::Deployed);
+}
+
+#[test]
+fn multipart_rollouts_deploy_only_after_every_part_has_a_sync_receipt() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let (repo, sha) = repo(c.root.parent().unwrap());
+    let step = "01-first/alpha/ROLLOUT";
+    c.merged_rollout(&host, step, Lane::Pi, &repo, &sha);
+    c.rollout_parts(step, &["east", "west"]);
+    let file = c.sync_receipt(&sha);
+    for (part, expected) in [("east", Phase::Merged), ("west", Phase::Deployed)] {
+        let deployed = commands::advance_gated(
+            &host,
+            &c.root,
+            &target(step),
+            commands::Advance {
+                to: &Phase::Deployed,
+                given: &Evidence {
+                    sha: Some(sha.clone()),
+                    ..Evidence::default()
+                },
+                file: Some(&file),
+                repo: None,
+                part: Some(part),
+                by: &[],
+            },
+            &commands::MergeGate::default(),
+        )
+        .unwrap();
+        assert!(deployed.ok(), "{:?}", deployed.violations);
+        let state = store::load_unit(&c.root.join("01-first/alpha")).unwrap();
+        assert_eq!(state.steps["ROLLOUT"].track.state, expected);
+        assert_eq!(state.steps["ROLLOUT"].parts[part].state, Phase::Deployed);
+    }
+    assert_clean(&c.root);
 }

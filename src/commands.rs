@@ -512,7 +512,7 @@ fn init_step(
             violations.push(Violation::new(
                 &full,
                 "init-target",
-                "a release step ships a tag; --study marks a step that ships none",
+                "a release step ships a tag; it cannot be a study or rollout",
             ));
         }
     } else if ships.given() {
@@ -641,8 +641,12 @@ fn init_step(
     if let Some(github) = &ships.github {
         body.push_str(&format!("- github: {github}\n"));
     }
-    if !work.is_code() {
-        body.push_str("- study: finishes with `cm advance <step> done --evidence <path>`\n");
+    match work {
+        Work::Code => {}
+        Work::Study => {
+            body.push_str("- study: finishes with `cm advance <step> done --evidence <path>`\n")
+        }
+        Work::Rollout => body.push_str("- kind: rollout\n"),
     }
     if kickoff {
         body.push_str(&format!("- kickoff: {full}/kickoff.md\n"));
@@ -653,10 +657,14 @@ fn init_step(
     outcome.line(match work {
         Work::Code => format!("declared {full} ({lane})"),
         Work::Study => format!("declared {full} ({lane}, study)"),
+        Work::Rollout => format!("declared {full} ({lane}, rollout)"),
     });
     outcome.field("target", full.clone());
     outcome.field("lane", lane.name());
-    outcome.field("study", !work.is_code());
+    outcome.field("study", work == Work::Study);
+    if work == Work::Rollout {
+        outcome.field("kind", "rollout");
+    }
     outcome.field("after", shown);
     outcome.field("tag", tag.as_ref().map(ToString::to_string));
     if declaration.kickoff.is_some() {
@@ -1725,7 +1733,9 @@ pub fn advance_gated(
         .then(|| crate::ledger::single_evidence(root, target))
         .flatten();
     let file = file.or(single.as_deref());
-    let finishing_code = *to == Phase::Done && finish == Finish::Shipped && target.step.is_some();
+    let finishing_code = *to == Phase::Done
+        && matches!(finish, Finish::Shipped | Finish::Rollout)
+        && target.step.is_some();
     let code_finish = || {
         Violation::new(
             &full,

@@ -215,11 +215,12 @@ pub fn evidence_for(phase: &Phase, finish: Finish) -> (&'static [Flag], &'static
         (Phase::PrOpen, _) => (&[Flag::Pr, Flag::Sha], &[]),
         (Phase::Merged, _) => (&[Flag::Sha], &[]),
         (Phase::Released, _) => (&[Flag::Tag], &[Flag::Digest]),
+        (Phase::Deployed, Finish::Rollout) => (&[Flag::Sha, Flag::File], &[Flag::Digest]),
         (Phase::Deployed, _) => (&[Flag::Digest], &[]),
         (Phase::Done, Finish::Evidence) | (Phase::Superseded, _) => (&[Flag::File], &[]),
         (
             Phase::Drafted | Phase::Launched | Phase::Blocked(_) | Phase::Done,
-            Finish::Evidence | Finish::Shipped,
+            Finish::Evidence | Finish::Shipped | Finish::Rollout,
         ) => (&[], &[]),
     }
 }
@@ -228,6 +229,7 @@ pub fn evidence_for(phase: &Phase, finish: Finish) -> (&'static [Flag], &'static
 pub enum Finish {
     Shipped,
     Evidence,
+    Rollout,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,22 +263,31 @@ impl Track {
         if self.state.is_final() {
             return Err(format!("{} is final", self.state));
         }
+        if finish == Finish::Rollout && *to == Phase::Released {
+            return Err(
+                "a rollout skips released; from merged, move to deployed with --sha and --evidence"
+                    .into(),
+            );
+        }
         match (to, finish) {
-            (Phase::Blocked(_) | Phase::Superseded, Finish::Shipped | Finish::Evidence)
+            (
+                Phase::Blocked(_) | Phase::Superseded,
+                Finish::Shipped | Finish::Evidence | Finish::Rollout,
+            )
             | (Phase::Done, Finish::Evidence) => return Ok(()),
-            (Phase::Drafted, Finish::Shipped | Finish::Evidence) => {
+            (Phase::Drafted, Finish::Shipped | Finish::Evidence | Finish::Rollout) => {
                 return Err("drafted is where a track starts, never a move".into());
             }
-            (Phase::Launched, Finish::Shipped | Finish::Evidence) => {
+            (Phase::Launched, Finish::Shipped | Finish::Evidence | Finish::Rollout) => {
                 return Err(
                     "launched is entered only by `cm launch`, which runs the launch checks".into(),
                 );
             }
             (
                 Phase::PrOpen | Phase::Merged | Phase::Released | Phase::Deployed,
-                Finish::Shipped | Finish::Evidence,
+                Finish::Shipped | Finish::Evidence | Finish::Rollout,
             )
-            | (Phase::Done, Finish::Shipped) => {}
+            | (Phase::Done, Finish::Shipped | Finish::Rollout) => {}
         }
         let resting = self.resting();
         let blocked = match self.state {
@@ -293,7 +304,11 @@ impl Track {
         if blocked && to == resting {
             return Ok(());
         }
-        let next = resting.successor();
+        let next = if finish == Finish::Rollout && *resting == Phase::Merged {
+            Some(Phase::Deployed)
+        } else {
+            resting.successor()
+        };
         if next.as_ref() == Some(to) {
             return Ok(());
         }
@@ -588,10 +603,14 @@ impl After {
     pub fn needs(&self, finish: Finish) -> Phase {
         match (self, finish) {
             (After::Merged(_) | After::PrOpen(_), Finish::Evidence) => Phase::Done,
-            (After::Merged(_), Finish::Shipped) => Phase::Merged,
-            (After::PrOpen(_), Finish::Shipped) => Phase::PrOpen,
-            (After::Tag(_), Finish::Shipped | Finish::Evidence) => Phase::Released,
-            (After::Deployed(_), Finish::Shipped | Finish::Evidence) => Phase::Deployed,
+            (After::Merged(_), Finish::Shipped | Finish::Rollout) => Phase::Merged,
+            (After::PrOpen(_), Finish::Shipped | Finish::Rollout) => Phase::PrOpen,
+            (After::Tag(_), Finish::Shipped | Finish::Evidence | Finish::Rollout) => {
+                Phase::Released
+            }
+            (After::Deployed(_), Finish::Shipped | Finish::Evidence | Finish::Rollout) => {
+                Phase::Deployed
+            }
         }
     }
 
@@ -964,13 +983,14 @@ pub enum Work {
     #[default]
     Code,
     Study,
+    Rollout,
 }
 
 impl Work {
     pub fn is_code(&self) -> bool {
         match self {
             Work::Code => true,
-            Work::Study => false,
+            Work::Study | Work::Rollout => false,
         }
     }
 }
@@ -1045,7 +1065,12 @@ impl Step {
     ) -> Option<(Phase, Phase)> {
         let reach = self.parts_reach()?;
         let from = self.track.state.clone();
-        if self.track.resting().successor().as_ref() != Some(&reach)
+        let next = if self.work == Work::Rollout && *self.track.resting() == Phase::Merged {
+            Some(Phase::Deployed)
+        } else {
+            self.track.resting().successor()
+        };
+        if next.as_ref() != Some(&reach)
             || self.track.blocked_from.is_some()
             || self.track.check(&reach, self.finish(release)).is_err()
             || (reach == Phase::Deployed && self.unresolved_watches(root).next().is_some())
@@ -1069,6 +1094,7 @@ impl Step {
 
     pub fn finish(&self, release: bool) -> Finish {
         match (self.work, self.lane) {
+            (Work::Rollout, _) => Finish::Rollout,
             (Work::Study, _) | (Work::Code, Some(Lane::Owner)) => Finish::Evidence,
             (Work::Code, Some(Lane::Coordinator))
                 if !release

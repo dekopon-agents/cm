@@ -59,8 +59,10 @@ pub fn unit(state: &UnitState) -> String {
                 match (step.lane, step.work) {
                     (None, Work::Code) => "—".to_owned(),
                     (None, Work::Study) => "study".to_owned(),
+                    (None, Work::Rollout) => "rollout".to_owned(),
                     (Some(lane), Work::Code) => lane.name().to_owned(),
                     (Some(lane), Work::Study) => format!("{lane}, study"),
+                    (Some(lane), Work::Rollout) => format!("{lane}, rollout"),
                 },
                 if after.is_empty() {
                     "—".to_owned()
