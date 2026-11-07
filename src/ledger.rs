@@ -1,6 +1,3 @@
-//! The campaign files people used to append by hand, written through cm: FEEDBACK.md,
-//! OWNER-QUEUE.md items, step evidence and the REVIEW-OFF.md ledger. Every change is journaled.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -404,13 +401,31 @@ pub(crate) fn add_queue_item(
     if !violations.is_empty() {
         return Ok(Outcome::refused(violations));
     }
-    let number = headings(&queue)
+    let history = fs::read_to_string(root.join(store::JOURNAL))?;
+    let journal_numbers = history.lines().filter_map(|line| {
+        if !journal::is_stamped(line) {
+            return None;
+        }
+        let (_, title) = line.split_once(" — ")?;
+        let (action, item) = title.strip_prefix("owner-queue ")?.split_once(' ')?;
+        matches!(action, "add" | "answer" | "strike")
+            .then(|| item_number(item))
+            .flatten()
+    });
+    let last = headings(&queue)
         .iter()
         .filter(|heading| heading.level == 2)
         .filter_map(|heading| item_number(heading.text))
+        .chain(journal_numbers)
         .max()
-        .unwrap_or(0)
-        + 1;
+        .unwrap_or(0);
+    let Some(number) = last.checked_add(1) else {
+        return Ok(Outcome::refused(vec![Violation::new(
+            QUEUE_FILE,
+            "owner-queue-number-exhausted",
+            "the highest owner-queue item is u32::MAX; no new item number is available",
+        )]));
+    };
     let title = format!("{number}. {}", item.title.trim());
     append(
         &root.join(QUEUE_FILE),
@@ -550,7 +565,12 @@ fn update_queue_item(
             "\n"
         };
         next.replace_range(body_start..end, &format!("{newline}\n{body}\n\n"));
-        violations.extend(templates::owner_queue(&next));
+        let edited = format!("# Owner queue\n\n## {}\n\n{body}\n", heading.text);
+        violations.extend(
+            templates::owner_queue(&edited)
+                .into_iter()
+                .map(|violation| violation.at(heading.line)),
+        );
     } else {
         next.replace_range(start..end, "");
     }
@@ -594,23 +614,55 @@ fn update_queue_item(
     if !violations.is_empty() {
         return Ok(Outcome::refused(violations));
     }
-    write_atomic(&root.join(QUEUE_FILE), next.as_bytes())?;
-    if let Some(resume) = resume {
-        write_atomic(&root.join("RESUME.md"), resume.as_bytes())?;
-    }
     let mut journal_body = format!("- {QUEUE_FILE}: `## {}`\n", heading.text);
+    if !matches!(update, QueueUpdate::Edit) {
+        journal_body.push_str("\nRemoved item:\n\n");
+        for line in queue[start..end].split_inclusive('\n') {
+            journal_body.push_str("> ");
+            journal_body.push_str(line);
+        }
+        if !journal_body.ends_with('\n') {
+            journal_body.push('\n');
+        }
+    }
     match update {
         QueueUpdate::Answer => journal_body.push_str(&format!("\nAnswer:\n{body}\n")),
         QueueUpdate::Strike => journal_body.push_str(&format!("\nReason: {body}\n")),
         QueueUpdate::Edit => {}
     }
     let at = stamp(host.now());
-    let journal = journal_line(
+    let failed_write = |path, rule, error: anyhow::Error| {
+        Outcome::refused(vec![Violation::new(
+            path,
+            rule,
+            format!(
+                "owner-queue {action} {number} failed; the item remains in the queue: {error:#}"
+            ),
+        )])
+    };
+    let journal = match journal_line(
         root,
         &at,
         &format!("owner-queue {action} {}", heading.text),
         &journal_body,
-    )?;
+    ) {
+        Ok(journal) => journal,
+        Err(error) => {
+            return Ok(failed_write(
+                store::JOURNAL,
+                "owner-queue-journal-write",
+                error,
+            ));
+        }
+    };
+    if let Some(resume) = resume
+        && let Err(error) = write_atomic(&root.join("RESUME.md"), resume.as_bytes())
+    {
+        return Ok(failed_write("RESUME.md", "owner-queue-resume-write", error));
+    }
+    if let Err(error) = write_atomic(&root.join(QUEUE_FILE), next.as_bytes()) {
+        return Ok(failed_write(QUEUE_FILE, "owner-queue-write", error));
+    }
     let mut outcome = Outcome::default();
     outcome.line(format!("owner-queue {action} {}", heading.text));
     outcome.field("item", number);
