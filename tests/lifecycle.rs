@@ -12,6 +12,9 @@ use cm::state::{After, Evidence, Lane, Phase, UnitState, Work};
 use cm::store::{self, Target, parse_target};
 use jiff::Timestamp;
 
+#[allow(dead_code)]
+mod support;
+
 #[path = "support/campaign.rs"]
 mod campaign_fixture;
 #[path = "support/kickoff.rs"]
@@ -374,6 +377,164 @@ fn merged_non_release_steps_refuse_a_descendant_merge_sha() {
     );
     assert_eq!(rules(&outcome), vec!["advance-refused"]);
     assert_eq!(c.files(), before);
+}
+
+#[test]
+fn github_merge_time_appears_in_state_and_close_accounting() {
+    for merged_at in [Some(lifecycle_fixture::MERGED_AT), None] {
+        let host = Fake::at("2026-10-08T07:00:00Z");
+        let c = campaign(&host);
+        let (repo, sha) = repo(c.root.parent().unwrap());
+        unit_with_step(&c, &host, "Go.\n");
+        let step = "01-first/alpha/BUILD";
+        let target = parse_target(step, true).unwrap();
+        assert!(
+            commands::launch(&host, &c.root, &target, Some(&repo))
+                .unwrap()
+                .ok()
+        );
+        let evidence = Evidence {
+            pr: Some("https://github.com/o/r/pull/7".into()),
+            sha: Some(sha.clone()),
+            ..Evidence::default()
+        };
+        assert!(advance(&host, &c, step, "pr-open", evidence.clone()).ok());
+        assert!(advance(&host, &c, step, "blocked:waiting", Evidence::default()).ok());
+        let gh = lifecycle_fixture::merged_pull(&sha, merged_at);
+        let forge = cm::forge::Gh {
+            program: gh.program(),
+            ..cm::forge::Gh::default()
+        };
+        let later = Fake::at("2026-10-08T20:00:00Z");
+        let moved = commands::advance_gated(
+            &later,
+            &c.root,
+            &target,
+            commands::Advance {
+                to: &Phase::Merged,
+                given: &evidence,
+                file: None,
+                repo: Some(&repo),
+                part: None,
+                by: &[],
+            },
+            &commands::MergeGate {
+                forge: Some(&forge),
+                ..commands::MergeGate::default()
+            },
+        )
+        .unwrap();
+        assert!(moved.ok(), "{:?}", moved.violations);
+        let unit = store::load_unit(&c.root.join("01-first/alpha")).unwrap();
+        assert_eq!(unit.schema, 5);
+        let track = &unit.steps["BUILD"].track;
+        assert_eq!(track.evidence.merged_at.as_deref(), merged_at);
+        assert_eq!(track.since, cm::host::stamp(later.now()));
+        let shown = merged_at.unwrap_or(&track.since);
+        let state = fs::read_to_string(c.root.join("01-first/alpha/STATE.md")).unwrap();
+        let row = state
+            .lines()
+            .find(|line| line.starts_with("| BUILD | merged |"))
+            .unwrap();
+        assert_eq!(row.split('|').nth(3).unwrap().trim(), shown);
+        let stored: serde_json::Value =
+            store::read_json(&store::state_path(&c.root.join("01-first/alpha"))).unwrap();
+        assert_eq!(
+            stored["steps"]["BUILD"]["evidence"].get("merged_at"),
+            merged_at.map(|at| serde_json::json!(at)).as_ref()
+        );
+        assert!(advance(&later, &c, step, "blocked:carried", Evidence::default()).ok());
+        let restored =
+            commands::unblock(&later, &c.root, &target, Some(&c.unblock_file())).unwrap();
+        assert!(restored.ok(), "{:?}", restored.violations);
+        assert!(advance(&later, &c, step, "blocked:carried", Evidence::default()).ok());
+        assert!(
+            advance(
+                &later,
+                &c,
+                "01-first/alpha",
+                "blocked:carried",
+                Evidence::default()
+            )
+            .ok()
+        );
+        let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+        let closed = commands::close(&later, &c.root).unwrap();
+        assert!(closed.ok(), "{:?}", closed.violations);
+        assert_eq!(
+            fs::read_to_string(c.root.join("JOURNAL.md")).unwrap(),
+            format!(
+                "{journal}\n## 2026-10-08T20:00Z — cm close\n\n- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n- merged: {step} at {shown}\n"
+            ),
+        );
+    }
+}
+
+#[test]
+fn close_counts_real_release_remerges_once_and_preserves_the_original_pr_time() {
+    let host = Fake::at("2026-10-08T20:00:00Z");
+    let c = campaign(&host);
+    let (repo, first) = repo(c.root.parent().unwrap());
+    let step = "00-release/cm/1.0.0";
+    c.merged_step(&host, step, Lane::Coordinator, &repo, &first);
+    c.record_merge_time(step, lifecycle_fixture::MERGED_AT);
+    git(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "second merge"],
+    );
+    let second = git(&repo, &["rev-parse", "HEAD"]);
+    let later = Fake::at("2026-10-09T08:00:00Z");
+    let moved = advance(
+        &later,
+        &c,
+        step,
+        "merged",
+        Evidence {
+            sha: Some(second),
+            ..Default::default()
+        },
+    );
+    assert!(moved.ok(), "{:?}", moved.violations);
+    let unit = store::load_unit(&c.root.join("00-release/cm")).unwrap();
+    let track = &unit.steps["1.0.0"].track;
+    assert_eq!(
+        track.evidence.merged_at.as_deref(),
+        Some(lifecycle_fixture::MERGED_AT)
+    );
+    assert_eq!(track.since, cm::host::stamp(host.now()));
+    assert_eq!(unit.history.last().unwrap().evidence.merged_at, None);
+    assert!(advance(&later, &c, step, "blocked:carried", Evidence::default()).ok());
+    assert!(
+        commands::unblock(
+            &later,
+            &c.root,
+            &parse_target(step, true).unwrap(),
+            Some(&c.unblock_file())
+        )
+        .unwrap()
+        .ok()
+    );
+    assert!(advance(&later, &c, step, "blocked:carried", Evidence::default()).ok());
+    assert!(
+        advance(
+            &later,
+            &c,
+            "00-release/cm",
+            "blocked:carried",
+            Evidence::default()
+        )
+        .ok()
+    );
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    let closed = commands::close(&later, &c.root).unwrap();
+    assert!(closed.ok(), "{:?}", closed.violations);
+    assert_eq!(
+        fs::read_to_string(c.root.join("JOURNAL.md")).unwrap(),
+        format!(
+            "{journal}\n## 2026-10-09T08:00Z — cm close\n\n- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n- merged: {step} at {}\n- merged: {step} at 2026-10-09T08:00Z\n",
+            lifecycle_fixture::MERGED_AT
+        ),
+    );
 }
 
 #[test]

@@ -3,11 +3,21 @@ use std::collections::BTreeMap;
 use jiff::Timestamp;
 
 use crate::plan::{Next, Units};
-use crate::state::{Lane, Phase, Release, Step, UnitState, Version, Watch, WatchStatus, Work};
+use crate::state::{
+    Lane, Phase, Release, Step, Track, UnitState, Version, Watch, WatchStatus, Work,
+};
 use crate::sync::Moved;
 
 fn cell(text: &str) -> String {
     text.replace('|', "\\|").replace('\n', " ")
+}
+
+fn since(track: &Track) -> &str {
+    if track.state == Phase::Merged {
+        track.evidence.merged_at.as_deref().unwrap_or(&track.since)
+    } else {
+        &track.since
+    }
 }
 
 pub fn unit(state: &UnitState) -> String {
@@ -20,7 +30,7 @@ pub fn unit(state: &UnitState) -> String {
         "| {} | {} | {} | {} |\n\n",
         cell(&state.unit),
         cell(&state.track.state.to_string()),
-        state.track.since,
+        since(&state.track),
         cell(&state.track.evidence.summary()),
     ));
     out.push_str("## Alive\n\n");
@@ -33,7 +43,7 @@ pub fn unit(state: &UnitState) -> String {
                 "| {} | {} | {} | {} | {} | {} |\n",
                 cell(name),
                 cell(&step.track.state.to_string()),
-                step.track.since,
+                since(&step.track),
                 step.launches,
                 if step.worktree.is_empty() {
                     "—".to_owned()
@@ -84,7 +94,7 @@ pub fn unit(state: &UnitState) -> String {
                     cell(name),
                     cell(part),
                     cell(&track.state.to_string()),
-                    track.since,
+                    since(track),
                     cell(&track.evidence.summary()),
                 ));
             }
