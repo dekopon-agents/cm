@@ -83,6 +83,44 @@ impl Campaign {
         fs::write(self.root.join("JOURNAL.md"), text).unwrap();
     }
 
+    pub fn fail_epoch_read(&self, invalid_utf8: bool) -> String {
+        let path = self.root.join("EPOCH.md");
+        if invalid_utf8 {
+            fs::write(&path, [0xff]).unwrap();
+        } else {
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+        }
+        fs::read_to_string(path).unwrap_err().to_string()
+    }
+
+    pub fn remove_epoch(&self) {
+        fs::remove_file(self.root.join("EPOCH.md")).unwrap();
+    }
+
+    pub fn journal_body_file(&self, body: &str) -> PathBuf {
+        let path = self.root.join("journal-body.txt");
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    pub fn seed_journal(&self, entries: usize) {
+        let mut text = self.journal_text();
+        for index in 0..entries {
+            text.push('\n');
+            text.push_str(&cm::journal::entry(
+                "2026-01-02T09:30Z",
+                if index % 2 == 0 {
+                    "idea admit IDEA-9001"
+                } else {
+                    "observation"
+                },
+                Some(&format!("- observation: {index}\n")),
+            ));
+        }
+        self.restore_journal(&text);
+    }
+
     pub fn idea_snapshot(&self) -> BTreeMap<PathBuf, Vec<u8>> {
         let mut snapshot = self.files();
         for file in fs::read_dir(self.idea_dir()).unwrap() {

@@ -586,3 +586,80 @@ fn unfinished_history_fences_refuse_instead_of_hiding_new_state() {
     );
     assert_eq!(c.idea_snapshot(), snapshot);
 }
+
+#[test]
+fn superseding_with_an_existing_invalid_id_refuses_before_writing() {
+    let c = ideas();
+    c.add_idea("IDEA-9001");
+    c.add_idea("broken");
+    ok(c.cm(&["idea", "admit", "IDEA-9001"]));
+    let snapshot = c.idea_snapshot();
+    assert_eq!(
+        rules(&c.cm(&[
+            "idea",
+            "outcome",
+            "IDEA-9001",
+            "superseded",
+            "--by",
+            "broken"
+        ])),
+        ["idea-outcome-flags"]
+    );
+    assert_eq!(c.idea_snapshot(), snapshot);
+}
+
+#[test]
+fn manifest_read_failures_refuse_lint_and_commands_with_the_cause() {
+    for invalid_utf8 in [false, true] {
+        let c = ideas();
+        c.add_idea("IDEA-9001");
+        c.duplicate_idea("IDEA-9001");
+        assert_eq!(
+            rules(&c.cm(&["lint"])),
+            ["idea-duplicate-id", "idea-duplicate-id"]
+        );
+        let cause = c.fail_epoch_read(invalid_utf8);
+        let snapshot = c.idea_snapshot();
+        for args in [vec!["lint"], vec!["idea", "admit", "IDEA-9001"]] {
+            let result = c.cm(&args);
+            assert_eq!(rules(&result), ["idea-manifest"]);
+            assert_eq!(result["violations"][0]["path"], "EPOCH.md");
+            assert_eq!(
+                result["violations"][0]["message"],
+                format!("reading {}: {cause}", c.root.join("EPOCH.md").display())
+            );
+            assert_eq!(c.idea_snapshot(), snapshot);
+        }
+    }
+    let c = ideas();
+    c.remove_epoch();
+    ok(c.cm(&["lint"]));
+    assert_eq!(rules(&c.cm(&["idea", "admit", "IDEA-9001"])), ["idea-dir"]);
+}
+
+#[test]
+fn admission_recovery_uses_raw_entry_boundaries_in_a_large_journal() {
+    for later_entry in [false, true] {
+        let c = ideas();
+        c.add_idea("IDEA-9001");
+        c.seed_journal(4096);
+        let body = c.journal_body_file("```md\nAn unfinished journal example.\n");
+        ok(c.cm(&["journal", "notes", "--body-file", body.to_str().unwrap()]));
+        let before = c.journal_text();
+        let result = ok(c.cm(&["idea", "admit", "IDEA-9001"]));
+        assert_eq!(result["changed"], true);
+        assert_journal(
+            &c,
+            &before,
+            &result,
+            "idea admit IDEA-9001",
+            "- idea: IDEA-9001\n- epoch: epoch-alpha\n",
+        );
+        if later_entry {
+            ok(c.cm(&["journal", "later observation"]));
+        }
+        let snapshot = c.idea_snapshot();
+        assert_eq!(ok(c.cm(&["idea", "admit", "IDEA-9001"]))["changed"], false);
+        assert_eq!(c.idea_snapshot(), snapshot);
+    }
+}

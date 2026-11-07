@@ -100,7 +100,13 @@ struct Manifest {
 
 /// Existing campaigns without ideas_dir have no idea lint rules.
 fn manifest(root: &Path, required: bool, out: &mut Vec<Violation>) -> Option<Manifest> {
-    let text = fs::read_to_string(root.join(EPOCH)).unwrap_or_default();
+    let text = match crate::ledger::read_existing(&root.join(EPOCH)) {
+        Ok(text) => text.unwrap_or_default(),
+        Err(error) => {
+            out.push(Violation::new(EPOCH, "idea-manifest", format!("{error:#}")));
+            return None;
+        }
+    };
     let Some(dir) = field(&text, "ideas_dir").filter(|value| !value.is_empty()) else {
         if required {
             out.push(Violation::new(
@@ -485,22 +491,25 @@ fn append_history(text: &str, line: &str) -> String {
 
 fn journaled(root: &Path, title: &str, body: &str) -> Result<bool> {
     let text = fs::read_to_string(root.join(JOURNAL))?;
-    let headings = headings(&text);
-    Ok(headings.iter().enumerate().any(|(index, heading)| {
-        let line = text.lines().nth(heading.line - 1).unwrap_or_default();
-        if heading.level != 2
-            || !journal::is_stamped(line)
-            || !line.ends_with(&format!(" — {title}"))
-        {
-            return false;
+    let suffix = format!(" — {title}");
+    let body = body.trim();
+    let mut start = None;
+    let mut at = 0;
+    // Journal boundaries are raw stamped lines, even inside unfinished Markdown fences.
+    for raw in text.split_inclusive('\n') {
+        let line = raw
+            .strip_suffix('\n')
+            .map(|line| line.strip_suffix('\r').unwrap_or(line))
+            .unwrap_or(raw);
+        if journal::is_stamped(line) {
+            if start.is_some_and(|start| text[start..at].trim() == body) {
+                return Ok(true);
+            }
+            start = line.ends_with(&suffix).then_some(at + raw.len());
         }
-        let end = headings[index + 1..]
-            .iter()
-            .find(|heading| heading.level <= 2)
-            .map(|heading| offset(&text, heading.line - 1))
-            .unwrap_or(text.len());
-        text[offset(&text, heading.line)..end].trim() == body.trim()
-    }))
+        at += raw.len();
+    }
+    Ok(start.is_some_and(|start| text[start..].trim() == body))
 }
 
 pub(crate) fn run(host: &dyn Host, root: &Path, id: &str, action: Action<'_>) -> Result<Outcome> {
@@ -645,7 +654,15 @@ pub(crate) fn run(host: &dyn Host, root: &Path, id: &str, action: Action<'_>) ->
                 ));
             }
             if let Some(by) = by {
-                resolve(root, &ideas, by, &mut violations);
+                if !id_valid(by) {
+                    violations.push(Violation::new(
+                        &path,
+                        "idea-outcome-flags",
+                        "--by is an idea id: <PREFIX>-<digits>",
+                    ));
+                } else {
+                    resolve(root, &ideas, by, &mut violations);
+                }
             }
             let target = to
                 .map(|target| {
