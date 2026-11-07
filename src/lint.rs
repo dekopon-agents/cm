@@ -565,9 +565,14 @@ fn lint_unit(root: &Path, dir: &Path, seen: &mut Seen) -> Vec<Violation> {
     out.extend(unit_state_file(root, dir, &unit));
     lint_holds(root, &unit, seen, &mut out);
     let tracks = std::iter::once((expected.clone(), &unit.track)).chain(
-        unit.steps
-            .iter()
-            .map(|(name, step)| (format!("{expected}/{name}"), &step.track)),
+        unit.steps.iter().flat_map(|(name, step)| {
+            let target = format!("{expected}/{name}");
+            std::iter::once((target.clone(), &step.track)).chain(
+                step.parts
+                    .iter()
+                    .map(move |(part, track)| (format!("{target}#{part}"), track)),
+            )
+        }),
     );
     for (target, track) in tracks {
         if let Some(file) = &track.evidence.file

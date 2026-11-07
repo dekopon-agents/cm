@@ -259,6 +259,13 @@ impl Track {
         }
     }
 
+    fn successor(&self, finish: Finish) -> Option<Phase> {
+        match (self.resting(), finish) {
+            (Phase::Merged, Finish::Rollout) => Some(Phase::Deployed),
+            (phase, _) => phase.successor(),
+        }
+    }
+
     pub fn check(&self, to: &Phase, finish: Finish) -> Result<(), String> {
         if self.state.is_final() {
             return Err(format!("{} is final", self.state));
@@ -304,11 +311,7 @@ impl Track {
         if blocked && to == resting {
             return Ok(());
         }
-        let next = if finish == Finish::Rollout && *resting == Phase::Merged {
-            Some(Phase::Deployed)
-        } else {
-            resting.successor()
-        };
+        let next = self.successor(finish);
         if next.as_ref() == Some(to) {
             return Ok(());
         }
@@ -1093,11 +1096,7 @@ impl Step {
     ) -> Option<(Phase, Phase)> {
         let reach = self.parts_reach()?;
         let from = self.track.state.clone();
-        let next = if self.work == Work::Rollout && *self.track.resting() == Phase::Merged {
-            Some(Phase::Deployed)
-        } else {
-            self.track.resting().successor()
-        };
+        let next = self.track.successor(self.finish(release));
         if next.as_ref() != Some(&reach)
             || self.track.blocked_from.is_some()
             || self.track.check(&reach, self.finish(release)).is_err()

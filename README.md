@@ -235,15 +235,17 @@ and dependents at merged or later, done or superseded have no pin warning. A hea
 never been recorded is reported as `head not recorded`. A multipart step has no single head to pin.
 Pins are refused in `known-red --until` and `blocked:until:`.
 
-A step or `pr-open:` gate on an `owner`-lane or study step, or a non-release `coordinator`-lane step
-without a recorded PR, SHA or declared parts, is met only when that step is `done`.
+A step or `pr-open:` gate on an `owner`-lane step other than a rollout, a study step, or a
+non-release `coordinator`-lane step without a recorded PR, SHA or declared parts is met only
+when that step is `done`. Rollout gates use `merged` or `pr-open`, including in the owner lane.
 A blocked step meets the gates of the state it was blocked from. A bare step name is in the declaring step's unit.
 
 `cm next` numbers each action and prints its exact cm command; JSON carries the same string
 as `command` on each item. CARD.md uses the same renderer and numbers its Next, Waiting and
 Blocked lines across those sections. Run commands from the campaign folder, or append `-C DIR`.
 Replace quoted placeholders such as `'<watch-evidence-file>'` with the named input.
-Ready owner steps offer `cm advance <step> done --evidence '<owner-evidence-file>'`.
+Ready owner steps other than rollouts offer `cm advance <step> done --evidence '<owner-evidence-file>'`.
+Ready owner rollouts offer `cm launch <step>`.
 Ready local steps name a worktree placeholder. Waiting steps offer `cm next <step>` to recheck
 their gates, or `cm amend --kickoff-file` when the kickoff is missing. Stalled launches offer
 `cm attempt <step>` to inspect the attempt before acting; dirty PRs offer `cm attention` with
@@ -272,7 +274,9 @@ without a recorded tag, as does a coordinator step with a recorded PR, SHA or de
 Declare a config or rollout step with `cm init <step> --lane L --kind rollout`. After it merges,
 `cm advance <step> deployed --sha <merge-sha> --evidence <sync-receipt.md>` records its deployment.
 The receipt names the Argo sync revision and must be a non-empty regular file inside the campaign,
-outside `.cm/`; the SHA resolves in the step's worktree or `--repo`. A rollout skips `released`,
+outside `.cm/`; the SHA resolves in the step's worktree or `--repo` and must equal or descend
+from the recorded merge SHA (`merge-lineage`). An unrelated history, including a separate
+repository without that merge, is refused. A rollout skips `released`,
 requires no `--digest`, and `cm sync` never advances it by release tags or deployment receipts.
 It keeps the launch and merge gates and finishes with `done` after `deployed`, including in the
 owner and coordinator lanes. `--kind` and `--study` are mutually exclusive; a release step cannot
@@ -489,7 +493,7 @@ closed until the last part arrives. Moving the step itself past `launched` names
 (`part-short`). Declaring parts on a step that already moved on hands the step's state and
 evidence to the first new part and rests the step at `launched`. A step a watch held below
 `deployed` rolls up when the watch resolves. A release step, a study and an
-owner-lane step have no parts.
+owner-lane step other than a rollout have no parts.
 
 ### Pinned evidence
 
@@ -560,8 +564,8 @@ merge in the step's worktree or `--repo` checkout. It journals the old and new S
 the phase, timestamp and other evidence, and refuses another lineage (`merge-lineage`). This
 evidence update does not repeat the merge gate; non-release steps still refuse `merged` again.
 `cm sync` records `released` when that tag exists in that
-repository and contains the prep merge, and moves the repository's merged steps that the tag
-contains along with it. `cm advance <step> released --tag T` also requires T to contain the
+repository and contains the prep merge, and moves the repository's merged steps other than
+rollouts that the tag contains along with it. `cm advance <step> released --tag T` also requires T to contain the
 recorded merge SHA, refusing with `tag-lineage` otherwise. A release cut without a prep PR
 moves from `drafted` or `launched` with `released --tag T --sha S`; T must contain S.
 These checks use `--repo` or the step's worktree, resolving the commit and tag with Git and
@@ -569,7 +573,7 @@ checking ancestry. Without a checkout, cm uses GitHub's tag comparison in the re
 repository or the release's declared `--github` repository; an unread comparison refuses the move.
 The tick's smoke receipt is
 `cm advance 00-release/<line>/<version> deployed --digest …`; the next sync carries `deployed` to
-every step a deployed release of that line contains, so a fix-forward release deploys what the one
+every step other than a rollout that a deployed release of that line contains, so a fix-forward release deploys what the one
 before it shipped.
 
 ## Releases

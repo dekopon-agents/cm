@@ -1959,7 +1959,7 @@ pub fn advance_gated(
                 })
             {
                 Some((repo, full_sha)) => {
-                    if remerge
+                    if (remerge || (finish == Finish::Rollout && *to == Phase::Deployed))
                         && !track
                             .evidence
                             .sha

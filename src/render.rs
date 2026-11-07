@@ -432,11 +432,11 @@ pub fn card(
     let ready: Vec<String> = next
         .ready
         .iter()
-        .map(|(target, lane)| {
+        .map(|(target, lane, finish)| {
             next_item(
                 &mut number,
                 &format!("`{target}` ({})", lane.map_or("—", Lane::name)),
-                &crate::plan::launch_command(target, *lane),
+                &crate::plan::launch_command(target, *lane, *finish),
             )
         })
         .collect();

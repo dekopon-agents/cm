@@ -140,6 +140,11 @@ pub fn stale_evidence<'a>(units: &'a Units, step: &Step) -> Vec<&'a crate::state
     let mut files: Vec<&crate::evidence::CampaignFile> =
         step.pins.iter().map(|pin| &pin.file).collect();
     files.extend(&step.track.evidence.file);
+    files.extend(
+        step.parts
+            .values()
+            .filter_map(|part| part.evidence.file.as_ref()),
+    );
     files.dedup();
     let mut out: Vec<&crate::state::Pin> = Vec::new();
     for file in files {
@@ -230,6 +235,10 @@ impl Candidate<'_> {
         self.step.lane
     }
 
+    fn finish(&self) -> Finish {
+        self.step.finish(Release::of_target(&self.target).is_some())
+    }
+
     fn waits_on(&self) -> Vec<String> {
         let mut out: Vec<String> = self
             .gates
@@ -252,7 +261,7 @@ impl Candidate<'_> {
     fn to_json(&self, root: &Path) -> Value {
         json!({
             "target": self.target,
-            "command": launch_command(&self.target, self.lane()),
+            "command": launch_command(&self.target, self.lane(), self.finish()),
             "lane": self.lane().map(Lane::name),
             "dir": self.target,
             "kickoff": self.kickoff.as_ref().map(|path| relative(root, path)),
@@ -473,12 +482,12 @@ pub fn dirty_line(url: &str, observed: &Observed) -> String {
 
 pub struct Next {
     pub paused: bool,
-    pub ready: Vec<(String, Option<Lane>)>,
+    pub ready: Vec<(String, Option<Lane>, Finish)>,
     pub waiting: Vec<(String, Vec<String>)>,
 }
 
-pub(crate) fn launch_command(target: &str, lane: Option<Lane>) -> String {
-    if lane == Some(Lane::Owner) {
+pub(crate) fn launch_command(target: &str, lane: Option<Lane>, finish: Finish) -> String {
+    if lane == Some(Lane::Owner) && finish == Finish::Evidence {
         return format!("cm advance {target} done --evidence '<owner-evidence-file>'");
     }
     let worktree = if lane == Some(Lane::Pi) {
@@ -511,7 +520,11 @@ pub fn summary(root: &Path, units: &Units) -> Next {
     let mut waiting = Vec::new();
     for candidate in candidates(root, units) {
         if !paused && candidate.ready() {
-            ready.push((candidate.target.clone(), candidate.lane()));
+            ready.push((
+                candidate.target.clone(),
+                candidate.lane(),
+                candidate.finish(),
+            ));
         } else {
             waiting.push((candidate.target.clone(), candidate.waits_on()));
         }
@@ -675,7 +688,7 @@ pub fn next_at(
                     "{full} ({}) is next",
                     candidate.lane().map_or("—", Lane::name)
                 ),
-                &launch_command(&full, candidate.lane()),
+                &launch_command(&full, candidate.lane(), candidate.finish()),
             ));
             outcome.field("steps", vec![candidate.to_json(root)]);
             outcome.field("waiting", Vec::<Value>::new());
@@ -715,7 +728,7 @@ pub fn next_at(
                 candidate.target,
                 candidate.lane().map_or("—", Lane::name)
             ),
-            &launch_command(&candidate.target, candidate.lane()),
+            &launch_command(&candidate.target, candidate.lane(), candidate.finish()),
         ));
     }
     for candidate in &waiting {

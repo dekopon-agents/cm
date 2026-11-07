@@ -2023,11 +2023,13 @@ fn rollout_deployment_refuses_missing_or_invalid_receipts_and_missing_shas() {
     c.merged_rollout(&host, step, Lane::Pi, &repo, &sha);
     let file = c.sync_receipt(&sha);
     let missing = c.root.join("missing.md");
+    let unrelated = campaign_fixture::unrelated_commit(&repo);
     let before = c.files();
     for (given_sha, receipt, expected) in [
         (Some(sha.clone()), None, "evidence-missing"),
         (Some(sha.clone()), Some(&missing), "evidence-file"),
         (None, Some(&file), "evidence-missing"),
+        (Some(unrelated), Some(&file), "merge-lineage"),
     ] {
         let refused = commands::advance(
             &host,
@@ -2093,15 +2095,18 @@ fn sync_leaves_rollouts_merged_even_when_a_containing_release_is_deployed() {
 }
 
 #[test]
-fn multipart_rollouts_deploy_only_after_every_part_has_a_sync_receipt() {
+fn multipart_rollouts_check_each_receipt_after_deployment() {
     let host = Fake::at("2026-10-08T07:00:00Z");
     let c = campaign(&host);
     let (repo, sha) = repo(c.root.parent().unwrap());
     let step = "01-first/alpha/ROLLOUT";
     c.merged_rollout(&host, step, Lane::Pi, &repo, &sha);
     c.rollout_parts(step, &["east", "west"]);
-    let file = c.sync_receipt(&sha);
-    for (part, expected) in [("east", Phase::Merged), ("west", Phase::Deployed)] {
+    let files = c.part_sync_receipts(&host, step, &sha);
+    for ((part, expected), file) in [("east", Phase::Merged), ("west", Phase::Deployed)]
+        .into_iter()
+        .zip(&files)
+    {
         let deployed = commands::advance_gated(
             &host,
             &c.root,
@@ -2112,7 +2117,7 @@ fn multipart_rollouts_deploy_only_after_every_part_has_a_sync_receipt() {
                     sha: Some(sha.clone()),
                     ..Evidence::default()
                 },
-                file: Some(&file),
+                file: Some(file),
                 repo: None,
                 part: Some(part),
                 by: &[],
@@ -2126,4 +2131,43 @@ fn multipart_rollouts_deploy_only_after_every_part_has_a_sync_receipt() {
         assert_eq!(state.steps["ROLLOUT"].parts[part].state, Phase::Deployed);
     }
     assert_clean(&c.root);
+    let units = cm::plan::load_units(&c.root).unwrap();
+    let after = After::Merged(step.into());
+    assert!(cm::plan::gate(&units, &after).met());
+    assert_eq!(
+        units["01-first/alpha"].steps["ROLLOUT"]
+            .track
+            .evidence
+            .file
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        store::relative(&c.root, &files[1])
+    );
+
+    c.receipt_stale(step, &files[0], Some("candidate advanced"));
+    let units = cm::plan::load_units(&c.root).unwrap();
+    let gate = cm::plan::gate(&units, &after);
+    assert!(!gate.met());
+    assert_eq!(gate.stale, [store::relative(&c.root, &files[0])]);
+    let stale = lint(&c.root).unwrap();
+    assert!(
+        stale
+            .violations
+            .iter()
+            .any(|v| v.path == step && v.rule == "evidence-stale")
+    );
+
+    c.receipt_stale(step, &files[0], None);
+    assert_clean(&c.root);
+    fs::remove_file(&files[0]).unwrap();
+    let missing = lint(&c.root).unwrap();
+    assert!(
+        missing
+            .violations
+            .iter()
+            .any(|v| v.path == format!("{step}#east") && v.rule == "evidence-file"),
+        "{:?}",
+        missing.violations
+    );
 }
