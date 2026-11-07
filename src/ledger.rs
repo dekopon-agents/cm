@@ -11,7 +11,7 @@ use crate::journal;
 use crate::markdown::headings;
 use crate::outcome::{Outcome, Violation};
 use crate::store::{self, Target, is_name, lock, write_atomic};
-use crate::templates::{self, LOOP_WITHHELD, QUEUE_FILE};
+use crate::templates::{self, LOOP_WITHHELD, MAC_LANE, MAC_LANE_FILE, QUEUE_FILE};
 
 pub const FEEDBACK: &str = "FEEDBACK.md";
 
@@ -686,6 +686,362 @@ fn update_queue_item(
         outcome.line(next);
         outcome.field("next", next);
     }
+    Ok(outcome)
+}
+
+// MAC-LANE.md
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacState {
+    Open,
+    Held,
+    Running,
+    Done,
+    Withdrawn,
+}
+
+impl MacState {
+    pub fn name(self) -> &'static str {
+        match self {
+            MacState::Open => "open",
+            MacState::Held => "held",
+            MacState::Running => "running",
+            MacState::Done => "done",
+            MacState::Withdrawn => "withdrawn",
+        }
+    }
+
+    pub fn open(self) -> bool {
+        match self {
+            MacState::Open | MacState::Held | MacState::Running => true,
+            MacState::Done | MacState::Withdrawn => false,
+        }
+    }
+}
+
+pub struct MacItem {
+    pub line: usize,
+    pub number: u32,
+    pub state: MacState,
+    pub title: String,
+    head: usize,
+    status_end: Option<usize>,
+}
+
+fn list_number(line: &str) -> Option<(usize, Result<u32, String>)> {
+    let line = line.trim_end_matches(['\r', '\n']);
+    let (number, rest) = line.split_once('.')?;
+    if number.is_empty()
+        || !number.bytes().all(|byte| byte.is_ascii_digit())
+        || !(rest.starts_with(' ') || rest.is_empty())
+    {
+        return None;
+    }
+    let head = number.len() + 1 + rest.len() - rest.trim_start_matches([' ', '\t']).len();
+    let parsed = number.parse::<u32>().map_err(|_| {
+        format!(
+            "item number `{number}` is outside the supported range 0..={}",
+            u32::MAX
+        )
+    });
+    Some((head, parsed))
+}
+
+fn bold(text: &str) -> Option<(usize, usize)> {
+    let start = text.find("**")?;
+    let end = start + 2 + text[start + 2..].find("**")? + 2;
+    Some((start, end))
+}
+
+fn mac_status(span: &str) -> Option<MacState> {
+    let word = span.split(|c: char| !c.is_ascii_alphabetic()).next()?;
+    match word {
+        "DONE" => Some(MacState::Done),
+        "WITHDRAWN" => Some(MacState::Withdrawn),
+        "HELD" => Some(MacState::Held),
+        "RUNNING" => Some(MacState::Running),
+        "Receipt" if span.contains("held") => Some(MacState::Held),
+        "Receipt" => Some(MacState::Open),
+        _ => None,
+    }
+}
+
+pub fn mac_lane_items(text: &str) -> Result<Vec<MacItem>, Vec<Violation>> {
+    let mut starts = Vec::new();
+    let mut violations = Vec::new();
+    let mut offset = 0;
+    for (index, line) in text.split_inclusive('\n').enumerate() {
+        if let Some((head, number)) = list_number(line) {
+            match number {
+                Ok(number) => starts.push((index + 1, offset, offset + head, number)),
+                Err(message) => violations
+                    .push(Violation::new(MAC_LANE_FILE, "mac-lane-number", message).at(index + 1)),
+            }
+        }
+        offset += line.len();
+    }
+    if !violations.is_empty() {
+        return Err(violations);
+    }
+    Ok(starts
+        .iter()
+        .enumerate()
+        .map(|(index, &(line, _, head, number))| {
+            let end = starts.get(index + 1).map_or(text.len(), |next| next.1);
+            let item = &text[head..end];
+            let status = bold(item)
+                .filter(|(open, _)| *open == 0)
+                .and_then(|(_, close)| Some((mac_status(&item[2..close - 2])?, close)));
+            let (state, rest) = match status {
+                Some((state, close)) => (state, &item[close..]),
+                None => (MacState::Open, item),
+            };
+            let title = bold(rest).map_or_else(
+                || rest.lines().next().unwrap_or_default(),
+                |(open, close)| &rest[open + 2..close - 2],
+            );
+            MacItem {
+                line,
+                number,
+                state,
+                title: title
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .trim_end_matches(['.', ':'])
+                    .to_owned(),
+                head,
+                status_end: status
+                    .map(|(_, close)| head + close + usize::from(item[close..].starts_with(' '))),
+            }
+        })
+        .collect())
+}
+
+pub fn mac_lane_open(root: &Path) -> Result<Vec<MacItem>> {
+    let text = read_existing(&root.join(MAC_LANE_FILE))?.unwrap_or_default();
+    let items = mac_lane_items(&text)
+        .map_err(|violations| anyhow::Error::msg(violations.into_iter().next().unwrap()))?;
+    Ok(items.into_iter().filter(|item| item.state.open()).collect())
+}
+
+pub fn lint_mac_lane(root: &Path) -> Vec<Violation> {
+    let text = match read_existing(&root.join(MAC_LANE_FILE)) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Vec::new(),
+        Err(error) => {
+            return vec![Violation::new(
+                MAC_LANE_FILE,
+                "mac-lane-unreadable",
+                format!("{error:#}; restore readable MAC-LANE.md before continuing"),
+            )];
+        }
+    };
+    let items = match mac_lane_items(&text) {
+        Ok(items) => items,
+        Err(violations) => return violations,
+    };
+    let mut out = Vec::new();
+    let mut last = 0_u32;
+    for item in items {
+        if last.checked_add(1) != Some(item.number) {
+            let place = match last {
+                0 => "the first item".to_owned(),
+                last => format!("the item after {last}"),
+            };
+            out.push(
+                Violation::new(
+                    MAC_LANE_FILE,
+                    "mac-lane-number",
+                    format!(
+                        "{place} is numbered {}; items run 1, 2, 3… in order",
+                        item.number
+                    ),
+                )
+                .at(item.line),
+            );
+        }
+        last = item.number;
+    }
+    out
+}
+
+pub fn mac_lane_add(host: &dyn Host, root: &Path, title: &str, body: &str) -> Result<Outcome> {
+    let (_lock, mut violations) = guard(root)?;
+    one_line("the title", title, &mut violations, MAC_LANE_FILE);
+    if title.contains("**") || mac_status(title.trim()).is_some() {
+        violations.push(Violation::new(
+            MAC_LANE_FILE,
+            "mac-lane-title",
+            "the title may not hold `**` or begin with a Mac lane status word",
+        ));
+    }
+    if !violations.is_empty() {
+        return Ok(Outcome::refused(violations));
+    }
+    let path = root.join(MAC_LANE_FILE);
+    let mut text = read_existing(&path)?.unwrap_or_else(|| MAC_LANE.to_owned());
+    let items = match mac_lane_items(&text) {
+        Ok(items) => items,
+        Err(violations) => return Ok(Outcome::refused(violations)),
+    };
+    let Some(number) = items
+        .iter()
+        .map(|item| item.number)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+    else {
+        return Ok(Outcome::refused(vec![Violation::new(
+            MAC_LANE_FILE,
+            "mac-lane-number",
+            "the next item number exceeds the supported range; renumber the items first",
+        )]));
+    };
+    let title = title.trim();
+    let mut entry = format!("{number}. **{title}**");
+    for (index, line) in body.trim().lines().enumerate() {
+        if index == 0 {
+            entry.push(' ');
+        } else if line.trim().is_empty() {
+            entry.push('\n');
+            continue;
+        } else {
+            entry.push_str("\n    ");
+        }
+        entry.push_str(line.trim_end());
+    }
+    entry.push('\n');
+    if items.is_empty() {
+        append(&path, &text, &entry)?;
+    } else {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&entry);
+        write_atomic(&path, text.as_bytes())?;
+    }
+    let at = stamp(host.now());
+    let journal = journal_line(
+        root,
+        &at,
+        &format!("mac-lane add {number}. {title}"),
+        &format!("- {MAC_LANE_FILE}: `{number}. **{title}**`\n"),
+    )?;
+    let mut outcome = Outcome::default();
+    outcome.line(format!("{number}. {title}"));
+    outcome.field("item", number);
+    outcome.field("journal", journal);
+    Ok(outcome)
+}
+
+pub fn mac_lane_done(host: &dyn Host, root: &Path, number: u32, receipt: &str) -> Result<Outcome> {
+    let (_lock, mut violations) = guard(root)?;
+    one_line("--receipt", receipt, &mut violations, MAC_LANE_FILE);
+    let path = root.join(MAC_LANE_FILE);
+    let text = read_existing(&path)?.unwrap_or_default();
+    let items = match mac_lane_items(&text) {
+        Ok(items) => items,
+        Err(violations) => return Ok(Outcome::refused(violations)),
+    };
+    let found: Vec<&MacItem> = items.iter().filter(|item| item.number == number).collect();
+    let item = match found[..] {
+        [item] if item.state.open() => Some(item),
+        [item] => {
+            violations.push(
+                Violation::new(
+                    MAC_LANE_FILE,
+                    "mac-lane-closed",
+                    format!("item {number} is already {}", item.state.name()),
+                )
+                .at(item.line),
+            );
+            None
+        }
+        [] => {
+            violations.push(Violation::new(
+                MAC_LANE_FILE,
+                "mac-lane-item",
+                format!("MAC-LANE.md has no item {number}"),
+            ));
+            None
+        }
+        _ => {
+            violations.push(Violation::new(
+                MAC_LANE_FILE,
+                "mac-lane-number",
+                format!("MAC-LANE.md numbers more than one item {number}; renumber them first"),
+            ));
+            None
+        }
+    };
+    let Some(item) = item.filter(|_| violations.is_empty()) else {
+        return Ok(Outcome::refused(violations));
+    };
+    let date = host.now().strftime("%Y-%m-%d").to_string();
+    let status = format!("**DONE {date}** ({}). ", receipt.trim());
+    let mut out = text[..item.head].to_owned();
+    if out.ends_with('.') {
+        out.push(' ');
+    }
+    let rest = &text[item.status_end.unwrap_or(item.head)..];
+    let trimmed = rest.trim_start_matches([' ', '\t']);
+    if trimmed.is_empty() || trimmed.starts_with(['\r', '\n']) {
+        out.push_str(status.trim_end());
+        out.push_str(trimmed);
+    } else {
+        out.push_str(&status);
+        out.push_str(rest);
+    }
+    let label = if item.title.is_empty() {
+        number.to_string()
+    } else {
+        format!("{number}. {}", item.title)
+    };
+    write_atomic(&path, out.as_bytes())?;
+    let at = stamp(host.now());
+    let journal = journal_line(
+        root,
+        &at,
+        &format!("mac-lane done {label}"),
+        &format!("- {MAC_LANE_FILE}: `{number}. {}`\n", status.trim_end()),
+    )?;
+    let mut outcome = Outcome::default();
+    outcome.line(format!("{label}: {}", status.trim_end()));
+    outcome.field("item", number);
+    outcome.field("journal", journal);
+    Ok(outcome)
+}
+
+pub fn mac_lane_list(root: &Path) -> Result<Outcome> {
+    let open = match mac_lane_open(root) {
+        Ok(open) => open,
+        Err(error) => return Ok(Outcome::refused(vec![error.downcast::<Violation>()?])),
+    };
+    let mut outcome = Outcome::default();
+    for item in &open {
+        outcome.line(format!(
+            "{}. {} ({})",
+            item.number,
+            item.title,
+            item.state.name()
+        ));
+    }
+    if open.is_empty() {
+        outcome.line("no open Mac lane item");
+    }
+    outcome.field(
+        "items",
+        open.iter()
+            .map(|item| {
+                serde_json::json!({
+                    "item": item.number,
+                    "state": item.state.name(),
+                    "title": item.title,
+                })
+            })
+            .collect::<Vec<_>>(),
+    );
     Ok(outcome)
 }
 

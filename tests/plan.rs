@@ -3647,3 +3647,61 @@ fn init_rejects_invalid_parts_before_writing_state() {
         assert!(!c.root.join(target).exists());
     }
 }
+
+#[test]
+#[cfg(unix)]
+fn sync_completes_and_writes_card_with_an_invalid_mac_lane() {
+    for (lane, rule) in [
+        (
+            b"# Mac lane queue\n\n4294967296. Pending\n".as_slice(),
+            "mac-lane-number",
+        ),
+        (
+            b"# Mac lane queue\n\n2. **DONE 2000-01-01**\n".as_slice(),
+            "mac-lane-number",
+        ),
+        (
+            b"# Mac lane queue\n\n1. **DONE 2000-01-01**\n1. **DONE 2000-01-01**\n".as_slice(),
+            "mac-lane-number",
+        ),
+        (
+            b"# Mac lane queue\n\n1. **Pending** \xff\n".as_slice(),
+            "mac-lane-unreadable",
+        ),
+    ] {
+        let host = at("2000-01-02T00:00:00Z");
+        let c = campaign(&host);
+        let target = "01-a/u/S1";
+        assert!(declare(&host, &c, target, Lane::Pi, &[]).ok());
+        kickoff(&c, target);
+        open_pr(&host, &c, target, "https://github.com/o/r/pull/1");
+        fs::write(c.root.join("MAC-LANE.md"), lane).unwrap();
+        fs::write(c.root.join("CARD.md"), "Stale card.\n").unwrap();
+        let before = fs::read(c.root.join("JOURNAL.md")).unwrap();
+        let gh = support::FakeGh::new(
+            "echo '{\"state\":\"closed\",\"merged\":true,\"merge_commit_sha\":\"abc123\"}'\n",
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("-C")
+            .arg(&c.root)
+            .args(["sync", "--json"])
+            .env("PATH", gh.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["ok"], true);
+        assert!(result["journal"].is_string());
+        assert_eq!(state(&c, target), Phase::Merged);
+        assert_ne!(fs::read(c.root.join("JOURNAL.md")).unwrap(), before);
+        let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+        assert_eq!(
+            card.lines()
+                .filter(|line| *line == "Mac lane: invalid, see cm lint")
+                .count(),
+            1
+        );
+        let linted = lint(&c.root).unwrap();
+        assert_eq!(rules(&linted), vec![rule], "{:?}", linted.violations);
+    }
+}
