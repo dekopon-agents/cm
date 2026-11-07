@@ -16,6 +16,8 @@ use jiff::Timestamp;
 mod campaign_fixture;
 #[path = "support/kickoff.rs"]
 mod kickoff_fixture;
+#[path = "support/lifecycle.rs"]
+mod lifecycle_fixture;
 
 use campaign_fixture::{Campaign, campaign, git, repo};
 
@@ -239,6 +241,111 @@ fn advance(host: &Fake, c: &Campaign, what: &str, to: &str, evidence: Evidence) 
         None,
     )
     .unwrap()
+}
+
+#[test]
+fn merged_releases_accept_a_descendant_merge_sha() {
+    for lane in [Lane::Coordinator, Lane::Codex] {
+        let host = Fake::at("2026-10-08T07:00:00Z");
+        let c = campaign(&host);
+        let (repo, first) = repo(c.root.parent().unwrap());
+        let step = "00-release/cm/1.0.0";
+        c.merged_step(&host, step, lane, &repo, &first);
+        let dir = c.root.join("00-release/cm");
+        let before = store::load_unit(&dir).unwrap();
+        let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+        git(
+            &repo,
+            &["commit", "-q", "--allow-empty", "-m", "second merge"],
+        );
+        let second = git(&repo, &["rev-parse", "HEAD"]);
+        let later = Fake::at("2026-10-08T08:00:00Z");
+        let outcome = advance(
+            &later,
+            &c,
+            step,
+            "merged",
+            Evidence {
+                sha: Some(second[..10].into()),
+                ..Evidence::default()
+            },
+        );
+        assert!(outcome.ok(), "{:?}", outcome.violations);
+        assert_eq!(outcome.fields["previous_sha"], first);
+        assert_eq!(outcome.fields["evidence"]["sha"], second);
+        let after = store::load_unit(&dir).unwrap();
+        let mut expected = before.clone();
+        expected.steps.get_mut("1.0.0").unwrap().track.evidence.sha = Some(second.clone());
+        expected.history.push(cm::state::Move {
+            at: "2026-10-08T08:00Z".into(),
+            target: step.into(),
+            from: Phase::Merged,
+            to: Phase::Merged,
+            evidence: Evidence {
+                sha: Some(second.clone()),
+                ..Evidence::default()
+            },
+        });
+        assert_eq!(after, expected);
+        assert_eq!(
+            fs::read_to_string(c.root.join("JOURNAL.md")).unwrap(),
+            format!(
+                "{journal}\n## 2026-10-08T08:00Z — advance {step}: merged → merged\n\n- evidence: sha {second}\n- previous merge sha: {first}\n"
+            )
+        );
+    }
+}
+
+#[test]
+fn merged_releases_refuse_an_unrelated_merge_sha() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let (repo, first) = repo(c.root.parent().unwrap());
+    let step = "00-release/cm/1.0.0";
+    c.merged_step(&host, step, Lane::Coordinator, &repo, &first);
+    git(&repo, &["checkout", "-q", "--orphan", "unrelated"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "unrelated"]);
+    let unrelated = git(&repo, &["rev-parse", "HEAD"]);
+    let before = c.files();
+    let outcome = advance(
+        &host,
+        &c,
+        step,
+        "merged",
+        Evidence {
+            sha: Some(unrelated),
+            ..Evidence::default()
+        },
+    );
+    assert_eq!(rules(&outcome), vec!["merge-lineage"]);
+    assert_eq!(c.files(), before);
+}
+
+#[test]
+fn merged_non_release_steps_refuse_a_descendant_merge_sha() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let (repo, first) = repo(c.root.parent().unwrap());
+    let step = "01-first/alpha/BUILD";
+    c.merged_step(&host, step, Lane::Coordinator, &repo, &first);
+    git(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "second merge"],
+    );
+    let second = git(&repo, &["rev-parse", "HEAD"]);
+    let before = c.files();
+    let outcome = advance(
+        &host,
+        &c,
+        step,
+        "merged",
+        Evidence {
+            sha: Some(second),
+            ..Evidence::default()
+        },
+    );
+    assert_eq!(rules(&outcome), vec!["advance-refused"]);
+    assert_eq!(c.files(), before);
 }
 
 #[test]
