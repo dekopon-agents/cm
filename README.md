@@ -60,7 +60,7 @@ error.
 | `cm attempt <NN-name>/<unit>/<step> [--claim TOKEN] [claim [--coordinator L] --expect G \| begin KIND \| record KIND ID \| restart --lane L [--evidence PATH] \| end complete\|partial\|unknown [--evidence PATH]]` | Shows a remote attempt and what to do next from committed state alone, or extends it; each change is journaled. See [Attempts](#attempts). |
 | `cm unblock <NN-name>/<unit>[/<step>] [--evidence PATH]` | Releases a `blocked:<reason>` track to the state it was blocked from. Omit `--evidence` only for a step whose `blocked:until:<condition>` holds; the condition is journaled. Other blocks require a campaign evidence file, as for `done`. A step that rests at `drafted` or `launched` still waits on every `--after`: `cm next` and `cm launch` check them again, and the move lists what is still unmet. |
 | `cm amend <NN-name>/<unit>/<step> [--study] [--lane L] [--after A]… [--drop-after A]… [--part NAME]… [--kickoff-file F] [--github OWNER/NAME] [--tag PATTERN]` | Changes a declared step that rests at `drafted` or `launched`: marks it a study, moves its lane, or removes gates with `--drop-after` before adding gates with `--after` (each declared, never closing a cycle: `after-cycle`). Removing a gate it lacks is `after-absent`. `--kickoff-file F` replaces `kickoff.md` from a non-empty file of at most 1 MiB (`-` reads stdin) and journals one line; it refuses a step past launched. `--github` and `--tag` change a release step's repository and tag pattern through `pr-open` and `merged`, refusing once released; its prep PR must be in that repository. `--part` declares required parts (see [Parts](#parts)); given alone it also amends a step that has moved on, short of final. Journals the change; a change that changes nothing is `amend-empty`. |
-| `cm advance <NN-name>/<unit>[/<step>] <state> [--sha S] [--pr URL] [--tag T] [--digest D] [--evidence PATH] [--repo PATH] [--head SHA] [--ci-verified PATH] [--override PATH] [--part NAME]` | Moves one state along `drafted → launched → pr-open → merged → released → deployed → done`, or to `blocked:<reason>`; an `owner`-lane or study step, or a non-release `coordinator`-lane step without a recorded PR, SHA or declared parts, moves to `done` from `drafted` or `launched` with `--evidence` (see [Finishing](#finishing)). `superseded --evidence PATH` retires a step replaced by other work from any state short of final; it meets no gate, so its consumers are amended. A release step moves to `released --tag T` from `drafted` or `launched` when the tag was cut without a prep PR (tag-only). Refuses a skipped state and a state without its evidence, journals the move and re-renders `STATE.md`. A `codex`-lane step moves to `merged` only through its merge gate (see [Merge gate](#merge-gate)). An already `merged` release step accepts `merged --sha S` again when S descends from its recorded merge, updating only its evidence SHA and journaling both SHAs; otherwise it refuses (`merge-lineage`). `--part NAME` moves one part of a multipart step (see [Parts](#parts)). A step with an unresolved watch does not move to `deployed` or `done` (`watch-open`, see [Watches](#watches)), and `done --evidence` refuses a stale pinned file (`evidence-stale`). |
+| `cm advance <NN-name>/<unit>[/<step>] <state> [--sha S] [--pr URL] [--tag T] [--digest D] [--evidence PATH] [--by STEP[,STEP…]] [--repo PATH] [--head SHA] [--ci-verified PATH] [--override PATH] [--part NAME]` | Moves one state along `drafted → launched → pr-open → merged → released → deployed → done`, or to `blocked:<reason>`; an `owner`-lane or study step, or a non-release `coordinator`-lane step without a recorded PR, SHA or declared parts, moves to `done` from `drafted` or `launched` with `--evidence` (see [Finishing](#finishing)). `superseded --evidence PATH [--by STEP[,STEP…]]` retires a step replaced by other work from any state short of final, recording its declared successors in state and the journal and showing them in `STATE.md` and `CARD.md`; it meets no gate, so its consumers are amended. A release step moves to `released --tag T` from `drafted` or `launched` when the tag was cut without a prep PR (tag-only). Refuses a skipped state and a state without its evidence, journals the move and re-renders `STATE.md`. A `codex`-lane step moves to `merged` only through its merge gate (see [Merge gate](#merge-gate)). An already `merged` release step accepts `merged --sha S` again when S descends from its recorded merge, updating only its evidence SHA and journaling both SHAs; otherwise it refuses (`merge-lineage`). `--part NAME` moves one part of a multipart step (see [Parts](#parts)). A step with an unresolved watch does not move to `deployed` or `done` (`watch-open`, see [Watches](#watches)), and `done --evidence` refuses a stale pinned file (`evidence-stale`). |
 | `cm known-red <step> --commit SHA --check NAME --reason T --owner WHO --until A` | Records a known-red exception for the step's merge gate (see [Known-red exceptions](#known-red-exceptions)) and journals it. |
 | `cm watch <step> add --signal span:Q\|log:Q\|metric:Q --deadline T`, `cm watch <step> resolve ID --evidence PATH`, `cm watch <step> withdraw ID --reason TEXT`, `cm watch <step> amend ID --signal SIGNAL` | Records a pending live read that holds the step below `deployed`, closes it with evidence or a withdrawal reason, or corrects its signal (see [Watches](#watches)). |
 | `cm close` | Seals the campaign. Refuses, listing every gap, while `OWNER-QUEUE.md` or `MAC-LANE.md` has an open item, `MAC-LANE.md` has a numbering gap or repeat (`mac-lane-number`), or any unit or step is short of `done` or `blocked:<reason>`. Then it stamps `closed` in `.cm/state.json` and journals the close. From there unit `cm init`, `cm launch`, `cm advance` and a second `cm close` refuse with `campaign-closed`; `cm journal` stays open for follow-up observations. |
@@ -128,7 +128,7 @@ Campaign `.cm/state.json`:
 
 ```json
 {
-  "schema": 4,
+  "schema": 5,
   "kind": "campaign",
   "initialized": "2026-10-08T07:04Z",
   "written": ["RESUME.md", "JOURNAL.md", "LIMITS.toml", "OWNER-QUEUE.md"],
@@ -148,7 +148,7 @@ Unit `.cm/state.json`:
 
 ```json
 {
-  "schema": 4,
+  "schema": 5,
   "kind": "unit",
   "unit": "01-first/alpha",
   "state": "launched",
@@ -185,7 +185,7 @@ was blocked from, or moves to that state's successor; a step blocked before its 
 | `released` | `--tag` | `--digest` | the tag resolves locally; a release step's is its declared tag |
 | `deployed` | `--digest` | | `sha256:<64 hex>` |
 | `done` | `--evidence` for an `owner`-lane or study step, or a non-release `coordinator`-lane step without a recorded PR, SHA or declared parts; nothing for a code step at `deployed` | | a non-empty regular file inside the campaign, outside `.cm/`; recorded relative to it |
-| `superseded` | `--evidence` | | as for `done`; final like `done` |
+| `superseded` | `--evidence` | `--by STEP[,STEP…]` | as for `done`; final like `done` |
 
 SHAs and tags resolve in `--repo`, else the step's worktree, else (for a unit) any step's worktree.
 A commit or tag made elsewhere needs a `git fetch` first. A release step's `--tag` must be the tag it
@@ -249,6 +249,19 @@ campaign, in the move's evidence beside its stamp, and `cm lint` re-checks it ev
 `done --evidence` on a code step, or `done` on one short of `deployed`, is `done-code-step`. A
 release step cannot be a study. A `coordinator`-lane release step keeps the code-step ladder even
 without a recorded tag, as does a coordinator step with a recorded PR, SHA or declared parts.
+
+`cm advance <step> superseded --evidence <path> --by <step>[,<step>…]` retires a step
+and records its successors in the track's `evidence.superseded_by`, its move history and the
+journal. `STATE.md` and `CARD.md` show the successor references. Every successor must already
+be declared; a short name resolves in the retiring step's unit, and a full
+`<NN-name>/<unit>/<step>` can name a step in another unit. A step cannot name itself. Repeated
+successors are recorded once, in the order given. `--by` is optional for retirements without a
+named successor, and is a usage error with any state other than `superseded`. `--evidence`
+remains required. Superseding meets no gate; amend consumers to name the replacement work.
+
+cm 0.10 raises SCHEMA from 4 to 5 for successor references and writes every unit state, and a
+new campaign state, as schema 5. Older state remains readable; missing successor references
+default to an empty list. Upgrade every reader before writing shared state with cm 0.10.
 
 cm 0.9 raises SCHEMA from 3 to 4 for watch withdrawal and writes every unit state, and a new
 campaign state, as schema 4. Units written by 0.9 cannot be read by cm 0.8.x; upgrade every

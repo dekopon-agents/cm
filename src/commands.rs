@@ -1425,6 +1425,7 @@ pub fn advance(
             file,
             repo,
             part: None,
+            by: &[],
         },
         &MergeGate::default(),
     )
@@ -1437,6 +1438,7 @@ pub struct Advance<'a> {
     pub file: Option<&'a Path>,
     pub repo: Option<&'a Path>,
     pub part: Option<&'a str>,
+    pub by: &'a [String],
 }
 
 pub fn advance_gated(
@@ -1452,6 +1454,7 @@ pub fn advance_gated(
         file,
         repo,
         part,
+        by,
     } = advance;
     let normalized;
     let to = if let Phase::Blocked(reason) = to {
@@ -1698,6 +1701,49 @@ pub fn advance_gated(
     };
     let mut evidence = given.clone();
     evidence.file = None;
+    evidence.superseded_by.clear();
+    if !by.is_empty() {
+        if *to != Phase::Superseded || target.step.is_none() || part.is_some() {
+            violations.push(Violation::new(
+                &full,
+                "superseded-by",
+                "--by applies only to a step moving to superseded",
+            ));
+        } else {
+            let units = plan::load_units(root)?;
+            for successor in by {
+                let successor = if successor.contains('/') {
+                    successor.clone()
+                } else {
+                    format!("{}/{successor}", target.unit)
+                };
+                match store::parse_target(&successor, true) {
+                    Err(message) => {
+                        violations.push(Violation::new(&full, "superseded-by", message))
+                    }
+                    Ok(target) => {
+                        let successor =
+                            format!("{}/{}", target.unit, target.step.unwrap_or_default());
+                        if successor == step_full {
+                            violations.push(Violation::new(
+                                &full,
+                                "superseded-by",
+                                "a step cannot supersede itself",
+                            ));
+                        } else if plan::step(&units, &successor).is_none() {
+                            violations.push(Violation::new(
+                                &full,
+                                "superseded-by",
+                                format!("{successor} is not declared; declare every successor with `cm init` first"),
+                            ));
+                        } else if !evidence.superseded_by.contains(&successor) {
+                            evidence.superseded_by.push(successor);
+                        }
+                    }
+                }
+            }
+        }
+    }
     if let Some(file) = file {
         match CampaignFile::resolve(root, file) {
             Ok(found) => {

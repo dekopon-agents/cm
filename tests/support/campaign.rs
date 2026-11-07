@@ -33,6 +33,30 @@ pub fn campaign(host: &dyn Host) -> Campaign {
 }
 
 impl Campaign {
+    pub fn supersession(&self, host: &dyn Host) {
+        for target in [
+            "01-first/alpha/OLD",
+            "01-first/alpha/NEW",
+            "02-next/beta/NEXT",
+        ] {
+            let declared = commands::declare(
+                host,
+                &self.root.join(target),
+                &commands::Declaration {
+                    lane: Some(cm::state::Lane::Codex),
+                    ..commands::Declaration::default()
+                },
+            )
+            .unwrap();
+            assert!(declared.ok(), "{:?}", declared.violations);
+        }
+        fs::write(
+            self.root.join("replacement.md"),
+            "Replaced by the declared work.\n",
+        )
+        .unwrap();
+    }
+
     pub fn files(&self) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
         fn visit(
             root: &Path,
