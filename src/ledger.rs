@@ -457,39 +457,21 @@ pub struct MacItem {
 }
 
 fn list_number(line: &str) -> Option<(usize, Result<u32, String>)> {
-    let trimmed = line.trim_start_matches(' ');
-    let indent = line.len() - trimmed.len();
-    if indent > 3 {
-        return None;
-    }
-    let first = trimmed.trim_start_matches(['+', '-']).as_bytes().first()?;
-    if !first.is_ascii_digit() {
-        return None;
-    }
-    let marker = trimmed.find(['.', ')'])?;
-    let number = &trimmed[..marker];
-    let rest = &trimmed[marker + 1..];
-    let head = indent + marker + 1 + rest.len() - rest.trim_start_matches([' ', '\t']).len();
-    let parsed = if trimmed.as_bytes()[marker] == b'.'
-        && (rest.starts_with([' ', '\t', '\r', '\n']) || rest.is_empty())
-        && number.bytes().all(|byte| byte.is_ascii_digit())
+    let line = line.trim_end_matches(['\r', '\n']);
+    let (number, rest) = line.split_once('.')?;
+    if number.is_empty()
+        || !number.bytes().all(|byte| byte.is_ascii_digit())
+        || !(rest.starts_with(' ') || rest.is_empty())
     {
-        number
-            .parse::<u32>()
-            .ok()
-            .filter(|number| *number > 0)
-            .ok_or_else(|| {
-                format!(
-                    "item number `{number}` is outside the supported range 1..={}",
-                    u32::MAX
-                )
-            })
-    } else {
-        Err(format!(
-            "malformed item number `{number}`; use `N. ` with an integer in 1..={}",
+        return None;
+    }
+    let head = number.len() + 1 + rest.len() - rest.trim_start_matches([' ', '\t']).len();
+    let parsed = number.parse::<u32>().map_err(|_| {
+        format!(
+            "item number `{number}` is outside the supported range 0..={}",
             u32::MAX
-        ))
-    };
+        )
+    });
     Some((head, parsed))
 }
 
@@ -727,18 +709,33 @@ pub fn mac_lane_done(host: &dyn Host, root: &Path, number: u32, receipt: &str) -
     let date = host.now().strftime("%Y-%m-%d").to_string();
     let status = format!("**DONE {date}** ({}). ", receipt.trim());
     let mut out = text[..item.head].to_owned();
-    out.push_str(&status);
-    out.push_str(&text[item.status_end.unwrap_or(item.head)..]);
+    if out.ends_with('.') {
+        out.push(' ');
+    }
+    let rest = &text[item.status_end.unwrap_or(item.head)..];
+    let trimmed = rest.trim_start_matches([' ', '\t']);
+    if trimmed.is_empty() || trimmed.starts_with(['\r', '\n']) {
+        out.push_str(status.trim_end());
+        out.push_str(trimmed);
+    } else {
+        out.push_str(&status);
+        out.push_str(rest);
+    }
+    let label = if item.title.is_empty() {
+        number.to_string()
+    } else {
+        format!("{number}. {}", item.title)
+    };
     write_atomic(&path, out.as_bytes())?;
     let at = stamp(host.now());
     let journal = journal_line(
         root,
         &at,
-        &format!("mac-lane done {number}. {}", item.title),
+        &format!("mac-lane done {label}"),
         &format!("- {MAC_LANE_FILE}: `{number}. {}`\n", status.trim_end()),
     )?;
     let mut outcome = Outcome::default();
-    outcome.line(format!("{number}. {}: {}", item.title, status.trim_end()));
+    outcome.line(format!("{label}: {}", status.trim_end()));
     outcome.field("item", number);
     outcome.field("journal", journal);
     Ok(outcome)
