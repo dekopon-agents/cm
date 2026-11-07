@@ -129,9 +129,9 @@ enum Commands {
         /// <NN-name>/<unit> or <NN-name>/<unit>/<step>
         #[arg(value_parser = any_target)]
         target: Target,
-        /// A non-empty file in the campaign folder, outside `.cm/`, showing what cleared the block.
+        /// A non-empty campaign file showing what cleared the block; optional when a step's until condition holds.
         #[arg(long, value_name = "PATH")]
-        evidence: PathBuf,
+        evidence: Option<PathBuf>,
     },
     /// Change a drafted or launched step's declaration. Release --github/--tag also allow pr-open or merged. --part alone also amends a step that moved on.
     Amend {
@@ -669,7 +669,8 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             },
         ),
         Commands::Unblock { target, evidence } => {
-            commands::unblock(host, &root()?, target, &under_root(cli, evidence))
+            let file = evidence.as_ref().map(|path| under_root(cli, path));
+            commands::unblock(host, &root()?, target, file.as_deref())
         }
         Commands::Amend {
             target,

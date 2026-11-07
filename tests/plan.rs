@@ -164,11 +164,7 @@ fn next_and_card_number_actions_with_the_same_commands() {
             0,
             "cm attention --pr https://github.com/o/r/pull/1 --worker '<worker-session>' --coordinator '<coordinator-session>'",
         ),
-        (
-            "unblock_now",
-            0,
-            "cm unblock 01-a/u/BLOCKED --evidence '<unblock-evidence-file>'",
-        ),
+        ("unblock_now", 0, "cm unblock 01-a/u/BLOCKED"),
         (
             "stale",
             0,
@@ -235,7 +231,7 @@ fn next_and_card_number_actions_with_the_same_commands() {
         (
             "Blocked",
             vec![
-                "5. `01-a/u/BLOCKED` blocked:until:epoch:WORKING since 2026-10-17T08:00Z; condition holds — `cm unblock 01-a/u/BLOCKED --evidence '<unblock-evidence-file>'`",
+                "5. `01-a/u/BLOCKED` blocked:until:epoch:WORKING since 2026-10-17T08:00Z; condition holds — `cm unblock 01-a/u/BLOCKED`",
             ],
         ),
     ] {
@@ -306,7 +302,7 @@ fn base_unblock_marker_prevents_a_repeat_notification() {
     assert_eq!(fs::read(&marker).unwrap(), before);
     assert_eq!(
         plan::next_at(&c.root, None, None, host.now).unwrap().fields["unblock_now"][0]["command"],
-        "cm unblock 01-a/u/BLOCKED --evidence '<unblock-evidence-file>'"
+        "cm unblock 01-a/u/BLOCKED"
     );
     fs::remove_file(&marker).unwrap();
     assert!(sync(&host, &forge, &c.root).unwrap().ok());
@@ -464,7 +460,7 @@ fn card_rechecks_unmet_until_blocks_and_unblocks_satisfied_or_free_text_blocks()
         (
             "until:owner-queue:1",
             "# Owner queue\n",
-            "cm unblock 01-a/u/park --evidence '<unblock-evidence-file>'",
+            "cm unblock 01-a/u/park",
         ),
         (
             "waiting-owner",
@@ -521,10 +517,7 @@ fn card_rechecks_unmet_until_blocks_and_unblocks_satisfied_or_free_text_blocks()
             fs::write(c.root.join("OWNER-QUEUE.md"), "# Owner queue\n").unwrap();
             let next = c.run_next_command(printed);
             assert_eq!(next["unblock_now"][0]["target"], "01-a/u/park");
-            assert_eq!(
-                next["unblock_now"][0]["command"],
-                "cm unblock 01-a/u/park --evidence '<unblock-evidence-file>'"
-            );
+            assert_eq!(next["unblock_now"][0]["command"], "cm unblock 01-a/u/park");
         }
     }
 }
@@ -3833,7 +3826,7 @@ fn blocked_until_epoch_reads_crlf_and_requires_an_exact_closing_delimiter() {
                 "1. `{target}` blocked:until:epoch:WORKING since 2026-10-17T08:00Z; condition {} — `{}`",
                 if met { "holds" } else { "does not hold" },
                 if met {
-                    format!("cm unblock {target} --evidence '<unblock-evidence-file>'")
+                    format!("cm unblock {target}")
                 } else {
                     "cm next".to_owned()
                 }
