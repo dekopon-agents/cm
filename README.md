@@ -199,7 +199,7 @@ was blocked from, or moves to that state's successor; a step blocked before its 
 | `merged` | `--sha` | `--pr` | SHA resolves to a commit; a PR URL records GitHub’s merge time when available |
 | `released` | `--tag`; also `--sha` for a tag-only release from `drafted` or `launched` | `--digest` | the tag exists and contains the recorded merge SHA, or the given tag-only SHA; a release step's tag is its declared tag |
 | `deployed` | `--sha` and `--evidence` for a rollout; `--digest` otherwise | optional `--digest` for a rollout | rollout: SHA resolves to a commit and evidence is a non-empty campaign file naming the Argo sync revision; otherwise `sha256:<64 hex>` |
-| `done` | `--evidence` for an `owner`-lane or study step, or a non-release `coordinator`-lane step without a recorded PR, SHA or declared parts; nothing for a code step at `deployed` | | a non-empty regular file inside the campaign, outside `.cm/`; recorded relative to it |
+| `done` | `--evidence` for a study, an `owner`-lane step other than a rollout, or a non-release `coordinator`-lane step other than a rollout without a recorded PR, SHA or declared parts; nothing for a code or rollout step at `deployed` | | a non-empty regular file inside the campaign, outside `.cm/`; recorded relative to it |
 | `superseded` | `--evidence` | `--by STEP[,STEP…]` | as for `done`; final like `done` |
 
 SHAs and tags resolve in `--repo`, else the step's worktree, else (for a unit) any step's worktree.
@@ -272,9 +272,9 @@ blocks offer `cm unblock`.
 ### Finishing
 
 A code step finishes at `deployed`, or `merged` where it has no release; `cm advance <step> done`
-after `deployed` is unchanged. An `owner`-lane step or one declared with `--study` ships no PR.
-A non-release `coordinator`-lane step without a recorded PR, SHA or declared parts also finishes
-with evidence:
+after `deployed` is unchanged. An `owner`-lane step other than a rollout, or one declared with
+`--study`, ships no PR. A non-release `coordinator`-lane step other than a rollout, without a
+recorded PR, SHA or declared parts, also finishes with evidence:
 `cm advance <step> done --evidence <path>` moves it to `done` from any state short of `done`
 (blocked steps from where they rest). The path must be a non-empty regular file inside the
 campaign folder and outside every `.cm/` folder (`evidence-file`); it is recorded, relative to the

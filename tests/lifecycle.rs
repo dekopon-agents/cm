@@ -2262,7 +2262,13 @@ fn multipart_rollouts_check_each_receipt_after_deployment() {
     let (repo, sha) = repo(c.root.parent().unwrap());
     let step = "01-first/alpha/ROLLOUT";
     c.merged_rollout(&host, step, Lane::Pi, &repo, &sha);
-    c.rollout_parts(step, &["east", "west"]);
+    c.rollout_parts(
+        step,
+        &[
+            ("east", Some(lifecycle_fixture::MERGED_AT)),
+            ("west", Some("2026-10-08T07:05:00Z")),
+        ],
+    );
     let files = c.part_sync_receipts(&host, step, &sha);
     for ((part, expected), file) in [("east", Phase::Merged), ("west", Phase::Deployed)]
         .into_iter()
@@ -2291,6 +2297,11 @@ fn multipart_rollouts_check_each_receipt_after_deployment() {
         assert_eq!(state.steps["ROLLOUT"].track.state, expected);
         assert_eq!(state.steps["ROLLOUT"].parts[part].state, Phase::Deployed);
     }
+    let state = store::load_unit(&c.root.join("01-first/alpha")).unwrap();
+    assert_eq!(
+        state.steps["ROLLOUT"].track.evidence.merged_at.as_deref(),
+        Some(lifecycle_fixture::MERGED_AT),
+    );
     assert_clean(&c.root);
     let units = cm::plan::load_units(&c.root).unwrap();
     let after = After::Merged(step.into());

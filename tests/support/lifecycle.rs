@@ -54,13 +54,15 @@ impl Campaign {
         commands::write_unit(&dir, &unit).unwrap();
     }
 
-    pub fn rollout_parts(&self, full: &str, names: &[&str]) {
+    pub fn rollout_parts(&self, full: &str, times: &[(&str, Option<&str>)]) {
         let target = parse_target(full, true).unwrap();
         let dir = self.root.join(target.unit);
         let mut unit = store::load_unit(&dir).unwrap();
         let step = unit.steps.get_mut(target.step.as_deref().unwrap()).unwrap();
-        for name in names {
-            step.parts.insert((*name).into(), step.track.clone());
+        for (name, merged_at) in times {
+            let mut part = step.track.clone();
+            part.evidence.merged_at = merged_at.map(str::to_owned);
+            step.parts.insert((*name).into(), part);
         }
         commands::write_unit(&dir, &unit).unwrap();
     }
