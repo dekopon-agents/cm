@@ -83,6 +83,7 @@ fn declare_work(
         ships: Ships::default(),
         parts: Vec::new(),
         work,
+        kickoff: None,
     };
     commands::declare(host, &c.root.join(target), &declaration).unwrap()
 }

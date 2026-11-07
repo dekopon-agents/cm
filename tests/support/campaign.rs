@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cm::commands;
@@ -34,7 +34,15 @@ pub fn campaign(host: &dyn Host) -> Campaign {
 
 impl Campaign {
     pub fn kickoff(&self, target: &str, text: &str) {
+        fs::create_dir_all(self.root.join(target)).unwrap();
         fs::write(self.root.join(target).join("kickoff.md"), text).unwrap();
+    }
+
+    pub fn legacy_release_tag(&self, unit: &str, version: &str, tag: &str) {
+        let path = cm::store::state_path(&self.root.join(unit));
+        let mut value: serde_json::Value = cm::store::read_json(&path).unwrap();
+        value["steps"][version]["tag"] = tag.into();
+        cm::store::write_json(&path, &value).unwrap();
     }
 
     pub fn sized_file(&self, name: &str, bytes: u64, tracked: bool) {
@@ -63,4 +71,25 @@ impl Campaign {
             );
         }
     }
+}
+
+pub fn git(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "user.name=cm", "-c", "user.email=cm@example.com"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+pub fn repo(dir: &Path) -> (PathBuf, String) {
+    let repo = dir.join("wt");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    let sha = git(&repo, &["rev-parse", "HEAD"]);
+    (repo, sha)
 }
