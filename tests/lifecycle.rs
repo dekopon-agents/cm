@@ -877,11 +877,105 @@ fn inherited_defaults_refuse_git_invalid_tags_saved_by_older_versions() {
         c.legacy_release_tag("00-release/widget", "1.2.3", tag);
         let state_path = store::state_path(&c.root.join("00-release/widget"));
         let before = fs::read(&state_path).unwrap();
-        assert!(
+        let refused =
             commands::declare(&host, &c.root.join("00-release/widget/1.2.4"), &declaration)
-                .is_err()
-        );
+                .unwrap();
+        assert_eq!(rules(&refused), vec!["release-tag"]);
         assert!(!c.root.join("00-release/widget/1.2.4").exists());
         assert_eq!(fs::read(&state_path).unwrap(), before);
+    }
+}
+
+#[test]
+fn legacy_release_tags_load_lint_and_can_be_repaired_by_amend() {
+    let host = Fake::at("2026-10-08T07:04:00Z");
+    let c = campaign(&host);
+    let step = "00-release/widget/1.2.3";
+    let declaration = commands::Declaration {
+        lane: Some(cm::state::Lane::Pi),
+        ..commands::Declaration::default()
+    };
+    assert!(
+        commands::declare(&host, &c.root.join(step), &declaration)
+            .unwrap()
+            .ok()
+    );
+    let baseline = lint(&c.root).unwrap();
+    c.legacy_release_tag("00-release/widget", "1.2.3", "release/1.2.3.lock");
+    let unit_dir = c.root.join("00-release/widget");
+    let unit = store::load_unit(&unit_dir).unwrap();
+    assert_eq!(
+        unit.steps["1.2.3"].tag.as_ref().unwrap().as_str(),
+        "release/1.2.3.lock"
+    );
+    let legacy_lint = lint(&c.root).unwrap();
+    assert_eq!(legacy_lint.violations, baseline.violations);
+    assert_eq!(legacy_lint.fields["warnings"], baseline.fields["warnings"]);
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .current_dir(&c.root)
+        .args(["--json", "amend", step, "--tag", "v{version}"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let unit = store::load_unit(&unit_dir).unwrap();
+    assert_eq!(unit.steps["1.2.3"].tag.as_ref().unwrap().as_str(), "v1.2.3");
+    assert_clean(&c.root);
+}
+
+#[test]
+fn kickoff_inputs_accept_the_byte_limit_and_refuse_larger_files_and_stdin() {
+    let host = Fake::at("2026-10-08T07:04:00Z");
+    let c = campaign(&host);
+    let limit = 1024 * 1024;
+    for command in ["init", "amend"] {
+        for source in ["file", "stdin"] {
+            for size in [limit, limit + 1] {
+                let step = format!("01-first/alpha/{command}-{source}-{size}");
+                if command == "amend" {
+                    let declaration = commands::Declaration {
+                        lane: Some(cm::state::Lane::Pi),
+                        kickoff: Some("Existing work.\n".into()),
+                        ..commands::Declaration::default()
+                    };
+                    assert!(
+                        commands::declare(&host, &c.root.join(&step), &declaration)
+                            .unwrap()
+                            .ok()
+                    );
+                }
+                let input = kickoff_fixture::file(&"x".repeat(size));
+                let before = fs::read(c.root.join("JOURNAL.md")).unwrap();
+                let state_path = store::state_path(&c.root.join("01-first/alpha"));
+                let state_before = fs::read(&state_path).ok();
+                let mut cli = Command::new(env!("CARGO_BIN_EXE_cm"));
+                cli.current_dir(&c.root).args(["--json", command, &step]);
+                if command == "init" {
+                    cli.args(["--lane", "pi"]);
+                }
+                cli.arg("--kickoff-file");
+                if source == "stdin" {
+                    cli.arg("-").stdin(Stdio::from(input.reopen().unwrap()));
+                } else {
+                    cli.arg(input.path());
+                }
+                let output = cli.output().unwrap();
+                let kickoff = c.root.join(&step).join("kickoff.md");
+                if size == limit {
+                    assert!(output.status.success(), "{output:?}");
+                    assert_eq!(fs::read(&kickoff).unwrap(), vec![b'x'; limit]);
+                } else {
+                    assert_eq!(output.status.code(), Some(1));
+                    let fields: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                    assert_eq!(fields["violations"][0]["rule"], "kickoff-size");
+                    assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), before);
+                    assert_eq!(fs::read(&state_path).ok(), state_before);
+                    if command == "amend" {
+                        assert_eq!(fs::read(&kickoff).unwrap(), b"Existing work.\n");
+                    } else {
+                        assert!(!c.root.join(&step).exists());
+                    }
+                }
+            }
+        }
     }
 }

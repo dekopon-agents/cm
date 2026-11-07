@@ -10,7 +10,7 @@ use crate::epoch::{self, Status};
 use crate::forge::GithubRepo;
 use crate::host::{Host, System};
 use crate::lint;
-use crate::outcome::Outcome;
+use crate::outcome::{Outcome, Violation};
 use crate::state::{Evidence, Lane, Phase, Work};
 use crate::store::{self, Target, parse_target};
 
@@ -69,7 +69,7 @@ enum Commands {
         /// A release step's tag pattern, holding `{version}` once; cm records the one tag it names. With neither release flag, inherits the newest declared release; otherwise defaults to `v{version}`.
         #[arg(long, value_name = "PATTERN")]
         tag: Option<String>,
-        /// Write kickoff.md from a non-empty file, or `-` for stdin. Never overwrites an existing kickoff.
+        /// Write kickoff.md from a non-empty file of at most 1 MiB, or `-` for stdin. Never overwrites an existing kickoff.
         #[arg(long, value_name = "F")]
         kickoff_file: Option<PathBuf>,
     },
@@ -152,7 +152,7 @@ enum Commands {
         /// A required part (one PR) of a multipart step; the step moves to a state only once every part has. On a step past launched, the first new part takes the step's state and evidence and the step rests at launched. Repeat for each.
         #[arg(long, value_name = "NAME")]
         part: Vec<String>,
-        /// Replace kickoff.md from a non-empty file, or `-` for stdin.
+        /// Replace kickoff.md from a non-empty file of at most 1 MiB, or `-` for stdin.
         #[arg(long, value_name = "F")]
         kickoff_file: Option<PathBuf>,
         /// A release step's new repository; its prep PR must be there.
@@ -467,13 +467,43 @@ fn under_root(cli: &Cli, path: &Path) -> PathBuf {
     }
 }
 
-fn read_body(path: &Path) -> Result<String> {
-    if path == Path::new("-") {
-        let mut body = String::new();
-        std::io::stdin().read_to_string(&mut body)?;
-        return Ok(body);
+const KICKOFF_MAX_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug)]
+struct InputTooLarge {
+    path: PathBuf,
+    limit: usize,
+}
+
+impl std::fmt::Display for InputTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "kickoff input exceeds the {}-byte limit", self.limit)
     }
-    std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+}
+
+impl std::error::Error for InputTooLarge {}
+
+fn read_body(path: &Path, limit: Option<usize>) -> Result<String> {
+    let reader: Box<dyn Read> = if path == Path::new("-") {
+        Box::new(std::io::stdin().lock())
+    } else {
+        Box::new(std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?)
+    };
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.map_or(u64::MAX, |limit| limit as u64 + 1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if let Some(limit) = limit
+        && bytes.len() > limit
+    {
+        return Err(InputTooLarge {
+            path: path.to_owned(),
+            limit,
+        }
+        .into());
+    }
+    String::from_utf8(bytes).with_context(|| format!("reading {}", path.display()))
 }
 
 fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
@@ -513,7 +543,10 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                     tag: tag.clone(),
                 },
                 work: if *study { Work::Study } else { Work::Code },
-                kickoff: kickoff_file.as_deref().map(read_body).transpose()?,
+                kickoff: kickoff_file
+                    .as_deref()
+                    .map(|path| read_body(path, Some(KICKOFF_MAX_BYTES)))
+                    .transpose()?,
             };
             commands::declare(host, &under_root(cli, dir), &declaration)
         }
@@ -533,7 +566,10 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             plan_revision.as_deref(),
         ),
         Commands::Journal { title, body_file } => {
-            let body = body_file.as_deref().map(read_body).transpose()?;
+            let body = body_file
+                .as_deref()
+                .map(|path| read_body(path, None))
+                .transpose()?;
             commands::journal(host, &root()?, title, body.as_deref())
         }
         Commands::Launch {
@@ -576,7 +612,10 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 after: after.clone(),
                 drop_after: drop_after.clone(),
                 parts: part.clone(),
-                kickoff: kickoff_file.as_deref().map(read_body).transpose()?,
+                kickoff: kickoff_file
+                    .as_deref()
+                    .map(|path| read_body(path, Some(KICKOFF_MAX_BYTES)))
+                    .transpose()?,
                 ships: commands::Ships {
                     github: github.clone(),
                     tag: tag.clone(),
@@ -692,7 +731,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             disposition,
             body_file,
         } => {
-            let body = read_body(body_file)?;
+            let body = read_body(body_file, None)?;
             let entry = crate::ledger::Feedback {
                 title,
                 urgency: urgency.as_deref(),
@@ -727,7 +766,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             candidate,
             harness,
         } => {
-            let body = read_body(body_file)?;
+            let body = read_body(body_file, None)?;
             let pin = crate::ledger::PinArgs {
                 candidate: candidate.as_deref(),
                 harness: harness.as_deref(),
@@ -851,7 +890,17 @@ fn name(command: &Commands) -> &'static str {
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
     let command = name(&cli.command);
-    match run(&cli, &System) {
+    let outcome = run(&cli, &System).or_else(|error| {
+        if let Some(large) = error.downcast_ref::<InputTooLarge>() {
+            return Ok(Outcome::refused(vec![Violation::new(
+                large.path.to_string_lossy(),
+                "kickoff-size",
+                large.to_string(),
+            )]));
+        }
+        Err(error)
+    });
+    match outcome {
         Ok(outcome) => {
             if cli.json {
                 println!("{}", outcome.to_json(command));
