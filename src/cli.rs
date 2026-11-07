@@ -231,7 +231,7 @@ enum Commands {
         #[arg(long, value_name = "AFTER")]
         until: String,
     },
-    /// Hold a step below deployed until a live read lands: `add` records the stored signal and its deadline, `resolve` closes it with evidence. Past the deadline it reads expired: unresolved, never a pass.
+    /// Hold a step below deployed until a live read lands: `add` records the stored signal and its deadline, `resolve` closes it with evidence, `withdraw` closes it with a reason, and `amend` corrects its signal. Past the deadline it reads expired: unresolved, never a pass.
     Watch {
         /// <NN-name>/<unit>/<step>
         #[arg(value_parser = step_target)]
@@ -344,6 +344,18 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum WatchAct {
+    /// Close an unresolved watch with a reason, releasing its hold.
+    Withdraw {
+        id: u32,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Replace an unresolved watch's stored signal, keeping its deadline.
+    Amend {
+        id: u32,
+        #[arg(long)]
+        signal: String,
+    },
     /// Record a pending read of a stored signal: span:<query>, log:<query> or metric:<query>.
     Add {
         #[arg(long)]
@@ -683,6 +695,14 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             target,
             act: WatchAct::Resolve { id, evidence },
         } => crate::holds::watch_resolve(host, &root()?, target, *id, &under_root(cli, evidence)),
+        Commands::Watch {
+            target,
+            act: WatchAct::Withdraw { id, reason },
+        } => crate::holds::watch_withdraw(host, &root()?, target, *id, reason),
+        Commands::Watch {
+            target,
+            act: WatchAct::Amend { id, signal },
+        } => crate::holds::watch_amend(host, &root()?, target, *id, signal),
         Commands::Feedback {
             title,
             urgency,
