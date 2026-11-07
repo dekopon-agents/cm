@@ -729,6 +729,8 @@ pub fn launch_remote(
     let campaign = store::load_campaign(root)?;
     let mut violations = journal::check(root, &campaign);
     violations.extend(closed(root, &campaign));
+    let coordinator = remote.coordinator.as_deref().unwrap_or("—");
+    violations.extend(crate::attempt::check_coordinator(&full, coordinator));
     let units = plan::load_units(root)?;
     if let Some(reason) = &remote.no_parts {
         if reason.trim().is_empty() || reason.contains(['\n', '\r']) {
@@ -889,7 +891,7 @@ pub fn launch_remote(
             lane: step.lane,
             id: format!("{full}#{launches}"),
             generation: 1,
-            coordinator: remote.coordinator.clone().unwrap_or_else(|| "—".to_owned()),
+            coordinator: coordinator.to_owned(),
             claimed_at: at.clone(),
             deadline: remote
                 .cap_min

@@ -566,6 +566,11 @@ fn launch_and_claim_default_to_the_remote_session_unless_a_label_is_given() {
             Some("cse_explicit"),
         ),
         (None, Some("explicit"), Some("explicit")),
+        (
+            Some("session_cloud\n## stray"),
+            Some("explicit"),
+            Some("explicit"),
+        ),
     ] {
         let c = campaign(&host);
         let step = "01-a/u/S1";
@@ -603,6 +608,58 @@ fn launch_and_claim_default_to_the_remote_session_unless_a_label_is_given() {
                 unit.steps["S1"].attempt.as_ref().unwrap().coordinator,
                 expected.unwrap_or("—")
             );
+        }
+    }
+}
+
+#[test]
+fn launch_refuses_invalid_coordinator_labels_without_changing_state_or_journal() {
+    let host = at("2026-10-08T07:00:00Z");
+    for (session, label) in [
+        (Some("session_cloud\n## stray"), None),
+        (Some(" cse_cloud\n## stray "), None),
+        (Some("session_cloud"), Some("session_flag\n## stray")),
+        (None, Some("")),
+        (None, Some(" \t")),
+    ] {
+        let c = campaign(&host);
+        let step = "01-a/u/S1";
+        assert!(declare(&host, &c, step, Lane::ClaudeCloud, &[]).ok());
+        let before: Vec<_> = [
+            ".cm/state.json",
+            "01-a/u/.cm/state.json",
+            "01-a/u/STATE.md",
+            "JOURNAL.md",
+        ]
+        .into_iter()
+        .map(|name| (name, fs::read(c.root.join(name)).unwrap()))
+        .collect();
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_cm"));
+        command
+            .arg("--json")
+            .arg("-C")
+            .arg(&c.root)
+            .args(["launch", step])
+            .env_remove("CLAUDE_CODE_REMOTE_SESSION_ID");
+        if let Some(session) = session {
+            command.env("CLAUDE_CODE_REMOTE_SESSION_ID", session);
+        }
+        if let Some(label) = label {
+            command.args(["--coordinator", label]);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["ok"], false, "{report}");
+        let rules: Vec<_> = report["violations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["rule"].as_str().unwrap())
+            .collect();
+        assert_eq!(rules, ["attempt-claim"], "{report}");
+        for (name, bytes) in before {
+            assert_eq!(fs::read(c.root.join(name)).unwrap(), bytes, "{name}");
         }
     }
 }
