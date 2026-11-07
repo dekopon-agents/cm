@@ -9,6 +9,33 @@ use cm::store::{self, parse_target};
 use super::campaign_fixture::Campaign;
 
 impl Campaign {
+    pub fn recorded_head(&self, target: &str, phase: Phase, sha: &str) {
+        let target = parse_target(target, true).unwrap();
+        let dir = self.root.join(&target.unit);
+        let mut unit = store::load_unit(&dir).unwrap();
+        let step = unit.steps.get_mut(target.step.as_deref().unwrap()).unwrap();
+        step.track.state = phase;
+        step.track.evidence.pr = Some("https://github.com/o/r/pull/1".into());
+        step.track.evidence.sha = Some(sha.into());
+        store::write_json(&store::state_path(&dir), &unit).unwrap();
+    }
+
+    pub fn observed_head(&self, target: &str, sha: Option<&str>) {
+        store::write_json(
+            &pulls_path(&self.root),
+            &std::collections::BTreeMap::from([(
+                "https://github.com/o/r/pull/1",
+                Observed {
+                    target: target.into(),
+                    at: "2026-10-17T08:00Z".into(),
+                    head: sha.map(str::to_owned),
+                    mergeable_state: None,
+                },
+            )]),
+        )
+        .unwrap();
+    }
+
     pub fn base_unblock_marker(&self) -> String {
         let key = r#"{"condition":"epoch:WORKING","since":"2026-10-17T08:00Z","target":"01-a/u/BLOCKED"}"#.to_owned();
         store::write_json(
