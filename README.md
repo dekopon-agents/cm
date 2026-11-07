@@ -220,10 +220,12 @@ met. `--after` takes:
 A pin uses the latest synced open PR head, which sync also saves as the step's recorded SHA.
 After merge, that SHA is the merge commit; a pin to the old PR head becomes stale when
 those commits differ.
-When the recorded commit differs or the source is superseded, `cm next` and CARD list the
-dependent under `waiting` as `stale pin`, with its recheck command, even after launch.
-`cm lint` warns `pin-unmet` for unmet pins. A head that has never been recorded is reported
-as `head not recorded`. A multipart step has no single head to pin.
+Drafted dependents wait on their pin before launch. When the recorded commit differs or the
+source is superseded, `cm next` and CARD list launched and PR-open dependents under `waiting`
+as `stale pin`, with a recheck command; `cm lint` warns `pin-unmet` in those two states.
+Named `cm next` keeps that warning alongside any pending fresh review. Blocked dependents
+and dependents at merged or later, done or superseded have no pin warning. A head that has
+never been recorded is reported as `head not recorded`. A multipart step has no single head to pin.
 Pins are refused in `known-red --until` and `blocked:until:`.
 
 A step or `pr-open:` gate on an `owner`-lane or study step, or a non-release `coordinator`-lane step

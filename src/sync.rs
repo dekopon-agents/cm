@@ -158,18 +158,26 @@ impl<'a> Run<'a> {
                     let Some(pr) = &track.evidence.pr else {
                         continue;
                     };
-                    let head = self.heads.get(&target).cloned().map(Some).or_else(|| {
+                    let head = self.heads.get(&target).cloned().or_else(|| {
                         self.open
                             .get(pr)
                             .or_else(|| seen.get(pr))
                             .filter(|observed| observed.target == target)
-                            .map(|observed| observed.head.clone())
+                            .and_then(|observed| observed.head.clone())
                     });
                     if let Some(head) = head
-                        && track.evidence.sha != head
+                        && track.evidence.sha.as_deref() != Some(head.as_str())
                     {
-                        track.evidence.sha = head;
+                        let before = track
+                            .evidence
+                            .sha
+                            .replace(head.clone())
+                            .unwrap_or_else(|| "not recorded".into());
                         self.dirty.insert(unit_name.clone());
+                        self.notes.push((
+                            unit_name.clone(),
+                            format!("- head {target}: {before} → {head}"),
+                        ));
                     }
                 }
             }

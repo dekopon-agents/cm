@@ -888,7 +888,10 @@ fn pin_gate_warns_after_launch_and_keeps_the_latest_head_without_its_cache() {
     forge
         .pulls
         .insert("https://github.com/o/r/pull/1".into(), open(&moved));
-    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    let synced = sync(&host, &forge, &c.root).unwrap();
+    assert!(synced.ok());
+    assert_eq!(synced.fields["moves"], serde_json::json!([]));
+    assert!(synced.fields["journal"].is_string());
     let stale = format!("pin:01-a/u/S1@aaaaaaa (stale pin; recorded head {moved})");
     let next = next_one(&c, dependent);
     assert_eq!(rules(&next), ["after-unmet"]);
@@ -924,28 +927,55 @@ fn pin_gate_warns_after_launch_and_keeps_the_latest_head_without_its_cache() {
         moved
     );
     assert_eq!(next.fields["waiting"][0]["after"][0]["met"], false);
+    forge
+        .pulls
+        .get_mut("https://github.com/o/r/pull/1")
+        .unwrap()
+        .head = None;
+    let headless = sync(&host, &forge, &c.root).unwrap();
+    assert!(headless.ok());
+    assert!(headless.fields.get("journal").is_none());
+    assert_eq!(
+        store::load_unit(&c.root.join("01-a/u")).unwrap().steps["S1"]
+            .track
+            .evidence
+            .sha
+            .as_deref(),
+        Some(moved.as_str())
+    );
 }
 
 #[test]
-fn pin_gate_compares_the_merge_commit_after_sync() {
+fn pin_gate_warnings_stop_after_the_dependent_merges() {
     let host = at("2026-10-17T08:00:00Z");
     let c = campaign(&host);
     let source = "01-a/u/S1";
     let dependent = "01-a/u/S2";
     let opening = "a".repeat(40);
-    let merged = "b".repeat(40);
+    let merge_sha = "b".repeat(40);
     assert!(declare(&host, &c, source, Lane::Pi, &[]).ok());
     c.recorded_head(source, Phase::PrOpen, &opening);
-    assert!(declare(&host, &c, dependent, Lane::Codex, &["pin:S1@aaaaaaa"]).ok());
+    assert!(declare(&host, &c, dependent, Lane::Pi, &["pin:S1@aaaaaaa"]).ok());
     kickoff(&c, dependent);
+    open_pr(&host, &c, dependent, "https://github.com/o/r/pull/2");
+    let dependent_head = store::load_unit(&c.root.join("01-a/u")).unwrap().steps["S2"]
+        .track
+        .evidence
+        .sha
+        .clone()
+        .unwrap();
     let mut forge = FakeForge::default();
     forge.pulls.insert(
         "https://github.com/o/r/pull/1".into(),
         Pull {
             state: PullState::Merged,
-            merge_commit: Some(CommitSha::new(&merged)),
+            merge_commit: Some(CommitSha::new(&merge_sha)),
             ..open(&opening)
         },
+    );
+    forge.pulls.insert(
+        "https://github.com/o/r/pull/2".into(),
+        open(&dependent_head),
     );
     assert!(sync(&host, &forge, &c.root).unwrap().ok());
     assert_eq!(state(&c, source), Phase::Merged);
@@ -953,9 +983,67 @@ fn pin_gate_compares_the_merge_commit_after_sync() {
     assert_eq!(next.fields["steps"], serde_json::json!([]));
     assert_eq!(
         next.fields["waiting"][0]["after"][0]["evidence"]["sha"],
-        merged
+        merge_sha
     );
     assert_eq!(next.fields["waiting"][0]["after"][0]["met"], false);
+    let assert_quiet = |phase: Phase| {
+        assert_eq!(state(&c, dependent), phase);
+        let next = plan::next(&c.root, None, None).unwrap();
+        assert_eq!(next.fields["waiting"], serde_json::json!([]), "{phase}");
+        let named = next_one(&c, dependent);
+        assert_eq!(rules(&named), ["next-state"], "{phase}");
+        assert!(named.fields.get("waiting").is_none());
+        let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+        assert!(!card.contains("stale pin"), "{phase}: {card}");
+        assert_eq!(
+            lint(&c.root).unwrap().fields["warnings"],
+            serde_json::json!([]),
+            "{phase}"
+        );
+    };
+    assert!(
+        advance(
+            &host,
+            &c,
+            dependent,
+            "merged",
+            Evidence {
+                sha: Some(dependent_head.clone()),
+                ..Evidence::default()
+            }
+        )
+        .ok()
+    );
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    assert_quiet(Phase::Merged);
+
+    let release = "00-release/r/1.0.0";
+    assert!(declare_release(&host, &c, release, "o/r", "v{version}").ok());
+    kickoff(&c, release);
+    let prep = "https://github.com/o/r/pull/3";
+    open_pr(&host, &c, release, prep);
+    forge.pulls.insert(prep.into(), merged("prep"));
+    forge.tags.insert(
+        ("o/r".into(), "v1.0.0".into()),
+        ["prep".into(), dependent_head].into(),
+    );
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    assert_quiet(Phase::Released);
+    assert!(
+        advance(
+            &host,
+            &c,
+            release,
+            "deployed",
+            Evidence {
+                digest: Some(format!("sha256:{}", "d".repeat(64))),
+                ..Evidence::default()
+            }
+        )
+        .ok()
+    );
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    assert_quiet(Phase::Deployed);
 }
 
 #[test]

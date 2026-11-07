@@ -715,6 +715,63 @@ fn rising_counts_request_a_fresh_reader_until_one_is_recorded() {
 }
 
 #[test]
+fn a_pr_open_stale_pin_stays_visible_with_a_pending_fresh_review() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let stale = review_fixture::stale_pin(&c.root, STEP);
+    for count in 1..=2 {
+        let report = c.report(
+            &format!("r{count}"),
+            &format!("{count:08x}"),
+            &review_fixture::BLOCKING[..count],
+            "FIX REQUIRED",
+        );
+        assert!(record(&host, &c, &report, "astra").ok());
+    }
+    for target in [None, Some(target())] {
+        let next = plan::next_at(&c.root, target.as_ref(), None, host.now).unwrap();
+        assert_eq!(next.fields["steps"], serde_json::json!([]));
+        assert_eq!(next.fields["fresh_readers"].as_array().unwrap().len(), 1);
+        assert_eq!(next.fields["fresh_readers"][0]["target"], STEP);
+        assert_eq!(
+            next.fields["fresh_readers"][0]["command"],
+            format!("cm review record {STEP} '<fresh-review-report>' --reviewer fresh-opus")
+        );
+        assert_eq!(next.fields["waiting"][0]["target"], STEP);
+        assert_eq!(
+            next.fields["waiting"][0]["waits_on"],
+            serde_json::json!([stale])
+        );
+        assert_eq!(
+            next.fields["waiting"][0]["command"],
+            format!("cm next {STEP}")
+        );
+    }
+    let units = plan::load_units(&c.root).unwrap();
+    let card = cm::render::card(
+        &c.root,
+        host.now,
+        "campaign",
+        &units,
+        &plan::summary(&c.root, &units),
+        &[],
+    );
+    assert!(
+        card.lines()
+            .any(|line| line == format!("1. `{STEP}` waits on {stale} — `cm next {STEP}`"))
+    );
+    let linted = lint(&c.root).unwrap();
+    assert!(
+        linted.fields["warnings"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(format!(
+                "pin-unmet: {STEP}: {stale}; recheck with `cm next {STEP}`"
+            )))
+    );
+}
+
+#[test]
 fn a_step_without_a_pr_still_requests_a_fresh_reader() {
     let host = at("2026-10-25T06:00:00Z");
     let c = campaign(&host, false);

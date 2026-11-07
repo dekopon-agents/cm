@@ -204,6 +204,10 @@ fn kickoff(root: &Path, target: &str) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+pub(crate) fn pin_warning_applies(step: &Step) -> bool {
+    matches!(step.track.state, Phase::Launched | Phase::PrOpen)
+}
+
 struct Candidate<'a> {
     target: String,
     step: &'a Step,
@@ -216,6 +220,10 @@ impl Candidate<'_> {
         self.step.track.state == Phase::Drafted
             && self.kickoff.is_some()
             && self.gates.iter().all(Gate::met)
+    }
+
+    fn warns_pin(&self) -> bool {
+        pin_warning_applies(self.step) && self.gates.iter().any(Gate::pin_unmet)
     }
 
     fn lane(&self) -> Option<Lane> {
@@ -276,10 +284,7 @@ fn candidates<'a>(root: &Path, units: &'a Units) -> Vec<Candidate<'a>> {
             target,
             step,
         })
-        .filter(|candidate| {
-            candidate.step.track.state == Phase::Drafted
-                || candidate.gates.iter().any(Gate::pin_unmet)
-        })
+        .filter(|candidate| candidate.step.track.state == Phase::Drafted || candidate.warns_pin())
         .collect()
 }
 
@@ -613,12 +618,13 @@ pub fn next_at(
             target.unit,
             target.step.as_deref().unwrap_or_default()
         );
-        if has_fresh_reader {
+        let candidate = all.iter().find(|candidate| candidate.target == full);
+        if has_fresh_reader && !candidate.is_some_and(Candidate::warns_pin) {
             outcome.field("steps", Vec::<Value>::new());
             outcome.field("waiting", Vec::<Value>::new());
             return Ok(outcome);
         }
-        let Some(candidate) = all.iter().find(|candidate| candidate.target == full) else {
+        let Some(candidate) = candidate else {
             let message = match step(&units, &full) {
                 Some(step) if step.lane.is_none() => format!(
                     "{full} was launched without a declaration; only steps declared with `cm init {full} --lane …` are handed out"
