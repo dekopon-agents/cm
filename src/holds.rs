@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::{Value, json};
 
+use crate::commands::shell_word;
 use crate::commands::write_unit;
 use crate::evidence::CampaignFile;
 use crate::forge::{CheckState, CommitSha, Conclusion, Forge, GithubRepo};
@@ -916,7 +917,7 @@ pub struct Held {
     pub lines: Vec<String>,
 }
 
-pub fn held(units: &Units, now: jiff::Timestamp, root: &Path) -> Held {
+pub(crate) fn held(units: &Units, now: jiff::Timestamp, root: &Path, number: &mut usize) -> Held {
     let mut held = Held {
         watches: Vec::new(),
         stale: Vec::new(),
@@ -927,15 +928,24 @@ pub fn held(units: &Units, now: jiff::Timestamp, root: &Path) -> Held {
             let target = format!("{unit_name}/{name}");
             for watch in step.unresolved_watches(root) {
                 let status = watch.status(now, root);
-                held.lines.push(format!(
-                    "watch {target}#{} {}: {} (deadline {})",
-                    watch.id,
-                    status.name(),
-                    watch.signal,
-                    watch.deadline
+                let command = format!(
+                    "cm watch {target} resolve {} --evidence '<watch-evidence-file>'",
+                    watch.id
+                );
+                held.lines.push(crate::render::next_item(
+                    number,
+                    &format!(
+                        "watch {target}#{} {}: {} (deadline {})",
+                        watch.id,
+                        status.name(),
+                        watch.signal,
+                        watch.deadline
+                    ),
+                    &command,
                 ));
                 held.watches.push(json!({
                     "target": target,
+                    "command": command,
                     "id": watch.id,
                     "signal": watch.signal.to_string(),
                     "deadline": watch.deadline,
@@ -944,10 +954,21 @@ pub fn held(units: &Units, now: jiff::Timestamp, root: &Path) -> Held {
             }
             for pin in plan::stale_evidence(units, step) {
                 let why = pin.stale.clone().unwrap_or_default();
-                held.lines
-                    .push(format!("stale {target}: {} ({why})", pin.file));
+                let mut command = format!(
+                    "cm evidence {target} --name '<fresh-evidence-name>' --body-file '<fresh-evidence-file>' --candidate {}",
+                    shell_word(&pin.candidate.step)
+                );
+                if let Some(harness) = &pin.harness {
+                    command.push_str(&format!(" --harness {}", shell_word(&harness.step)));
+                }
+                held.lines.push(crate::render::next_item(
+                    number,
+                    &format!("stale {target}: {} ({why})", pin.file),
+                    &command,
+                ));
                 held.stale.push(json!({
                     "target": target,
+                    "command": command,
                     "file": pin.file.to_string(),
                     "candidate": pin.candidate.to_string(),
                     "harness": pin.harness.as_ref().map(ToString::to_string),

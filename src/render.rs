@@ -271,6 +271,17 @@ fn watch_summary(root: &std::path::Path, now: Timestamp, units: &Units) -> Vec<S
     rows
 }
 
+/// The action line shared by `cm next` and CARD.md. Numbering spans all action sections.
+pub(crate) fn next_item(number: &mut usize, description: &str, command: &str) -> String {
+    let description: String = description
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let line = format!("{number}. {description} — `{command}`");
+    *number += 1;
+    line
+}
+
 pub fn card(
     root: &std::path::Path,
     now: Timestamp,
@@ -289,6 +300,7 @@ pub fn card(
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut flight = Vec::new();
     let mut blocked = Vec::new();
+    let mut number = 1;
     for (unit, state) in units {
         for (step_name, step) in &state.steps {
             let target = format!("{unit}/{step_name}");
@@ -308,24 +320,27 @@ pub fn card(
                         .map(|pr| format!(" {pr}"))
                         .unwrap_or_default()
                 )),
-                Phase::Blocked(_) => blocked.push(format!(
-                    "- `{target}` {} since {}{}",
-                    step.track.state,
-                    step.track.since,
-                    match &step.track.state {
-                        Phase::Blocked(reason) => reason
-                            .strip_prefix("until:")
-                            .map(|condition| format!(
-                                "; condition {}",
-                                if crate::plan::block_met(root, units, unit, condition) {
-                                    "holds"
-                                } else {
-                                    "does not hold"
-                                }
-                            ))
-                            .unwrap_or_default(),
-                        _ => String::new(),
-                    }
+                Phase::Blocked(_) => blocked.push((
+                    target.clone(),
+                    format!(
+                        "`{target}` {} since {}{}",
+                        step.track.state,
+                        step.track.since,
+                        match &step.track.state {
+                            Phase::Blocked(reason) => reason
+                                .strip_prefix("until:")
+                                .map(|condition| format!(
+                                    "; condition {}",
+                                    if crate::plan::block_met(root, units, unit, condition) {
+                                        "holds"
+                                    } else {
+                                        "does not hold"
+                                    }
+                                ))
+                                .unwrap_or_default(),
+                            _ => String::new(),
+                        }
+                    ),
                 )),
                 _ => {}
             }
@@ -359,12 +374,28 @@ pub fn card(
     let ready: Vec<String> = next
         .ready
         .iter()
-        .map(|(target, lane)| format!("- `{target}` ({})", lane.map_or("—", Lane::name)))
+        .map(|(target, lane)| {
+            next_item(
+                &mut number,
+                &format!("`{target}` ({})", lane.map_or("—", Lane::name)),
+                &crate::plan::launch_command(target, *lane),
+            )
+        })
         .collect();
     let waiting: Vec<String> = next
         .waiting
         .iter()
-        .map(|(target, on)| format!("- `{target}` waits on {}", on.join("; ")))
+        .map(|(target, on)| {
+            next_item(
+                &mut number,
+                &format!("`{target}` waits on {}", on.join("; ")),
+                &crate::plan::waiting_command(root, target),
+            )
+        })
+        .collect();
+    let blocked: Vec<String> = blocked
+        .iter()
+        .map(|(target, line)| next_item(&mut number, line, &crate::plan::unblock_command(target)))
         .collect();
     let moved: Vec<String> = moves
         .iter()
