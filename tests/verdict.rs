@@ -727,7 +727,7 @@ fn next_and_sync_flag_a_stalled_codex_launch_and_a_dirty_pr() {
     assert!(
         late.lines
             .iter()
-            .any(|line| line.starts_with("stalled 01-a/u/S1: codex launch with no PR"))
+            .any(|line| line.starts_with("1. stalled 01-a/u/S1: codex launch with no PR"))
     );
     let limits = fs::read_to_string(c.root.join("LIMITS.toml"))
         .unwrap()

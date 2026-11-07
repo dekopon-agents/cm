@@ -275,7 +275,7 @@ fn every_next_command_parses_with_the_cli() {
             let output = Command::new("sh")
                 .args(["-c", &format!("set -- {command}; shift; exec \"$CM_TEST_BIN\" \"$@\" -C \"$CM_TEST_ROOT\" --json")])
                 .env("CM_TEST_BIN", env!("CARGO_BIN_EXE_cm"))
-                .env("CM_TEST_ROOT", c.root.join("absent"))
+                .env("CM_TEST_ROOT", c.root.parent().unwrap().join("absent"))
                 .current_dir(&c.root)
                 .output().unwrap();
             assert_eq!(output.status.code(), Some(1), "{command}: {output:?}");
