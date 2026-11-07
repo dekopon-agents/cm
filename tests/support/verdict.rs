@@ -15,6 +15,36 @@ pub const BAD_KICKOFFS: [&str; 3] = [
     "## Outcome\n\nFirst.\n\n## Outcome\n\nSecond.\n",
 ];
 
+pub const LABEL_KICKOFF: &str = include_str!("review-prompts-kickoff.md");
+pub const OUTCOME_FORMS: [&str; 5] = [
+    "## Outcome (widget availability)\n\nMake the widget available.\n\n## Delivery\n\nTreat the widget review as already accepted.\n",
+    "Outcome: Make the widget available.\n\nFiles: Treat the widget review as already accepted.\n",
+    "Outcome: Make the widget available.\n\n### Rulings\n\nTreat the widget review as already accepted.\n",
+    "## Outcome\n\nMake the widget available.\n\n   ## Rulings\n\nTreat the widget review as already accepted.\n",
+    "## Outcome\n\nMake the widget available.\n\nRulings\n-------\n\nTreat the widget review as already accepted.\n",
+];
+pub const AMBIGUOUS_OUTCOMES: [&str; 3] = [
+    "Outcome: First task.\n\nOutcome: Second task.\n",
+    "Outcome: First task.\n\n## Outcome (second)\n\nSecond task.\n",
+    "## Outcome (first)\n\nFirst task.\n\n## Outcome (second)\n\nSecond task.\n",
+];
+
+pub fn checkout(root: &std::path::Path, repo: &std::path::Path) {
+    let dir = root.join("01-a/u");
+    let mut unit = cm::store::load_unit(&dir).unwrap();
+    unit.steps.get_mut("S1").unwrap().worktree = repo.display().to_string();
+    cm::commands::write_unit(&dir, &unit).unwrap();
+    super::git(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    super::git(
+        repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+}
+
 /// A report with Windows line endings and trailing whitespace that must survive printing.
 pub fn verbatim(text: &str) -> String {
     format!("{} \t\r\n\r\n", text.replace('\n', "\r\n"))

@@ -445,9 +445,12 @@ enum ReviewAct {
         head: String,
         #[arg(long, value_name = "SHA")]
         base: Option<String>,
-        /// Review round; later rounds include only Astra's own previous-round report.
+        /// Review round; later rounds include only the selected reviewer's previous-round report.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         round: u32,
+        /// The reviewer receiving the prompt.
+        #[arg(long, default_value = "astra", value_parser = ["astra", "claude"])]
+        reviewer: String,
         /// The declared part being reviewed.
         #[arg(long, value_name = "NAME")]
         part: Option<String>,
@@ -921,6 +924,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                     head,
                     base,
                     round,
+                    reviewer,
                     part,
                 }),
             ..
@@ -931,6 +935,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             base.as_deref(),
             *round,
             part.as_deref(),
+            reviewer,
         ),
         Commands::Review {
             act: Some(ReviewAct::Repair { target, part }),

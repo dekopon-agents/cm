@@ -70,7 +70,7 @@ error.
 | `cm evidence <NN-name>/<unit>/<step> --name NAME --body-file F [--candidate STEP[@SHA] [--harness STEP[@SHA]]]` | Writes `<step>/evidence/<NAME>.md` once from a non-empty body and journals the path. `cm advance <step> done` without `--evidence` takes the step's one evidence file when it has exactly one. `--candidate` and `--harness` pin the file to the commits it was produced against (see [Pinned evidence](#pinned-evidence)). |
 | `cm review <step> --pr URL --head SHA --model ID --effort E --verdict accept\|fix-required --findings C/F --cost USD --wall MIN [--delta FROM_SHA]`, `cm review --import` | Appends one row to the review ledger `.cm/reviews.json` and renders `REVIEW-OFF.md` from it, rows in PR order with a delta review under its PR, and journals the row. The rows a hand-written `REVIEW-OFF.md` already holds are imported once, kept cell for cell, and the text before and after the table (per-PR adjudications, rules) is kept byte for byte (`--import`, or the first `cm review`). The step must be declared (`step-unknown`); an imported delta row is the one whose `#` cell carries `Δ`. After that a hand edit is `review-hand-edit`, as for `STATE.md`. |
 | `cm review record <step> <report-file> [--reviewer KIND] [--part NAME]` | Parses the `cm-review` block that ends the report (see [Review verdicts](#review-verdicts)), computes the verdict, copies the report to `<step>/evidence/reviews/R<n>[-KIND].md` and records the review in `.cm/verdicts.json` as `R<n>`, its findings as `R<n>.<id>`. Refuses a report with no block or a malformed one (`review-block`, one per problem, with its line), an undeclared step and a report already recorded for the step (`review-duplicate`). A report whose own verdict line disagrees with the computed one is recorded with the computed verdict and the disagreement printed and journaled. `--part` selects a declared part and its PR; it is required on multipart steps. Distinct FIX REQUIRED heads on the current PR count toward the ten-pass step cap; rising blocking counts request an independent reader and only a non-converging `fresh-opus` round blocks the step (see [Rounds](#rounds)). |
-| `cm review prompt <step> --head SHA [--base SHA] [--round N] [--part NAME]` | Prints a blind reviewer prompt from a fixed template: only the kickoff's Outcome, base and head. Round 2 adds only Astra's own report from the first fix round. No coordinator rulings or worker brief are read. Refuses an unknown head (`review-head`) or missing task (`review-outcome`). See [Review verdicts](#review-verdicts). |
+| `cm review prompt <step> --head SHA [--base SHA] [--round N] [--reviewer astra\|claude] [--part NAME]` | Prints a blind reviewer prompt from a fixed template: only the kickoff's Outcome, base and full head SHA. Round 2 adds only the selected reviewer's own report from the first fix round (default `astra`). No coordinator rulings or worker brief are read. Refuses an unknown head (`review-head`) or missing task (`review-outcome`). See [Review verdicts](#review-verdicts). |
 | `cm review repair-brief <step> [--part NAME]` | Prints a fixed repair header followed by every report at the latest reviewed head of the current PR/part, verbatim and in recording order. Does not call a round the last; convergence decides the next action. Refuses when no round is recorded (`review-round`). |
 | `cm review resolve <step> <finding> --by <commit\|ruling-file>` | Records what resolved a blocking finding: `R<n>.<id>`, or `<id>` in the step's latest review holding it; an id whose `R<n>` is not a review number names no finding (`finding-unknown`). `--by` is a ruling file in the campaign when that path exists, else a commit SHA. A follow-up is `resolve-not-blocking`; a second resolution is `resolve-done`. |
 | `cm ruling <step> "<text>"` | Appends `- YYYY-MM-DD: <text>` to `<step>/evidence/coordinator-scope.md`, creating it with `# Scope and coordinator rulings: <step>` when it is missing, and journals the line. |
@@ -299,21 +299,29 @@ and record include the attempt id, action kind, generation and returned id when 
 ### Review verdicts
 
 Use `cm review prompt <step> --head SHA [--base SHA]` for a blind review. The task is the
-single non-empty Markdown `Outcome` section in `kickoff.md`, including its subheadings and
-ending at the next heading of the same or higher level. Other kickoff sections and
+single non-empty `Outcome:` label or Markdown `Outcome` section in `kickoff.md`. A label ends
+at the next label or heading; a heading may have a parenthetical suffix and includes its
+subheadings, ending at the next heading of the same or higher level. Indented ATX and Setext
+headings both delimit sections. Other kickoff sections and
 `coordinator-scope.md` never enter the prompt. `cm brief` remains the worker packet with rulings.
 The template lives in `templates/REVIEW-PROMPT.md`; it accepts no coordinator commentary.
 
 `--head` must be a SHA known in the selected step/part's evidence, recorded reviews or last
 `cm sync` observation for its current PR. Run `cm sync` after a repair push to recognize the
-new head before recording its review. `--base`, when supplied, is a SHA; otherwise the prompt
-names the repository's default branch. Round 1 includes no reports. `--round 2` appends only the latest recorded
-`astra` report at the first FIX REQUIRED head; later rounds similarly use the preceding fix
-round as [Rounds](#rounds) defines it. Reports from other reviewers never enter the prompt.
-A missing Astra report or a preceding round at the requested head is refused (`review-round`).
+new head before recording its review. The prompt prints the full matching head SHA and
+refuses ambiguous prefixes. `--base`, when supplied, is a SHA; otherwise cm resolves the
+merge base of the head and `origin/HEAD` using the registered worktree, or the current checkout
+when no worktree is registered. An unavailable merge base is refused (`review-base`); pass
+`--base SHA` when no checkout is available. Round 1 includes no reports. `--round 2` appends only
+the latest recorded report from the selected `--reviewer astra|claude` (default `astra`) at
+the first FIX REQUIRED head; later rounds similarly use the preceding fix round as
+[Rounds](#rounds) defines it. Reports from other reviewers never enter the prompt. A missing
+report for that reviewer or a preceding round at the requested head is refused (`review-round`).
 
 Use `cm review repair-brief <step>` to hand the worker the latest round's reports under the
-fixed header in `templates/REPAIR-BRIEF.md`. Both commands require `--part NAME` for multipart
+fixed header in `templates/REPAIR-BRIEF.md`. Rounds follow the order in which distinct heads
+first appear; recording another report for an older head does not make it the latest round.
+Both commands require `--part NAME` for multipart
 steps and scope reports to that part's current PR. Both only print: they write no state or
 journal entries and launch no reviewers.
 

@@ -337,6 +337,12 @@ fn record(host: &Fake, c: &Campaign, report: &Path, reviewer: &str) -> Outcome {
     verdict::record(host, &c.root, &target(), report, Some(reviewer), None).unwrap()
 }
 
+fn prompt_campaign(host: &Fake) -> Campaign {
+    let c = campaign(host, true);
+    review_fixture::checkout(&c.root, &c.repo);
+    c
+}
+
 #[test]
 fn record_computes_the_verdict_from_the_block() {
     let host = at("2026-10-25T06:00:00Z");
@@ -1502,7 +1508,7 @@ fn rulings_append_to_the_scope_file_and_the_brief_carries_it() {
 #[test]
 fn review_prompt_contains_only_the_task_and_commit_range() {
     let host = at("2026-10-25T06:00:00Z");
-    let c = campaign(&host, true);
+    let c = prompt_campaign(&host);
     c.write(&format!("{STEP}/kickoff.md"), review_fixture::KICKOFF);
     assert!(
         verdict::ruling(&host, &c.root, &target(), review_fixture::RULING)
@@ -1532,9 +1538,9 @@ fn review_prompt_contains_only_the_task_and_commit_range() {
 }
 
 #[test]
-fn second_review_prompt_adds_only_astras_own_first_fix_round_report() {
+fn second_review_prompt_adds_only_the_selected_reviewers_own_report() {
     let host = at("2026-10-25T06:00:00Z");
-    let c = campaign(&host, true);
+    let c = prompt_campaign(&host);
     c.write(&format!("{STEP}/kickoff.md"), review_fixture::KICKOFF);
     assert!(
         verdict::ruling(&host, &c.root, &target(), review_fixture::RULING)
@@ -1550,6 +1556,22 @@ fn second_review_prompt_adds_only_astras_own_first_fix_round_report() {
         "FIX REQUIRED",
     );
     assert!(record(&host, &c, &astra, "astra").ok());
+    let missing = review_fixture::review(
+        &c.root,
+        &[
+            "prompt",
+            STEP,
+            "--head",
+            &c.head(),
+            "--round",
+            "2",
+            "--reviewer",
+            "claude",
+        ],
+    );
+    assert_eq!(missing.status.code(), Some(1));
+    let missing: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(missing["violations"][0]["rule"], "review-round");
     let other = c.report(
         "first-other",
         "aaaaaaa1",
@@ -1557,23 +1579,89 @@ fn second_review_prompt_adds_only_astras_own_first_fix_round_report() {
         "FIX REQUIRED",
     );
     assert!(record(&host, &c, &other, "claude").ok());
-    let output = review_fixture::review(
-        &c.root,
-        &["prompt", STEP, "--head", &c.head(), "--round", "2"],
-    );
+    let astra = fs::read_to_string(astra).unwrap();
+    let claude = fs::read_to_string(other).unwrap();
+    let accepted = fs::read_to_string(accepted).unwrap();
+    for (reviewer, own, other) in [("astra", &astra, &claude), ("claude", &claude, &astra)] {
+        let output = review_fixture::review(
+            &c.root,
+            &[
+                "prompt",
+                STEP,
+                "--head",
+                &c.head(),
+                "--round",
+                "2",
+                "--reviewer",
+                reviewer,
+            ],
+        );
+        assert!(output.status.success(), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let prompt = result["prompt"].as_str().unwrap();
+        assert!(prompt.ends_with(own));
+        assert!(!prompt.contains(other));
+        assert!(!prompt.contains(&accepted));
+        assert!(!prompt.contains(review_fixture::RULING));
+    }
+}
+
+#[test]
+fn review_prompt_accepts_label_and_parenthetical_outcomes_and_stops_at_boundaries() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = prompt_campaign(&host);
+    for kickoff in review_fixture::OUTCOME_FORMS {
+        c.write(&format!("{STEP}/kickoff.md"), kickoff);
+        let output = review_fixture::review(&c.root, &["prompt", STEP, "--head", &c.head()]);
+        assert!(output.status.success(), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let prompt = result["prompt"].as_str().unwrap();
+        assert!(prompt.contains("Make the widget available."));
+        assert!(!prompt.contains(review_fixture::RULING));
+    }
+    c.write(&format!("{STEP}/kickoff.md"), review_fixture::LABEL_KICKOFF);
+    let output = review_fixture::review(&c.root, &["prompt", STEP, "--head", &c.head()]);
     assert!(output.status.success(), "{output:?}");
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let prompt = result["prompt"].as_str().unwrap();
-    assert!(prompt.ends_with(&fs::read_to_string(astra).unwrap()));
-    assert!(!prompt.contains(&fs::read_to_string(other).unwrap()));
-    assert!(!prompt.contains(&fs::read_to_string(accepted).unwrap()));
-    assert!(!prompt.contains(review_fixture::RULING));
+    assert!(prompt.contains("N2 (changes what a reviewer sees on purpose)"));
+    assert!(prompt.contains("N3: `cm review repair-brief <step>`"));
+    assert!(!prompt.contains("Loss:"));
+    assert!(!prompt.contains("Files:"));
+    assert!(!prompt.contains("Tests:"));
+    assert!(!prompt.contains("README:"));
+}
+
+#[test]
+fn review_prompt_prints_the_full_head_and_resolved_merge_base() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = prompt_campaign(&host);
+    c.write(&format!("{STEP}/kickoff.md"), review_fixture::KICKOFF);
+    let base = c.head();
+    let branch = git(&c.repo, &["symbolic-ref", "--short", "HEAD"]);
+    let head = commit(&c.repo, "widget.txt", "widget\n");
+    git(&c.repo, &["checkout", "-qb", "upstream", &base]);
+    let tip = commit(&c.repo, "upstream.txt", "upstream\n");
+    git(&c.repo, &["update-ref", "refs/remotes/origin/main", &tip]);
+    git(&c.repo, &["checkout", "-q", &branch]);
+    assert!(
+        sync(&host, &FakeForge::open(&head, &[]), &c.root)
+            .unwrap()
+            .ok()
+    );
+    let output = review_fixture::review(&c.root, &["prompt", STEP, "--head", &head[..8]]);
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let prompt = result["prompt"].as_str().unwrap();
+    assert!(prompt.contains(&format!("Head: {head}\n")));
+    assert!(prompt.contains(&format!("Base: {base}\n")));
+    assert!(!prompt.contains(&tip));
 }
 
 #[test]
 fn second_review_prompt_recognizes_the_repaired_head_after_sync() {
     let host = at("2026-10-25T06:00:00Z");
-    let c = campaign(&host, true);
+    let c = prompt_campaign(&host);
     c.write(&format!("{STEP}/kickoff.md"), review_fixture::KICKOFF);
     let first = c.report(
         "first",
@@ -1608,7 +1696,7 @@ fn second_review_prompt_recognizes_the_repaired_head_after_sync() {
 #[test]
 fn repair_brief_preserves_every_latest_round_report_verbatim() {
     let host = at("2026-10-25T06:00:00Z");
-    let c = campaign(&host, true);
+    let c = prompt_campaign(&host);
     let old = c.report("old", "aaaaaaa1", &review_fixture::BLOCKING, "FIX REQUIRED");
     assert!(record(&host, &c, &old, "astra").ok());
     let astra = c.report(
@@ -1622,6 +1710,13 @@ fn repair_brief_preserves_every_latest_round_report_verbatim() {
     assert!(record(&host, &c, &astra, "astra").ok());
     let other = c.report("latest-other", "bbbbbbb2", &[], "ACCEPT");
     assert!(record(&host, &c, &other, "claude").ok());
+    let backfill = c.report(
+        "older-round-backfill",
+        "aaaaaaa1",
+        &review_fixture::BLOCKING[1..2],
+        "FIX REQUIRED",
+    );
+    assert!(record(&host, &c, &backfill, "claude").ok());
     let journal = sha256(&c.root.join("JOURNAL.md"));
     let ledger = sha256(&c.root.join(".cm/verdicts.json"));
     let output = review_fixture::review(&c.root, &["repair-brief", STEP]);
@@ -1633,6 +1728,7 @@ fn repair_brief_preserves_every_latest_round_report_verbatim() {
         fs::read_to_string(other).unwrap()
     )));
     assert!(!brief.contains(&fs::read_to_string(old).unwrap()));
+    assert!(!brief.contains(&fs::read_to_string(backfill).unwrap()));
     assert!(!brief.to_lowercase().contains("final round"));
     assert!(!brief.to_lowercase().contains("last round"));
     assert_eq!(sha256(&c.root.join("JOURNAL.md")), journal);
@@ -1642,7 +1738,7 @@ fn repair_brief_preserves_every_latest_round_report_verbatim() {
 #[test]
 fn review_prompt_refuses_unknown_heads_and_missing_outcomes_or_prior_reports() {
     let host = at("2026-10-25T06:00:00Z");
-    let c = campaign(&host, true);
+    let c = prompt_campaign(&host);
     c.write(&format!("{STEP}/kickoff.md"), review_fixture::KICKOFF);
     for head in ["0000000000000000000000000000000000000000", "main"] {
         let output = review_fixture::review(&c.root, &["prompt", STEP, "--head", head]);
@@ -1651,7 +1747,10 @@ fn review_prompt_refuses_unknown_heads_and_missing_outcomes_or_prior_reports() {
         assert_eq!(result["violations"][0]["rule"], "review-head");
         assert!(result.get("prompt").is_none());
     }
-    for kickoff in review_fixture::BAD_KICKOFFS {
+    for kickoff in review_fixture::BAD_KICKOFFS
+        .into_iter()
+        .chain(review_fixture::AMBIGUOUS_OUTCOMES)
+    {
         c.write(&format!("{STEP}/kickoff.md"), kickoff);
         let output = review_fixture::review(&c.root, &["prompt", STEP, "--head", &c.head()]);
         assert_eq!(output.status.code(), Some(1));
@@ -1678,7 +1777,7 @@ fn review_prompt_refuses_unknown_heads_and_missing_outcomes_or_prior_reports() {
 #[test]
 fn review_prompts_and_repairs_scope_rounds_to_the_current_pr_and_part() {
     let host = at("2026-10-25T06:00:00Z");
-    let c = campaign(&host, true);
+    let c = prompt_campaign(&host);
     c.write(&format!("{STEP}/kickoff.md"), review_fixture::KICKOFF);
     let old = c.report(
         "old-pr",

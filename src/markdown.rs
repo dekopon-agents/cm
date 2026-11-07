@@ -67,10 +67,18 @@ pub(crate) fn unterminated_fence(text: &str) -> bool {
 pub fn headings(text: &str) -> Vec<Heading<'_>> {
     let mut fences = Fences::default();
     let mut out = Vec::new();
+    let mut paragraph = None;
     for (index, line) in text.lines().enumerate() {
         if fences.contains(line) {
+            paragraph = None;
             continue;
         }
+        let trimmed = line.trim_start_matches(' ');
+        if line.len() - trimmed.len() > 3 {
+            paragraph = None;
+            continue;
+        }
+        let line = trimmed;
         let level = line.bytes().take_while(|byte| *byte == b'#').count();
         if (1..=6).contains(&level) && line[level..].starts_with(' ') {
             out.push(Heading {
@@ -78,9 +86,56 @@ pub fn headings(text: &str) -> Vec<Heading<'_>> {
                 level,
                 text: line[level + 1..].trim(),
             });
+            paragraph = None;
+        } else if let Some(level) = setext_level(line) {
+            if let Some((start, title)) = paragraph.take() {
+                out.push(Heading {
+                    line: start,
+                    level,
+                    text: title,
+                });
+            }
+        } else if line.trim().is_empty() {
+            paragraph = None;
+        } else if paragraph.is_none() {
+            paragraph = Some((index + 1, line.trim()));
         }
     }
     out
+}
+
+pub(crate) fn setext_level(line: &str) -> Option<usize> {
+    let line = line.trim_end();
+    if !line.is_empty() && line.bytes().all(|byte| byte == b'=') {
+        Some(1)
+    } else if !line.is_empty() && line.bytes().all(|byte| byte == b'-') {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// Plain kickoff labels outside code fences, such as `Outcome:` and `Files:`.
+pub(crate) fn labels(text: &str) -> Vec<(usize, &str)> {
+    let mut fences = Fences::default();
+    text.lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if fences.contains(line) {
+                return None;
+            }
+            let trimmed = line.trim_start_matches(' ');
+            if line.len() - trimmed.len() > 3 {
+                return None;
+            }
+            let (name, _) = trimmed.split_once(':')?;
+            (name.starts_with(|c: char| c.is_ascii_alphabetic())
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_')))
+            .then_some((index + 1, name))
+        })
+        .collect()
 }
 
 pub fn code_spans(text: &str) -> Vec<(usize, &str)> {
@@ -203,11 +258,14 @@ mod tests {
 
     #[test]
     fn headings_skip_fences() {
-        let text = "# A\n```\n# not\n```\n## B\n#nope\n";
+        let text = "# A\n```\n# not\n```\n   ## B\n\nC\n===\n\n  D\n  ---\n\n#nope\n";
         let found: Vec<_> = headings(text)
             .into_iter()
             .map(|heading| (heading.line, heading.level, heading.text))
             .collect();
-        assert_eq!(found, vec![(1, 1, "A"), (5, 2, "B")]);
+        assert_eq!(
+            found,
+            vec![(1, 1, "A"), (5, 2, "B"), (7, 1, "C"), (10, 2, "D")]
+        );
     }
 }

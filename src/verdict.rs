@@ -1367,11 +1367,17 @@ pub fn brief(root: &Path, target: &Target) -> Result<Outcome> {
 
 // Reviewer prompts read only the kickoff Outcome and the selected PR/part's reports.
 
+struct PromptScope {
+    evidence: Evidence,
+    reviews: Vec<Recorded>,
+    repo: PathBuf,
+}
+
 fn prompt_scope(
     root: &Path,
     target: &Target,
     part: Option<&str>,
-) -> Result<Result<(Evidence, Vec<Recorded>), Violation>> {
+) -> Result<Result<PromptScope, Violation>> {
     let full = full_name(target);
     if !declared(root, target)? {
         return Ok(Err(Violation::new(
@@ -1409,26 +1415,63 @@ fn prompt_scope(
             review.step == full && review.pr == track.evidence.pr && review.part.as_deref() == part
         })
         .collect();
-    Ok(Ok((track.evidence.clone(), reviews)))
+    Ok(Ok(PromptScope {
+        evidence: track.evidence.clone(),
+        reviews,
+        repo: if step.worktree.is_empty() {
+            std::env::current_dir()?
+        } else {
+            PathBuf::from(&step.worktree)
+        },
+    }))
 }
 
 fn kickoff_task(text: &str) -> Option<String> {
     let headings = crate::markdown::headings(text);
-    let mut outcomes = headings.iter().filter(|heading| heading.text == "Outcome");
-    let heading = outcomes.next()?;
-    if outcomes.next().is_some() {
+    let outcomes: Vec<_> = headings
+        .iter()
+        .filter(|heading| {
+            heading.text == "Outcome"
+                || (heading.text.starts_with("Outcome (") && heading.text.ends_with(')'))
+        })
+        .collect();
+    let labels = crate::markdown::labels(text);
+    let outcome_labels: Vec<_> = labels
+        .iter()
+        .filter(|(_, label)| *label == "Outcome")
+        .collect();
+    if outcomes.len() + outcome_labels.len() != 1 {
         return None;
     }
-    let end = headings
-        .iter()
-        .find(|next| next.line > heading.line && next.level <= heading.level)
-        .map_or(text.lines().count(), |next| next.line - 1);
-    let task = text
-        .lines()
-        .skip(heading.line)
-        .take(end - heading.line)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let lines: Vec<_> = text.lines().collect();
+    let task = if let Some(heading) = outcomes.first() {
+        let end = headings
+            .iter()
+            .find(|next| next.line > heading.line && next.level <= heading.level)
+            .map_or(lines.len(), |next| next.line - 1);
+        let mut start = heading.line;
+        if !lines[start - 1].trim_start().starts_with('#') {
+            start += lines[start..]
+                .iter()
+                .position(|line| crate::markdown::setext_level(line.trim_start()).is_some())?
+                + 1;
+        }
+        lines[start..end].join("\n")
+    } else {
+        let (line, _) = outcome_labels[0];
+        let end = labels
+            .iter()
+            .map(|(line, _)| *line)
+            .chain(headings.iter().map(|heading| heading.line))
+            .filter(|next| *next > *line)
+            .min()
+            .map_or(lines.len(), |next| next - 1);
+        let (_, first) = lines[line - 1].split_once(':')?;
+        std::iter::once(first.trim_start())
+            .chain(lines[*line..end].iter().copied())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let task = task.trim();
     (!task.is_empty()).then(|| task.to_owned())
 }
@@ -1461,27 +1504,56 @@ pub(crate) fn prompt(
     base: Option<&str>,
     round: u32,
     part: Option<&str>,
+    reviewer: &str,
 ) -> Result<Outcome> {
     let full = full_name(target);
-    let (evidence, reviews) = match prompt_scope(root, target, part)? {
+    let PromptScope {
+        evidence,
+        reviews,
+        repo,
+    } = match prompt_scope(root, target, part)? {
         Ok(scope) => scope,
         Err(violation) => return Ok(Outcome::refused(vec![violation])),
     };
-    if !is_sha(head)
-        || !(evidence
-            .sha
-            .as_deref()
-            .is_some_and(|known| same_commit(known, head))
-            || reviews.iter().any(|review| review.at_head(head))
-            || synced_head(root, target, part, evidence.pr.as_deref())
-                .is_some_and(|known| same_commit(&known, head)))
-    {
+    let synced = synced_head(root, target, part, evidence.pr.as_deref());
+    let known: Vec<_> = evidence
+        .sha
+        .iter()
+        .chain(reviews.iter().map(|review| &review.head))
+        .chain(synced.iter())
+        .filter(|known| is_sha(known) && same_commit(known, head))
+        .collect();
+    let mut matches: Vec<_> = known
+        .iter()
+        .filter(|known| known.len() == 40)
+        .map(|known| known.to_lowercase())
+        .collect();
+    if matches.is_empty() && !known.is_empty() && is_sha(head) {
+        matches.extend(
+            git_out(
+                &repo,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{head}^{{commit}}"),
+                ],
+            )
+            .filter(|resolved| known.iter().any(|known| same_commit(known, resolved))),
+        );
+    }
+    matches.sort();
+    matches.dedup();
+    let Some(head) = matches
+        .first()
+        .filter(|_| is_sha(head) && matches.len() == 1)
+    else {
         return Ok(Outcome::refused(vec![Violation::new(
             &full,
             "review-head",
-            "--head must name a known head in the selected PR/part's evidence, recorded reviews or last cm sync; run cm sync to refresh it",
+            "--head must unambiguously match a full head in the selected PR/part's evidence, recorded reviews or last cm sync; run cm sync to refresh it",
         )]));
-    }
+    };
     if base.is_some_and(|base| !is_sha(base)) {
         return Ok(Outcome::refused(vec![Violation::new(
             &full,
@@ -1489,6 +1561,20 @@ pub(crate) fn prompt(
             "--base must be a commit SHA (7 to 40 hex digits)",
         )]));
     }
+    let resolved_base = base.map(str::to_owned).or_else(|| {
+        let tip = git_out(
+            &repo,
+            &["rev-parse", "--verify", "--quiet", "origin/HEAD^{commit}"],
+        )?;
+        git_out(&repo, &["merge-base", head, &tip])
+    });
+    let Some(base) = resolved_base else {
+        return Ok(Outcome::refused(vec![Violation::new(
+            &full,
+            "review-base",
+            "cannot resolve the merge base with origin/HEAD; use the step's worktree or run from its checkout, or pass --base SHA",
+        )]));
+    };
     let kickoff = root.join(&full).join("kickoff.md");
     let task = read_existing(&kickoff)?.and_then(|text| kickoff_task(&text));
     let Some(task) = task else {
@@ -1499,24 +1585,28 @@ pub(crate) fn prompt(
         )]));
     };
     let mut text = crate::templates::REVIEW_PROMPT
-        .replace("{base}", base.unwrap_or("the repository's default branch"))
+        .replace("{base}", &base)
         .replace("{head}", head)
         .replace("{task}", &task);
     if round > 1 {
         let heads = fix_heads(reviews.iter());
         let previous = heads.get((round - 2) as usize).and_then(|head| {
-            reviews.iter().rev().find(|review| {
-                review.at_head(head) && review.reviewer.as_deref() == Some(ASTRA_REVIEWER)
-            })
+            reviews
+                .iter()
+                .rev()
+                .find(|review| review.at_head(head) && review.reviewer.as_deref() == Some(reviewer))
         });
         let Some(previous) = previous.filter(|previous| !previous.at_head(head)) else {
             return Ok(Outcome::refused(vec![Violation::new(
                 &full,
                 "review-round",
-                "the preceding fix round must have Astra's own report at a different head",
+                format!(
+                    "the preceding fix round must have {reviewer}'s own report at a different head"
+                ),
             )]));
         };
-        text.push_str("\n## Your previous-round report\n\n");
+        text.push('\n');
+        text.push_str(crate::templates::PREVIOUS_REVIEW);
         text.push_str(&fs::read_to_string(root.join(previous.report.as_str()))?);
     }
     let mut outcome = Outcome::default();
@@ -1527,11 +1617,17 @@ pub(crate) fn prompt(
 
 pub(crate) fn repair_brief(root: &Path, target: &Target, part: Option<&str>) -> Result<Outcome> {
     let full = full_name(target);
-    let (_, reviews) = match prompt_scope(root, target, part)? {
+    let PromptScope { reviews, .. } = match prompt_scope(root, target, part)? {
         Ok(scope) => scope,
         Err(violation) => return Ok(Outcome::refused(vec![violation])),
     };
-    let Some(latest) = reviews.last() else {
+    let mut heads = Vec::<&str>::new();
+    for review in &reviews {
+        if !heads.iter().any(|head| review.at_head(head)) {
+            heads.push(&review.head);
+        }
+    }
+    let Some(latest) = heads.last() else {
         return Ok(Outcome::refused(vec![Violation::new(
             &full,
             "review-round",
@@ -1539,7 +1635,7 @@ pub(crate) fn repair_brief(root: &Path, target: &Target, part: Option<&str>) -> 
         )]));
     };
     let mut text = crate::templates::REPAIR_BRIEF.to_owned();
-    for review in reviews.iter().filter(|review| review.at_head(&latest.head)) {
+    for review in reviews.iter().filter(|review| review.at_head(latest)) {
         text.push_str("\n\n");
         text.push_str(&fs::read_to_string(root.join(review.report.as_str()))?);
     }
