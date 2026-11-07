@@ -696,6 +696,7 @@ pub fn close(host: &dyn Host, root: &Path) -> Result<Outcome> {
     campaign.closed = Some(at.clone());
     write_json(&state_path(root), &campaign)?;
     let heading = record(root, &at, "cm close", &body)?;
+    crate::sync::render_resume(root, &plan::load_units(root)?, true)?;
     let mut outcome = Outcome::default();
     outcome.field("closed", at);
     outcome.field("journal", heading.clone());
@@ -1120,6 +1121,75 @@ fn git_commit(repo: &Path, rev: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+fn evidence_repos(repo: Option<&Path>, unit: &UnitState, target: &Target) -> Vec<PathBuf> {
+    match (repo, &target.step) {
+        (Some(repo), _) => vec![absolute(repo)],
+        (None, Some(step)) => unit
+            .steps
+            .get(step)
+            .map(|step| PathBuf::from(&step.worktree))
+            .into_iter()
+            .collect(),
+        (None, None) => unit
+            .steps
+            .values()
+            .map(|step| PathBuf::from(&step.worktree))
+            .collect(),
+    }
+}
+
+struct TagRead {
+    repo: GithubRepo,
+    tag: TagName,
+    sha: String,
+    contains: Result<bool, Violation>,
+}
+
+fn read_tag(
+    full: &str,
+    forge: Option<&dyn Forge>,
+    repo: GithubRepo,
+    tag: TagName,
+    sha: String,
+) -> TagRead {
+    let contains = match forge {
+        Some(forge) => match forge.tag_exists(&repo, &tag) {
+            Ok(true) => forge
+                .tag_contains(&repo, &tag, &CommitSha::new(&sha))
+                .map_err(|error| {
+                    Violation::new(
+                        full,
+                        "tag-lineage",
+                        format!(
+                            "could not check whether tag `{tag}` contains commit {sha}: {error}"
+                        ),
+                    )
+                }),
+            Ok(false) => Err(Violation::new(
+                full,
+                "evidence-tag",
+                format!("tag `{tag}` does not exist in {repo}"),
+            )),
+            Err(error) => Err(Violation::new(
+                full,
+                "evidence-tag",
+                format!("could not read tag `{tag}` in {repo}: {error}"),
+            )),
+        },
+        None => Err(Violation::new(
+            full,
+            "tag-lineage",
+            "no GitHub reader; pass --repo <a checkout of the repo>",
+        )),
+    };
+    TagRead {
+        repo,
+        tag,
+        sha,
+        contains,
+    }
+}
+
 fn is_pr_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://github.com/") else {
         return false;
@@ -1439,6 +1509,7 @@ pub fn advance(
             file,
             repo,
             part: None,
+            by: &[],
         },
         &MergeGate::default(),
     )
@@ -1451,6 +1522,7 @@ pub struct Advance<'a> {
     pub file: Option<&'a Path>,
     pub repo: Option<&'a Path>,
     pub part: Option<&'a str>,
+    pub by: &'a [String],
 }
 
 pub fn advance_gated(
@@ -1466,6 +1538,7 @@ pub fn advance_gated(
         file,
         repo,
         part,
+        by,
     } = advance;
     let normalized;
     let to = if let Phase::Blocked(reason) = to {
@@ -1517,6 +1590,39 @@ pub fn advance_gated(
                 track.evidence.sha.as_deref(),
                 &standing,
             ))
+        });
+    let tag_read = (*to == Phase::Released && repo.is_none())
+        .then(|| store::load_unit(&root.join(&target.unit)).ok())
+        .flatten()
+        .and_then(|unit| {
+            if evidence_repos(repo, &unit, target)
+                .iter()
+                .any(|repo| repo.exists())
+            {
+                return None;
+            }
+            let step = target.step.as_ref().and_then(|step| unit.steps.get(step));
+            let track = match (&target.step, step, part) {
+                (None, _, _) => &unit.track,
+                (Some(_), Some(step), Some(part)) => step.parts.get(part)?,
+                (Some(_), Some(step), None) => &step.track,
+                _ => return None,
+            };
+            let github = track
+                .evidence
+                .pr
+                .as_deref()
+                .and_then(GithubRepo::of_pr)
+                .or_else(|| step.and_then(|step| step.github.clone()))?;
+            let tag = given.tag.as_deref()?.parse::<TagName>().ok()?;
+            let tag_only = Release::of_target(&full).is_some()
+                && matches!(track.resting(), Phase::Drafted | Phase::Launched);
+            let sha = if tag_only {
+                given.sha.as_ref()
+            } else {
+                track.evidence.sha.as_ref()
+            }?;
+            Some(read_tag(&full, gate.forge, github, tag, sha.clone()))
         });
     let _lock = lock(root)?;
     let campaign = store::load_campaign(root)?;
@@ -1672,6 +1778,8 @@ pub fn advance_gated(
     let resuming = matches!(track.state, Phase::Blocked(_)) && track.resting() == to;
     let (required, optional) = if resuming {
         (&[][..], &[][..])
+    } else if tag_only {
+        (&[Flag::Tag, Flag::Sha][..], &[Flag::Digest][..])
     } else {
         evidence_for(to, finish)
     };
@@ -1697,20 +1805,7 @@ pub fn advance_gated(
             ));
         }
     }
-    let repos: Vec<PathBuf> = match (repo, &target.step) {
-        (Some(repo), _) => vec![absolute(repo)],
-        (None, Some(step)) => unit
-            .steps
-            .get(step)
-            .map(|step| PathBuf::from(&step.worktree))
-            .into_iter()
-            .collect(),
-        (None, None) => unit
-            .steps
-            .values()
-            .map(|step| PathBuf::from(&step.worktree))
-            .collect(),
-    };
+    let repos = evidence_repos(repo, &unit, target);
     let mut evidence = given.clone();
     evidence.file = None;
     evidence.merged_at = read
@@ -1719,6 +1814,49 @@ pub fn advance_gated(
             Some(read.pr.as_str()) == given.pr.as_deref().or(track.evidence.pr.as_deref())
         })
         .and_then(|read| read.merged_at.clone());
+    evidence.superseded_by.clear();
+    if !by.is_empty() {
+        if *to != Phase::Superseded || target.step.is_none() || part.is_some() {
+            violations.push(Violation::new(
+                &full,
+                "superseded-by",
+                "--by applies only to a step moving to superseded",
+            ));
+        } else {
+            let units = plan::load_units(root)?;
+            for successor in by {
+                let successor = if successor.contains('/') {
+                    successor.clone()
+                } else {
+                    format!("{}/{successor}", target.unit)
+                };
+                match store::parse_target(&successor, true) {
+                    Err(message) => {
+                        violations.push(Violation::new(&full, "superseded-by", message))
+                    }
+                    Ok(target) => {
+                        let successor =
+                            format!("{}/{}", target.unit, target.step.unwrap_or_default());
+                        if successor == step_full {
+                            violations.push(Violation::new(
+                                &full,
+                                "superseded-by",
+                                "a step cannot supersede itself",
+                            ));
+                        } else if plan::step(&units, &successor).is_none() {
+                            violations.push(Violation::new(
+                                &full,
+                                "superseded-by",
+                                format!("{successor} is not declared; declare every successor with `cm init` first"),
+                            ));
+                        } else if !evidence.superseded_by.contains(&successor) {
+                            evidence.superseded_by.push(successor);
+                        }
+                    }
+                }
+            }
+        }
+    }
     if let Some(file) = file {
         match CampaignFile::resolve(root, file) {
             Ok(found) => {
@@ -1807,7 +1945,17 @@ pub fn advance_gated(
         .map(|repo| repo.display().to_string())
         .collect();
     let repos: Vec<PathBuf> = repos.into_iter().filter(|repo| repo.exists()).collect();
-    if needs_repo && repos.is_empty() {
+    let remote_repo = (*to == Phase::Released && repo.is_none() && repos.is_empty())
+        .then(|| {
+            track
+                .evidence
+                .pr
+                .as_deref()
+                .and_then(GithubRepo::of_pr)
+                .or_else(|| declared.as_ref().and_then(|step| step.github.clone()))
+        })
+        .flatten();
+    if needs_repo && repos.is_empty() && remote_repo.is_none() {
         let message = if gone.is_empty() {
             "no repository to resolve --sha or --tag in; pass --repo <a checkout of the repo>"
                 .to_owned()
@@ -1838,7 +1986,7 @@ pub fn advance_gated(
                             .sha
                             .as_deref()
                             .and_then(|old| git_commit(repo, old))
-                            .is_some_and(|old| crate::verdict::is_ancestor(repo, &old, &full_sha))
+                            .is_some_and(|old| crate::verdict::is_ancestor(repo, &old, &full_sha) == Some(true))
                     {
                         violations.push(Violation::new(
                             &full,
@@ -1851,6 +1999,7 @@ pub fn advance_gated(
                     }
                     evidence.sha = Some(full_sha);
                 }
+                None if hex && remote_repo.is_some() => {}
                 None => violations.push(Violation::new(
                     &full,
                     "evidence-sha",
@@ -1866,6 +2015,7 @@ pub fn advance_gated(
             }
         }
         if let Some(tag) = &given.tag
+            && remote_repo.is_none()
             && !repos
                 .iter()
                 .any(|repo| git_commit(repo, &format!("refs/tags/{tag}")).is_some())
@@ -1874,6 +2024,60 @@ pub fn advance_gated(
                 &full,
                 "evidence-tag",
                 format!("tag `{tag}` does not resolve; `git fetch --tags` first if CI made it, or pass --repo"),
+            ));
+        }
+    }
+    if *to == Phase::Released
+        && !resuming
+        && (tag_only || *track.resting() == Phase::Merged)
+        && let Some(tag) = &given.tag
+        && (remote_repo.is_some() || !repos.is_empty())
+    {
+        let sha = if tag_only {
+            evidence.sha.as_deref()
+        } else {
+            track.evidence.sha.as_deref()
+        };
+        if let Some(sha) = sha {
+            let contains = if let Some(repo) = &remote_repo {
+                match tag.parse::<TagName>() {
+                    Ok(tag) => tag_read
+                        .as_ref()
+                        .filter(|read| read.repo == *repo && read.tag == tag && read.sha == sha)
+                        .map(|read| read.contains.clone())
+                        .unwrap_or_else(|| Err(Violation::new(
+                            &full,
+                            "tag-lineage",
+                            "release evidence changed while reading GitHub; retry or pass --repo",
+                        ))),
+                    Err(message) => Err(Violation::new(&full, "evidence-tag", message)),
+                }
+            } else {
+                repos.iter().filter_map(|repo| {
+                    let sha = git_commit(repo, sha)?;
+                    let tag = git_commit(repo, &format!("refs/tags/{tag}"))?;
+                    crate::verdict::is_ancestor(repo, &sha, &tag)
+                }).reduce(|left, right| left || right)
+                    .ok_or_else(|| Violation::new(
+                        &full,
+                        "tag-lineage",
+                        "tag containment could not be read; pass --repo <a checkout of the repo>",
+                    ))
+            };
+            match contains {
+                Ok(true) => {}
+                Ok(false) => violations.push(Violation::new(
+                    &full,
+                    "tag-lineage",
+                    format!("tag `{tag}` does not contain commit {sha}"),
+                )),
+                Err(violation) => violations.push(violation),
+            }
+        } else if !tag_only {
+            violations.push(Violation::new(
+                &full,
+                "tag-lineage",
+                "released needs a recorded merge SHA to check tag containment",
             ));
         }
     }

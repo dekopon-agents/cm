@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::commands;
 use crate::epoch::{self, Status};
@@ -179,7 +179,7 @@ enum Commands {
         /// <NN-name>/<unit> or <NN-name>/<unit>/<step>
         #[arg(value_parser = any_target)]
         target: Target,
-        /// pr-open, merged, released, deployed, done or blocked:<reason>. An owner-lane or study step moves to done, with --evidence, from drafted or launched.
+        /// pr-open, merged, released, deployed, done, superseded or blocked:<reason>. An owner-lane or study step moves to done, with --evidence, from drafted or launched.
         state: Phase,
         /// A commit: the PR head for pr-open, the merge commit for merged.
         #[arg(long)]
@@ -193,9 +193,12 @@ enum Commands {
         /// sha256:<hex> of the released or deployed artifact.
         #[arg(long)]
         digest: Option<String>,
-        /// A non-empty file in the campaign folder, outside `.cm/`, that shows an owner-lane or study step is done (done).
+        /// A non-empty file in the campaign folder, outside `.cm/`, that shows a step is done or superseded.
         #[arg(long, value_name = "PATH")]
         evidence: Option<PathBuf>,
+        /// Declared successors of a superseded step, comma-separated; short names resolve in its unit.
+        #[arg(long, value_delimiter = ',', value_name = "STEP[,STEP…]")]
+        by: Vec<String>,
         /// The repository --sha and --tag resolve in; defaults to the step worktrees.
         #[arg(long, value_name = "PATH")]
         repo: Option<PathBuf>,
@@ -735,6 +738,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             tag,
             digest,
             evidence: file,
+            by,
             repo,
             head,
             ci_verified,
@@ -746,8 +750,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 pr: pr.clone(),
                 tag: tag.clone(),
                 digest: digest.clone(),
-                file: None,
-                merged_at: None,
+                ..Evidence::default()
             };
             let file = file.as_deref().map(|file| under_root(cli, file));
             let forge = crate::forge::Gh::default();
@@ -767,6 +770,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                     file: file.as_deref(),
                     repo: repo.as_deref(),
                     part: part.as_deref(),
+                    by,
                 },
                 &gate,
             )
@@ -1009,6 +1013,17 @@ fn name(command: &Commands) -> &'static str {
 
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Commands::Advance { state, by, .. } = &cli.command
+        && !by.is_empty()
+        && *state != Phase::Superseded
+    {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--by applies only to superseded",
+            )
+            .exit();
+    }
     let command = name(&cli.command);
     let outcome = run(&cli, &System).or_else(|error| {
         if let Some(large) = error.downcast_ref::<InputTooLarge>() {

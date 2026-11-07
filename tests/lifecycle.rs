@@ -22,6 +22,11 @@ mod kickoff_fixture;
 #[path = "support/lifecycle.rs"]
 mod lifecycle_fixture;
 
+#[path = "support/forge.rs"]
+mod forge_fixture;
+#[path = "support/resume.rs"]
+mod resume_fixture;
+
 use campaign_fixture::{Campaign, campaign, git, repo};
 
 struct Fake {
@@ -125,7 +130,7 @@ fn init_never_overwrites_and_adopts_what_lints_clean() {
         cm::templates::LOOP_WITHHELD,
         &template[end..]
     )
-    .replace("Nothing has shipped yet.", "Our own words.");
+    .replace("No releases recorded.", "Our own words.");
     fs::write(root.join("RESUME.md"), &resume).unwrap();
     fs::write(
         root.join("OWNER-QUEUE.md"),
@@ -325,6 +330,29 @@ fn merged_releases_refuse_an_unrelated_merge_sha() {
 }
 
 #[test]
+fn merged_releases_refuse_unreadable_ancestry() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let (repo, first, later) =
+        campaign_fixture::repo_with_missing_history(c.root.parent().unwrap());
+    let step = "00-release/cm/1.0.0";
+    c.merged_step(&host, step, Lane::Coordinator, &repo, &first);
+    let before = c.files();
+    let outcome = advance(
+        &host,
+        &c,
+        step,
+        "merged",
+        Evidence {
+            sha: Some(later),
+            ..Evidence::default()
+        },
+    );
+    assert_eq!(rules(&outcome), ["merge-lineage"]);
+    assert_eq!(c.files(), before);
+}
+
+#[test]
 fn merged_non_release_steps_refuse_a_descendant_merge_sha() {
     let host = Fake::at("2026-10-08T07:00:00Z");
     let c = campaign(&host);
@@ -387,6 +415,7 @@ fn github_merge_time_appears_in_state_and_close_accounting() {
                 file: None,
                 repo: Some(&repo),
                 part: None,
+                by: &[],
             },
             &commands::MergeGate {
                 forge: Some(&forge),
@@ -497,6 +526,147 @@ fn a_step_walks_from_launch_to_done() {
         journal.contains("## 2026-10-08T07:00Z — advance 01-first/alpha/BUILD: deployed → done\n")
     );
     assert_clean(&c.root);
+}
+
+#[test]
+fn a_release_tag_must_contain_the_recorded_merge() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let (repo, sha, _) = campaign_fixture::release_repo(c.root.parent().unwrap());
+    unit_with_step(&c, &host, "Build the thing.\n");
+    let step = "01-first/alpha/BUILD";
+    assert!(
+        commands::launch(&host, &c.root, &target(step), Some(&repo))
+            .unwrap()
+            .ok()
+    );
+    assert!(
+        advance(
+            &host,
+            &c,
+            step,
+            "pr-open",
+            Evidence {
+                pr: Some("https://github.com/o/r/pull/7".into()),
+                sha: Some(sha.clone()),
+                ..Evidence::default()
+            }
+        )
+        .ok()
+    );
+    assert!(
+        advance(
+            &host,
+            &c,
+            step,
+            "merged",
+            Evidence {
+                sha: Some(sha),
+                ..Evidence::default()
+            }
+        )
+        .ok()
+    );
+    let before = c.files();
+    let refused = advance(
+        &host,
+        &c,
+        step,
+        "released",
+        Evidence {
+            tag: Some("v0.1.0".into()),
+            ..Evidence::default()
+        },
+    );
+    assert_eq!(rules(&refused), ["tag-lineage"]);
+    assert_eq!(c.files(), before);
+    fs::rename(repo.join(".git"), repo.join("unreadable-git")).unwrap();
+    let unread = advance(
+        &host,
+        &c,
+        step,
+        "released",
+        Evidence {
+            tag: Some("v0.2.0".into()),
+            ..Evidence::default()
+        },
+    );
+    assert_eq!(rules(&unread), ["evidence-tag", "tag-lineage"]);
+    assert_eq!(
+        unread
+            .violations
+            .iter()
+            .find(|violation| violation.rule == "tag-lineage")
+            .unwrap()
+            .message,
+        "tag containment could not be read; pass --repo <a checkout of the repo>"
+    );
+    assert_eq!(c.files(), before);
+    fs::rename(repo.join("unreadable-git"), repo.join(".git")).unwrap();
+    let released = advance(
+        &host,
+        &c,
+        step,
+        "released",
+        Evidence {
+            tag: Some("v0.2.0".into()),
+            ..Evidence::default()
+        },
+    );
+    assert!(released.ok(), "{:?}", released.violations);
+}
+
+#[test]
+fn a_tag_only_release_requires_a_sha_contained_in_the_tag() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    for launched in [false, true] {
+        let c = campaign(&host);
+        let (repo, merged, unshipped) = campaign_fixture::release_repo(c.root.parent().unwrap());
+        let step = "00-release/widget/0.2.0";
+        assert!(
+            commands::declare(
+                &host,
+                &c.root.join(step),
+                &commands::Declaration {
+                    lane: Some(Lane::Coordinator),
+                    ..commands::Declaration::default()
+                }
+            )
+            .unwrap()
+            .ok()
+        );
+        c.kickoff(step, "Cut the release.\n");
+        if launched {
+            assert!(
+                commands::launch(&host, &c.root, &target(step), Some(&repo))
+                    .unwrap()
+                    .ok()
+            );
+        }
+        let release = |sha| {
+            commands::advance(
+                &host,
+                &c.root,
+                &target(step),
+                &Phase::Released,
+                &Evidence {
+                    sha,
+                    tag: Some("v0.2.0".into()),
+                    ..Evidence::default()
+                },
+                None,
+                Some(&repo),
+            )
+            .unwrap()
+        };
+        let before = c.files();
+        assert_eq!(rules(&release(None)), ["evidence-missing"]);
+        assert_eq!(rules(&release(Some(unshipped))), ["tag-lineage"]);
+        assert_eq!(c.files(), before);
+        let released = release(Some(merged[..10].into()));
+        assert!(released.ok(), "{:?}", released.violations);
+        assert_eq!(released.fields["evidence"]["sha"], merged);
+    }
 }
 
 #[test]
@@ -1459,7 +1629,7 @@ fn resolving_or_withdrawing_the_last_watch_keeps_a_release_on_the_shipping_ladde
     let host = Fake::at("2026-10-08T07:00:00Z");
     for withdraw in [false, true] {
         let c = campaign(&host);
-        let (repo, _) = repo(c.root.parent().unwrap());
+        let (repo, sha) = repo(c.root.parent().unwrap());
         git(&repo, &["tag", "v1.0.0"]);
         let step = "00-release/cm/1.0.0";
         let target = target(step);
@@ -1482,6 +1652,7 @@ fn resolving_or_withdrawing_the_last_watch_keeps_a_release_on_the_shipping_ladde
             &target,
             &Phase::Released,
             &Evidence {
+                sha: Some(sha),
                 tag: Some("v1.0.0".into()),
                 ..Evidence::default()
             },
@@ -1530,4 +1701,322 @@ fn resolving_or_withdrawing_the_last_watch_keeps_a_release_on_the_shipping_ladde
         let unit = store::load_unit(&c.root.join(&target.unit)).unwrap();
         assert_eq!(unit.steps["1.0.0"].track.state, Phase::Done);
     }
+}
+
+#[test]
+fn sync_rewrites_only_resume_status_and_is_idempotent() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let forge = c.resume_releases(&host);
+    let path = c.root.join("RESUME.md");
+    fs::write(&path, resume_fixture::resume_text("Stale status.\r\n")).unwrap();
+
+    let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    let status = "| State | Steps |\n|---|---|\n| drafted | 2 |\n| released | 2 |\n| deployed | 1 |\n| done | 1 |\n| superseded | 1 |\n| blocked | 1 |\n\n| Release line | Released | Deployed |\n|---|---|---|\n| alpha | 2.0.0 | — |\n| gizmo | 3.0.0 | 3.0.0 |\n| widget | 1.10.0 | 1.9.0 |\n\nEpoch status: working.\n";
+    let expected = resume_fixture::resume_text(status).into_bytes();
+    assert_eq!(fs::read(&path).unwrap(), expected);
+    let later = Fake::at("2026-10-08T08:00:00Z");
+    let out = cm::sync::sync(&later, &forge, &c.root).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    assert_eq!(fs::read(&path).unwrap(), expected);
+}
+
+#[test]
+fn sync_leaves_resume_without_markers_unchanged() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let text = resume_fixture::resume_text("Owner status.\r\n")
+        .replace("<!-- cm:status -->\r\n", "")
+        .replace("<!-- cm:status-end -->\r\n", "");
+    let path = c.root.join("RESUME.md");
+    fs::write(&path, &text).unwrap();
+    let out = cm::sync::sync(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
+    assert_clean(&c.root);
+}
+
+#[test]
+fn sync_renders_empty_state_and_current_epoch_status() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let path = c.root.join("RESUME.md");
+    fs::write(&path, resume_fixture::resume_text("Stale.\n")).unwrap();
+    for epoch in [
+        None,
+        Some("OPEN"),
+        Some("PLANNING"),
+        Some("WORKING"),
+        Some("CLOSED"),
+    ] {
+        if let Some(epoch) = epoch {
+            fs::write(
+                c.root.join("EPOCH.md"),
+                format!("---\nstatus: {epoch}\n---\n"),
+            )
+            .unwrap();
+        }
+        let out = cm::sync::sync(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
+        assert!(out.ok(), "{:?}", out.violations);
+        let epoch = epoch.unwrap_or("unknown").to_lowercase();
+        let status = format!(
+            "| State | Steps |\n|---|---|\n| — | 0 |\n\nNo releases recorded.\n\nEpoch status: {epoch}.\n"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            resume_fixture::resume_text(&status).as_bytes()
+        );
+    }
+}
+
+#[test]
+fn lint_reports_malformed_resume_status_markers_and_sync_preserves_them() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let original = resume_fixture::resume_text("Old status.\n");
+    let outside = original
+        .replace("<!-- cm:status -->\r\n", "")
+        .replace("<!-- cm:status-end -->\r\n", "")
+        + "\r\n<!-- cm:status -->\r\nOld status.\r\n<!-- cm:status-end -->\r\n";
+    for text in [
+        original.replace("<!-- cm:status -->\r\n", ""),
+        original.replace("<!-- cm:status-end -->\r\n", ""),
+        original
+            .replace("cm:status-end", "cm:temporary")
+            .replace("cm:status", "cm:status-end")
+            .replace("cm:temporary", "cm:status"),
+        original.replace(
+            "<!-- cm:status -->",
+            "<!-- cm:status -->\n<!-- cm:status -->",
+        ),
+        outside,
+    ] {
+        fs::write(c.root.join("RESUME.md"), &text).unwrap();
+        let out = lint(&c.root).unwrap();
+        assert_eq!(rules(&out), vec!["resume-status"], "{:?}", out.violations);
+        assert_eq!(out.violations[0].path, "RESUME.md");
+        let out = cm::sync::sync(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
+        assert!(out.ok(), "{:?}", out.violations);
+        assert_eq!(fs::read(c.root.join("RESUME.md")).unwrap(), text.as_bytes());
+    }
+}
+
+#[test]
+fn close_and_epoch_closed_refresh_resume_without_sync() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    c.resume_working_epoch();
+    let path = c.root.join("RESUME.md");
+    fs::write(&path, resume_fixture::resume_text("Stale status.\n")).unwrap();
+    let out = cm::sync::sync(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    let working = fs::read_to_string(&path).unwrap();
+    assert!(working.contains("Epoch status: working.\n"));
+    let expected = working.replace("Epoch status: working.", "Epoch status: closed.");
+
+    let out = commands::close(&host, &c.root).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+
+    // The epoch transition must refresh stale generated content itself, too.
+    fs::write(&path, &working).unwrap();
+    let out = cm::epoch::epoch(&host, &c.root, cm::epoch::Status::Closed, None, None).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+}
+
+#[test]
+fn sync_and_lint_ignore_fenced_marker_examples() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    for fence in ["```", "~~~"] {
+        for real_span in [false, true] {
+            let c = campaign(&host);
+            let status = real_span.then_some("Stale status.\n");
+            let text = resume_fixture::resume_with_marker_example(fence, status);
+            let path = c.root.join("RESUME.md");
+            fs::write(&path, &text).unwrap();
+            assert_clean(&c.root);
+            let out = cm::sync::sync(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
+            assert!(out.ok(), "{:?}", out.violations);
+            let expected = if real_span {
+                resume_fixture::resume_with_marker_example(
+                    fence,
+                    Some(
+                        "| State | Steps |\n|---|---|\n| — | 0 |\n\nNo releases recorded.\n\nEpoch status: unknown.\n",
+                    ),
+                )
+            } else {
+                text
+            };
+            assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
+fn superseded_records_one_or_two_successors_in_state_journal_and_card() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    for (by, successors) in [
+        ("NEW", vec!["01-first/alpha/NEW"]),
+        (
+            "NEW,02-next/beta/NEXT",
+            vec!["01-first/alpha/NEW", "02-next/beta/NEXT"],
+        ),
+        (
+            "NEW,01-first/alpha/NEW,02-next/beta/NEXT",
+            vec!["01-first/alpha/NEW", "02-next/beta/NEXT"],
+        ),
+    ] {
+        let c = campaign(&host);
+        c.supersession(&host);
+        let before = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .current_dir(&c.root)
+            .args([
+                "--json",
+                "advance",
+                "01-first/alpha/OLD",
+                "superseded",
+                "--evidence",
+                "replacement.md",
+                "--by",
+                by,
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            result["evidence"]["superseded_by"],
+            serde_json::json!(successors)
+        );
+
+        let dir = c.root.join("01-first/alpha");
+        let state = store::load_unit(&dir).unwrap();
+        let retired = &state.steps["OLD"].track;
+        assert_eq!(state.schema, cm::state::SCHEMA);
+        assert_eq!(retired.state, Phase::Superseded);
+        assert_eq!(retired.evidence.superseded_by, successors);
+        let moved = state.history.last().unwrap();
+        assert_eq!(moved.evidence.superseded_by, successors);
+        let round_trip: UnitState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(round_trip, state);
+        let summary = format!(
+            "file replacement.md; superseded by {}",
+            successors.join(", ")
+        );
+        let rendered = fs::read_to_string(dir.join("STATE.md")).unwrap();
+        assert_eq!(
+            rendered
+                .lines()
+                .find(|line| line.starts_with("| OLD |"))
+                .unwrap(),
+            format!(
+                "| OLD | superseded | {} | 0 | — | {summary} |",
+                retired.since
+            )
+        );
+        let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+        assert_eq!(
+            journal.strip_prefix(&before).unwrap().trim_start(),
+            format!(
+                "{}\n\n- evidence: {summary}\n",
+                result["journal"].as_str().unwrap()
+            )
+        );
+
+        let synced = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .current_dir(&c.root)
+            .args(["--json", "sync"])
+            .output()
+            .unwrap();
+        assert!(synced.status.success(), "{synced:?}");
+        let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+        let links: Vec<_> = successors.iter().map(|step| format!("`{step}`")).collect();
+        assert_eq!(
+            card.lines()
+                .find(|line| line.starts_with("- `01-first/alpha/OLD`"))
+                .unwrap(),
+            format!("- `01-first/alpha/OLD` superseded by {}", links.join(", "))
+        );
+    }
+}
+
+#[test]
+fn superseded_refuses_undeclared_self_or_invalid_successors_without_writing() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    c.supersession(&host);
+    let before = c.files();
+    for by in [
+        "NEW,MISSING",
+        "03-absent/unit/MISSING",
+        "OLD",
+        "01-first/alpha/OLD",
+        "NEW,01-first/alpha/OLD",
+        "01-first/alpha",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .current_dir(&c.root)
+            .args([
+                "--json",
+                "advance",
+                "01-first/alpha/OLD",
+                "superseded",
+                "--evidence",
+                "replacement.md",
+                "--by",
+                by,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{by}: {output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["violations"][0]["rule"], "superseded-by", "{result}");
+        assert_eq!(c.files(), before, "{by}");
+    }
+}
+
+#[test]
+fn by_is_a_usage_error_outside_superseded_and_does_not_replace_evidence() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    c.supersession(&host);
+    let before = c.files();
+    for state in [
+        "drafted",
+        "launched",
+        "pr-open",
+        "merged",
+        "released",
+        "deployed",
+        "done",
+        "blocked:waiting",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .current_dir(&c.root)
+            .args(["advance", "01-first/alpha/OLD", state, "--by", "NEW"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{state}: {output:?}");
+        assert_eq!(c.files(), before, "{state}");
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .current_dir(&c.root)
+        .args([
+            "--json",
+            "advance",
+            "01-first/alpha/OLD",
+            "superseded",
+            "--by",
+            "NEW",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["violations"][0]["rule"], "evidence-missing");
+    assert_eq!(c.files(), before);
 }

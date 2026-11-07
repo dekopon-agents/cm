@@ -33,6 +33,30 @@ pub fn campaign(host: &dyn Host) -> Campaign {
 }
 
 impl Campaign {
+    pub fn supersession(&self, host: &dyn Host) {
+        for target in [
+            "01-first/alpha/OLD",
+            "01-first/alpha/NEW",
+            "02-next/beta/NEXT",
+        ] {
+            let declared = commands::declare(
+                host,
+                &self.root.join(target),
+                &commands::Declaration {
+                    lane: Some(cm::state::Lane::Codex),
+                    ..commands::Declaration::default()
+                },
+            )
+            .unwrap();
+            assert!(declared.ok(), "{:?}", declared.violations);
+        }
+        fs::write(
+            self.root.join("replacement.md"),
+            "Replaced by the declared work.\n",
+        )
+        .unwrap();
+    }
+
     pub fn files(&self) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
         fn visit(
             root: &Path,
@@ -136,4 +160,34 @@ pub fn repo(dir: &Path) -> (PathBuf, String) {
     git(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
     let sha = git(&repo, &["rev-parse", "HEAD"]);
     (repo, sha)
+}
+
+pub fn release_repo(dir: &Path) -> (PathBuf, String, String) {
+    let (repo, _) = repo(dir);
+    git(&repo, &["tag", "v0.1.0"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "merge"]);
+    let merged = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "release"]);
+    git(&repo, &["tag", "-a", "v0.2.0", "-m", "release"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "unshipped"]);
+    let unshipped = git(&repo, &["rev-parse", "HEAD"]);
+    (repo, merged, unshipped)
+}
+
+pub fn repo_with_missing_history(dir: &Path) -> (PathBuf, String, String) {
+    let (repo, first) = repo(dir);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "middle"]);
+    let middle = git(&repo, &["rev-parse", "HEAD"]);
+    git(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "later merge"],
+    );
+    let later = git(&repo, &["rev-parse", "HEAD"]);
+    fs::remove_file(
+        repo.join(".git/objects")
+            .join(&middle[..2])
+            .join(&middle[2..]),
+    )
+    .unwrap();
+    (repo, first, later)
 }
