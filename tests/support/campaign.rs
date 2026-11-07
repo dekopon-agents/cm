@@ -161,3 +161,33 @@ pub fn repo(dir: &Path) -> (PathBuf, String) {
     let sha = git(&repo, &["rev-parse", "HEAD"]);
     (repo, sha)
 }
+
+pub fn release_repo(dir: &Path) -> (PathBuf, String, String) {
+    let (repo, _) = repo(dir);
+    git(&repo, &["tag", "v0.1.0"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "merge"]);
+    let merged = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "release"]);
+    git(&repo, &["tag", "-a", "v0.2.0", "-m", "release"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "unshipped"]);
+    let unshipped = git(&repo, &["rev-parse", "HEAD"]);
+    (repo, merged, unshipped)
+}
+
+pub fn repo_with_missing_history(dir: &Path) -> (PathBuf, String, String) {
+    let (repo, first) = repo(dir);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "middle"]);
+    let middle = git(&repo, &["rev-parse", "HEAD"]);
+    git(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "later merge"],
+    );
+    let later = git(&repo, &["rev-parse", "HEAD"]);
+    fs::remove_file(
+        repo.join(".git/objects")
+            .join(&middle[..2])
+            .join(&middle[2..]),
+    )
+    .unwrap();
+    (repo, first, later)
+}

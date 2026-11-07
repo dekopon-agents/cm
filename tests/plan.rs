@@ -1977,6 +1977,7 @@ fn a_tag_only_release_releases_a_merged_member_it_contains() {
         &parse_target("00-release/cm/0.7.0", false).unwrap(),
         &Phase::Released,
         &Evidence {
+            sha: Some(git(&repo, &["rev-parse", "HEAD"])),
             tag: Some("v0.7.0".into()),
             ..Evidence::default()
         },
@@ -2017,6 +2018,7 @@ fn tag_only_member(host: &Fake, github: Option<&str>) -> (Campaign, FakeForge) {
         &parse_target("00-release/cm/0.7.0", false).unwrap(),
         &Phase::Released,
         &Evidence {
+            sha: Some(git(&repo, &["rev-parse", "HEAD"])),
             tag: Some("v0.7.0".into()),
             ..Evidence::default()
         },
