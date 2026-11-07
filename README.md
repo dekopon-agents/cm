@@ -51,7 +51,7 @@ error.
 | Command | Contract |
 |---|---|
 | `cm init [DIR]` | Writes `RESUME.md`, `JOURNAL.md`, `LIMITS.toml`, `OWNER-QUEUE.md` and `.cm/state.json` from templates embedded in the binary. Never overwrites: in an existing folder it writes only what is missing and adopts each existing file as the baseline once it lints clean. `cm init <NN-name>/<unit>` inside a campaign writes the unit's `.cm/state.json` and its rendered `STATE.md`. |
-| `cm init <NN-name>/<unit>/<step> --lane L [--after A]… [--study] [--github OWNER/NAME] [--tag PATTERN] [--kickoff-file F]` | Declares a step `drafted` in lane `pi`, `codex`, `claude-cloud`, `fable`, `owner` or `coordinator` (a step the coordinator session runs itself), creating the unit if needed. `--study` marks a step that ships no PR: like an `owner`-lane step it finishes with `cm advance <step> done --evidence <path>` (see [Finishing](#finishing)). Each `--after` is one gate (see [Order](#order)); every step or release it names must already be declared, so the order has no cycles. `--kickoff-file F` writes `kickoff.md` from a non-empty file of at most 1 MiB (`-` reads stdin), never replacing an existing one, and journals one line. `--github` and `--tag` declare a release step's repository and tag (see [Releases](#releases)). A relative folder resolves against `-C` when it is given. A declaration is changed only by `cm amend`: a different one is `step-declared`, and the same one again repairs what an interrupted declaration left half written (the step folder, a missing kickoff when `--kickoff-file` is given, a missing or stale `STATE.md`) without replaying the journal, or else is a no-op. |
+| `cm init <NN-name>/<unit>/<step> --lane L [--after A]… [--study] [--github OWNER/NAME] [--tag PATTERN] [--kickoff-file F]` | Declares a step `drafted` in lane `pi`, `codex`, `claude-cloud`, `fable`, `owner` or `coordinator` (a step the coordinator session runs itself), creating the unit if needed. `--study` marks a step that ships no PR: like an `owner`-lane step it finishes with `cm advance <step> done --evidence <path>` (see [Finishing](#finishing)). Each `--after` is one gate, including `pin:<step>@<sha>` for a recorded head (see [Order](#order)); every step or release it names must already be declared, so the order has no cycles. `--kickoff-file F` writes `kickoff.md` from a non-empty file of at most 1 MiB (`-` reads stdin), never replacing an existing one, and journals one line. `--github` and `--tag` declare a release step's repository and tag (see [Releases](#releases)). A relative folder resolves against `-C` when it is given. A declaration is changed only by `cm amend`: a different one is `step-declared`, and the same one again repairs what an interrupted declaration left half written (the step folder, a missing kickoff when `--kickoff-file` is given, a missing or stale `STATE.md`) without replaying the journal, or else is a no-op. |
 | `cm next [<NN-name>/<unit>/<step>] [--lane L]` | Numbers every item with its next cm command (`command` on each JSON item), shared with CARD.md’s Next, Waiting and Blocked sections; named inputs appear as quoted placeholders (see [Order](#order)). Lists the declared `drafted` steps whose every `--after` is met and whose folder has `kickoff.md` (`steps`), the rest with what each waits on (`waiting`), and the merged release steps that wait for their tag (`tags`). It also flags (`stalled`) each `codex`-lane step at `launched` with no PR whose attempt was claimed more than `codex_stall_hours` ago (LIMITS.toml, default 2; the launch stamp for a step launched without an attempt), and (`dirty`) each `pr-open` step whose PR the last `cm sync` saw with `mergeable_state: dirty`; neither is a violation. Nothing is next while `LIMITS.toml` is paused. `tags` is in version order. Given a step, it refuses (exit 1) unless that step is next, naming every unmet gate, and lists a refused step under `waiting`, never `steps`. |
 | `cm sync` | Reads GitHub with read-only `gh api` calls, each killed after 60 seconds, without holding `.cm/lock`; then it takes the lock, reloads the state and applies the moves that still hold. It moves steps along: `pr-open` → `merged` when the PR merged (the merge commit and GitHub's optional `merged_at` are the evidence; `since` remains the sync time), a release step `merged` → `released` when its declared tag exists in its repository and contains the prep merge, any other step `merged` → `released` by the first release of its repository whose tag contains its merge, and `released` → `deployed` once a `deployed` release of the same line contains its merge. One journal entry lists the moves and new notifications; a sync with neither journals nothing. It refreshes the marked status span in `RESUME.md` from state (step counts, newest released and deployed version per release line, and epoch status), preserving all owner prose and silently leaving files without markers alone. It rewrites `CARD.md`, whose first line is `Last run: <stamp>`, and `.cm/pulls.json` with what it saw of each open PR (head, `mergeable_state`; a PR GitHub did not answer for keeps its last observation and stamp while its step rests at `pr-open` on it), and reports `stalled` and `dirty` as `cm next` does. A `codex`-lane step whose PR merged moves to `merged` only when its merge gate holds at the PR's head; otherwise it stays `pr-open` and each unmet condition is a `merge-gate` violation. A PR closed unmerged (`pr-closed`) or an observation `gh` could not make (`sync-unknown`) exits 1 after the rest is applied. |
 | `cm epoch planning\|working\|closed [--skill-revision R] [--plan-revision S]` | Moves `EPOCH.md`'s front matter one status along `OPEN → PLANNING → WORKING → CLOSED`, stamps `planning_started_at`, `working_started_at` or `closed_at` with the date, sets the pins it is given, journals the move, and refreshes RESUME.md’s generated status span. It refuses a null pin: PLANNING needs `skill_revision`, WORKING and CLOSED also `approved_plan_revision`. `closed` follows `cm close`. |
@@ -213,7 +213,7 @@ the tag it was declared with (`release-tag`), and its `pr-open --pr` must be in 
 ### Order
 
 `cm advance <step> blocked:until:<condition>` records a checkable block. Conditions
-are the same as `--after` (`<step>`, `pr-open:<step>`, `tag:<line>@<version>`,
+are the state gates from `--after` (`<step>`, `pr-open:<step>`, `tag:<line>@<version>`,
 `deployed:<line>@<version>`), plus `epoch:WORKING` and `owner-queue:<n>` (item
 heading removed from OWNER-QUEUE.md). `cm next` lists satisfied blocks under
 `unblock now` (`unblock_now` in JSON), with a numbered
@@ -231,8 +231,20 @@ met. `--after` takes:
 |---|---|
 | `<step>` or `<NN-name>/<unit>/<step>` | that step is `merged` or later |
 | `pr-open:<step>` | that step is `pr-open` or later (a chain that builds on an open PR) |
+| `pin:<step>@<sha>` | that step's recorded head matches `<sha>` (7 to 40 hex digits, case-insensitive prefix matching as for pinned evidence) |
 | `tag:<line>@<version>` | the release step `00-release/<line>/<version>` is `released` or later |
 | `deployed:<line>@<version>` | that release step is `deployed` or later |
+
+A pin uses the latest synced open PR head, which sync also saves as the step's recorded SHA.
+After merge, that SHA is the merge commit; a pin to the old PR head becomes stale when
+those commits differ.
+Drafted dependents wait on their pin before launch. When the recorded commit differs or the
+source is superseded, `cm next` and CARD list launched and PR-open dependents under `waiting`
+as `stale pin`, with a recheck command; `cm lint` warns `pin-unmet` in those two states.
+Named `cm next` keeps that warning alongside any pending fresh review. Blocked dependents
+and dependents at merged or later, done or superseded have no pin warning. A head that has
+never been recorded is reported as `head not recorded`. A multipart step has no single head to pin.
+Pins are refused in `known-red --until` and `blocked:until:`.
 
 A step or `pr-open:` gate on an `owner`-lane or study step, or a non-release `coordinator`-lane step
 without a recorded PR, SHA or declared parts, is met only when that step is `done`.
@@ -277,10 +289,11 @@ successors are recorded once, in the order given. `--by` is optional for retirem
 named successor, and is a usage error with any state other than `superseded`. `--evidence`
 remains required. Superseding meets no gate; amend consumers to name the replacement work.
 
-cm 0.10 raises SCHEMA from 4 to 5 for successor references and optional merge times. It writes
-every unit state, and a new campaign state, as schema 5. Older state remains readable; missing
-successor references default to an empty list and missing merge times remain absent. Upgrade
-every reader before writing shared state with cm 0.10.
+cm 0.10 raises SCHEMA from 4 to 5 for persisted pin dependency gates and `superseded_by`
+successor references, and optional merge times. It writes every unit state, and a new campaign state, as schema 5.
+Schema 1 through 4 state remains readable; missing successor references default to an empty
+list and missing merge times remain absent. cm 0.9 refuses schema 5 as newer state. Upgrade every reader before writing shared
+state with cm 0.10.
 
 cm 0.9 raises SCHEMA from 3 to 4 for watch withdrawal and writes every unit state, and a new
 campaign state, as schema 4. Units written by 0.9 cannot be read by cm 0.8.x; upgrade every
@@ -441,8 +454,8 @@ The gate's flags on any other move are `evidence-unexpected`. Steps in other lan
 
 `cm known-red <step> --commit SHA --check NAME --reason T --owner WHO --until A` lets (c) accept
 one failing check at one commit. In this form every field is required: the commit is all 40 hex digits and must
-be the head of a PR the step (or one of its parts) records; `--until` is a gate as `--after` takes
-it, naming a declared step or release, and must not already hold. cm reads GitHub before it
+be the head of a PR the step (or one of its parts) records; `--until` is a state gate as `--after` takes
+it (excluding `pin:`), naming a declared step or release, and must not already hold. cm reads GitHub before it
 records the exception and refuses one whose check is absent, is anything but `failure` (an
 infrastructure failure: cancelled, timed out, never run), or did not also fail at the PR's base
 (green there is a regression this change made; absent, pending or unread there may be one). The merge gate, in `cm advance` and `cm sync`, applies the same
