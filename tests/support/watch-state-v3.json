@@ -1,0 +1,41 @@
+{
+  "schema": 3,
+  "kind": "unit",
+  "unit": "01-a/u",
+  "state": "drafted",
+  "since": "2026-10-26T08:00Z",
+  "steps": {
+    "check": {
+      "state": "drafted",
+      "since": "2026-10-26T08:00Z",
+      "lane": "pi",
+      "launches": 0,
+      "watches": [
+        {
+          "id": 1,
+          "signal": "log:open",
+          "deadline": "2026-10-29T06:00Z",
+          "added": "2026-10-26T08:00Z"
+        },
+        {
+          "id": 2,
+          "signal": "log:resolved",
+          "deadline": "2026-10-29T06:00Z",
+          "added": "2026-10-26T08:00Z",
+          "resolved": {
+            "at": "2026-10-26T09:00Z",
+            "evidence": "01-a/u/check/kickoff.md"
+          }
+        },
+        {
+          "id": 3,
+          "signal": "log:expired",
+          "deadline": "2026-10-27T06:00Z",
+          "added": "2026-10-26T08:00Z",
+          "expired": "2026-10-27T07:00Z"
+        }
+      ]
+    }
+  },
+  "history": []
+}

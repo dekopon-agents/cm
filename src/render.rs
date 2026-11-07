@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use jiff::Timestamp;
+
 use crate::plan::{Next, Units};
 use crate::state::{Lane, Phase, Step, UnitState, Watch, WatchStatus, Work};
 use crate::sync::Moved;
@@ -169,12 +171,9 @@ fn holds(name: &str, step: &Step) -> Vec<String> {
 fn watch_record(name: &str, watch: &Watch) -> String {
     let status = match (&watch.withdrawn, &watch.resolved, &watch.expired) {
         (Some(at), _, _) => format!("withdrawn {at}"),
-        (None, Some(resolved), _) => format!(
-            "resolution recorded {} by {}",
-            resolved.at, resolved.evidence
-        ),
-        (None, None, Some(at)) => format!("expiry recorded {at}: unresolved"),
-        (None, None, None) => "unresolved".to_owned(),
+        (None, Some(resolved), _) => format!("resolved {} by {}", resolved.at, resolved.evidence),
+        (None, None, Some(at)) => format!("expired: unresolved since {at}"),
+        (None, None, None) => "open".to_owned(),
     };
     format!(
         "{name}#{}: watch {} by {}, {status}",
@@ -200,14 +199,87 @@ fn signal_preview(watch: &Watch) -> String {
     preview
 }
 
+fn watch_summary(root: &std::path::Path, now: Timestamp, units: &Units) -> Vec<String> {
+    let mut counts = [0usize; 3];
+    let mut qualifying = Vec::new();
+    for (unit, state) in units {
+        for (name, step) in &state.steps {
+            if step.track.state.is_final() {
+                continue;
+            }
+            for watch in &step.watches {
+                let status = watch.status(now, root);
+                let (group, instant) = match status {
+                    WatchStatus::Open => (0, crate::plan::instant(&watch.deadline)),
+                    WatchStatus::Expired => (
+                        1,
+                        watch
+                            .expired
+                            .as_deref()
+                            .and_then(crate::plan::instant)
+                            .or_else(|| crate::plan::instant(&watch.deadline)),
+                    ),
+                    WatchStatus::Withdrawn => {
+                        let Some(at) = watch.withdrawn.as_deref().and_then(crate::plan::instant)
+                        else {
+                            continue;
+                        };
+                        if at > now
+                            || now.duration_since(at) > jiff::SignedDuration::from_secs(24 * 3600)
+                        {
+                            continue;
+                        }
+                        (2, Some(at))
+                    }
+                    WatchStatus::Resolved => continue,
+                };
+                counts[group] += 1;
+                qualifying.push((group, instant, unit, name, watch, status));
+            }
+        }
+    }
+    qualifying.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| {
+                if a.0 == 0 {
+                    a.1.cmp(&b.1)
+                } else {
+                    b.1.cmp(&a.1)
+                }
+            })
+            .then_with(|| (a.2, a.3, a.4.id).cmp(&(b.2, b.3, b.4.id)))
+    });
+    let mut rows = vec![format!(
+        "- Counts: open {}; expired-unresolved {}; withdrawn-recent {}",
+        counts[0], counts[1], counts[2]
+    )];
+    for (_, _, unit, name, watch, status) in qualifying.iter().take(10) {
+        rows.push(format!(
+            "- {unit}/{name}#{}: {}, deadline {}; {}",
+            watch.id,
+            status.name(),
+            watch.deadline,
+            cell(&signal_preview(watch))
+        ));
+    }
+    if qualifying.len() > 10 {
+        rows.push(format!(
+            "- … and {} more: see the unit STATE.md",
+            qualifying.len() - 10
+        ));
+    }
+    rows
+}
+
 pub fn card(
     root: &std::path::Path,
-    at: &str,
+    now: Timestamp,
     name: &str,
     units: &Units,
     next: &Next,
     moves: &[Moved],
 ) -> String {
+    let at = crate::host::stamp(now);
     let mut out = format!(
         "Last run: {at}\n\n# {name} card\n\nRendered by `cm sync` from cm state after reading GitHub; the next sync overwrites it.\n\n"
     );
@@ -310,31 +382,7 @@ pub fn card(
     section(&mut out, "Waiting", &waiting, "Nothing waits.");
     section(&mut out, "In flight", &flight, "Nothing is in flight.");
     section(&mut out, "Blocked", &blocked, "Nothing is blocked.");
-    let now = crate::plan::instant(at).expect("CARD's timestamp is an RFC 3339 instant");
-    let mut watches = Vec::new();
-    for (unit, state) in units {
-        for (name, step) in &state.steps {
-            if step.track.state.is_final() {
-                continue;
-            }
-            for watch in &step.watches {
-                let status = watch.status(now, root);
-                if status == WatchStatus::Resolved {
-                    continue;
-                }
-                watches.push(format!(
-                    "- {unit}/{name}#{}: {}, deadline {}; {}",
-                    watch.id,
-                    status.name(),
-                    watch.deadline,
-                    cell(&signal_preview(watch))
-                ));
-            }
-        }
-    }
-    if !watches.is_empty() {
-        section(&mut out, "Watches", &watches, "");
-    }
+    section(&mut out, "Watches", &watch_summary(root, now, units), "");
     section(&mut out, "Moved this run", &moved, "No moves.");
     out
 }

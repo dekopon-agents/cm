@@ -67,6 +67,9 @@ fn git(repo: &Path, args: &[&str]) -> String {
 mod campaign_fixture;
 use campaign_fixture::{Campaign, campaign};
 
+#[path = "support/watch.rs"]
+mod watch_fixture;
+
 fn declare_work(
     host: &Fake,
     c: &Campaign,
@@ -2629,6 +2632,244 @@ fn withdrawing_an_expired_watch_closes_its_hold() {
 }
 
 #[test]
+fn state_watch_rows_preserve_the_base_wording_and_add_withdrawn() {
+    let host = at("2026-10-28T07:00:00Z");
+    let c = campaign(&host);
+    let dir = c.schema_three_watches();
+    let target = parse_target("01-a/u/check", true).unwrap();
+    assert!(
+        cm::holds::watch_add(
+            &host,
+            &c.root,
+            &target,
+            "log:withdrawn",
+            "2026-10-29T06:00Z"
+        )
+        .unwrap()
+        .ok()
+    );
+    assert!(
+        cm::holds::watch_withdraw(&host, &c.root, &target, 4, "wrong signal")
+            .unwrap()
+            .ok()
+    );
+    let unit = store::load_unit(&dir).unwrap();
+    let rendered = cm::render::unit(&unit);
+    let rows: Vec<_> = rendered
+        .lines()
+        .filter(|line| line.starts_with("- check#"))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "- check#1: watch log:open by 2026-10-29T06:00Z, open",
+            "- check#2: watch log:resolved by 2026-10-29T06:00Z, resolved 2026-10-26T09:00Z by 01-a/u/check/kickoff.md",
+            "- check#3: watch log:expired by 2026-10-27T06:00Z, expired: unresolved since 2026-10-27T07:00Z",
+            "- check#4: watch log:withdrawn by 2026-10-29T06:00Z, withdrawn 2026-10-28T07:00Z",
+        ]
+    );
+}
+
+#[test]
+fn a_schema_three_watch_unit_lints_without_rewriting_its_state() {
+    let host = at("2026-10-28T07:00:00Z");
+    let c = campaign(&host);
+    let dir = c.schema_three_watches();
+    let json_before = fs::read(dir.join(".cm/state.json")).unwrap();
+    let state_before = fs::read_to_string(dir.join("STATE.md")).unwrap();
+    let unit = store::load_unit(&dir).unwrap();
+    assert_eq!(unit.schema, 3);
+    assert_eq!(cm::render::unit(&unit), state_before);
+    let linted = cm::lint::lint_at(&c.root, host.now).unwrap();
+    assert!(linted.ok(), "{:?}", linted.violations);
+    assert_eq!(fs::read(dir.join(".cm/state.json")).unwrap(), json_before);
+    assert_eq!(
+        fs::read_to_string(dir.join("STATE.md")).unwrap(),
+        state_before
+    );
+}
+
+#[test]
+fn card_watch_counts_and_rows_stay_bounded_and_prioritized() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/check";
+    assert!(declare(&host, &c, step, Lane::Pi, &[]).ok());
+    kickoff(&c, step);
+    let target = parse_target(step, true).unwrap();
+    for hour in [4, 1, 3, 2] {
+        assert!(
+            cm::holds::watch_add(
+                &host,
+                &c.root,
+                &target,
+                "log:open",
+                &format!("2026-10-29T{hour:02}:00Z")
+            )
+            .unwrap()
+            .ok()
+        );
+    }
+    for hour in 0..18 {
+        assert!(
+            cm::holds::watch_add(
+                &host,
+                &c.root,
+                &target,
+                "log:expired",
+                &format!("2026-10-27T{hour:02}:00Z")
+            )
+            .unwrap()
+            .ok()
+        );
+    }
+    for id in 23..=25 {
+        assert!(
+            cm::holds::watch_add(
+                &host,
+                &c.root,
+                &target,
+                "log:withdrawn",
+                "2026-10-29T06:00Z"
+            )
+            .unwrap()
+            .ok()
+        );
+        assert!(
+            cm::holds::watch_withdraw(
+                &at("2026-10-28T05:00:00Z"),
+                &c.root,
+                &target,
+                id,
+                "wrong signal"
+            )
+            .unwrap()
+            .ok()
+        );
+    }
+    let mut units = plan::load_units(&c.root).unwrap();
+    units
+        .get_mut("01-a/u")
+        .unwrap()
+        .steps
+        .get_mut("check")
+        .unwrap()
+        .watches[4]
+        .expired = Some("2026-10-28T06:00Z".to_owned());
+    let next = plan::summary(&c.root, &units);
+    let card = cm::render::card(
+        &c.root,
+        at("2026-10-28T07:00:00Z").now,
+        "test",
+        &units,
+        &next,
+        &[],
+    );
+    let section = card
+        .split_once("## Watches\n\n")
+        .unwrap()
+        .1
+        .split("\n## ")
+        .next()
+        .unwrap();
+    let lines: Vec<_> = section.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines.len(), 12, "{section}");
+    assert_eq!(
+        lines[0],
+        "- Counts: open 4; expired-unresolved 18; withdrawn-recent 3"
+    );
+    assert_eq!(lines[11], "- … and 15 more: see the unit STATE.md");
+    let ids: Vec<u32> = lines[1..11]
+        .iter()
+        .map(|line| {
+            line.split_once('#')
+                .unwrap()
+                .1
+                .split_once(':')
+                .unwrap()
+                .0
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(ids, [2, 4, 3, 1, 5, 22, 21, 20, 19, 18]);
+}
+
+#[test]
+fn card_watch_withdrawals_are_visible_for_twenty_four_hours() {
+    let host = at("2026-10-26T04:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/check";
+    assert!(declare(&host, &c, step, Lane::Pi, &[]).ok());
+    kickoff(&c, step);
+    let target = parse_target(step, true).unwrap();
+    for id in [1, 2] {
+        assert!(
+            cm::holds::watch_add(
+                &host,
+                &c.root,
+                &target,
+                "log:withdrawn",
+                "2026-10-29T06:00Z"
+            )
+            .unwrap()
+            .ok()
+        );
+        let withdrawn = if id == 1 {
+            "2026-10-26T07:00:00Z"
+        } else {
+            "2026-10-27T05:00:00Z"
+        };
+        assert!(
+            cm::holds::watch_withdraw(&at(withdrawn), &c.root, &target, id, "wrong signal")
+                .unwrap()
+                .ok()
+        );
+    }
+    let units = plan::load_units(&c.root).unwrap();
+    let next = plan::summary(&c.root, &units);
+    let boundary = cm::render::card(
+        &c.root,
+        at("2026-10-27T07:00:00Z").now,
+        "test",
+        &units,
+        &next,
+        &[],
+    );
+    assert!(
+        boundary
+            .lines()
+            .any(|line| line.starts_with("- 01-a/u/check#1: withdrawn,")),
+        "{boundary}"
+    );
+    assert!(
+        boundary
+            .lines()
+            .any(|line| line.starts_with("- 01-a/u/check#2: withdrawn,")),
+        "{boundary}"
+    );
+    let card = cm::render::card(
+        &c.root,
+        at("2026-10-27T07:00:01Z").now,
+        "test",
+        &units,
+        &next,
+        &[],
+    );
+    assert!(!card.contains("check#1"), "{card}");
+    assert!(
+        card.contains("- Counts: open 0; expired-unresolved 0; withdrawn-recent 1"),
+        "{card}"
+    );
+    let state = fs::read_to_string(c.root.join("01-a/u/STATE.md")).unwrap();
+    assert!(
+        state.lines().any(|line| line
+            == "- check#1: watch log:withdrawn by 2026-10-29T06:00Z, withdrawn 2026-10-26T07:00Z"),
+        "{state}"
+    );
+}
+
+#[test]
 fn card_watch_rows_are_short_and_only_show_relevant_live_watches() {
     let host = at("2026-10-26T08:00:00Z");
     let c = campaign(&host);
@@ -2656,9 +2897,15 @@ fn card_watch_rows_are_short_and_only_show_relevant_live_watches() {
             .ok()
     );
     assert!(
-        cm::holds::watch_withdraw(&host, &c.root, &target, 2, "wrong signal")
-            .unwrap()
-            .ok()
+        cm::holds::watch_withdraw(
+            &at("2026-10-27T05:00:00Z"),
+            &c.root,
+            &target,
+            2,
+            "wrong signal"
+        )
+        .unwrap()
+        .ok()
     );
     for (step, phase) in [
         ("01-a/u/finished", "done"),
@@ -2691,7 +2938,14 @@ fn card_watch_rows_are_short_and_only_show_relevant_live_watches() {
     }
     let units = plan::load_units(&c.root).unwrap();
     let next = plan::summary(&c.root, &units);
-    let card = cm::render::card(&c.root, "2026-10-27T07:00Z", "test", &units, &next, &[]);
+    let card = cm::render::card(
+        &c.root,
+        at("2026-10-27T07:00:00Z").now,
+        "test",
+        &units,
+        &next,
+        &[],
+    );
     assert!(!card.contains("live#1"), "{card}");
     assert!(!card.contains("finished#1"), "{card}");
     assert!(!card.contains("retired#1"), "{card}");
@@ -2700,24 +2954,31 @@ fn card_watch_rows_are_short_and_only_show_relevant_live_watches() {
         .filter(|line| line.starts_with("- 01-a/u/live#"))
         .collect();
     assert_eq!(rows.len(), 3, "{card}");
-    assert!(rows[0].starts_with("- 01-a/u/live#2: withdrawn, deadline 2026-10-29T06:00Z; "));
-    assert!(rows[1].starts_with("- 01-a/u/live#3: open, deadline 2026-10-29T06:00Z; "));
-    let preview = rows[1].split_once("; ").unwrap().1;
+    assert!(rows[0].starts_with("- 01-a/u/live#3: open, deadline 2026-10-29T06:00Z; "));
+    assert!(rows[2].starts_with("- 01-a/u/live#2: withdrawn, deadline 2026-10-29T06:00Z; "));
+    let preview = rows[0].split_once("; ").unwrap().1;
     assert_eq!(preview.chars().count(), 80);
     assert!(preview.ends_with('…'));
     assert!(
-        rows[2].starts_with("- 01-a/u/live#4: expired: unresolved, deadline 2026-10-27T06:00Z; ")
+        rows[1].starts_with("- 01-a/u/live#4: expired: unresolved, deadline 2026-10-27T06:00Z; ")
     );
     let state = fs::read_to_string(c.root.join("01-a/u/STATE.md")).unwrap();
     assert!(state.contains(&"界".repeat(200)), "{state}");
     assert!(
-        state.contains("resolution recorded 2026-10-26T08:00Z by 01-a/u/live/kickoff.md"),
+        state.contains("resolved 2026-10-26T08:00Z by 01-a/u/live/kickoff.md"),
         "{state}"
     );
     fs::remove_file(&read).unwrap();
     let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
     assert!(cm::lint::unit_state_file(&c.root, &c.root.join("01-a/u"), &unit).is_empty());
-    let reopened = cm::render::card(&c.root, "2026-10-27T07:00Z", "test", &units, &next, &[]);
+    let reopened = cm::render::card(
+        &c.root,
+        at("2026-10-27T07:00:00Z").now,
+        "test",
+        &units,
+        &next,
+        &[],
+    );
     assert!(
         reopened
             .lines()

@@ -420,11 +420,14 @@ it from state instead of polling it.
 
 `cm watch <step> withdraw <id> --reason <text>` closes an unresolved watch as withdrawn and
 journals the reason. A withdrawn watch no longer holds `advance` or `sync`, is omitted from
-`cm next`'s `watches`, and remains visible as withdrawn in STATE and on CARD while its step
-is live. CARD lists only open, expired-unresolved and withdrawn watches on nonfinal steps,
-with one line per watch, computed status and signals limited to 80 characters. STATE keeps
-the full signal and recorded resolution or expiry details; time passing does not change its
-canonical render. A resolved or already withdrawn watch cannot be withdrawn.
+`cm next`'s `watches`, and remains visible as withdrawn in STATE. CARD summarizes watches on
+nonfinal steps with counts for open, expired-unresolved and withdrawals within the last 24
+hours, then at most 10 rows: open watches by nearest deadline, expired watches by newest
+recorded expiry (or deadline before sync records expiry), then recent withdrawals. Further
+qualifying watches are counted in an overflow line pointing to unit STATE.md. Rows use computed
+status and signals limited to 80 characters. STATE preserves the existing open, resolved and
+expired wording and adds a withdrawn row, keeping full signals and history. A resolved or
+already withdrawn watch cannot be withdrawn.
 `cm watch <step> amend <id> --signal <signal>` replaces an unresolved watch's signal using the
 same validation as `add`. It journals the old and new signals and keeps the original deadline,
 including an expired deadline. An unchanged signal is refused as `watch-amend-empty`.
