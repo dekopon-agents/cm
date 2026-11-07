@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -1335,7 +1335,7 @@ pub fn ruling(host: &dyn Host, root: &Path, target: &Target, text: &str) -> Resu
 }
 
 /// The step's kickoff, then its scope file under [`SCOPE_HEADING`]: the brief the coordinator
-/// hands every reviewer.
+/// hands the worker.
 pub fn brief(root: &Path, target: &Target) -> Result<Outcome> {
     let full = full_name(target);
     let kickoff = root.join(&full).join("kickoff.md");
@@ -1362,6 +1362,300 @@ pub fn brief(root: &Path, target: &Target) -> Result<Outcome> {
     outcome.field("brief", text);
     outcome.field("kickoff", relative(root, &kickoff));
     outcome.field("scope", scope.is_some().then_some(rel));
+    Ok(outcome)
+}
+
+// Reviewer prompts read only the kickoff Outcome and the selected PR/part's reports.
+
+struct PromptScope {
+    evidence: Evidence,
+    reviews: Vec<Recorded>,
+    repo: PathBuf,
+}
+
+fn prompt_scope(
+    root: &Path,
+    target: &Target,
+    part: Option<&str>,
+) -> Result<Result<PromptScope, Violation>> {
+    let full = full_name(target);
+    if !declared(root, target)? {
+        return Ok(Err(Violation::new(
+            &full,
+            "step-unknown",
+            "the step is not declared",
+        )));
+    }
+    let unit = store::load_unit(&root.join(&target.unit))?;
+    let step = &unit.steps[target.step.as_deref().unwrap_or_default()];
+    let track = match part {
+        Some(part) => match step.parts.get(part) {
+            Some(track) => track,
+            None => {
+                return Ok(Err(Violation::new(
+                    &full,
+                    "part-unknown",
+                    format!("the step declares no part `{part}`"),
+                )));
+            }
+        },
+        None if !step.parts.is_empty() => {
+            return Ok(Err(Violation::new(
+                &full,
+                "review-part",
+                "the step has parts; select the reviewed part with --part NAME",
+            )));
+        }
+        None => &step.track,
+    };
+    let reviews = load(root)?
+        .reviews
+        .into_iter()
+        .filter(|review| {
+            review.step == full && review.pr == track.evidence.pr && review.part.as_deref() == part
+        })
+        .collect();
+    Ok(Ok(PromptScope {
+        evidence: track.evidence.clone(),
+        reviews,
+        repo: if step.worktree.is_empty() {
+            std::env::current_dir()?
+        } else {
+            PathBuf::from(&step.worktree)
+        },
+    }))
+}
+
+fn kickoff_task(text: &str) -> Option<String> {
+    use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+    use std::ops::Range;
+
+    let mut headings = Vec::new();
+    let mut heading: Option<(HeadingLevel, Range<usize>, String)> = None;
+    let mut tasks = Vec::new();
+    for (event, range) in Parser::new(text).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                heading = Some((level, range, String::new()));
+            }
+            Event::Text(value) | Event::Code(value) => {
+                if let Some((_, _, title)) = &mut heading {
+                    title.push_str(&value);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some((_, _, title)) = &mut heading {
+                    title.push(' ');
+                }
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                headings.push(heading.take()?);
+            }
+            Event::Start(Tag::Paragraph) if text[range.clone()].starts_with("Outcome:") => {
+                tasks.push((range, "Outcome:".len()));
+            }
+            _ => {}
+        }
+    }
+    for (index, (level, range, title)) in headings.iter().enumerate() {
+        let title = title.trim();
+        if title == "Outcome" || (title.starts_with("Outcome (") && title.ends_with(')')) {
+            let end = headings[index + 1..]
+                .iter()
+                .find(|(next, _, _)| next <= level)
+                .map_or(text.len(), |(_, range, _)| range.start);
+            tasks.push((range.end..end, 0));
+        }
+    }
+    if tasks.len() != 1 {
+        return None;
+    }
+    let (range, label_len) = tasks.pop()?;
+    let task = &text[range];
+    (!task[label_len..].trim().is_empty()).then(|| task.to_owned())
+}
+
+fn synced_head(
+    root: &Path,
+    target: &Target,
+    part: Option<&str>,
+    pr: Option<&str>,
+) -> Option<String> {
+    let pr = pr?;
+    let seen = read_json::<std::collections::BTreeMap<String, crate::plan::Observed>>(
+        &crate::plan::pulls_path(root),
+    )
+    .ok()?;
+    let observed = seen.get(pr)?;
+    let name = match part {
+        Some(part) => format!("{}#{part}", full_name(target)),
+        None => full_name(target),
+    };
+    (observed.target == name)
+        .then(|| observed.head.clone())
+        .flatten()
+}
+
+pub(crate) fn prompt(
+    root: &Path,
+    target: &Target,
+    head: &str,
+    base: Option<&str>,
+    round: u32,
+    part: Option<&str>,
+    reviewer: &str,
+) -> Result<Outcome> {
+    let full = full_name(target);
+    let PromptScope {
+        evidence,
+        reviews,
+        repo,
+    } = match prompt_scope(root, target, part)? {
+        Ok(scope) => scope,
+        Err(violation) => return Ok(Outcome::refused(vec![violation])),
+    };
+    let synced = synced_head(root, target, part, evidence.pr.as_deref());
+    let known: Vec<_> = evidence
+        .sha
+        .iter()
+        .chain(reviews.iter().map(|review| &review.head))
+        .chain(synced.iter())
+        .filter(|known| is_sha(known) && same_commit(known, head))
+        .collect();
+    let mut matches: Vec<_> = known
+        .iter()
+        .filter(|known| known.len() == 40)
+        .map(|known| known.to_lowercase())
+        .collect();
+    if matches.is_empty() && !known.is_empty() && is_sha(head) {
+        matches.extend(
+            git_out(
+                &repo,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{head}^{{commit}}"),
+                ],
+            )
+            .filter(|resolved| known.iter().any(|known| same_commit(known, resolved))),
+        );
+    }
+    matches.sort();
+    matches.dedup();
+    let Some(head) = matches
+        .first()
+        .filter(|_| is_sha(head) && matches.len() == 1)
+    else {
+        return Ok(Outcome::refused(vec![Violation::new(
+            &full,
+            "review-head",
+            "--head must unambiguously match a full head in the selected PR/part's evidence, recorded reviews or last cm sync; run cm sync to refresh it",
+        )]));
+    };
+    if base.is_some_and(|base| !is_sha(base)) {
+        return Ok(Outcome::refused(vec![Violation::new(
+            &full,
+            "review-base",
+            "--base must be a commit SHA (7 to 40 hex digits)",
+        )]));
+    }
+    let resolved_base = base.map(str::to_owned).or_else(|| {
+        let tip = git_out(
+            &repo,
+            &["rev-parse", "--verify", "--quiet", "origin/HEAD^{commit}"],
+        )?;
+        git_out(&repo, &["merge-base", head, &tip])
+    });
+    let Some(base) = resolved_base else {
+        return Ok(Outcome::refused(vec![Violation::new(
+            &full,
+            "review-base",
+            "cannot resolve the merge base with origin/HEAD; use the step's worktree or run from its checkout, or pass --base SHA",
+        )]));
+    };
+    let kickoff = root.join(&full).join("kickoff.md");
+    let task = read_existing(&kickoff)?.and_then(|text| kickoff_task(&text));
+    let Some(task) = task else {
+        return Ok(Outcome::refused(vec![Violation::new(
+            &full,
+            "review-outcome",
+            "kickoff.md must contain one non-empty Outcome section",
+        )]));
+    };
+    let mut text = crate::templates::REVIEW_PROMPT
+        .replace("{base}", &base)
+        .replace("{head}", head)
+        .replace("{task}", &task);
+    if round > 1 {
+        let heads = fix_heads(reviews.iter());
+        let previous = heads.get((round - 2) as usize).and_then(|head| {
+            reviews
+                .iter()
+                .rev()
+                .find(|review| review.at_head(head) && review.reviewer.as_deref() == Some(reviewer))
+        });
+        let Some(previous) = previous.filter(|previous| !previous.at_head(head)) else {
+            return Ok(Outcome::refused(vec![Violation::new(
+                &full,
+                "review-round",
+                format!(
+                    "the preceding fix round must have {reviewer}'s own report at a different head"
+                ),
+            )]));
+        };
+        text.push('\n');
+        text.push_str(crate::templates::PREVIOUS_REVIEW);
+        text.push_str(&fs::read_to_string(root.join(previous.report.as_str()))?);
+    }
+    let mut outcome = Outcome::default();
+    outcome.line(text.clone());
+    outcome.field("prompt", text);
+    Ok(outcome)
+}
+
+pub(crate) fn repair_brief(root: &Path, target: &Target, part: Option<&str>) -> Result<Outcome> {
+    let full = full_name(target);
+    let PromptScope { reviews, .. } = match prompt_scope(root, target, part)? {
+        Ok(scope) => scope,
+        Err(violation) => return Ok(Outcome::refused(vec![violation])),
+    };
+    let mut heads = HashSet::new();
+    let mut prefixes = HashSet::new();
+    let mut latest = None;
+    for review in &reviews {
+        let head = review.head.to_ascii_lowercase();
+        let lengths = 7..=head.len();
+        if !prefixes.contains(&head)
+            && !lengths
+                .clone()
+                .filter_map(|length| head.get(..length))
+                .any(|prefix| heads.contains(prefix))
+        {
+            prefixes.extend(
+                lengths
+                    .filter_map(|length| head.get(..length))
+                    .map(str::to_owned),
+            );
+            heads.insert(head);
+            latest = Some(review.head.as_str());
+        }
+    }
+    let Some(latest) = latest else {
+        return Ok(Outcome::refused(vec![Violation::new(
+            &full,
+            "review-round",
+            "no review round is recorded for the selected PR/part",
+        )]));
+    };
+    let mut text = crate::templates::REPAIR_BRIEF.to_owned();
+    for review in reviews.iter().filter(|review| review.at_head(latest)) {
+        text.push_str("\n\n");
+        text.push_str(&fs::read_to_string(root.join(review.report.as_str()))?);
+    }
+    let mut outcome = Outcome::default();
+    outcome.line(text.clone());
+    outcome.field("repair_brief", text);
     Ok(outcome)
 }
 
