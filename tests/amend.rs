@@ -372,6 +372,7 @@ fn a_tag_only_release_and_a_superseded_step_are_recorded() {
         &target("00-release/guest/0.7.0"),
         &Phase::Released,
         &Evidence {
+            sha: Some(campaign_fixture::git(&repo, &["rev-parse", "HEAD"])),
             tag: Some("guest-v0.7.0".into()),
             ..Evidence::default()
         },
