@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use jiff::Timestamp;
 
 use crate::plan::{Next, Units};
-use crate::state::{Lane, Phase, Step, UnitState, Watch, WatchStatus, Work};
+use crate::state::{Lane, Phase, Release, Step, UnitState, Version, Watch, WatchStatus, Work};
 use crate::sync::Moved;
 
 fn cell(text: &str) -> String {
@@ -281,6 +281,66 @@ pub(crate) fn next_item(number: &mut usize, description: &str, command: &str) ->
     line
 }
 
+fn state_counts(units: &Units) -> String {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for state in units.values() {
+        for step in state.steps.values() {
+            let key = match &step.track.state {
+                Phase::Blocked(_) => "blocked".to_owned(),
+                other => other.to_string(),
+            };
+            *counts.entry(key).or_default() += 1;
+        }
+    }
+    let mut out = "| State | Steps |\n|---|---|\n".to_owned();
+    let order = crate::state::ORDER
+        .iter()
+        .map(ToString::to_string)
+        .chain(["superseded".to_owned(), "blocked".to_owned()]);
+    for state in order {
+        if let Some(count) = counts.get(&state) {
+            out.push_str(&format!("| {state} | {count} |\n"));
+        }
+    }
+    if counts.is_empty() {
+        out.push_str("| — | 0 |\n");
+    }
+    out
+}
+
+pub(crate) fn status_lines(
+    units: &Units,
+    released: &[Release],
+    deployed: &[Release],
+    epoch: Option<crate::epoch::Status>,
+) -> String {
+    let mut out = state_counts(units);
+    let mut lines: BTreeMap<&str, [Option<Version>; 2]> = BTreeMap::new();
+    for (index, releases) in [released, deployed].into_iter().enumerate() {
+        for release in releases {
+            let newest = &mut lines.entry(&release.line).or_default()[index];
+            *newest = Some(newest.map_or(release.version, |old| old.max(release.version)));
+        }
+    }
+    out.push('\n');
+    if lines.is_empty() {
+        out.push_str("No releases recorded.\n");
+    } else {
+        out.push_str("| Release line | Released | Deployed |\n|---|---|---|\n");
+        for (line, versions) in lines {
+            let [released, deployed] = versions.map(|version| {
+                version.map_or_else(|| "—".to_owned(), |version| version.to_string())
+            });
+            out.push_str(&format!("| {} | {released} | {deployed} |\n", cell(line)));
+        }
+    }
+    out.push_str(&format!(
+        "\nEpoch status: {}.\n",
+        epoch.map_or_else(|| "unknown".to_owned(), |status| status.to_string())
+    ));
+    out
+}
+
 pub fn card(
     root: &std::path::Path,
     now: Timestamp,
@@ -296,18 +356,12 @@ pub fn card(
     if next.paused {
         out.push_str("**Paused:** LIMITS.toml has `paused = true`; nothing launches.\n\n");
     }
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut flight = Vec::new();
     let mut blocked = Vec::new();
     let mut number = 1;
     for (unit, state) in units {
         for (step_name, step) in &state.steps {
             let target = format!("{unit}/{step_name}");
-            let key = match &step.track.state {
-                Phase::Blocked(_) => "blocked".to_owned(),
-                other => other.to_string(),
-            };
-            *counts.entry(key).or_default() += 1;
             match &step.track.state {
                 Phase::Launched | Phase::PrOpen => flight.push(format!(
                     "- `{target}` {}{}",
@@ -346,19 +400,7 @@ pub fn card(
             }
         }
     }
-    out.push_str("| State | Steps |\n|---|---|\n");
-    let order = crate::state::ORDER
-        .iter()
-        .map(ToString::to_string)
-        .chain(["superseded".to_owned(), "blocked".to_owned()]);
-    for state in order {
-        if let Some(count) = counts.get(&state) {
-            out.push_str(&format!("| {state} | {count} |\n"));
-        }
-    }
-    if counts.is_empty() {
-        out.push_str("| — | 0 |\n");
-    }
+    out.push_str(&state_counts(units));
     let section = |out: &mut String, title: &str, lines: &[String], empty: &str| {
         out.push_str(&format!("\n## {title}\n\n"));
         if lines.is_empty() {

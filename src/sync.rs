@@ -832,6 +832,36 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
         .unwrap_or_default();
     let card = render::card(root, run.now, &name, &run.units, &next, &run.moves);
     write_atomic(&root.join(CARD), card.as_bytes())?;
+    let resume_path = root.join("RESUME.md");
+    match std::fs::read_to_string(&resume_path) {
+        Ok(mut resume) => {
+            if let Ok(Some(span)) = crate::templates::status_span(&resume) {
+                let epoch = match std::fs::read_to_string(root.join(crate::epoch::EPOCH)) {
+                    Ok(text) => crate::epoch::status(&text),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                };
+                let releases = |phase| {
+                    run.releases(phase)
+                        .into_iter()
+                        .map(|shipped| shipped.release)
+                        .collect::<Vec<_>>()
+                };
+                let status = render::status_lines(
+                    &run.units,
+                    &releases(&Phase::Released),
+                    &releases(&Phase::Deployed),
+                    epoch,
+                );
+                if resume[span.clone()] != status {
+                    resume.replace_range(span, &status);
+                    write_atomic(&resume_path, resume.as_bytes())?;
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     for moved in &run.moves {
         outcome.line(format!(
             "{}: {} → {} ({})",
