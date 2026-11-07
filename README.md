@@ -300,8 +300,8 @@ and record include the attempt id, action kind, generation and returned id when 
 
 Use `cm review prompt <step> --head SHA [--base SHA]` for a blind review. The task is the
 single non-empty `Outcome:` label or Markdown `Outcome` section in `kickoff.md`. A label ends
-at the next label or heading; a heading may have a parenthetical suffix and includes its
-subheadings, ending at the next heading of the same or higher level. Indented ATX and Setext
+at a blank line or the next label or heading; a heading may have a parenthetical suffix and
+includes its subheadings, ending at the next heading of the same or higher level. Indented ATX and Setext
 headings both delimit sections. Other kickoff sections and
 `coordinator-scope.md` never enter the prompt. `cm brief` remains the worker packet with rulings.
 The template lives in `templates/REVIEW-PROMPT.md`; it accepts no coordinator commentary.
@@ -310,9 +310,10 @@ The template lives in `templates/REVIEW-PROMPT.md`; it accepts no coordinator co
 `cm sync` observation for its current PR. Run `cm sync` after a repair push to recognize the
 new head before recording its review. The prompt prints the full matching head SHA and
 refuses ambiguous prefixes. `--base`, when supplied, is a SHA; otherwise cm resolves the
-merge base of the head and `origin/HEAD` using the registered worktree, or the current checkout
-when no worktree is registered. An unavailable merge base is refused (`review-base`); pass
-`--base SHA` when no checkout is available. Round 1 includes no reports. `--round 2` appends only
+merge base of the head and local `origin/HEAD` using the registered worktree, or the current
+checkout when no worktree is registered. An unavailable merge base is refused (`review-base`);
+pass `--base SHA` when no checkout is available or the clone is stale. Round 1 includes no
+reports. `--round 2` appends only
 the latest recorded report from the selected `--reviewer astra|claude` (default `astra`) at
 the first FIX REQUIRED head; later rounds similarly use the preceding fix round as
 [Rounds](#rounds) defines it. Reports from other reviewers never enter the prompt. A missing

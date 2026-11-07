@@ -55,6 +55,21 @@ pub fn single_item(host: &dyn Host) -> Campaign {
     c
 }
 
+pub const SETEXT_HEADING: &str = "0000000007. Middle\n-----------------\n";
+
+pub fn setext_item(host: &dyn Host) -> Campaign {
+    let c = single_item(host);
+    fs::write(
+        c.root.join("OWNER-QUEUE.md"),
+        format!(
+            "{OWNER_QUEUE}\n{}",
+            MIDDLE.replace("## 7. Middle\n", SETEXT_HEADING)
+        ),
+    )
+    .unwrap();
+    c
+}
+
 pub fn obstruct_write(root: &Path, name: &str) {
     fs::create_dir(root.join(format!(".{name}.cm-tmp"))).unwrap();
 }

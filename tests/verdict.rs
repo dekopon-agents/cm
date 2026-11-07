@@ -1624,8 +1624,8 @@ fn review_prompt_accepts_label_and_parenthetical_outcomes_and_stops_at_boundarie
     assert!(output.status.success(), "{output:?}");
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let prompt = result["prompt"].as_str().unwrap();
-    assert!(prompt.contains("N2 (changes what a reviewer sees on purpose)"));
-    assert!(prompt.contains("N3: `cm review repair-brief <step>`"));
+    assert!(prompt.contains("Make the widget available through a status command"));
+    assert!(prompt.contains("Another command prints the widget's history without changing it."));
     assert!(!prompt.contains("Loss:"));
     assert!(!prompt.contains("Files:"));
     assert!(!prompt.contains("Tests:"));

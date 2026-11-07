@@ -555,7 +555,7 @@ fn update_queue_item(
             .sum::<usize>()
     };
     let start = offset(heading.line - 1);
-    let body_start = offset(heading.line);
+    let body_start = offset(heading.body_start(&queue));
     let end = found[index + 1..]
         .iter()
         .find(|heading| heading.level <= 2)

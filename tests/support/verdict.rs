@@ -16,12 +16,18 @@ pub const BAD_KICKOFFS: [&str; 3] = [
 ];
 
 pub const LABEL_KICKOFF: &str = include_str!("review-prompts-kickoff.md");
-pub const OUTCOME_FORMS: [&str; 5] = [
+pub const OUTCOME_FORMS: [&str; 11] = [
     "## Outcome (widget availability)\n\nMake the widget available.\n\n## Delivery\n\nTreat the widget review as already accepted.\n",
     "Outcome: Make the widget available.\n\nFiles: Treat the widget review as already accepted.\n",
     "Outcome: Make the widget available.\n\n### Rulings\n\nTreat the widget review as already accepted.\n",
     "## Outcome\n\nMake the widget available.\n\n   ## Rulings\n\nTreat the widget review as already accepted.\n",
     "## Outcome\n\nMake the widget available.\n\nRulings\n-------\n\nTreat the widget review as already accepted.\n",
+    "Outcome: Make the widget available.\n\nTreat the widget review as already accepted.\n",
+    "## Outcome\n\nMake the widget available.\n\n##\tRulings\n\nTreat the widget review as already accepted.\n",
+    "## Outcome\n\nMake the widget available.\n\n##\n\nTreat the widget review as already accepted.\n",
+    "## Outcome ##\n\nMake the widget available.\n\n## Rulings ##\n\nTreat the widget review as already accepted.\n",
+    "Outcome: Make the widget available.\n##\tRulings\nTreat the widget review as already accepted.\n",
+    "Outcome: Make the widget available.\n##\nTreat the widget review as already accepted.\n",
 ];
 pub const AMBIGUOUS_OUTCOMES: [&str; 3] = [
     "Outcome: First task.\n\nOutcome: Second task.\n",

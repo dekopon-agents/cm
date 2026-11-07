@@ -498,6 +498,28 @@ fn owner_queue_edit_preserves_the_heading_and_required_fields() {
 }
 
 #[test]
+fn owner_queue_edit_preserves_a_setext_heading_and_keeps_the_gate_closed() {
+    let c = queue_fixture::setext_item(&Fake);
+    let resume = fs::read(c.root.join("RESUME.md")).unwrap();
+    let edited = ledger::owner_queue_edit(&Fake, &c.root, 7, queue_fixture::REPLACEMENT).unwrap();
+    assert!(edited.ok(), "{:?}", edited.violations);
+    assert_eq!(edited.fields["queue_drained"], false);
+    let queue = fs::read_to_string(c.root.join("OWNER-QUEUE.md")).unwrap();
+    assert_eq!(
+        queue,
+        format!(
+            "{}\n{}\n{}\n\n",
+            cm::templates::OWNER_QUEUE,
+            queue_fixture::SETEXT_HEADING,
+            queue_fixture::REPLACEMENT
+        )
+    );
+    assert!(cm::templates::queue_open(&queue));
+    assert_eq!(fs::read(c.root.join("RESUME.md")).unwrap(), resume);
+    assert!(lint(&c.root).unwrap().ok());
+}
+
+#[test]
 fn owner_queue_unknown_items_and_empty_bodies_are_refused_without_writes() {
     let c = queue_fixture::campaign(&Fake);
     let before: Vec<_> = ["OWNER-QUEUE.md", "RESUME.md", "JOURNAL.md"]

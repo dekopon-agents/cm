@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -1449,13 +1449,7 @@ fn kickoff_task(text: &str) -> Option<String> {
             .iter()
             .find(|next| next.line > heading.line && next.level <= heading.level)
             .map_or(lines.len(), |next| next.line - 1);
-        let mut start = heading.line;
-        if !lines[start - 1].trim_start().starts_with('#') {
-            start += lines[start..]
-                .iter()
-                .position(|line| crate::markdown::setext_level(line.trim_start()).is_some())?
-                + 1;
-        }
+        let start = heading.body_start(text);
         lines[start..end].join("\n")
     } else {
         let (line, _) = outcome_labels[0];
@@ -1463,6 +1457,14 @@ fn kickoff_task(text: &str) -> Option<String> {
             .iter()
             .map(|(line, _)| *line)
             .chain(headings.iter().map(|heading| heading.line))
+            .chain(
+                lines
+                    .iter()
+                    .enumerate()
+                    .skip(*line)
+                    .filter(|(_, text)| text.trim().is_empty())
+                    .map(|(index, _)| index + 1),
+            )
             .filter(|next| *next > *line)
             .min()
             .map_or(lines.len(), |next| next - 1);
@@ -1621,13 +1623,28 @@ pub(crate) fn repair_brief(root: &Path, target: &Target, part: Option<&str>) -> 
         Ok(scope) => scope,
         Err(violation) => return Ok(Outcome::refused(vec![violation])),
     };
-    let mut heads = Vec::<&str>::new();
+    let mut heads = HashSet::new();
+    let mut prefixes = HashSet::new();
+    let mut latest = None;
     for review in &reviews {
-        if !heads.iter().any(|head| review.at_head(head)) {
-            heads.push(&review.head);
+        let head = review.head.to_ascii_lowercase();
+        let lengths = 7..=head.len();
+        if !prefixes.contains(&head)
+            && !lengths
+                .clone()
+                .filter_map(|length| head.get(..length))
+                .any(|prefix| heads.contains(prefix))
+        {
+            prefixes.extend(
+                lengths
+                    .filter_map(|length| head.get(..length))
+                    .map(str::to_owned),
+            );
+            heads.insert(head);
+            latest = Some(review.head.as_str());
         }
     }
-    let Some(latest) = heads.last() else {
+    let Some(latest) = latest else {
         return Ok(Outcome::refused(vec![Violation::new(
             &full,
             "review-round",
