@@ -61,10 +61,7 @@ fn git(repo: &Path, args: &[&str]) -> String {
 
 #[path = "support/campaign.rs"]
 mod campaign_fixture;
-#[path = "support/forge.rs"]
-mod forge_fixture;
 use campaign_fixture::{Campaign, campaign};
-use forge_fixture::FakeForge;
 
 #[path = "support/forge.rs"]
 mod forge_fixture;

@@ -14,8 +14,6 @@ use jiff::Timestamp;
 
 #[path = "support/campaign.rs"]
 mod campaign_fixture;
-#[path = "support/forge.rs"]
-mod forge_fixture;
 #[path = "support/kickoff.rs"]
 mod kickoff_fixture;
 #[path = "support/lifecycle.rs"]
