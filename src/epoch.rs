@@ -129,17 +129,21 @@ pub(crate) fn status(text: &str) -> Option<Status> {
     Status::of_label(value(&lines, &front, "status")?)
 }
 
-fn set(lines: &mut Vec<String>, front: &mut Front, key: &str, text: &str) {
+fn set(lines: &mut Vec<String>, front: &mut Front, key: &str, text: &str) -> (usize, bool) {
     let line = format!("{key}: {text}");
     match (front.start..front.end).find(|index| {
         lines[*index]
             .strip_prefix(key)
             .is_some_and(|rest| rest.starts_with(':'))
     }) {
-        Some(index) => lines[index] = line,
+        Some(index) => {
+            lines[index] = line;
+            (index, true)
+        }
         None => {
             lines.insert(front.end, line);
             front.end += 1;
+            (front.end - 1, false)
         }
     }
 }
@@ -148,23 +152,17 @@ fn set(lines: &mut Vec<String>, front: &mut Front, key: &str, text: &str) {
 pub(crate) fn set_text(text: &str, key: &str, value: &str) -> Option<String> {
     let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
     let mut front = front(&lines)?;
-    let index = (front.start..front.end).find(|index| {
-        lines[*index]
-            .strip_prefix(key)
-            .is_some_and(|rest| rest.starts_with(':'))
-    });
-    let at = index.unwrap_or(front.end);
-    set(&mut lines, &mut front, key, value);
+    let (at, replaced) = set(&mut lines, &mut front, key, value);
     let start: usize = text.split_inclusive('\n').take(at).map(str::len).sum();
     let original = text[start..].split_inclusive('\n').next()?;
     let ending = if original.ends_with("\r\n") {
         "\r\n"
-    } else if original.ends_with('\n') || index.is_none() {
+    } else if original.ends_with('\n') || !replaced {
         "\n"
     } else {
         ""
     };
-    let end = start + if index.is_some() { original.len() } else { 0 };
+    let end = start + if replaced { original.len() } else { 0 };
     Some(format!(
         "{}{}{ending}{}",
         &text[..start],

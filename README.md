@@ -93,7 +93,7 @@ ideas: [IDEA-9003, IDEA-9001]
 
 Each idea file is named `<id>.md` or `<id>-<slug>.md`. Its front matter includes
 `id: IDEA-9001` and `maturity: captured` (or `exploring` or `designed`). Admission
-sets `current_epoch: epoch-alpha`. A `## Epoch history` section must already exist.
+sets `current_epoch: epoch-alpha`. A `## Epoch history` section must already exist, with every Markdown fence closed.
 cm changes only the `current_epoch` and `maturity` front-matter lines and appends
 history entries; other keys, sections and existing history entries keep their bytes.
 

@@ -516,11 +516,13 @@ pub(crate) fn run(host: &dyn Host, root: &Path, id: &str, action: Action<'_>) ->
     };
     violations.extend(validate(root, idea));
     let path = relative(root, &idea.path);
-    if history(&idea.text).is_none() {
+    if history(&idea.text)
+        .is_none_or(|range| crate::markdown::unterminated_fence(&idea.text[range]))
+    {
         violations.push(Violation::new(
             &path,
             "idea-history",
-            "the idea needs exactly one `## Epoch history` section",
+            "the idea needs exactly one `## Epoch history` section with closed Markdown fences",
         ));
     }
     let at = stamp(host.now());
