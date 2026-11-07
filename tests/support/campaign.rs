@@ -162,6 +162,12 @@ pub fn repo(dir: &Path) -> (PathBuf, String) {
     (repo, sha)
 }
 
+pub fn unrelated_commit(repo: &Path) -> String {
+    git(repo, &["checkout", "-q", "--orphan", "unrelated"]);
+    git(repo, &["commit", "-q", "--allow-empty", "-m", "unrelated"]);
+    git(repo, &["rev-parse", "HEAD"])
+}
+
 pub fn release_repo(dir: &Path) -> (PathBuf, String, String) {
     let (repo, _) = repo(dir);
     git(&repo, &["tag", "v0.1.0"]);

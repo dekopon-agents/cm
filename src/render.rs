@@ -69,8 +69,10 @@ pub fn unit(state: &UnitState) -> String {
                 match (step.lane, step.work) {
                     (None, Work::Code) => "—".to_owned(),
                     (None, Work::Study) => "study".to_owned(),
+                    (None, Work::Rollout) => "rollout".to_owned(),
                     (Some(lane), Work::Code) => lane.name().to_owned(),
                     (Some(lane), Work::Study) => format!("{lane}, study"),
+                    (Some(lane), Work::Rollout) => format!("{lane}, rollout"),
                 },
                 if after.is_empty() {
                     "—".to_owned()
@@ -440,11 +442,11 @@ pub fn card(
     let ready: Vec<String> = next
         .ready
         .iter()
-        .map(|(target, lane)| {
+        .map(|(target, lane, finish)| {
             next_item(
                 &mut number,
                 &format!("`{target}` ({})", lane.map_or("—", Lane::name)),
-                &crate::plan::launch_command(target, *lane),
+                &crate::plan::launch_command(target, *lane, *finish),
             )
         })
         .collect();

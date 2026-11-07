@@ -1,19 +1,36 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use cm::commands::{self, Declaration};
 use cm::host::{Host, stamp};
-use cm::state::{Evidence, Lane, Phase};
+use cm::state::{Evidence, Lane, Phase, Work};
 use cm::store::{self, parse_target};
 
 use super::campaign_fixture::Campaign;
 
 impl Campaign {
     pub fn merged_step(&self, host: &dyn Host, full: &str, lane: Lane, repo: &Path, sha: &str) {
+        self.merged_work(host, full, lane, repo, sha, Work::Code);
+    }
+
+    pub fn merged_rollout(&self, host: &dyn Host, full: &str, lane: Lane, repo: &Path, sha: &str) {
+        self.merged_work(host, full, lane, repo, sha, Work::Rollout);
+    }
+
+    fn merged_work(
+        &self,
+        host: &dyn Host,
+        full: &str,
+        lane: Lane,
+        repo: &Path,
+        sha: &str,
+        work: Work,
+    ) {
         let declared = commands::declare(
             host,
             &self.root.join(full),
             &Declaration {
                 lane: Some(lane),
+                work,
                 ..Declaration::default()
             },
         )
@@ -31,6 +48,89 @@ impl Campaign {
             &Evidence {
                 sha: Some(sha.into()),
                 pr: Some("https://github.com/o/cm/pull/7".into()),
+                ..Evidence::default()
+            },
+        );
+        commands::write_unit(&dir, &unit).unwrap();
+    }
+
+    pub fn rollout_parts(&self, full: &str, times: &[(&str, Option<&str>)]) {
+        let target = parse_target(full, true).unwrap();
+        let dir = self.root.join(target.unit);
+        let mut unit = store::load_unit(&dir).unwrap();
+        let step = unit.steps.get_mut(target.step.as_deref().unwrap()).unwrap();
+        for (name, merged_at) in times {
+            let mut part = step.track.clone();
+            part.evidence.merged_at = merged_at.map(str::to_owned);
+            step.parts.insert((*name).into(), part);
+        }
+        commands::write_unit(&dir, &unit).unwrap();
+    }
+
+    pub fn sync_receipt(&self, sha: &str) -> PathBuf {
+        let path = self.root.join("sync-receipt.md");
+        std::fs::write(&path, format!("Argo sync revision: {sha}\n")).unwrap();
+        path
+    }
+
+    pub fn part_sync_receipts(&self, host: &dyn Host, full: &str, sha: &str) -> [PathBuf; 2] {
+        let target = parse_target(full, true).unwrap();
+        let holder = format!("{}/RECEIPTS", target.unit);
+        let declared = commands::declare(
+            host,
+            &self.root.join(&holder),
+            &Declaration {
+                lane: Some(Lane::Coordinator),
+                work: Work::Study,
+                ..Declaration::default()
+            },
+        )
+        .unwrap();
+        assert!(declared.ok(), "{:?}", declared.violations);
+        self.kickoff(&holder, "Record sync receipts.\n");
+        ["east", "west"].map(|part| {
+            let receipt = cm::ledger::evidence_pinned(
+                host,
+                &self.root,
+                &parse_target(&holder, true).unwrap(),
+                part,
+                "Argo synced the pinned revision.\n",
+                &cm::ledger::PinArgs {
+                    candidate: Some(&format!("{full}#{part}@{sha}")),
+                    harness: None,
+                },
+            )
+            .unwrap();
+            assert!(receipt.ok(), "{:?}", receipt.violations);
+            self.root.join(receipt.fields["path"].as_str().unwrap())
+        })
+    }
+
+    pub fn receipt_stale(&self, full: &str, file: &Path, reason: Option<&str>) {
+        let target = parse_target(full, true).unwrap();
+        let dir = self.root.join(target.unit);
+        let mut unit = store::load_unit(&dir).unwrap();
+        let relative = store::relative(&self.root, file);
+        let pin = unit
+            .steps
+            .values_mut()
+            .flat_map(|step| &mut step.pins)
+            .find(|pin| pin.file.as_str() == relative)
+            .unwrap();
+        pin.stale = reason.map(str::to_owned);
+        commands::write_unit(&dir, &unit).unwrap();
+    }
+
+    pub fn release_receipt(&self, host: &dyn Host, repo: &Path, sha: &str) {
+        self.merged_step(host, "00-release/cm/1.0.0", Lane::Pi, repo, sha);
+        let dir = self.root.join("00-release/cm");
+        let mut unit = store::load_unit(&dir).unwrap();
+        unit.steps.get_mut("1.0.0").unwrap().track.apply(
+            Phase::Deployed,
+            &stamp(host.now()),
+            &Evidence {
+                tag: Some("v1.0.0".into()),
+                digest: Some(format!("sha256:{}", "d".repeat(64))),
                 ..Evidence::default()
             },
         );

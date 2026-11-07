@@ -60,6 +60,9 @@ enum Commands {
         /// The step is a study: it ships no PR and finishes with `cm advance <step> done --evidence <path>`.
         #[arg(long)]
         study: bool,
+        /// A rollout deploys directly from merged with --sha and --evidence, without a release.
+        #[arg(long, value_parser = ["rollout"], conflicts_with = "study")]
+        kind: Option<String>,
         /// What the step waits on: <step> or <NN-name>/<unit>/<step> (merged), pr-open:<step>, tag:<line>@<version> or deployed:<line>@<version>. Repeat for each.
         #[arg(long, value_name = "AFTER")]
         after: Vec<String>,
@@ -608,6 +611,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             dir,
             lane,
             study,
+            kind,
             after,
             github,
             tag,
@@ -621,7 +625,13 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                     github: github.clone(),
                     tag: tag.clone(),
                 },
-                work: if *study { Work::Study } else { Work::Code },
+                work: if *study {
+                    Work::Study
+                } else if kind.is_some() {
+                    Work::Rollout
+                } else {
+                    Work::Code
+                },
                 kickoff: kickoff_file
                     .as_deref()
                     .map(|path| read_body(path, Some(KICKOFF_MAX_BYTES)))

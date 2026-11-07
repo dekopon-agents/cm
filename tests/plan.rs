@@ -560,6 +560,7 @@ fn ready_owner_commands_finish_with_named_evidence() {
     assert_eq!(state(&c, "01-a/u/owner"), Phase::Done);
 }
 
+#[cfg(unix)]
 fn advance(host: &Fake, c: &Campaign, target: &str, to: &str, evidence: Evidence) -> Outcome {
     commands::advance(
         host,
@@ -604,6 +605,40 @@ fn open_pr(host: &Fake, c: &Campaign, target: &str, pr: &str) {
     };
     let moved = advance(host, c, target, "pr-open", evidence);
     assert!(moved.ok(), "{:?}", moved.violations);
+}
+
+#[test]
+fn ready_owner_rollouts_offer_launch_in_next_and_card() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let step = "01-a/u/rollout";
+    assert!(declare_work(&host, &c, step, Lane::Owner, &[], Work::Rollout).ok());
+    kickoff(&c, step);
+    let command = format!("cm launch {step}");
+    let next = next_one(&c, step);
+    assert_eq!(next.fields["steps"][0]["command"], command);
+    assert_eq!(
+        next.lines,
+        [format!("1. {step} (owner) is next — `{command}`")]
+    );
+    let all = plan::next(&c.root, None, None).unwrap();
+    assert_eq!(all.fields["steps"][0]["command"], command);
+    assert_eq!(all.lines, [format!("1. next {step} (owner) — `{command}`")]);
+    let units = plan::load_units(&c.root).unwrap();
+    let card = cm::render::card(
+        &c.root,
+        host.now,
+        "campaign",
+        &units,
+        &plan::summary(&c.root, &units),
+        &[],
+    );
+    assert!(
+        card.contains(&format!("1. `{step}` (owner) — `{command}`")),
+        "{card}"
+    );
+    assert_eq!(c.run_next_command(&command)["ok"], true);
+    assert_eq!(state(&c, step), Phase::Launched);
 }
 
 #[test]

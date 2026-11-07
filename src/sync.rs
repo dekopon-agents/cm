@@ -13,7 +13,7 @@ use crate::journal;
 use crate::outcome::{Outcome, Violation};
 use crate::plan::{self, Units};
 use crate::render;
-use crate::state::{Evidence, Lane, Move, Phase, Release, Step, Track};
+use crate::state::{Evidence, Lane, Move, Phase, Release, Step, Track, Work};
 use crate::store::{self, lock, parse_target, write_atomic};
 
 pub const CARD: &str = "CARD.md";
@@ -645,7 +645,7 @@ impl<'a> Run<'a> {
         let releases = Self::releases(&self.units, &Phase::Released);
         'steps: for tracked in self.tracks_at(&Phase::Merged) {
             let target = tracked.name();
-            if Release::of_target(&tracked.target).is_some() {
+            if tracked.step.work == Work::Rollout || Release::of_target(&tracked.target).is_some() {
                 continue;
             }
             let Some((repo, sha)) = merge_of(&tracked.track.evidence) else {
@@ -726,7 +726,7 @@ impl<'a> Run<'a> {
         let deployed = Self::releases(&self.units, &Phase::Deployed);
         for tracked in self.tracks_at(&Phase::Released) {
             let target = tracked.name();
-            if Release::of_target(&tracked.target).is_some() {
+            if tracked.step.work == Work::Rollout || Release::of_target(&tracked.target).is_some() {
                 continue;
             }
             let Some((repo, sha)) = merge_of(&tracked.track.evidence) else {
