@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -401,24 +402,26 @@ pub(crate) fn add_queue_item(
     if !violations.is_empty() {
         return Ok(Outcome::refused(violations));
     }
-    let history = fs::read_to_string(root.join(store::JOURNAL))?;
-    let journal_numbers = history.lines().filter_map(|line| {
-        if !journal::is_stamped(line) {
-            return None;
-        }
-        let (_, title) = line.split_once(" — ")?;
-        let (action, item) = title.strip_prefix("owner-queue ")?.split_once(' ')?;
-        matches!(action, "add" | "answer" | "strike")
-            .then(|| item_number(item))
-            .flatten()
-    });
-    let last = headings(&queue)
+    let mut last = headings(&queue)
         .iter()
         .filter(|heading| heading.level == 2)
         .filter_map(|heading| item_number(heading.text))
-        .chain(journal_numbers)
         .max()
         .unwrap_or(0);
+    let history = BufReader::new(fs::File::open(root.join(store::JOURNAL))?);
+    for line in history.lines() {
+        let line = line?;
+        if journal::is_stamped(&line)
+            && let Some((_, title)) = line.split_once(" — ")
+            && let Some((action, item)) = title
+                .strip_prefix("owner-queue ")
+                .and_then(|text| text.split_once(' '))
+            && matches!(action, "add" | "answer" | "strike")
+            && let Some(number) = item_number(item)
+        {
+            last = last.max(number);
+        }
+    }
     let Some(number) = last.checked_add(1) else {
         return Ok(Outcome::refused(vec![Violation::new(
             QUEUE_FILE,
@@ -618,8 +621,12 @@ fn update_queue_item(
     if !matches!(update, QueueUpdate::Edit) {
         journal_body.push_str("\nRemoved item:\n\n");
         for line in queue[start..end].split_inclusive('\n') {
-            journal_body.push_str("> ");
-            journal_body.push_str(line);
+            if line.trim().is_empty() {
+                journal_body.push_str(">\n");
+            } else {
+                journal_body.push_str("> ");
+                journal_body.push_str(line);
+            }
         }
         if !journal_body.ends_with('\n') {
             journal_body.push('\n');
@@ -655,13 +662,19 @@ fn update_queue_item(
             ));
         }
     };
+    if let Err(error) = write_atomic(&root.join(QUEUE_FILE), next.as_bytes()) {
+        return Ok(failed_write(QUEUE_FILE, "owner-queue-write", error));
+    }
     if let Some(resume) = resume
         && let Err(error) = write_atomic(&root.join("RESUME.md"), resume.as_bytes())
     {
-        return Ok(failed_write("RESUME.md", "owner-queue-resume-write", error));
-    }
-    if let Err(error) = write_atomic(&root.join(QUEUE_FILE), next.as_bytes()) {
-        return Ok(failed_write(QUEUE_FILE, "owner-queue-write", error));
+        return Ok(Outcome::refused(vec![Violation::new(
+            "RESUME.md",
+            "owner-queue-resume-write",
+            format!(
+                "owner-queue {action} {number} failed; the item was already removed and journaled; updating RESUME.md failed: {error:#}"
+            ),
+        )]));
     }
     let mut outcome = Outcome::default();
     outcome.line(format!("owner-queue {action} {}", heading.text));

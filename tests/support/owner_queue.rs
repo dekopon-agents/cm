@@ -9,7 +9,7 @@ use super::campaign_fixture::{self, Campaign};
 
 pub const FIRST: &str = "## 2. First\n\nContext: One decision.\nProceed?\nRecommendation: Yes.\nAnswer:\n\n```text\n## 7. Literal heading\n```\n\n";
 pub const MIDDLE: &str = "## 7. Middle\n\nContext: Another decision.\nProceed?\nRecommendation: Wait.\nAnswer: Wait for confirmation.\n\n### Details\n\nMore context.\n\n";
-pub const ARCHIVED_MIDDLE: &str = "> ## 7. Middle\n> \n> Context: Another decision.\n> Proceed?\n> Recommendation: Wait.\n> Answer: Wait for confirmation.\n> \n> ### Details\n> \n> More context.\n> \n";
+pub const ARCHIVED_MIDDLE: &str = "> ## 7. Middle\n>\n> Context: Another decision.\n> Proceed?\n> Recommendation: Wait.\n> Answer: Wait for confirmation.\n>\n> ### Details\n>\n> More context.\n>\n";
 pub const LAST: &str =
     "## 11. Last café\n\nContext: Final decision.\nProceed?\nRecommendation: Yes.\nAnswer:";
 pub const ANSWER: &str = "Proceed with the smaller change.\n\nKeep the follow-up separate.\n";

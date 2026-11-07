@@ -296,6 +296,15 @@ mod queue_fixture;
 #[test]
 fn owner_queue_answer_removes_only_its_item_and_journals_the_body() {
     let c = queue_fixture::campaign(&Fake);
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&c.root)
+            .args(["add", "JOURNAL.md"])
+            .status()
+            .unwrap()
+            .success()
+    );
     let before = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
     let resume = fs::read(c.root.join("RESUME.md")).unwrap();
     let body = queue_fixture::body_file(&c.root, queue_fixture::ANSWER);
@@ -331,6 +340,13 @@ fn owner_queue_answer_removes_only_its_item_and_journals_the_body() {
         )
     );
     assert!(lint(&c.root).unwrap().ok());
+    let checked = Command::new("git")
+        .arg("-C")
+        .arg(&c.root)
+        .args(["diff", "--check", "--", "JOURNAL.md"])
+        .output()
+        .unwrap();
+    assert!(checked.status.success(), "{checked:?}");
 }
 
 #[test]
@@ -568,7 +584,6 @@ fn owner_queue_add_strips_one_recommendation_prefix_in_any_case() {
 fn owner_queue_removal_write_failures_preserve_the_item() {
     for (path, rule) in [
         ("JOURNAL.md", "owner-queue-journal-write"),
-        ("RESUME.md", "owner-queue-resume-write"),
         ("OWNER-QUEUE.md", "owner-queue-write"),
     ] {
         for action in ["answer", "strike"] {
@@ -616,19 +631,63 @@ fn owner_queue_removal_write_failures_preserve_the_item() {
                     )
                 );
             }
-            if path != "OWNER-QUEUE.md" {
-                assert_eq!(fs::read(c.root.join("RESUME.md")).unwrap(), resume);
-            } else {
-                assert_eq!(
-                    fs::read_to_string(c.root.join("RESUME.md")).unwrap(),
-                    std::str::from_utf8(&resume).unwrap().replacen(
-                        &format!("> {LOOP_WITHHELD}\n"),
-                        "",
-                        1
-                    )
-                );
-            }
+            assert_eq!(fs::read(c.root.join("RESUME.md")).unwrap(), resume);
+            let linted = lint(&c.root).unwrap();
+            assert!(linted.ok(), "{:?}", linted.violations);
         }
+    }
+}
+
+#[test]
+fn owner_queue_resume_write_failure_reports_the_journaled_removal() {
+    for action in ["answer", "strike"] {
+        let c = queue_fixture::single_item(&Fake);
+        let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+        let resume = fs::read(c.root.join("RESUME.md")).unwrap();
+        queue_fixture::obstruct_write(&c.root, "RESUME.md");
+        let body = queue_fixture::body_file(&c.root, queue_fixture::ANSWER);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cm"));
+        command
+            .arg("-C")
+            .arg(&c.root)
+            .args(["--json", "owner-queue", action, "7"]);
+        if action == "answer" {
+            command.arg("--body-file").arg(body);
+        } else {
+            command.args(["--reason", "Superseded."]);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{action}: {output:?}");
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["violations"].as_array().unwrap().len(), 1);
+        assert_eq!(json["violations"][0]["rule"], "owner-queue-resume-write");
+        assert_eq!(json["violations"][0]["path"], "RESUME.md");
+        assert!(json["violations"][0]["message"].as_str().unwrap().starts_with(
+            &format!("owner-queue {action} 7 failed; the item was already removed and journaled; updating RESUME.md failed: ")));
+        assert_eq!(
+            fs::read_to_string(c.root.join("OWNER-QUEUE.md")).unwrap(),
+            format!("{}\n", cm::templates::OWNER_QUEUE)
+        );
+        assert_eq!(fs::read(c.root.join("RESUME.md")).unwrap(), resume);
+        let after = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+        let added = after.strip_prefix(journal.as_str()).unwrap();
+        assert_eq!(
+            added.lines().nth(1).unwrap().split_once(" — ").unwrap().1,
+            format!("owner-queue {action} 7. Middle")
+        );
+        let reason = if action == "answer" {
+            format!("Answer:\n{}", queue_fixture::ANSWER.trim_end())
+        } else {
+            "Reason: Superseded.".to_owned()
+        };
+        assert_eq!(
+            added.lines().skip(3).collect::<Vec<_>>().join("\n"),
+            format!(
+                "- OWNER-QUEUE.md: `## 7. Middle`\n\nRemoved item:\n\n{}\n{reason}",
+                queue_fixture::ARCHIVED_MIDDLE
+            )
+        );
     }
 }
 
