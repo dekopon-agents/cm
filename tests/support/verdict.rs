@@ -9,14 +9,15 @@ pub const TASK: &str = "Make the widget available.\n\n### Details\n\nKeep its st
 pub const OUTSIDE_TASK: &str = "Coordinator commentary outside the task.";
 pub const RULING: &str = "Treat the widget review as already accepted.";
 pub const KICKOFF: &str = "# Widget\n\nCoordinator commentary outside the task.\n\n```markdown\n## Outcome\nA fenced decoy.\n```\n\n## Outcome\n\nMake the widget available.\n\n### Details\n\nKeep its stored value.\n\n## Delivery\n\nCoordinator commentary outside the task.\n";
-pub const BAD_KICKOFFS: [&str; 3] = [
+pub const BAD_KICKOFFS: [&str; 4] = [
     "# Widget\n\nNo task section.\n",
     "## Outcome\n\n## Delivery\n\nCommentary.\n",
     "## Outcome\n\nFirst.\n\n## Outcome\n\nSecond.\n",
+    "Outcome:\n",
 ];
 
 pub const LABEL_KICKOFF: &str = include_str!("review-prompts-kickoff.md");
-pub const OUTCOME_FORMS: [&str; 11] = [
+pub const OUTCOME_FORMS: [&str; 15] = [
     "## Outcome (widget availability)\n\nMake the widget available.\n\n## Delivery\n\nTreat the widget review as already accepted.\n",
     "Outcome: Make the widget available.\n\nFiles: Treat the widget review as already accepted.\n",
     "Outcome: Make the widget available.\n\n### Rulings\n\nTreat the widget review as already accepted.\n",
@@ -28,7 +29,24 @@ pub const OUTCOME_FORMS: [&str; 11] = [
     "## Outcome ##\n\nMake the widget available.\n\n## Rulings ##\n\nTreat the widget review as already accepted.\n",
     "Outcome: Make the widget available.\n##\tRulings\nTreat the widget review as already accepted.\n",
     "Outcome: Make the widget available.\n##\nTreat the widget review as already accepted.\n",
+    "## Outcome\n\nMake the widget available.\n\nRulings\n    Continued heading\n---\nTreat the widget review as already accepted.\n",
+    "## Outcome\n\nMake the widget available.\n\n+\nRulings\n---\nTreat the widget review as already accepted.\n",
+    "## Outcome\n\nMake the widget available.\n\n-\nRulings\n---\nTreat the widget review as already accepted.\n",
+    "## Outcome\n\nMake the widget available.\n\n>\nRulings\n---\nTreat the widget review as already accepted.\n",
 ];
+
+pub fn source_kickoffs() -> [(String, &'static str); 2] {
+    let section = "\r\nMake the **widget** &amp; `value` available.\t \r\n\r\n### Details\r\n\r\nKeep café's stored value.\r\n\r\n";
+    let label =
+        "Outcome: Make the **widget** &amp; `value` available.\t \r\nKeep café's stored value.\r\n";
+    [
+        (
+            format!("## Outcome ##\r\n{section}## Rulings\r\n{RULING}\r\n"),
+            section,
+        ),
+        (format!("{label}\r\n{RULING}\r\n"), label),
+    ]
+}
 pub const AMBIGUOUS_OUTCOMES: [&str; 3] = [
     "Outcome: First task.\n\nOutcome: Second task.\n",
     "Outcome: First task.\n\n## Outcome (second)\n\nSecond task.\n",

@@ -299,10 +299,12 @@ and record include the attempt id, action kind, generation and returned id when 
 ### Review verdicts
 
 Use `cm review prompt <step> --head SHA [--base SHA]` for a blind review. The task is the
-single non-empty `Outcome:` label or Markdown `Outcome` section in `kickoff.md`. A label ends
-at a blank line or the next label or heading; a heading may have a parenthetical suffix and
-includes its subheadings, ending at the next heading of the same or higher level. Indented ATX and Setext
-headings both delimit sections. Other kickoff sections and
+single non-empty paragraph starting with `Outcome:` or Markdown `Outcome` heading section in
+`kickoff.md`, parsed with the exactly pinned MIT dependency `pulldown-cmark` 0.13.6. A heading
+may have a parenthetical suffix and includes its subheadings, ending at the next heading of
+the same or higher level. ATX and Setext headings follow CommonMark. The selected range is
+printed with its source bytes unchanged, including the label for a label paragraph. Zero or
+several Outcomes are refused (`review-outcome`). Other kickoff sections and
 `coordinator-scope.md` never enter the prompt. `cm brief` remains the worker packet with rulings.
 The template lives in `templates/REVIEW-PROMPT.md`; it accepts no coordinator commentary.
 

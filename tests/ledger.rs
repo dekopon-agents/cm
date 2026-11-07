@@ -294,6 +294,48 @@ fn owner_queue_add_withholds_the_loop_banner() {
 mod queue_fixture;
 
 #[test]
+fn owner_queue_add_accepts_a_question_that_is_a_thematic_break() {
+    let (_temp, root) = campaign();
+    let item = queue_fixture::item("Widget", "Proceed.");
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&root)
+        .args([
+            "--json",
+            "owner-queue",
+            "add",
+            item.title,
+            "--context",
+            item.context,
+            "--question=---",
+            "--recommendation",
+            item.recommendation,
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["item"], 1);
+    assert_eq!(
+        fs::read_to_string(root.join("OWNER-QUEUE.md")).unwrap(),
+        format!(
+            "{}\n## 1. {}\n\nContext: {}\n---\nRecommendation: {}\nAnswer:\n",
+            cm::templates::OWNER_QUEUE,
+            item.title,
+            item.context,
+            item.recommendation
+        )
+    );
+    let edited = ledger::owner_queue_edit(&Fake, &root, 1, queue_fixture::REPLACEMENT).unwrap();
+    assert!(edited.ok(), "{:?}", edited.violations);
+    assert_eq!(edited.fields["queue_drained"], false);
+    assert!(cm::templates::queue_open(
+        &fs::read_to_string(root.join("OWNER-QUEUE.md")).unwrap()
+    ));
+    assert!(lint(&root).unwrap().ok());
+}
+
+#[test]
 fn owner_queue_answer_removes_only_its_item_and_journals_the_body() {
     let c = queue_fixture::campaign(&Fake);
     assert!(
@@ -495,28 +537,6 @@ fn owner_queue_edit_preserves_the_heading_and_required_fields() {
         .output()
         .unwrap();
     assert!(linted.status.success(), "{linted:?}");
-}
-
-#[test]
-fn owner_queue_edit_preserves_a_setext_heading_and_keeps_the_gate_closed() {
-    let c = queue_fixture::setext_item(&Fake);
-    let resume = fs::read(c.root.join("RESUME.md")).unwrap();
-    let edited = ledger::owner_queue_edit(&Fake, &c.root, 7, queue_fixture::REPLACEMENT).unwrap();
-    assert!(edited.ok(), "{:?}", edited.violations);
-    assert_eq!(edited.fields["queue_drained"], false);
-    let queue = fs::read_to_string(c.root.join("OWNER-QUEUE.md")).unwrap();
-    assert_eq!(
-        queue,
-        format!(
-            "{}\n{}\n{}\n\n",
-            cm::templates::OWNER_QUEUE,
-            queue_fixture::SETEXT_HEADING,
-            queue_fixture::REPLACEMENT
-        )
-    );
-    assert!(cm::templates::queue_open(&queue));
-    assert_eq!(fs::read(c.root.join("RESUME.md")).unwrap(), resume);
-    assert!(lint(&c.root).unwrap().ok());
 }
 
 #[test]

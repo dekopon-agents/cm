@@ -1427,55 +1427,52 @@ fn prompt_scope(
 }
 
 fn kickoff_task(text: &str) -> Option<String> {
-    let headings = crate::markdown::headings(text);
-    let outcomes: Vec<_> = headings
-        .iter()
-        .filter(|heading| {
-            heading.text == "Outcome"
-                || (heading.text.starts_with("Outcome (") && heading.text.ends_with(')'))
-        })
-        .collect();
-    let labels = crate::markdown::labels(text);
-    let outcome_labels: Vec<_> = labels
-        .iter()
-        .filter(|(_, label)| *label == "Outcome")
-        .collect();
-    if outcomes.len() + outcome_labels.len() != 1 {
+    use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+    use std::ops::Range;
+
+    let mut headings = Vec::new();
+    let mut heading: Option<(HeadingLevel, Range<usize>, String)> = None;
+    let mut tasks = Vec::new();
+    for (event, range) in Parser::new(text).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                heading = Some((level, range, String::new()));
+            }
+            Event::Text(value) | Event::Code(value) => {
+                if let Some((_, _, title)) = &mut heading {
+                    title.push_str(&value);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some((_, _, title)) = &mut heading {
+                    title.push(' ');
+                }
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                headings.push(heading.take()?);
+            }
+            Event::Start(Tag::Paragraph) if text[range.clone()].starts_with("Outcome:") => {
+                tasks.push((range, "Outcome:".len()));
+            }
+            _ => {}
+        }
+    }
+    for (index, (level, range, title)) in headings.iter().enumerate() {
+        let title = title.trim();
+        if title == "Outcome" || (title.starts_with("Outcome (") && title.ends_with(')')) {
+            let end = headings[index + 1..]
+                .iter()
+                .find(|(next, _, _)| next <= level)
+                .map_or(text.len(), |(_, range, _)| range.start);
+            tasks.push((range.end..end, 0));
+        }
+    }
+    if tasks.len() != 1 {
         return None;
     }
-    let lines: Vec<_> = text.lines().collect();
-    let task = if let Some(heading) = outcomes.first() {
-        let end = headings
-            .iter()
-            .find(|next| next.line > heading.line && next.level <= heading.level)
-            .map_or(lines.len(), |next| next.line - 1);
-        let start = heading.body_start(text);
-        lines[start..end].join("\n")
-    } else {
-        let (line, _) = outcome_labels[0];
-        let end = labels
-            .iter()
-            .map(|(line, _)| *line)
-            .chain(headings.iter().map(|heading| heading.line))
-            .chain(
-                lines
-                    .iter()
-                    .enumerate()
-                    .skip(*line)
-                    .filter(|(_, text)| text.trim().is_empty())
-                    .map(|(index, _)| index + 1),
-            )
-            .filter(|next| *next > *line)
-            .min()
-            .map_or(lines.len(), |next| next - 1);
-        let (_, first) = lines[line - 1].split_once(':')?;
-        std::iter::once(first.trim_start())
-            .chain(lines[*line..end].iter().copied())
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let task = task.trim();
-    (!task.is_empty()).then(|| task.to_owned())
+    let (range, label_len) = tasks.pop()?;
+    let task = &text[range];
+    (!task[label_len..].trim().is_empty()).then(|| task.to_owned())
 }
 
 fn synced_head(

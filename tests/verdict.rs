@@ -1633,6 +1633,25 @@ fn review_prompt_accepts_label_and_parenthetical_outcomes_and_stops_at_boundarie
 }
 
 #[test]
+fn review_prompt_preserves_the_selected_source_bytes() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = prompt_campaign(&host);
+    for (kickoff, task) in review_fixture::source_kickoffs() {
+        c.write(&format!("{STEP}/kickoff.md"), &kickoff);
+        let output = review_fixture::review(&c.root, &["prompt", STEP, "--head", &c.head()]);
+        assert!(output.status.success(), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let task_output = result["prompt"]
+            .as_str()
+            .unwrap()
+            .split_once("## Task\n\n")
+            .unwrap()
+            .1;
+        assert_eq!(task_output, format!("{task}\n"));
+    }
+}
+
+#[test]
 fn review_prompt_prints_the_full_head_and_resolved_merge_base() {
     let host = at("2026-10-25T06:00:00Z");
     let c = prompt_campaign(&host);

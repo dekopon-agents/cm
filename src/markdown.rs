@@ -6,21 +6,6 @@ pub struct Heading<'a> {
     pub text: &'a str,
 }
 
-impl Heading<'_> {
-    pub(crate) fn body_start(&self, text: &str) -> usize {
-        let mut lines = text.lines().enumerate().skip(self.line - 1);
-        if lines
-            .next()
-            .is_some_and(|(_, line)| atx_heading(line.trim_start()).is_some())
-        {
-            return self.line;
-        }
-        lines
-            .find(|(_, line)| setext_level(line.trim_start()).is_some())
-            .map_or(self.line, |(index, _)| index + 1)
-    }
-}
-
 pub fn first_difference(now: &str, then: &str) -> usize {
     now.lines()
         .zip(then.lines())
@@ -82,125 +67,20 @@ pub(crate) fn unterminated_fence(text: &str) -> bool {
 pub fn headings(text: &str) -> Vec<Heading<'_>> {
     let mut fences = Fences::default();
     let mut out = Vec::new();
-    let mut paragraph = None;
-    let mut container = false;
     for (index, line) in text.lines().enumerate() {
         if fences.contains(line) {
-            paragraph = None;
-            container = false;
             continue;
         }
-        let trimmed = line.trim_start_matches(' ');
-        if line.len() - trimmed.len() > 3 {
-            paragraph = None;
-            continue;
-        }
-        let line = trimmed;
-        if let Some((level, title)) = atx_heading(line) {
+        let level = line.bytes().take_while(|byte| *byte == b'#').count();
+        if (1..=6).contains(&level) && line[level..].starts_with(' ') {
             out.push(Heading {
                 line: index + 1,
                 level,
-                text: title,
+                text: line[level + 1..].trim(),
             });
-            paragraph = None;
-            container = false;
-        } else if let Some(level) = setext_level(line) {
-            if let Some((start, title)) = paragraph.take() {
-                out.push(Heading {
-                    line: start,
-                    level,
-                    text: title,
-                });
-            }
-            container = false;
-        } else if line.trim().is_empty() || thematic_break(line) {
-            paragraph = None;
-            container = false;
-        } else if list_or_quote(line, paragraph.is_some()) {
-            paragraph = None;
-            container = true;
-        } else if paragraph.is_none() && !container {
-            paragraph = Some((index + 1, line.trim()));
         }
     }
     out
-}
-
-fn atx_heading(line: &str) -> Option<(usize, &str)> {
-    let level = line.bytes().take_while(|byte| *byte == b'#').count();
-    let rest = &line[level..];
-    if !(1..=6).contains(&level) || (!rest.is_empty() && !rest.starts_with([' ', '\t'])) {
-        return None;
-    }
-    let title = rest.trim_matches([' ', '\t']);
-    let bare = title.trim_end_matches('#');
-    let title = if bare.len() < title.len() && (bare.is_empty() || bare.ends_with([' ', '\t'])) {
-        bare.trim_end_matches([' ', '\t'])
-    } else {
-        title
-    };
-    Some((level, title))
-}
-
-fn thematic_break(line: &str) -> bool {
-    let Some(marker @ (b'-' | b'*' | b'_')) = line.bytes().next() else {
-        return false;
-    };
-    let mut markers = line.bytes().filter(|byte| !matches!(byte, b' ' | b'\t'));
-    markers.clone().count() >= 3 && markers.all(|byte| byte == marker)
-}
-
-fn list_or_quote(line: &str, in_paragraph: bool) -> bool {
-    if line.starts_with('>') {
-        return true;
-    }
-    let after_marker = if line.starts_with(['-', '+', '*']) {
-        &line[1..]
-    } else {
-        let digits = line.bytes().take_while(u8::is_ascii_digit).count();
-        if !(1..=9).contains(&digits) || !line[digits..].starts_with(['.', ')']) {
-            return false;
-        }
-        if in_paragraph && line[..digits].parse::<u32>() != Ok(1) {
-            return false;
-        }
-        &line[digits + 1..]
-    };
-    (after_marker.is_empty() || after_marker.starts_with([' ', '\t']))
-        && (!in_paragraph || !after_marker.trim_matches([' ', '\t']).is_empty())
-}
-
-pub(crate) fn setext_level(line: &str) -> Option<usize> {
-    let line = line.trim_end();
-    if !line.is_empty() && line.bytes().all(|byte| byte == b'=') {
-        Some(1)
-    } else if !line.is_empty() && line.bytes().all(|byte| byte == b'-') {
-        Some(2)
-    } else {
-        None
-    }
-}
-
-pub(crate) fn labels(text: &str) -> Vec<(usize, &str)> {
-    let mut fences = Fences::default();
-    text.lines()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            if fences.contains(line) {
-                return None;
-            }
-            let trimmed = line.trim_start_matches(' ');
-            if line.len() - trimmed.len() > 3 {
-                return None;
-            }
-            let (name, _) = trimmed.split_once(':')?;
-            (name.starts_with(|c: char| c.is_ascii_alphabetic())
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_')))
-            .then_some((index + 1, name))
-        })
-        .collect()
 }
 
 pub fn code_spans(text: &str) -> Vec<(usize, &str)> {
@@ -323,50 +203,11 @@ mod tests {
 
     #[test]
     fn headings_skip_fences() {
-        let text = "# A\n```\n# not\n```\n   ## B\n\nC\n===\n\n  D\n  ---\n\n#nope\n";
+        let text = "# A\n```\n# not\n```\n## B\n#nope\n";
         let found: Vec<_> = headings(text)
             .into_iter()
             .map(|heading| (heading.line, heading.level, heading.text))
             .collect();
-        assert_eq!(
-            found,
-            vec![(1, 1, "A"), (5, 2, "B"), (7, 1, "C"), (10, 2, "D")]
-        );
-    }
-
-    #[test]
-    fn atx_headings_accept_tabs_empty_titles_and_closing_sequences() {
-        let found: Vec<_> =
-            headings("#\tTitle ##\n##\n### ###\n#### text#\n##### text ## tail\n######foo\n")
-                .into_iter()
-                .map(|heading| (heading.level, heading.text))
-                .collect();
-        assert_eq!(
-            found,
-            vec![
-                (1, "Title"),
-                (2, ""),
-                (3, ""),
-                (4, "text#"),
-                (5, "text ## tail")
-            ]
-        );
-    }
-
-    #[test]
-    fn setext_headings_exclude_list_items_and_block_quotes() {
-        for text in [
-            "- Item\n---\n",
-            "+ Item\n---\n",
-            "* Item\n---\n",
-            "1. Item\n---\n",
-            "7) Item\n---\n",
-            "> Quote\n---\n",
-            "- Item\nContinuation\n---\n",
-            "> Quote\nContinuation\n---\n",
-            "_ _ _\n---\n",
-        ] {
-            assert!(headings(text).is_empty(), "{text}");
-        }
+        assert_eq!(found, vec![(1, 1, "A"), (5, 2, "B")]);
     }
 }
