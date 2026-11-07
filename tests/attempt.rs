@@ -7,7 +7,7 @@ use cm::commands::{self, Declaration, Remote};
 use cm::host::Host;
 use cm::lint::lint;
 use cm::outcome::Outcome;
-use cm::state::{AttemptOutcome, Evidence, Lane};
+use cm::state::{AttemptOutcome, Evidence, Lane, Phase};
 use cm::store::{self, parse_target};
 use jiff::Timestamp;
 
@@ -218,6 +218,69 @@ fn an_action_with_no_id_closes_only_as_unknown() {
     assert!(advance(&host, &c, "01-a/u/S1", "blocked:lost", None).ok());
     assert!(launch(&host, &c, "01-a/u/S1", None).ok());
     assert!(lint(&c.root).unwrap().ok());
+}
+
+#[test]
+fn a_launched_step_with_an_ended_attempt_relaunches_from_its_newest_resume() {
+    for outcome in [
+        AttemptOutcome::Complete,
+        AttemptOutcome::Partial,
+        AttemptOutcome::Unknown,
+    ] {
+        let host = at("2026-10-19T09:00:00Z");
+        let c = campaign(&host);
+        let token = launched(&host, &c, Some(30));
+        let notes = note(&c, "partial.md");
+        assert!(end(&host, &c.root, &token, outcome, Some(notes)).ok());
+        for name in ["resume.md", "resume-1.md", "resume-2.md"] {
+            fs::write(c.root.join("01-a/u/S1").join(name), "Resume.\n").unwrap();
+        }
+
+        let relaunched = launch(&host, &c, "01-a/u/S1", None);
+        assert!(relaunched.ok(), "{:?}", relaunched.violations);
+        assert_eq!(relaunched.fields["prompt"], "01-a/u/S1/resume-2.md");
+        assert_eq!(relaunched.fields["launches"], 2);
+        let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+        let step = &unit.steps["S1"];
+        assert_eq!(step.track.state, Phase::Launched);
+        assert_eq!(step.launches, 2);
+        let attempt = step.attempt.as_ref().unwrap();
+        assert_eq!(attempt.id, "01-a/u/S1#2");
+        assert!(attempt.ended.is_none());
+    }
+}
+
+#[test]
+fn a_launched_step_with_an_open_attempt_refuses_relaunch_even_past_its_cap() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    launched(&host, &c, Some(30));
+    for now in ["2026-10-19T09:00:00Z", "2026-10-19T09:31:00Z"] {
+        let before = c.files();
+        let refused = launch(&at(now), &c, "01-a/u/S1", None);
+        assert_eq!(rules(&refused), vec!["attempt-open", "launch-state"]);
+        assert_eq!(c.files(), before);
+    }
+}
+
+#[test]
+fn a_launched_local_step_without_an_attempt_refuses_relaunch() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/S1", Lane::Pi, &[]).ok());
+    let (repo, _) = campaign_fixture::repo(c.root.parent().unwrap());
+    let target = target("01-a/u/S1");
+    assert!(
+        commands::launch(&host, &c.root, &target, Some(&repo))
+            .unwrap()
+            .ok()
+    );
+    let step = &store::load_unit(&c.root.join("01-a/u")).unwrap().steps["S1"];
+    assert!(step.attempt.is_none());
+    let before = c.files();
+    let refused = commands::launch(&host, &c.root, &target, Some(&repo)).unwrap();
+    assert_eq!(rules(&refused), vec!["launch-state"]);
+    assert_eq!(c.files(), before);
 }
 
 #[test]

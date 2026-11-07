@@ -360,6 +360,7 @@ impl Campaign {
                 file: None,
                 repo: Some(&self.repo),
                 part: None,
+                by: &[],
             },
             gate,
         )
@@ -406,6 +407,7 @@ fn released_without_a_checkout_reads_tag_containment_from_the_forge() {
                 file: None,
                 repo: None,
                 part: None,
+                by: &[],
             },
             &MergeGate {
                 forge: Some(forge),
@@ -469,6 +471,7 @@ fn released_without_a_checkout_refuses_a_containing_branch() {
             file: None,
             repo: None,
             part: None,
+            by: &[],
         },
         &MergeGate {
             forge: Some(&forge),
@@ -519,6 +522,7 @@ fn a_tag_only_release_without_a_checkout_uses_its_declared_repository() {
                 file: None,
                 repo: None,
                 part: None,
+                by: &[],
             },
             &MergeGate {
                 forge: Some(forge),
@@ -1340,6 +1344,7 @@ fn part_rounds_use_the_parts_pr_and_do_not_mix_counts() {
                 file: None,
                 repo: Some(&c.repo),
                 part: Some("two"),
+                by: &[],
             },
             &MergeGate::default()
         )
@@ -1581,6 +1586,7 @@ fn merge_gate_repair_commands_select_the_part_in_advance_and_sync() {
                 file: None,
                 repo: Some(&c.repo),
                 part: Some("-one"),
+                by: &[],
             },
             &gate,
         )
@@ -3010,6 +3016,7 @@ fn standing_registration_tries_each_parts_pr_without_changing_commit_selection()
             file: None,
             repo: Some(&c.repo),
             part: Some("two"),
+            by: &[],
         },
         &MergeGate::default(),
     )

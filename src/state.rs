@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::evidence::CampaignFile;
 use crate::forge::{GithubRepo, TagName};
 
-pub const SCHEMA: u32 = 4;
+pub const SCHEMA: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -126,6 +126,8 @@ pub struct Evidence {
     pub digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<CampaignFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded_by: Vec<String>,
 }
 
 impl Evidence {
@@ -147,6 +149,9 @@ impl Evidence {
         if other.file.is_some() {
             self.file.clone_from(&other.file);
         }
+        if !other.superseded_by.is_empty() {
+            self.superseded_by.clone_from(&other.superseded_by);
+        }
     }
 
     pub fn summary(&self) -> String {
@@ -159,6 +164,10 @@ impl Evidence {
         .into_iter()
         .filter_map(|(name, value)| value.as_ref().map(|value| format!("{name} {value}")))
         .chain(self.file.as_ref().map(|file| format!("file {file}")))
+        .chain(
+            (!self.superseded_by.is_empty())
+                .then(|| format!("superseded by {}", self.superseded_by.join(", "))),
+        )
         .collect();
         if parts.is_empty() {
             "—".to_owned()
