@@ -449,6 +449,15 @@ fn lint_holds(root: &Path, unit: &UnitState, seen: &mut Seen, out: &mut Vec<Viol
                 error.to_string(),
             )),
         }
+        for gate in crate::plan::gates(root, &seen.units, step)
+            .into_iter()
+            .filter(crate::plan::Gate::pin_unmet)
+        {
+            seen.warnings.push(format!(
+                "pin-unmet: {target}: {}; recheck with `cm next {target}`",
+                gate.describe()
+            ));
+        }
         for pin in &step.pins {
             if let Err(error) = pin.file.check(root) {
                 out.push(Violation::new(

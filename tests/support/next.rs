@@ -20,7 +20,7 @@ impl Campaign {
         store::write_json(&store::state_path(&dir), &unit).unwrap();
     }
 
-    pub fn observed_head(&self, target: &str, sha: &str) {
+    pub fn observed_head(&self, target: &str, sha: Option<&str>) {
         store::write_json(
             &pulls_path(&self.root),
             &std::collections::BTreeMap::from([(
@@ -28,7 +28,7 @@ impl Campaign {
                 Observed {
                     target: target.into(),
                     at: "2026-10-17T08:00Z".into(),
-                    head: Some(sha.into()),
+                    head: sha.map(str::to_owned),
                     mergeable_state: None,
                 },
             )]),

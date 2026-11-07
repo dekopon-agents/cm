@@ -60,6 +60,14 @@ impl Gate {
                 .is_some_and(|track| self.after.met_by(track, self.finish))
     }
 
+    pub(crate) fn pin_unmet(&self) -> bool {
+        matches!(self.after, After::Pin(_))
+            && !self
+                .track
+                .as_ref()
+                .is_some_and(|track| self.after.met_by(track, self.finish))
+    }
+
     pub fn describe(&self) -> String {
         let stale = if self.stale.is_empty() {
             String::new()
@@ -67,16 +75,21 @@ impl Gate {
             format!("; its pinned evidence is stale: {}", self.stale.join(", "))
         };
         if let After::Pin(_) = &self.after {
-            let head = self
+            if self
+                .track
+                .as_ref()
+                .is_some_and(|track| track.resting() == &Phase::Superseded)
+            {
+                return format!("{} (stale pin; step superseded{stale})", self.after);
+            }
+            let Some(head) = self
                 .track
                 .as_ref()
                 .and_then(|track| track.evidence.sha.as_deref())
-                .unwrap_or("none");
-            if !self
-                .track
-                .as_ref()
-                .is_some_and(|track| self.after.met_by(track, self.finish))
-            {
+            else {
+                return format!("{} (head not recorded{stale})", self.after);
+            };
+            if self.pin_unmet() {
                 return format!("{} (stale pin; recorded head {head}{stale})", self.after);
             }
             return format!("{} (recorded head {head}{stale})", self.after);
@@ -157,13 +170,14 @@ pub fn gates(root: &Path, units: &Units, step: &Step) -> Vec<Gate> {
             if let After::Pin(revision) = after
                 && let Some(track) = &mut gate.track
             {
-                // A sync observation is newer than the SHA recorded when the PR opened.
-                // A multipart step has no single head to pin.
-                track.evidence.sha =
-                    crate::holds::head(root, units, &revision.step).or_else(|| {
-                        self::step(units, &revision.step)
-                            .filter(|step| step.parts.is_empty())
-                            .and_then(|step| step.track.evidence.sha.clone())
+                track.evidence.sha = self::step(units, &revision.step)
+                    .filter(|step| step.parts.is_empty())
+                    .and_then(|step| {
+                        if step.track.resting() == &Phase::PrOpen {
+                            crate::holds::head(root, units, &revision.step)
+                        } else {
+                            step.track.evidence.sha.clone()
+                        }
                     });
             }
             gate
@@ -199,7 +213,9 @@ struct Candidate<'a> {
 
 impl Candidate<'_> {
     fn ready(&self) -> bool {
-        self.kickoff.is_some() && self.gates.iter().all(Gate::met)
+        self.step.track.state == Phase::Drafted
+            && self.kickoff.is_some()
+            && self.gates.iter().all(Gate::met)
     }
 
     fn lane(&self) -> Option<Lane> {
@@ -210,10 +226,16 @@ impl Candidate<'_> {
         let mut out: Vec<String> = self
             .gates
             .iter()
-            .filter(|gate| !gate.met())
+            .filter(|gate| {
+                if self.step.track.state == Phase::Drafted {
+                    !gate.met()
+                } else {
+                    gate.pin_unmet()
+                }
+            })
             .map(Gate::describe)
             .collect();
-        if self.kickoff.is_none() {
+        if self.step.track.state == Phase::Drafted && self.kickoff.is_none() {
             out.push(format!("{}/kickoff.md (not written)", self.target));
         }
         out
@@ -247,12 +269,16 @@ fn candidates<'a>(root: &Path, units: &'a Units) -> Vec<Candidate<'a>> {
                 .iter()
                 .map(move |(name, step)| (format!("{unit}/{name}"), step))
         })
-        .filter(|(_, step)| step.lane.is_some() && step.track.state == Phase::Drafted)
+        .filter(|(_, step)| step.lane.is_some())
         .map(|(target, step)| Candidate {
             kickoff: kickoff(root, &target),
             gates: gates(root, units, step),
             target,
             step,
+        })
+        .filter(|candidate| {
+            candidate.step.track.state == Phase::Drafted
+                || candidate.gates.iter().any(Gate::pin_unmet)
         })
         .collect()
 }
@@ -622,7 +648,7 @@ pub fn next_at(
             ));
         }
         outcome.violations.extend(unmet(&full, &candidate.gates));
-        if candidate.kickoff.is_none() {
+        if candidate.step.track.state == Phase::Drafted && candidate.kickoff.is_none() {
             outcome.violations.push(Violation::new(
                 &full,
                 "packet-kickoff",

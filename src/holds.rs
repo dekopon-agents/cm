@@ -755,15 +755,16 @@ pub fn head(root: &Path, units: &Units, target: &str) -> Option<String> {
     resolve_head(units, target, |pr| {
         store::read_json::<BTreeMap<String, plan::Observed>>(&plan::pulls_path(root))
             .ok()?
-            .remove(pr)?
-            .head
+            .remove(pr)
+            .filter(|observed| observed.target == target)
+            .map(|observed| observed.head)
     })
 }
 
 fn resolve_head(
     units: &Units,
     target: &str,
-    observed: impl FnOnce(&str) -> Option<String>,
+    observed: impl FnOnce(&str) -> Option<Option<String>>,
 ) -> Option<String> {
     let (name, part) = match target.split_once('#') {
         Some((name, part)) => (name, Some(part)),
@@ -786,8 +787,10 @@ fn resolve_head(
         | Phase::Superseded
         | Phase::Blocked(_) => return None,
     }
-    let observed = track.evidence.pr.as_deref().and_then(observed);
-    observed.or_else(|| track.evidence.sha.clone())
+    match track.evidence.pr.as_deref().and_then(observed) {
+        Some(head) => head,
+        None => track.evidence.sha.clone(),
+    }
 }
 
 pub fn revision(
@@ -949,7 +952,11 @@ pub(crate) fn held(units: &Units, now: jiff::Timestamp, root: &Path, number: &mu
         {
             target.push_str(&format!("#<{kind}-part>"));
         }
-        if resolve_head(units, &target, |pr| observations.get(pr)?.head.clone()).is_none() {
+        if resolve_head(units, &target, |pr| {
+            observations.get(pr).map(|seen| seen.head.clone())
+        })
+        .is_none()
+        {
             target.push_str(&format!("@<{kind}-sha>"));
         }
         shell_word(&target)

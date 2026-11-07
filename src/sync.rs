@@ -124,6 +124,7 @@ impl<'a> Run<'a> {
         self.released();
         self.deployed();
         self.settle();
+        self.remember_heads();
         let mut notes = crate::holds::mark_stale(&mut self.units, &self.heads, &self.at);
         notes.extend(crate::holds::mark_closed(&mut self.units, &self.at));
         notes.extend(crate::holds::mark_expired(
@@ -136,6 +137,43 @@ impl<'a> Run<'a> {
             self.dirty.insert(unit.clone());
         }
         self.notes.extend(notes);
+    }
+
+    fn remember_heads(&mut self) {
+        let seen =
+            store::read_json::<BTreeMap<String, plan::Observed>>(&plan::pulls_path(self.root))
+                .unwrap_or_default();
+        for (unit_name, unit) in &mut self.units {
+            for (name, step) in &mut unit.steps {
+                let target = format!("{unit_name}/{name}");
+                let tracks = std::iter::once((target.clone(), &mut step.track)).chain(
+                    step.parts
+                        .iter_mut()
+                        .map(|(part, track)| (format!("{target}#{part}"), track)),
+                );
+                for (target, track) in tracks {
+                    if track.resting() != &Phase::PrOpen {
+                        continue;
+                    }
+                    let Some(pr) = &track.evidence.pr else {
+                        continue;
+                    };
+                    let head = self.heads.get(&target).cloned().map(Some).or_else(|| {
+                        self.open
+                            .get(pr)
+                            .or_else(|| seen.get(pr))
+                            .filter(|observed| observed.target == target)
+                            .map(|observed| observed.head.clone())
+                    });
+                    if let Some(head) = head
+                        && track.evidence.sha != head
+                    {
+                        track.evidence.sha = head;
+                        self.dirty.insert(unit_name.clone());
+                    }
+                }
+            }
+        }
     }
 
     fn settle(&mut self) {

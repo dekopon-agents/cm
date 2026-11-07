@@ -128,7 +128,7 @@ Campaign `.cm/state.json`:
 
 ```json
 {
-  "schema": 4,
+  "schema": 5,
   "kind": "campaign",
   "initialized": "2026-10-08T07:04Z",
   "written": ["RESUME.md", "JOURNAL.md", "LIMITS.toml", "OWNER-QUEUE.md"],
@@ -148,7 +148,7 @@ Unit `.cm/state.json`:
 
 ```json
 {
-  "schema": 4,
+  "schema": 5,
   "kind": "unit",
   "unit": "01-first/alpha",
   "state": "launched",
@@ -213,13 +213,16 @@ met. `--after` takes:
 |---|---|
 | `<step>` or `<NN-name>/<unit>/<step>` | that step is `merged` or later |
 | `pr-open:<step>` | that step is `pr-open` or later (a chain that builds on an open PR) |
-| `pin:<step>@<sha>` | that step's recorded head matches `<sha>` (7 to 40 hex digits, case-insensitive prefix matching as for pinned evidence), regardless of its state |
+| `pin:<step>@<sha>` | that step's recorded head matches `<sha>` (7 to 40 hex digits, case-insensitive prefix matching as for pinned evidence) |
 | `tag:<line>@<version>` | the release step `00-release/<line>/<version>` is `released` or later |
 | `deployed:<line>@<version>` | that release step is `deployed` or later |
 
-A pin uses the latest synced open PR head, falling back to the step's recorded SHA.
-When the head differs or is missing, `cm next` lists the dependent under `waiting` as
-`stale pin`, with its recheck command. A multipart step has no single head to pin.
+A pin uses the latest synced open PR head, which sync also saves as the step's recorded SHA.
+After merge, that SHA is the merge commit; a pin to the old PR head then becomes stale.
+When the recorded commit differs or the source is superseded, `cm next` and CARD list the
+dependent under `waiting` as `stale pin`, with its recheck command, even after launch.
+`cm lint` warns `pin-unmet` for unmet pins. A head that has never been recorded is reported
+as `head not recorded`. A multipart step has no single head to pin.
 Pins are refused in `known-red --until` and `blocked:until:`.
 
 A step or `pr-open:` gate on an `owner`-lane or study step, or a non-release `coordinator`-lane step
@@ -255,6 +258,10 @@ campaign, in the move's evidence beside its stamp, and `cm lint` re-checks it ev
 `done --evidence` on a code step, or `done` on one short of `deployed`, is `done-code-step`. A
 release step cannot be a study. A `coordinator`-lane release step keeps the code-step ladder even
 without a recorded tag, as does a coordinator step with a recorded PR, SHA or declared parts.
+
+cm 0.10 raises SCHEMA from 4 to 5 for pinned dependency gates. Units written by 0.10
+require cm 0.10 or later; cm 0.9 refuses them as a newer schema. Schema 1 through 4
+state remains readable by 0.10.
 
 cm 0.9 raises SCHEMA from 3 to 4 for watch withdrawal and writes every unit state, and a new
 campaign state, as schema 4. Units written by 0.9 cannot be read by cm 0.8.x; upgrade every

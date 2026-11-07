@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::evidence::CampaignFile;
 use crate::forge::{GithubRepo, TagName};
 
-pub const SCHEMA: u32 = 4;
+pub const SCHEMA: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -603,11 +603,12 @@ impl After {
 
     pub fn met_by(&self, track: &Track, finish: Finish) -> bool {
         if let After::Pin(revision) = self {
-            return track
-                .evidence
-                .sha
-                .as_deref()
-                .is_some_and(|head| same_commit(head, &revision.sha));
+            return track.resting() != &Phase::Superseded
+                && track
+                    .evidence
+                    .sha
+                    .as_deref()
+                    .is_some_and(|head| same_commit(head, &revision.sha));
         }
         match (track.resting().rank(), self.needs(finish).rank()) {
             (Some(at), Some(needed)) => at >= needed,
