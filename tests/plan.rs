@@ -1172,6 +1172,7 @@ fn merged(sha: &str) -> Pull {
     Pull {
         state: PullState::Merged,
         merge_commit: Some(CommitSha::new(sha)),
+        merged_at: None,
         head: None,
         base: None,
         mergeable_state: None,
@@ -1229,6 +1230,7 @@ fn sync_moves_steps_from_github_state_and_renders_the_card() {
         Pull {
             state: PullState::Closed,
             merge_commit: None,
+            merged_at: None,
             head: None,
             base: None,
             mergeable_state: None,
@@ -2555,6 +2557,7 @@ fn open(head: &str) -> Pull {
     Pull {
         state: PullState::Open,
         merge_commit: None,
+        merged_at: None,
         head: Some(CommitSha::new(head)),
         base: None,
         mergeable_state: None,

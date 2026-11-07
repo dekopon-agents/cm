@@ -176,6 +176,7 @@ pub enum PullState {
 pub struct Pull {
     pub state: PullState,
     pub merge_commit: Option<CommitSha>,
+    pub merged_at: Option<String>,
     /// The PR's head commit, as GitHub reports it.
     pub head: Option<CommitSha>,
     /// The base branch's tip, as GitHub reports it.
@@ -493,6 +494,8 @@ impl Forge for Gh {
             merged: bool,
             merge_commit_sha: Option<String>,
             #[serde(default)]
+            merged_at: Option<String>,
+            #[serde(default)]
             head: Option<Head>,
             #[serde(default)]
             base: Option<Head>,
@@ -521,6 +524,7 @@ impl Forge for Gh {
                 .merge_commit_sha
                 .filter(|_| state == PullState::Merged)
                 .map(CommitSha::new),
+            merged_at: rest.merged_at.filter(|_| state == PullState::Merged),
             head: rest.head.map(|head| CommitSha::new(head.sha)),
             base: rest.base.map(|base| CommitSha::new(base.sha)),
             mergeable_state: rest

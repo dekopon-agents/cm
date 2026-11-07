@@ -121,6 +121,8 @@ pub struct Evidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
@@ -137,6 +139,7 @@ impl Evidence {
 
     pub fn absorb(&mut self, other: &Evidence) {
         for (mine, theirs) in [
+            (&mut self.merged_at, &other.merged_at),
             (&mut self.sha, &other.sha),
             (&mut self.pr, &other.pr),
             (&mut self.tag, &other.tag),
@@ -158,6 +161,7 @@ impl Evidence {
         let parts: Vec<String> = [
             ("pr", &self.pr),
             ("sha", &self.sha),
+            ("merged_at", &self.merged_at),
             ("tag", &self.tag),
             ("digest", &self.digest),
         ]
@@ -213,7 +217,7 @@ impl Flag {
 pub fn evidence_for(phase: &Phase, finish: Finish) -> (&'static [Flag], &'static [Flag]) {
     match (phase, finish) {
         (Phase::PrOpen, _) => (&[Flag::Pr, Flag::Sha], &[]),
-        (Phase::Merged, _) => (&[Flag::Sha], &[]),
+        (Phase::Merged, _) => (&[Flag::Sha], &[Flag::Pr]),
         (Phase::Released, _) => (&[Flag::Tag], &[Flag::Digest]),
         (Phase::Deployed, _) => (&[Flag::Digest], &[]),
         (Phase::Done, Finish::Evidence) | (Phase::Superseded, _) => (&[Flag::File], &[]),
@@ -1054,6 +1058,20 @@ impl Step {
         })
     }
 
+    pub(crate) fn merged_at(&self) -> Option<String> {
+        let times: Option<Vec<_>> = self
+            .parts
+            .values()
+            .map(|part| {
+                let at = part.evidence.merged_at.as_ref()?;
+                Some((crate::plan::instant(at)?, at))
+            })
+            .collect();
+        times
+            .and_then(|times| times.into_iter().max())
+            .map(|(_, at)| at.clone())
+    }
+
     pub fn roll_up_all(
         &mut self,
         release: bool,
@@ -1092,6 +1110,7 @@ impl Step {
             evidence
         };
         self.track.apply(reach.clone(), at, evidence);
+        self.track.evidence.merged_at = self.merged_at();
         Some((from, reach))
     }
 
