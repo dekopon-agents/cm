@@ -268,7 +268,7 @@ enum Commands {
         #[arg(long, value_name = "FILE")]
         body_file: PathBuf,
     },
-    /// Add the next numbered item to OWNER-QUEUE.md and withhold RESUME.md's `/loop`.
+    /// Add, answer, strike or edit numbered items in OWNER-QUEUE.md.
     OwnerQueue {
         #[command(subcommand)]
         act: QueueAct,
@@ -461,6 +461,26 @@ enum QueueAct {
         question: String,
         #[arg(long)]
         recommendation: String,
+    },
+    /// Journal the answer and remove the numbered item.
+    Answer {
+        number: u32,
+        /// A non-empty answer body; `-` reads stdin.
+        #[arg(long, value_name = "FILE")]
+        body_file: PathBuf,
+    },
+    /// Remove the numbered item and journal why.
+    Strike {
+        number: u32,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Replace the numbered item's body, keeping its heading and required fields.
+    Edit {
+        number: u32,
+        /// A non-empty item body; `-` reads stdin.
+        #[arg(long, value_name = "FILE")]
+        body_file: PathBuf,
     },
 }
 
@@ -779,6 +799,21 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 recommendation,
             },
         ),
+        Commands::OwnerQueue {
+            act: QueueAct::Answer { number, body_file },
+        } => {
+            let body = read_body(body_file, None)?;
+            crate::ledger::owner_queue_answer(host, &root()?, *number, &body)
+        }
+        Commands::OwnerQueue {
+            act: QueueAct::Strike { number, reason },
+        } => crate::ledger::owner_queue_strike(host, &root()?, *number, reason),
+        Commands::OwnerQueue {
+            act: QueueAct::Edit { number, body_file },
+        } => {
+            let body = read_body(body_file, None)?;
+            crate::ledger::owner_queue_edit(host, &root()?, *number, &body)
+        }
         Commands::Evidence {
             target,
             name,
