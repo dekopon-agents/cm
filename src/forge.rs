@@ -632,5 +632,16 @@ mod tests {
         for bad in ["", "-v1", "a..b", "a b", "v1/", "a//b", ".v1"] {
             assert!(bad.parse::<TagName>().is_err(), "{bad}");
         }
+        for legacy in [
+            "release/.hidden/v1",
+            "release/v1/.hidden",
+            "release/part.lock/v1",
+            "release/v1.lock",
+            "v1.lock",
+        ] {
+            let parsed: TagName = legacy.parse().unwrap();
+            let stored: TagName = serde_json::from_value(legacy.into()).unwrap();
+            assert_eq!(stored, parsed);
+        }
     }
 }

@@ -501,9 +501,16 @@ impl Release {
                 self.line
             ));
         }
-        pattern
-            .replace("{version}", &self.version.to_string())
-            .parse()
+        let tag = pattern.replace("{version}", &self.version.to_string());
+        if tag
+            .split('/')
+            .any(|part| part.starts_with('.') || part.ends_with(".lock"))
+        {
+            return Err(format!(
+                "`{tag}` has a tag component starting with `.` or ending with `.lock`"
+            ));
+        }
+        tag.parse()
     }
 
     fn parse(text: &str) -> Result<Release, String> {
@@ -1205,6 +1212,15 @@ mod tests {
         assert_eq!(release.tag(DEFAULT_TAG).unwrap().as_str(), "v0.3.0");
         assert_eq!(release.tag("cm-{version}").unwrap().as_str(), "cm-0.3.0");
         assert!(release.tag("cm-0.3.0").is_err());
+        for pattern in [
+            "release/.hidden/{version}",
+            "release/{version}/.hidden",
+            "release/part.lock/{version}",
+            "release/{version}.lock",
+            "{version}.lock",
+        ] {
+            assert!(release.tag(pattern).is_err(), "{pattern}");
+        }
         assert!(Release::of_target("01-a/cm/0.3.0").is_none());
     }
 

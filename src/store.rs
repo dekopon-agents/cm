@@ -161,13 +161,35 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 pub fn create_new(path: &Path, bytes: &[u8]) -> io::Result<bool> {
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut file) => {
-            file.write_all(bytes)?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => Err(error),
+    create_new_with(path, |file| file.write_all(bytes))
+}
+
+fn create_new_with(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o666));
+    }
+    let mut temporary = builder.tempfile_in(parent)?;
+    write(temporary.as_file_mut())?;
+    temporary.as_file().sync_all()?;
+    match temporary.persist_noclobber(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error.error),
     }
 }
 
@@ -241,4 +263,43 @@ pub fn parse_target(text: &str, with_step: bool) -> std::result::Result<Target, 
         unit: format!("{}/{}", parts[0], parts[1]),
         step: parts.get(2).map(|step| (*step).to_owned()),
     })
+}
+
+#[cfg(test)]
+#[path = "../tests/support/store.rs"]
+mod fixture;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_interrupted_creation_leaves_no_destination_and_retries_in_full() {
+        let (_temp, path) = fixture::destination();
+        let error = create_new_with(&path, |file| {
+            file.write_all(b"Partial")?;
+            assert!(!path.exists());
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "interrupted write",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!path.exists());
+        assert!(create_new(&path, b"Complete kickoff.\n").unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"Complete kickoff.\n");
+    }
+
+    #[test]
+    fn publishing_a_completed_file_keeps_a_destination_created_during_the_write() {
+        let (_temp, path) = fixture::destination();
+        let written = create_new_with(&path, |file| {
+            file.write_all(b"New kickoff.\n")?;
+            fs::write(&path, b"Kept kickoff.\n")
+        })
+        .unwrap();
+        assert!(!written);
+        assert_eq!(fs::read(&path).unwrap(), b"Kept kickoff.\n");
+    }
 }
