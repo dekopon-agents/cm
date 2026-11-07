@@ -42,7 +42,6 @@ fn rules(outcome: &Outcome) -> Vec<&'static str> {
 }
 
 #[path = "support/campaign.rs"]
-#[allow(dead_code)]
 mod campaign_fixture;
 use campaign_fixture::{Campaign, campaign};
 

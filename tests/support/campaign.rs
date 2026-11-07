@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -6,7 +8,7 @@ use cm::commands;
 use cm::host::Host;
 
 pub struct Campaign {
-    _temp: tempfile::TempDir,
+    pub(super) _temp: tempfile::TempDir,
     pub root: PathBuf,
 }
 
@@ -32,7 +34,6 @@ pub fn campaign(host: &dyn Host) -> Campaign {
 
 impl Campaign {
     /// A synthetic release declaration from before release tags were persisted.
-    #[allow(dead_code)] // Shared with suites that do not exercise legacy releases.
     pub fn legacy_release(&self, host: &dyn Host, full: &str) {
         let target = cm::store::parse_target(full, true).unwrap();
         assert!(cm::state::Release::of_target(full).is_some());

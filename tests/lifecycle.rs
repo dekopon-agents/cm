@@ -73,7 +73,6 @@ fn repo(dir: &Path) -> (PathBuf, String) {
 }
 
 #[path = "support/campaign.rs"]
-#[allow(dead_code)]
 mod campaign_fixture;
 use campaign_fixture::{Campaign, campaign};
 
@@ -939,4 +938,82 @@ fn coordinator_steps_can_declare_and_amend_pr_parts() {
             .collect::<Vec<_>>(),
         ["first", "second"]
     );
+}
+
+#[test]
+fn resolving_or_withdrawing_the_last_watch_keeps_a_release_on_the_shipping_ladder() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    for withdraw in [false, true] {
+        let c = campaign(&host);
+        let (repo, _) = repo(c.root.parent().unwrap());
+        git(&repo, &["tag", "v1.0.0"]);
+        let step = "00-release/cm/1.0.0";
+        let target = target(step);
+        assert!(
+            commands::declare(
+                &host,
+                &c.root.join(step),
+                &commands::Declaration {
+                    lane: Some(Lane::Coordinator),
+                    ..commands::Declaration::default()
+                },
+            )
+            .unwrap()
+            .ok()
+        );
+        c.kickoff(step, "Release check.\n");
+        let released = commands::advance(
+            &host,
+            &c.root,
+            &target,
+            &Phase::Released,
+            &Evidence {
+                tag: Some("v1.0.0".into()),
+                ..Evidence::default()
+            },
+            None,
+            Some(&repo),
+        )
+        .unwrap();
+        assert!(released.ok(), "{:?}", released.violations);
+        assert!(
+            cm::holds::watch_add(&host, &c.root, &target, "log:release", "2026-10-09T07:00Z",)
+                .unwrap()
+                .ok()
+        );
+        let deployed = Evidence {
+            digest: Some(format!("sha256:{}", "a".repeat(64))),
+            ..Evidence::default()
+        };
+        assert_eq!(
+            rules(&advance(&host, &c, step, "deployed", deployed.clone())),
+            ["watch-open"]
+        );
+        let closed = if withdraw {
+            cm::holds::watch_withdraw(&host, &c.root, &target, 1, "signal replaced")
+        } else {
+            cm::holds::watch_resolve(
+                &host,
+                &c.root,
+                &target,
+                1,
+                &c.root.join(step).join("kickoff.md"),
+            )
+        }
+        .unwrap();
+        assert!(closed.ok(), "{:?}", closed.violations);
+        let unit = store::load_unit(&c.root.join(&target.unit)).unwrap();
+        let release = &unit.steps["1.0.0"];
+        assert_eq!(release.unresolved_watches(&c.root).count(), 0);
+        assert_eq!(release.track.state, Phase::Released);
+        assert_eq!(
+            rules(&advance(&host, &c, step, "done", Evidence::default())),
+            ["done-code-step"]
+        );
+        assert!(advance(&host, &c, step, "deployed", deployed).ok());
+        let done = advance(&host, &c, step, "done", Evidence::default());
+        assert!(done.ok(), "{:?}", done.violations);
+        let unit = store::load_unit(&c.root.join(&target.unit)).unwrap();
+        assert_eq!(unit.steps["1.0.0"].track.state, Phase::Done);
+    }
 }

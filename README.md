@@ -62,7 +62,7 @@ error.
 | `cm amend <NN-name>/<unit>/<step> [--study] [--lane L] [--after A]… [--drop-after A]… [--part NAME]…` | Changes a declared step that rests at `drafted` or `launched`: marks it a study, moves its lane, or removes gates with `--drop-after` before adding gates with `--after` (each declared, never closing a cycle: `after-cycle`). Removing a gate it lacks is `after-absent`. `--part` declares required parts (see [Parts](#parts)); given alone it also amends a step that has moved on, short of final. Journals the change; a change that changes nothing is `amend-empty`. |
 | `cm advance <NN-name>/<unit>[/<step>] <state> [--sha S] [--pr URL] [--tag T] [--digest D] [--evidence PATH] [--repo PATH] [--head SHA] [--ci-verified PATH] [--override PATH] [--part NAME]` | Moves one state along `drafted → launched → pr-open → merged → released → deployed → done`, or to `blocked:<reason>`; an `owner`-lane or study step, or a non-release `coordinator`-lane step without a recorded PR, SHA or declared parts, moves to `done` from `drafted` or `launched` with `--evidence` (see [Finishing](#finishing)). `superseded --evidence PATH` retires a step replaced by other work from any state short of final; it meets no gate, so its consumers are amended. A release step moves to `released --tag T` from `drafted` or `launched` when the tag was cut without a prep PR (tag-only). Refuses a skipped state and a state without its evidence, journals the move and re-renders `STATE.md`. A `codex`-lane step moves to `merged` only through its merge gate (see [Merge gate](#merge-gate)). `--part NAME` moves one part of a multipart step (see [Parts](#parts)). A step with an unresolved watch does not move to `deployed` or `done` (`watch-open`, see [Watches](#watches)), and `done --evidence` refuses a stale pinned file (`evidence-stale`). |
 | `cm known-red <step> --commit SHA --check NAME --reason T --owner WHO --until A` | Records a known-red exception for the step's merge gate (see [Known-red exceptions](#known-red-exceptions)) and journals it. |
-| `cm watch <step> add --signal span:Q\|log:Q\|metric:Q --deadline T`, `cm watch <step> resolve ID --evidence PATH` | Records a pending live read that holds the step below `deployed`, or closes it with evidence (see [Watches](#watches)). |
+| `cm watch <step> add --signal span:Q\|log:Q\|metric:Q --deadline T`, `cm watch <step> resolve ID --evidence PATH`, `cm watch <step> withdraw ID --reason TEXT`, `cm watch <step> amend ID --signal SIGNAL` | Records a pending live read that holds the step below `deployed`, closes it with evidence or a withdrawal reason, or corrects its signal (see [Watches](#watches)). |
 | `cm close` | Seals the campaign. Refuses, listing every gap, while `OWNER-QUEUE.md` has an open item or any unit or step is short of `done` or `blocked:<reason>`. Then it stamps `closed` in `.cm/state.json` and journals the close. From there unit `cm init`, `cm launch`, `cm advance` and a second `cm close` refuse with `campaign-closed`; `cm journal` stays open for follow-up observations. |
 | `cm feedback "<title>" --urgency urgent\|queued --body-file F` | Appends `### FB-<sequence>-NNN · <urgency> · <title>` and the body to `FEEDBACK.md`, numbering on from the highest id of the letter in `EPOCH.md`'s `sequence:`, and journals a line naming it; an empty body is `feedback-empty`. `--follow-up <id> --disposition proposed\|accepted\|applied\|deferred\|rejected` appends `### <id> follow-up · <disposition>: <title>` to an existing id. Hand-written entries (dated `##` sections, `FB-` sub-entries) still parse. Log feedback whenever a file would otherwise be appended by hand. |
 | `cm owner-queue add "<title>" --context T --question T --recommendation T` | Appends `## N. <title>` (numbering on from the highest item), its `Context:` line, the question, a `Recommendation:` line and an empty `Answer:` to `OWNER-QUEUE.md`; refuses an empty field or a RESUME.md with no `>` banner (`resume-banner`), sets RESUME.md's banner to `OWNER-QUEUE not drained: /loop withheld` and journals the item. |
@@ -126,7 +126,7 @@ Campaign `.cm/state.json`:
 
 ```json
 {
-  "schema": 2,
+  "schema": 4,
   "kind": "campaign",
   "initialized": "2026-10-08T07:04Z",
   "written": ["RESUME.md", "JOURNAL.md", "LIMITS.toml", "OWNER-QUEUE.md"],
@@ -146,7 +146,7 @@ Unit `.cm/state.json`:
 
 ```json
 {
-  "schema": 2,
+  "schema": 4,
   "kind": "unit",
   "unit": "01-first/alpha",
   "state": "launched",
@@ -230,7 +230,10 @@ campaign, in the move's evidence beside its stamp, and `cm lint` re-checks it ev
 release step cannot be a study. A `coordinator`-lane release step keeps the code-step ladder even
 without a recorded tag, as does a coordinator step with a recorded PR, SHA or declared parts.
 
-cm 0.5.0 writes every unit state, and a new campaign state, as schema 3 (it adds `superseded`).
+cm 0.9 raises SCHEMA from 3 to 4 for watch withdrawal and writes every unit state, and a new
+campaign state, as schema 4. Units written by 0.9 cannot be read by cm 0.8.x; upgrade every
+reader before writing a shared unit with 0.9. Schema 1, 2 and 3 state remains readable by 0.9.
+cm 0.5.0 introduced schema 3 for `superseded`.
 Since 0.4.0 cm refuses state from a newer schema than it knows, so cm 0.4.x refuses schema 3
 cleanly; schema 1 and 2 state from 0.3.x and 0.4.x loads unchanged. cm
 0.3.x checks no schema and drops the fields it does not know when it re-saves a unit, so a campaign
@@ -421,6 +424,22 @@ deleted or emptied file reopens the watch (`cm lint` names it, `evidence-file`) 
 reads `expired: unresolved`: never a pass, journaled once by the next `cm sync`, warned by
 `cm lint`, and listed by `cm next` under `watches` with every open one, so the coordinator reads
 it from state instead of polling it.
+
+`cm watch <step> withdraw <id> --reason <text>` closes an unresolved watch as withdrawn and
+journals the reason. A withdrawn watch no longer holds `advance` or `sync`, is omitted from
+`cm next`'s `watches`, and remains visible as withdrawn in STATE. CARD summarizes watches on
+nonfinal steps with counts for open, expired-unresolved and withdrawals within the last 24
+hours, then at most 10 rows: open watches by nearest deadline, expired watches by newest
+recorded expiry (or deadline before sync records expiry), then recent withdrawals. Further
+qualifying watches are counted in an overflow line pointing to unit STATE.md. Rows use computed
+status and signals limited to 80 characters. STATE preserves the existing open, resolved and
+expired wording and adds a withdrawn row, keeping full signals and history. A resolved or
+already withdrawn watch cannot be withdrawn.
+`cm watch <step> amend <id> --signal <signal>` replaces an unresolved watch's signal using the
+same validation as `add`. It journals the old and new signals and keeps the original deadline,
+including an expired deadline. An unchanged signal is refused as `watch-amend-empty`.
+When amendment clears a stale resolution, the journal records it. Resolved and withdrawn
+watches cannot be amended.
 
 ### Releases
 
