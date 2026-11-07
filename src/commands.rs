@@ -64,6 +64,7 @@ pub struct Declaration {
     pub after: Vec<String>,
     pub ships: Ships,
     pub work: Work,
+    pub kickoff: Option<String>,
 }
 
 impl Declaration {
@@ -73,12 +74,64 @@ impl Declaration {
             || !self.after.is_empty()
             || self.ships.given()
             || !self.work.is_code()
+            || self.kickoff.is_some()
     }
 }
 
 impl Ships {
     fn given(&self) -> bool {
         self.github.is_some() || self.tag.is_some()
+    }
+
+    fn defaults(&self, unit: Option<&UnitState>, full: &str) -> Self {
+        if self.given() {
+            return self.clone();
+        }
+        let Some(unit) = unit else {
+            return self.clone();
+        };
+        // Repeating init uses that step's declaration, even after newer releases were declared.
+        let release = unit
+            .steps
+            .iter()
+            .filter(|(_, step)| step.lane.is_some())
+            .filter_map(|(name, step)| {
+                Release::of_target(&format!("{}/{name}", unit.unit)).map(|release| (release, step))
+            });
+        let previous = release
+            .clone()
+            .find(|(release, _)| release.target() == full)
+            .or_else(|| release.max_by_key(|(release, _)| release.version));
+        match previous {
+            Some((release, step)) => Self {
+                github: step.github.clone(),
+                tag: Some(step.release_tag(&release).as_str().replacen(
+                    &release.version.to_string(),
+                    "{version}",
+                    1,
+                )),
+            },
+            None => self.clone(),
+        }
+    }
+}
+
+fn check_kickoff(full: &str, text: Option<&str>) -> Option<Violation> {
+    text.filter(|text| text.trim().is_empty()).map(|_| {
+        Violation::new(
+            full,
+            "kickoff-file",
+            "--kickoff-file must hold non-empty text",
+        )
+    })
+}
+
+fn kickoff_outcome(outcome: &mut Outcome, full: &str, written: bool) {
+    let path = format!("{full}/kickoff.md");
+    outcome.field("kickoff", path.clone());
+    outcome.field("kickoff_kept", !written);
+    if !written {
+        outcome.line(format!("kept existing {path}"));
     }
 }
 
@@ -120,7 +173,7 @@ pub fn declare(host: &dyn Host, dir: &Path, declaration: &Declaration) -> Result
         return Ok(Outcome::refused(vec![Violation::new(
             dir.to_string_lossy(),
             "init-target",
-            "--lane, --part, --after, --study, --github and --tag declare a step inside a campaign; no campaign holds this folder",
+            "--lane, --part, --after, --study, --github, --tag and --kickoff-file declare a step inside a campaign; no campaign holds this folder",
         )]));
     }
     init_campaign(host, &dir)
@@ -286,6 +339,9 @@ fn release_checks(full: &str, unit: &UnitState, step_name: &str) -> Vec<Violatio
             ),
         )];
     };
+    if unit.steps.contains_key(step_name) {
+        return Vec::new();
+    }
     let above: Vec<String> = unit
         .steps
         .keys()
@@ -317,6 +373,7 @@ fn record_release(
     step_name: &str,
     ships: &Ships,
     tag: &TagName,
+    kickoff: Option<&str>,
 ) -> Result<Outcome> {
     let at = stamp(host.now());
     let full = format!("{}/{step_name}", unit.unit);
@@ -326,20 +383,31 @@ fn record_release(
     }
     write_unit(&root.join(&unit.unit), unit)?;
     let mut body = format!("- tag: {tag}\n");
+    let kickoff_path = root.join(&full).join("kickoff.md");
+    fs::create_dir_all(root.join(&full))?;
+    let written = if let Some(kickoff) = kickoff {
+        create_new(&kickoff_path, kickoff.as_bytes())?
+    } else {
+        false
+    };
+    if written {
+        body.push_str(&format!("- kickoff: {full}/kickoff.md\n"));
+    }
     if let Some(github) = &ships.github {
         body.push_str(&format!("- github: {github}\n"));
     }
     let heading = record(root, &at, &format!("record release {full}"), &body)?;
     let mut outcome = Outcome::default();
     outcome.line(format!("recorded {full}'s tag {tag}"));
-    outcome.field("target", full);
+    outcome.field("target", full.clone());
     outcome.field("tag", tag.to_string());
+    if kickoff.is_some() {
+        kickoff_outcome(&mut outcome, &full, written);
+    }
     outcome.field("journal", heading);
     Ok(outcome)
 }
 
-/// The same declaration again finishes one an interrupted `cm init` left half written: the step
-/// folder and a missing or stale STATE.md. The journal is not replayed.
 fn repair(
     host: &dyn Host,
     root: &Path,
@@ -347,6 +415,7 @@ fn repair(
     unit: Option<&UnitState>,
     step_name: &str,
     full: &str,
+    kickoff: Option<&str>,
 ) -> Result<Outcome> {
     let mut outcome = Outcome::default();
     outcome.field("target", full);
@@ -357,6 +426,13 @@ fn repair(
     if !dir.join(step_name).is_dir() {
         fs::create_dir_all(dir.join(step_name))?;
         repaired.push(format!("{full}/"));
+    }
+    if let Some(kickoff) = kickoff {
+        let written = create_new(&dir.join(step_name).join("kickoff.md"), kickoff.as_bytes())?;
+        if written {
+            repaired.push(format!("{full}/kickoff.md"));
+        }
+        kickoff_outcome(&mut outcome, full, written);
     }
     if !lint::unit_state_file(root, dir, unit).is_empty() {
         write_atomic(&dir.join(UNIT_STATE), render::unit(unit).as_bytes())?;
@@ -385,13 +461,13 @@ fn init_step(
     lane: Lane,
     declaration: &Declaration,
 ) -> Result<Outcome> {
-    let ships = &declaration.ships;
     let work = declaration.work;
     let full = format!("{unit_name}/{step_name}");
     let _lock = lock(root)?;
     let campaign = store::load_campaign(root)?;
     let mut violations = journal::check(root, &campaign);
     violations.extend(closed(root, &campaign));
+    violations.extend(check_kickoff(&full, declaration.kickoff.as_deref()));
     let units: Units = plan::load_units(root)?;
     let mut parsed = Vec::new();
     for text in &declaration.after {
@@ -417,6 +493,7 @@ fn init_step(
     }
     let dir = root.join(unit_name);
     let existing = units.get(unit_name).cloned();
+    let ships = declaration.ships.defaults(existing.as_ref(), &full);
     let mut tag = None;
     if unit_name.starts_with(&format!("{RELEASES}/")) {
         let empty = UnitState::new(unit_name, "");
@@ -467,7 +544,15 @@ fn init_step(
             && same_tag
             && violations.is_empty()
         {
-            return repair(host, root, &dir, existing.as_ref(), step_name, &full);
+            return repair(
+                host,
+                root,
+                &dir,
+                existing.as_ref(),
+                step_name,
+                &full,
+                declaration.kickoff.as_deref(),
+            );
         }
         if let (Some(mut unit), Some(tag)) = (existing.clone(), &tag)
             && declaration.parts.is_empty()
@@ -478,7 +563,15 @@ fn init_step(
             && step.work == work
             && violations.is_empty()
         {
-            return record_release(host, root, &mut unit, step_name, ships, tag);
+            return record_release(
+                host,
+                root,
+                &mut unit,
+                step_name,
+                &ships,
+                tag,
+                declaration.kickoff.as_deref(),
+            );
         }
         violations.push(Violation::new(
             &full,
@@ -529,6 +622,11 @@ fn init_step(
     let mut unit = existing.unwrap_or_else(|| UnitState::new(unit_name, &at));
     unit.steps.insert(step_name.to_owned(), new_step);
     write_unit(&dir, &unit)?;
+    let kickoff = if let Some(text) = &declaration.kickoff {
+        create_new(&dir.join(step_name).join("kickoff.md"), text.as_bytes())?
+    } else {
+        false
+    };
     let shown: Vec<String> = parsed.iter().map(After::to_string).collect();
     let mut body = format!(
         "- lane: {lane}\n- after: {}\n",
@@ -547,6 +645,9 @@ fn init_step(
     if !work.is_code() {
         body.push_str("- study: finishes with `cm advance <step> done --evidence <path>`\n");
     }
+    if kickoff {
+        body.push_str(&format!("- kickoff: {full}/kickoff.md\n"));
+    }
     body.push_str(&part_changes.join("\n"));
     let heading = record(root, &at, &format!("init step {full}"), &body)?;
     let mut outcome = Outcome::default();
@@ -554,11 +655,14 @@ fn init_step(
         Work::Code => format!("declared {full} ({lane})"),
         Work::Study => format!("declared {full} ({lane}, study)"),
     });
-    outcome.field("target", full);
+    outcome.field("target", full.clone());
     outcome.field("lane", lane.name());
     outcome.field("study", !work.is_code());
     outcome.field("after", shown);
     outcome.field("tag", tag.as_ref().map(ToString::to_string));
+    if declaration.kickoff.is_some() {
+        kickoff_outcome(&mut outcome, &full, kickoff);
+    }
     outcome.field("journal", heading);
     Ok(outcome)
 }
@@ -1989,6 +2093,8 @@ pub struct Amendment {
     pub after: Vec<String>,
     pub drop_after: Vec<String>,
     pub parts: Vec<String>,
+    pub kickoff: Option<String>,
+    pub ships: Ships,
 }
 
 fn add_parts(
@@ -2114,11 +2220,17 @@ pub fn amend(
             "the step was launched without a declaration; only a declared step is amended",
         ));
     }
-    let only_parts = !amendment.study
-        && amendment.lane.is_none()
-        && amendment.after.is_empty()
-        && amendment.drop_after.is_empty()
-        && !amendment.parts.is_empty();
+    let declaration_change = amendment.study
+        || amendment.lane.is_some()
+        || !amendment.after.is_empty()
+        || !amendment.drop_after.is_empty()
+        || amendment.kickoff.is_some();
+    let only_parts = !declaration_change && !amendment.ships.given() && !amendment.parts.is_empty();
+    let late_release = !declaration_change
+        && amendment.parts.is_empty()
+        && amendment.ships.given()
+        && Release::of_target(&full).is_some()
+        && matches!(step.track.resting(), Phase::PrOpen | Phase::Merged);
     let early = match step.track.resting() {
         Phase::Drafted | Phase::Launched => true,
         Phase::PrOpen
@@ -2129,18 +2241,74 @@ pub fn amend(
         | Phase::Superseded
         | Phase::Blocked(_) => false,
     };
-    if step.track.state.is_final() || (!early && !only_parts) {
+    if step.track.state.is_final() || (!early && !only_parts && !late_release) {
         violations.push(Violation::new(
             &full,
             "amend-state",
             format!(
-                "{full} is {}; only a drafted or launched step is amended, and --part alone amends any step short of done",
+                "{full} is {}; declaration changes require drafted or launched; release --github/--tag also allow pr-open or merged; --part alone amends any step short of done",
                 step.track.state
             ),
         ));
     }
     let mut changes = Vec::new();
     let mut next = step.clone();
+    violations.extend(check_kickoff(&full, amendment.kickoff.as_deref()));
+    if amendment.kickoff.is_some() {
+        if !root.join(&full).is_dir() {
+            violations.push(Violation::new(
+                &full, "kickoff-file",
+                "the step folder is missing; repeat its `cm init` declaration to repair it before amending the kickoff",
+            ));
+        }
+        changes.push(format!("- kickoff: {full}/kickoff.md"));
+    }
+    if amendment.ships.given() {
+        if let Some(release) = Release::of_target(&full) {
+            if let Some(github) = &amendment.ships.github
+                && step.github.as_ref() != Some(github)
+            {
+                next.github = Some(github.clone());
+                changes.push(format!(
+                    "- github: {} → {github}",
+                    step.release_repo(&release)
+                ));
+            }
+            if let Some(pattern) = &amendment.ships.tag {
+                match release.tag(pattern) {
+                    Ok(tag) if step.tag.as_ref() != Some(&tag) => {
+                        changes.push(format!("- tag: {} → {tag}", step.release_tag(&release)));
+                        next.tag = Some(tag);
+                    }
+                    Ok(_) => {}
+                    Err(message) => violations.push(Violation::new(&full, "release-tag", message)),
+                }
+            }
+            if let Some(repo) = step
+                .track
+                .evidence
+                .pr
+                .as_deref()
+                .and_then(GithubRepo::of_pr)
+                && !next.ships_from(&release, &repo)
+            {
+                violations.push(Violation::new(
+                    &full,
+                    "release-repo",
+                    format!(
+                        "the prep PR is in {repo}, but {release} ships from {}",
+                        next.release_repo(&release)
+                    ),
+                ));
+            }
+        } else {
+            violations.push(Violation::new(
+                &full,
+                "amend-target",
+                format!("--github and --tag amend a release step, {RELEASES}/<line>/<version>"),
+            ));
+        }
+    }
     if !amendment.parts.is_empty() {
         let at = stamp(host.now());
         add_parts(
@@ -2216,11 +2384,11 @@ pub fn amend(
             ));
         }
     }
-    if next == step && violations.is_empty() {
+    if next == step && amendment.kickoff.is_none() && violations.is_empty() {
         violations.push(Violation::new(
             &full,
             "amend-empty",
-            "nothing changes; pass --study, a new --lane, --after, --drop-after or --part",
+            "nothing changes; pass --study, a new --lane, --after, --drop-after, --part, --kickoff-file, --github or --tag",
         ));
     }
     if !next.parts.is_empty() && next.finish() == Finish::Evidence {
@@ -2242,6 +2410,9 @@ pub fn amend(
             to: next.track.state.clone(),
             evidence: Evidence::default(),
         });
+    }
+    if let Some(kickoff) = &amendment.kickoff {
+        write_atomic(&root.join(&full).join("kickoff.md"), kickoff.as_bytes())?;
     }
     unit.steps.insert(step_name.to_owned(), next);
     write_unit(&root.join(&target.unit), &unit)?;

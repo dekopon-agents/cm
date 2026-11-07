@@ -10,7 +10,7 @@ use crate::epoch::{self, Status};
 use crate::forge::GithubRepo;
 use crate::host::{Host, System};
 use crate::lint;
-use crate::outcome::Outcome;
+use crate::outcome::{Outcome, Violation};
 use crate::state::{Evidence, Lane, Phase, Work};
 use crate::store::{self, Target, parse_target};
 
@@ -63,12 +63,15 @@ enum Commands {
         /// What the step waits on: <step> or <NN-name>/<unit>/<step> (merged), pr-open:<step>, tag:<line>@<version> or deployed:<line>@<version>. Repeat for each.
         #[arg(long, value_name = "AFTER")]
         after: Vec<String>,
-        /// A release step's repository, <owner>/<name>; its prep PR must be there. Defaults to any owner's repository named for the release line.
+        /// A release step's repository, <owner>/<name>; its prep PR must be there. With neither release flag, inherits the newest declared release; otherwise defaults to any owner's repository named for the release line.
         #[arg(long, value_name = "OWNER/NAME")]
         github: Option<GithubRepo>,
-        /// A release step's tag pattern, holding `{version}` once; cm records the one tag it names. Defaults to `v{version}`.
+        /// A release step's tag pattern, holding `{version}` once; cm records the one tag it names. With neither release flag, inherits the newest declared release; otherwise defaults to `v{version}`.
         #[arg(long, value_name = "PATTERN")]
         tag: Option<String>,
+        /// Write kickoff.md from a non-empty file of at most 1 MiB, or `-` for stdin. Never overwrites an existing kickoff.
+        #[arg(long, value_name = "F")]
+        kickoff_file: Option<PathBuf>,
     },
     /// List the declared steps whose `--after` is met, or, given one, refuse it unless it is next.
     Next {
@@ -129,7 +132,7 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         evidence: PathBuf,
     },
-    /// Change a drafted or launched step's declaration: mark it a study, move its lane or add or remove gates. --part alone also amends a step that moved on.
+    /// Change a drafted or launched step's declaration. Release --github/--tag also allow pr-open or merged. --part alone also amends a step that moved on.
     Amend {
         /// <NN-name>/<unit>/<step>
         #[arg(value_parser = step_target)]
@@ -149,6 +152,15 @@ enum Commands {
         /// A required part (one PR) of a multipart step; the step moves to a state only once every part has. On a step past launched, the first new part takes the step's state and evidence and the step rests at launched. Repeat for each.
         #[arg(long, value_name = "NAME")]
         part: Vec<String>,
+        /// Replace kickoff.md from a non-empty file of at most 1 MiB, or `-` for stdin.
+        #[arg(long, value_name = "F")]
+        kickoff_file: Option<PathBuf>,
+        /// A release step's new repository; its prep PR must be there.
+        #[arg(long, value_name = "OWNER/NAME")]
+        github: Option<GithubRepo>,
+        /// A release step's new tag pattern, holding `{version}` once.
+        #[arg(long, value_name = "PATTERN")]
+        tag: Option<String>,
     },
     /// Show, claim or extend a remote launch's attempt record; every external action is recorded before the next.
     Attempt {
@@ -256,7 +268,7 @@ enum Commands {
         #[arg(long, value_name = "FILE")]
         body_file: PathBuf,
     },
-    /// Add the next numbered item to OWNER-QUEUE.md and withhold RESUME.md's `/loop`.
+    /// Add, answer, strike or edit numbered items in OWNER-QUEUE.md.
     OwnerQueue {
         #[command(subcommand)]
         act: QueueAct,
@@ -455,6 +467,26 @@ enum QueueAct {
         #[arg(long)]
         recommendation: String,
     },
+    /// Journal the answer and remove the numbered item.
+    Answer {
+        number: u32,
+        /// A non-empty answer body; `-` reads stdin.
+        #[arg(long, value_name = "FILE")]
+        body_file: PathBuf,
+    },
+    /// Remove the numbered item and journal why.
+    Strike {
+        number: u32,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Replace the numbered item's body, keeping its heading and required fields.
+    Edit {
+        number: u32,
+        /// A non-empty item body; `-` reads stdin.
+        #[arg(long, value_name = "FILE")]
+        body_file: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -491,13 +523,43 @@ fn under_root(cli: &Cli, path: &Path) -> PathBuf {
     }
 }
 
-fn read_body(path: &Path) -> Result<String> {
-    if path == Path::new("-") {
-        let mut body = String::new();
-        std::io::stdin().read_to_string(&mut body)?;
-        return Ok(body);
+const KICKOFF_MAX_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug)]
+struct InputTooLarge {
+    path: PathBuf,
+    limit: usize,
+}
+
+impl std::fmt::Display for InputTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "kickoff input exceeds the {}-byte limit", self.limit)
     }
-    std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+}
+
+impl std::error::Error for InputTooLarge {}
+
+fn read_body(path: &Path, limit: Option<usize>) -> Result<String> {
+    let reader: Box<dyn Read> = if path == Path::new("-") {
+        Box::new(std::io::stdin().lock())
+    } else {
+        Box::new(std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?)
+    };
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.map_or(u64::MAX, |limit| limit as u64 + 1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if let Some(limit) = limit
+        && bytes.len() > limit
+    {
+        return Err(InputTooLarge {
+            path: path.to_owned(),
+            limit,
+        }
+        .into());
+    }
+    String::from_utf8(bytes).with_context(|| format!("reading {}", path.display()))
 }
 
 fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
@@ -526,6 +588,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             after,
             github,
             tag,
+            kickoff_file,
         } => {
             let declaration = commands::Declaration {
                 parts: part.clone(),
@@ -536,6 +599,10 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                     tag: tag.clone(),
                 },
                 work: if *study { Work::Study } else { Work::Code },
+                kickoff: kickoff_file
+                    .as_deref()
+                    .map(|path| read_body(path, Some(KICKOFF_MAX_BYTES)))
+                    .transpose()?,
             };
             commands::declare(host, &under_root(cli, dir), &declaration)
         }
@@ -555,7 +622,10 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             plan_revision.as_deref(),
         ),
         Commands::Journal { title, body_file } => {
-            let body = body_file.as_deref().map(read_body).transpose()?;
+            let body = body_file
+                .as_deref()
+                .map(|path| read_body(path, None))
+                .transpose()?;
             commands::journal(host, &root()?, title, body.as_deref())
         }
         Commands::Launch {
@@ -585,6 +655,9 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             after,
             drop_after,
             part,
+            kickoff_file,
+            github,
+            tag,
         } => commands::amend(
             host,
             &root()?,
@@ -595,6 +668,14 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 after: after.clone(),
                 drop_after: drop_after.clone(),
                 parts: part.clone(),
+                kickoff: kickoff_file
+                    .as_deref()
+                    .map(|path| read_body(path, Some(KICKOFF_MAX_BYTES)))
+                    .transpose()?,
+                ships: commands::Ships {
+                    github: github.clone(),
+                    tag: tag.clone(),
+                },
             },
         ),
         Commands::Attempt { target, claim, act } => {
@@ -714,7 +795,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             disposition,
             body_file,
         } => {
-            let body = read_body(body_file)?;
+            let body = read_body(body_file, None)?;
             let entry = crate::ledger::Feedback {
                 title,
                 urgency: urgency.as_deref(),
@@ -742,10 +823,28 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 recommendation,
             },
         ),
+        Commands::OwnerQueue {
+            act: QueueAct::Answer { number, body_file },
+        } => {
+            let body = read_body(body_file, None)?;
+            crate::ledger::owner_queue_answer(host, &root()?, *number, &body)
+        }
+        Commands::OwnerQueue {
+            act: QueueAct::Strike { number, reason },
+        } => crate::ledger::owner_queue_strike(host, &root()?, *number, reason),
+        Commands::OwnerQueue {
+            act: QueueAct::Edit { number, body_file },
+        } => {
+            let body = read_body(body_file, None)?;
+            crate::ledger::owner_queue_edit(host, &root()?, *number, &body)
+        }
         Commands::MacLane {
             act: MacLaneAct::Add { title, body_file },
         } => {
-            let body = body_file.as_deref().map(read_body).transpose()?;
+            let body = body_file
+                .as_deref()
+                .map(|path| read_body(path, None))
+                .transpose()?;
             crate::ledger::mac_lane_add(host, &root()?, title, body.as_deref().unwrap_or_default())
         }
         Commands::MacLane {
@@ -761,7 +860,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             candidate,
             harness,
         } => {
-            let body = read_body(body_file)?;
+            let body = read_body(body_file, None)?;
             let pin = crate::ledger::PinArgs {
                 candidate: candidate.as_deref(),
                 harness: harness.as_deref(),
@@ -886,7 +985,17 @@ fn name(command: &Commands) -> &'static str {
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
     let command = name(&cli.command);
-    match run(&cli, &System) {
+    let outcome = run(&cli, &System).or_else(|error| {
+        if let Some(large) = error.downcast_ref::<InputTooLarge>() {
+            return Ok(Outcome::refused(vec![Violation::new(
+                large.path.to_string_lossy(),
+                "kickoff-size",
+                large.to_string(),
+            )]));
+        }
+        Err(error)
+    });
+    match outcome {
         Ok(outcome) => {
             if cli.json {
                 println!("{}", outcome.to_json(command));

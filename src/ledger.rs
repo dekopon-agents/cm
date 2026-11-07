@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -10,7 +11,7 @@ use crate::journal;
 use crate::markdown::headings;
 use crate::outcome::{Outcome, Violation};
 use crate::store::{self, Target, is_name, lock, write_atomic};
-use crate::templates::{LOOP_WITHHELD, MAC_LANE, MAC_LANE_FILE, QUEUE_FILE};
+use crate::templates::{self, LOOP_WITHHELD, MAC_LANE, MAC_LANE_FILE, QUEUE_FILE};
 
 pub const FEEDBACK: &str = "FEEDBACK.md";
 
@@ -352,6 +353,16 @@ pub(crate) fn add_queue_item(
     item: &QueueItem,
     mut violations: Vec<Violation>,
 ) -> Result<Outcome> {
+    let recommendation = item.recommendation.trim();
+    let prefix = "Recommendation:";
+    let recommendation = if recommendation
+        .get(..prefix.len())
+        .is_some_and(|text| text.eq_ignore_ascii_case(prefix))
+    {
+        recommendation[prefix.len()..].trim()
+    } else {
+        recommendation
+    };
     for (field, text) in [
         ("the title", item.title),
         ("--context", item.context),
@@ -359,6 +370,14 @@ pub(crate) fn add_queue_item(
         ("--recommendation", item.recommendation),
     ] {
         one_line(field, text, &mut violations, QUEUE_FILE);
+    }
+    if recommendation.is_empty() && !item.recommendation.trim().is_empty() {
+        one_line(
+            "--recommendation",
+            recommendation,
+            &mut violations,
+            QUEUE_FILE,
+        );
     }
     let missing = |name: &str| Violation::new(name, "missing-file", "run `cm init` to write it");
     let Some(queue) = read_existing(&root.join(QUEUE_FILE))? else {
@@ -383,13 +402,33 @@ pub(crate) fn add_queue_item(
     if !violations.is_empty() {
         return Ok(Outcome::refused(violations));
     }
-    let number = headings(&queue)
+    let mut last = headings(&queue)
         .iter()
         .filter(|heading| heading.level == 2)
         .filter_map(|heading| item_number(heading.text))
         .max()
-        .unwrap_or(0)
-        + 1;
+        .unwrap_or(0);
+    let history = BufReader::new(fs::File::open(root.join(store::JOURNAL))?);
+    for line in history.lines() {
+        let line = line?;
+        if journal::is_stamped(&line)
+            && let Some((_, title)) = line.split_once(" — ")
+            && let Some((action, item)) = title
+                .strip_prefix("owner-queue ")
+                .and_then(|text| text.split_once(' '))
+            && matches!(action, "add" | "answer" | "strike")
+            && let Some(number) = item_number(item)
+        {
+            last = last.max(number);
+        }
+    }
+    let Some(number) = last.checked_add(1) else {
+        return Ok(Outcome::refused(vec![Violation::new(
+            QUEUE_FILE,
+            "owner-queue-number-exhausted",
+            "the highest owner-queue item is u32::MAX; no new item number is available",
+        )]));
+    };
     let title = format!("{number}. {}", item.title.trim());
     append(
         &root.join(QUEUE_FILE),
@@ -398,7 +437,7 @@ pub(crate) fn add_queue_item(
             "## {title}\n\nContext: {}\n{}\nRecommendation: {}\nAnswer:\n",
             item.context.trim(),
             item.question.trim(),
-            item.recommendation.trim()
+            recommendation
         ),
     )?;
     if let Some(text) = &withheld {
@@ -414,6 +453,239 @@ pub(crate) fn add_queue_item(
     outcome.line(format!("## {title}"));
     outcome.field("item", number);
     outcome.field("journal", journal);
+    Ok(outcome)
+}
+
+pub fn owner_queue_answer(
+    host: &dyn Host,
+    root: &Path,
+    number: u32,
+    body: &str,
+) -> Result<Outcome> {
+    update_queue_item(host, root, number, QueueUpdate::Answer, body)
+}
+
+pub fn owner_queue_strike(
+    host: &dyn Host,
+    root: &Path,
+    number: u32,
+    reason: &str,
+) -> Result<Outcome> {
+    update_queue_item(host, root, number, QueueUpdate::Strike, reason)
+}
+
+pub fn owner_queue_edit(host: &dyn Host, root: &Path, number: u32, body: &str) -> Result<Outcome> {
+    update_queue_item(host, root, number, QueueUpdate::Edit, body)
+}
+
+enum QueueUpdate {
+    Answer,
+    Strike,
+    Edit,
+}
+
+fn update_queue_item(
+    host: &dyn Host,
+    root: &Path,
+    number: u32,
+    update: QueueUpdate,
+    body: &str,
+) -> Result<Outcome> {
+    let (_lock, mut violations) = guard(root)?;
+    let body = body.trim();
+    if body.is_empty() {
+        violations.push(Violation::new(
+            QUEUE_FILE,
+            "owner-queue-empty",
+            "the answer, reason or replacement body must not be empty",
+        ));
+    }
+    let action = match update {
+        QueueUpdate::Answer => {
+            if let Err(message) = journal::validate("answer", Some(body)) {
+                violations.push(Violation::new(QUEUE_FILE, "ledger-body", message));
+            }
+            "answer"
+        }
+        QueueUpdate::Strike => {
+            one_line("--reason", body, &mut violations, QUEUE_FILE);
+            "strike"
+        }
+        QueueUpdate::Edit => {
+            plain_body(QUEUE_FILE, body, 2, &mut violations);
+            "edit"
+        }
+    };
+    if !matches!(update, QueueUpdate::Strike) && crate::markdown::unterminated_fence(body) {
+        violations.push(Violation::new(
+            QUEUE_FILE,
+            "owner-queue-body-fence",
+            "the body must close every Markdown fence before the next entry",
+        ));
+    }
+    let Some(queue) = read_existing(&root.join(QUEUE_FILE))? else {
+        violations.push(Violation::new(
+            QUEUE_FILE,
+            "missing-file",
+            "run `cm init` to write it",
+        ));
+        return Ok(Outcome::refused(violations));
+    };
+    let found = headings(&queue);
+    let Some((index, heading)) = found
+        .iter()
+        .enumerate()
+        .find(|(_, heading)| heading.level == 2 && item_number(heading.text) == Some(number))
+    else {
+        violations.push(Violation::new(
+            QUEUE_FILE,
+            "owner-queue-unknown",
+            format!("item {number} names no open item in {QUEUE_FILE}"),
+        ));
+        return Ok(Outcome::refused(violations));
+    };
+    if !violations.is_empty() {
+        return Ok(Outcome::refused(violations));
+    }
+    let offset = |line| {
+        queue
+            .split_inclusive('\n')
+            .take(line)
+            .map(str::len)
+            .sum::<usize>()
+    };
+    let start = offset(heading.line - 1);
+    let body_start = offset(heading.line);
+    let end = found[index + 1..]
+        .iter()
+        .find(|heading| heading.level <= 2)
+        .map_or(queue.len(), |heading| offset(heading.line - 1));
+    let mut next = queue.clone();
+    if matches!(update, QueueUpdate::Edit) {
+        let newline = if queue[..body_start].ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        next.replace_range(body_start..end, &format!("{newline}\n{body}\n\n"));
+        let edited = format!("# Owner queue\n\n## {}\n\n{body}\n", heading.text);
+        violations.extend(
+            templates::owner_queue(&edited)
+                .into_iter()
+                .map(|violation| violation.at(heading.line)),
+        );
+    } else {
+        next.replace_range(start..end, "");
+    }
+    let drained = !templates::queue_open(&next);
+    let resume = if drained {
+        match read_existing(&root.join("RESUME.md"))? {
+            Some(resume) => {
+                let lines: Vec<&str> = resume.split_inclusive('\n').collect();
+                let start = lines
+                    .iter()
+                    .position(|line| !line.trim().is_empty())
+                    .unwrap_or(0);
+                let end = start
+                    + lines[start..]
+                        .iter()
+                        .take_while(|line| line.starts_with('>'))
+                        .count();
+                Some(
+                    lines
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, line)| {
+                            (!(start..end).contains(&index) || !line.contains(LOOP_WITHHELD))
+                                .then_some(*line)
+                        })
+                        .collect::<String>(),
+                )
+            }
+            None => {
+                violations.push(Violation::new(
+                    "RESUME.md",
+                    "missing-file",
+                    "run `cm init` to write it",
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if !violations.is_empty() {
+        return Ok(Outcome::refused(violations));
+    }
+    let mut journal_body = format!("- {QUEUE_FILE}: `## {}`\n", heading.text);
+    if !matches!(update, QueueUpdate::Edit) {
+        journal_body.push_str("\nRemoved item:\n\n");
+        for line in queue[start..end].split_inclusive('\n') {
+            if line.trim().is_empty() {
+                journal_body.push_str(">\n");
+            } else {
+                journal_body.push_str("> ");
+                journal_body.push_str(line);
+            }
+        }
+        if !journal_body.ends_with('\n') {
+            journal_body.push('\n');
+        }
+    }
+    match update {
+        QueueUpdate::Answer => journal_body.push_str(&format!("\nAnswer:\n{body}\n")),
+        QueueUpdate::Strike => journal_body.push_str(&format!("\nReason: {body}\n")),
+        QueueUpdate::Edit => {}
+    }
+    let at = stamp(host.now());
+    let failed_write = |path, rule, error: anyhow::Error| {
+        Outcome::refused(vec![Violation::new(
+            path,
+            rule,
+            format!(
+                "owner-queue {action} {number} failed; the item remains in the queue: {error:#}"
+            ),
+        )])
+    };
+    let journal = match journal_line(
+        root,
+        &at,
+        &format!("owner-queue {action} {}", heading.text),
+        &journal_body,
+    ) {
+        Ok(journal) => journal,
+        Err(error) => {
+            return Ok(failed_write(
+                store::JOURNAL,
+                "owner-queue-journal-write",
+                error,
+            ));
+        }
+    };
+    if let Err(error) = write_atomic(&root.join(QUEUE_FILE), next.as_bytes()) {
+        return Ok(failed_write(QUEUE_FILE, "owner-queue-write", error));
+    }
+    if let Some(resume) = resume
+        && let Err(error) = write_atomic(&root.join("RESUME.md"), resume.as_bytes())
+    {
+        return Ok(Outcome::refused(vec![Violation::new(
+            "RESUME.md",
+            "owner-queue-resume-write",
+            format!(
+                "owner-queue {action} {number} failed; the item was already removed and journaled; updating RESUME.md failed: {error:#}"
+            ),
+        )]));
+    }
+    let mut outcome = Outcome::default();
+    outcome.line(format!("owner-queue {action} {}", heading.text));
+    outcome.field("item", number);
+    outcome.field("journal", journal);
+    outcome.field("queue_drained", drained);
+    if drained {
+        let next = "OWNER-QUEUE is drained. The session must print the `/loop` command that resumes the campaign.";
+        outcome.line(next);
+        outcome.field("next", next);
+    }
     Ok(outcome)
 }
 
