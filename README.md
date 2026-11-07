@@ -344,11 +344,15 @@ A non-converging round prints `converging: false` and journals the owner's rulin
 `cm next` lists a `fresh reader` item with
 `cm review record <step> '<fresh-review-report>' --reviewer fresh-opus [--part=NAME]`.
 Have an independent Opus reader at high effort review the head, then record its report with that
-command. The item appears only while the PR is open and remains until a `fresh-opus` report is
-recorded for that PR and part. That fresh round compares its blocking count with the report
-that triggered the request. If it fails to converge, it blocks the step
-`blocked:non-convergence` and writes an owner-queue item for that block. After the owner answers
-and `cm unblock` releases it with evidence, another failing fresh round queues a new decision.
+command. The item appears before the step is merged, including when no PR is recorded, and
+remains until a `fresh-opus` report is recorded for that PR and part. That fresh round compares
+its blocking count with the report that triggered the request, or the latest report for the
+same step, PR and part when no request is pending. Without either baseline, `converging` is
+null and no convergence verdict is printed. A failing fresh round writes an owner-queue item
+and blocks the step `blocked:non-convergence` when it can change phase. An unrelated block and
+its resume phase stay intact; clearing that block leaves the owner decision pending. An
+existing non-convergence block or pending owner item suppresses duplicate queueing. After the
+owner answers and `cm unblock` releases the step, another failing fresh round queues a new decision.
 Three FIX REQUIRED rounds by count alone never block or queue. Existing `blocked:third-fix`
 states still load and can be released with `cm unblock`.
 

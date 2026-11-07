@@ -659,6 +659,21 @@ fn fix_heads<'a>(reviews: impl Iterator<Item = &'a Recorded>) -> Vec<&'a str> {
     heads
 }
 
+fn escalation_pending(root: &Path, step: &str) -> Result<bool> {
+    let title = format!("{step}: non-converging fresh reader");
+    Ok(
+        read_existing(&root.join(crate::templates::QUEUE_FILE))?.is_some_and(|queue| {
+            crate::markdown::headings(&queue).iter().any(|heading| {
+                heading.level == 2
+                    && heading
+                        .text
+                        .split_once(". ")
+                        .is_some_and(|(_, text)| text == title)
+            })
+        }),
+    )
+}
+
 fn step_pr(root: &Path, target: &Target, part: Option<&str>) -> Result<Option<String>> {
     let dir = root.join(&target.unit);
     if !store::is_unit(&dir) {
@@ -684,7 +699,7 @@ pub fn record(
 ) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
     let full = full_name(target);
-    let mut can_block = false;
+    let mut non_convergence_block = false;
     if !declared(root, target)? {
         violations.push(Violation::new(
             &full,
@@ -694,8 +709,8 @@ pub fn record(
     } else {
         let unit = store::load_unit(&root.join(&target.unit))?;
         let step = &unit.steps[target.step.as_deref().unwrap_or_default()];
-        can_block = !matches!(step.track.state, crate::state::Phase::Blocked(_))
-            && !step.track.state.is_final();
+        non_convergence_block = matches!(&step.track.state,
+            crate::state::Phase::Blocked(reason) if reason == NON_CONVERGENCE);
         if let Some(part) = part {
             if !step.parts.contains_key(part) {
                 violations.push(Violation::new(
@@ -826,15 +841,24 @@ pub fn record(
         fresh_readers(&verdicts)
             .into_iter()
             .find(|review| review.step == full && review.pr == pr && review.part.as_deref() == part)
+            .or_else(|| {
+                verdicts.reviews.iter().rev().find(|review| {
+                    review.step == full && review.pr == pr && review.part.as_deref() == part
+                })
+            })
     } else {
         previous_review(&verdicts.reviews, &full, pr.as_deref(), part, reviewer)
     };
-    let converging = previous.is_none_or(|before| {
-        findings.iter().filter(|finding| finding.blocking).count() <= blocking_count(before)
-    });
-    let escalate = !converging && reviewer == Some("fresh-opus") && can_block;
+    let converging = match previous {
+        Some(before) => Some(
+            findings.iter().filter(|finding| finding.blocking).count() <= blocking_count(before),
+        ),
+        None if reviewer == Some("fresh-opus") => None,
+        None => Some(true),
+    };
+    let escalate = converging == Some(false) && reviewer == Some("fresh-opus");
     let mut queued = None;
-    if escalate {
+    if escalate && !non_convergence_block && !escalation_pending(root, &full)? {
         let earlier = previous.expect("a non-converging review has a previous round");
         let title = format!("{full}: non-converging fresh reader");
         let context = format!(
@@ -914,7 +938,7 @@ pub fn record(
     if let Some(part) = part {
         body.push_str(&format!("- part: {part}\n"));
     }
-    if !converging {
+    if converging == Some(false) {
         body.push_str(&format!("- converging: false; ruling: “{RULING}”\n"));
     }
     let journal = journal_line(
@@ -943,7 +967,9 @@ pub fn record(
             "the report says {stated}; cm computes {verdict}: only an introduced or exposed contract finding blocks"
         ));
     }
-    outcome.line(format!("converging: {converging}"));
+    if let Some(converging) = converging {
+        outcome.line(format!("converging: {converging}"));
+    }
     if escalate {
         outcome.line(format!(
             "non-converging fresh reader: {full}{}; owner-queue item {}",

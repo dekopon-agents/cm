@@ -489,13 +489,11 @@ pub fn next_at(
                     None if step.parts.is_empty() => Some(&step.track),
                     None => None,
                 };
-                review.pr.is_some()
-                    && step
-                        .track
-                        .resting()
-                        .rank()
-                        .zip(Phase::Merged.rank())
-                        .is_some_and(|(state, merged)| state < merged)
+                step.track
+                    .resting()
+                    .rank()
+                    .zip(Phase::Merged.rank())
+                    .is_some_and(|(state, merged)| state < merged)
                     && lane.is_none_or(|lane| step.lane == Some(lane))
                     && track.is_some_and(|track| {
                         track.evidence.pr == review.pr

@@ -714,6 +714,173 @@ fn rising_counts_request_a_fresh_reader_until_one_is_recorded() {
 }
 
 #[test]
+fn a_step_without_a_pr_still_requests_a_fresh_reader() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, false);
+    for count in 1..=2 {
+        let report = c.report(
+            &format!("r{count}"),
+            &format!("{count:08x}"),
+            &review_fixture::BLOCKING[..count],
+            "FIX REQUIRED",
+        );
+        assert!(record(&host, &c, &report, "astra").ok());
+    }
+    for target in [None, Some(target())] {
+        let next = plan::next(&c.root, target.as_ref(), None).unwrap();
+        assert!(next.ok(), "{:?}", next.violations);
+        let requests = next.fields["fresh_readers"].as_array().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["target"], STEP);
+        assert_eq!(requests[0]["pr"], serde_json::Value::Null);
+        assert_eq!(
+            requests[0]["command"],
+            format!("cm review record {STEP} '<fresh-review-report>' --reviewer fresh-opus")
+        );
+    }
+}
+
+#[test]
+fn a_failing_fresh_read_queues_the_owner_without_replacing_an_unrelated_block() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    for cycle in 0..2 {
+        for count in 1..=2 {
+            let report = c.report(
+                &format!("normal{cycle}-{count}"),
+                &format!("{cycle:07x}{count}"),
+                &review_fixture::BLOCKING[..count],
+                "FIX REQUIRED",
+            );
+            assert!(record(&host, &c, &report, "astra").ok());
+        }
+        if cycle == 0 {
+            assert!(
+                commands::advance(
+                    &host,
+                    &c.root,
+                    &target(),
+                    &Phase::Blocked("ci".into()),
+                    &Evidence::default(),
+                    None,
+                    None
+                )
+                .unwrap()
+                .ok()
+            );
+        }
+        let before = store::load_unit(&c.root.join("01-a/u")).unwrap().steps["S1"]
+            .track
+            .clone();
+        let report = c.report(
+            &format!("fresh{cycle}"),
+            &format!("{cycle:07x}2"),
+            &review_fixture::BLOCKING,
+            "FIX REQUIRED",
+        );
+        let recorded = record(&host, &c, &report, "fresh-opus");
+        assert!(recorded.ok(), "{:?}", recorded.violations);
+        assert_eq!(recorded.fields["converging"], false);
+        assert_eq!(recorded.fields["blocked"], false);
+        assert_eq!(
+            recorded.fields["owner_queue"],
+            if cycle == 0 {
+                serde_json::json!(1)
+            } else {
+                serde_json::Value::Null
+            }
+        );
+        let after = store::load_unit(&c.root.join("01-a/u")).unwrap().steps["S1"]
+            .track
+            .clone();
+        assert_eq!(after, before);
+        assert_eq!(after.state, Phase::Blocked("ci".into()));
+        assert_eq!(after.blocked_from, Some(Phase::PrOpen));
+    }
+    let queue = fs::read_to_string(c.root.join("OWNER-QUEUE.md")).unwrap();
+    let titles: Vec<_> = cm::markdown::headings(&queue)
+        .into_iter()
+        .filter(|heading| heading.level == 2)
+        .map(|heading| heading.text)
+        .collect();
+    assert_eq!(titles, ["1. 01-a/u/S1: non-converging fresh reader"]);
+    let evidence = c.write("ci-fixed.md", "CI is green.\n");
+    assert!(
+        commands::unblock(&host, &c.root, &target(), &evidence)
+            .unwrap()
+            .ok()
+    );
+    assert_eq!(c.state(), Phase::PrOpen);
+    assert_eq!(
+        fs::read_to_string(c.root.join("OWNER-QUEUE.md")).unwrap(),
+        queue
+    );
+    assert!(cm::templates::queue_open_in(&c.root).unwrap());
+}
+
+#[test]
+fn a_fresh_read_without_a_pending_request_uses_the_previous_report() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let report = c.report(
+        "normal",
+        "aaaaaaa1",
+        &review_fixture::BLOCKING[..1],
+        "FIX REQUIRED",
+    );
+    assert!(record(&host, &c, &report, "astra").ok());
+    assert_eq!(
+        plan::next(&c.root, None, None).unwrap().fields["fresh_readers"],
+        serde_json::json!([])
+    );
+    let fresh = c.report(
+        "fresh",
+        "bbbbbbb2",
+        &review_fixture::BLOCKING[..2],
+        "FIX REQUIRED",
+    );
+    let recorded = record(&host, &c, &fresh, "fresh-opus");
+    assert!(recorded.ok(), "{:?}", recorded.violations);
+    assert_eq!(recorded.fields["converging"], false);
+    assert_eq!(recorded.fields["blocked"], true);
+    assert_eq!(recorded.fields["owner_queue"], 1);
+    let again = c.report(
+        "fresh-again",
+        "ccccccc3",
+        &review_fixture::BLOCKING,
+        "FIX REQUIRED",
+    );
+    let duplicate_escalation = record(&host, &c, &again, "fresh-opus");
+    assert!(
+        duplicate_escalation.ok(),
+        "{:?}",
+        duplicate_escalation.violations
+    );
+    assert_eq!(duplicate_escalation.fields["converging"], false);
+    assert_eq!(
+        duplicate_escalation.fields["owner_queue"],
+        serde_json::Value::Null
+    );
+}
+
+#[test]
+fn a_fresh_read_without_a_previous_report_has_no_convergence_verdict() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let report = c.report(
+        "fresh",
+        "aaaaaaa1",
+        &review_fixture::BLOCKING[..1],
+        "FIX REQUIRED",
+    );
+    let recorded = record(&host, &c, &report, "fresh-opus");
+    assert!(recorded.ok(), "{:?}", recorded.violations);
+    assert_eq!(recorded.fields["converging"], serde_json::Value::Null);
+    assert_eq!(recorded.fields["blocked"], false);
+    assert_eq!(recorded.fields["owner_queue"], serde_json::Value::Null);
+}
+
+#[test]
 fn a_fresh_round_compares_with_its_trigger_and_each_block_queues_the_owner() {
     let host = at("2026-10-25T06:00:00Z");
     let c = campaign(&host, true);
