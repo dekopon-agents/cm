@@ -550,9 +550,8 @@ impl<'a> Run<'a> {
         }
     }
 
-    fn releases(&self, at_least: &Phase) -> Vec<Shipped> {
-        let mut out: Vec<Shipped> = self
-            .units
+    fn releases(units: &Units, at_least: &Phase) -> Vec<Shipped> {
+        let mut out: Vec<Shipped> = units
             .iter()
             .flat_map(|(unit, state)| {
                 state
@@ -583,7 +582,7 @@ impl<'a> Run<'a> {
     }
 
     fn released(&mut self) {
-        let releases = self.releases(&Phase::Released);
+        let releases = Self::releases(&self.units, &Phase::Released);
         'steps: for tracked in self.tracks_at(&Phase::Merged) {
             let target = tracked.name();
             if tracked.step.work == Work::Rollout || Release::of_target(&tracked.target).is_some() {
@@ -663,8 +662,8 @@ impl<'a> Run<'a> {
     }
 
     fn deployed(&mut self) {
-        let released = self.releases(&Phase::Released);
-        let deployed = self.releases(&Phase::Deployed);
+        let released = Self::releases(&self.units, &Phase::Released);
+        let deployed = Self::releases(&self.units, &Phase::Deployed);
         for tracked in self.tracks_at(&Phase::Released) {
             let target = tracked.name();
             if tracked.step.work == Work::Rollout || Release::of_target(&tracked.target).is_some() {
@@ -731,6 +730,45 @@ fn guard(root: &Path) -> Result<Vec<Violation>> {
     let mut guard = journal::check(root, &campaign);
     guard.extend(closed(root, &campaign));
     Ok(guard)
+}
+
+// The caller holds the campaign lock. This renders state without advancing any steps.
+pub(crate) fn render_resume(root: &Path, units: &Units, closed: bool) -> Result<()> {
+    let resume_path = root.join("RESUME.md");
+    match std::fs::read_to_string(&resume_path) {
+        Ok(mut resume) => {
+            if let Ok(Some(span)) = crate::templates::status_span(&resume) {
+                let epoch = if closed {
+                    Some(crate::epoch::Status::Closed)
+                } else {
+                    match std::fs::read_to_string(root.join(crate::epoch::EPOCH)) {
+                        Ok(text) => crate::epoch::status(&text),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => return Err(error.into()),
+                    }
+                };
+                let releases = |phase| {
+                    Run::releases(units, phase)
+                        .into_iter()
+                        .map(|shipped| shipped.release)
+                        .collect::<Vec<_>>()
+                };
+                let status = render::status_lines(
+                    units,
+                    &releases(&Phase::Released),
+                    &releases(&Phase::Deployed),
+                    epoch,
+                );
+                if resume[span.clone()] != status {
+                    resume.replace_range(span, &status);
+                    write_atomic(&resume_path, resume.as_bytes())?;
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> {
@@ -832,6 +870,7 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
         .unwrap_or_default();
     let card = render::card(root, run.now, &name, &run.units, &next, &run.moves);
     write_atomic(&root.join(CARD), card.as_bytes())?;
+    render_resume(root, &run.units, false)?;
     for moved in &run.moves {
         outcome.line(format!(
             "{}: {} → {} ({})",

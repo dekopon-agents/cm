@@ -8,7 +8,15 @@
 
 ## State today
 
-Nothing has shipped yet.
+<!-- cm:status -->
+| State | Steps |
+|---|---|
+| — | 0 |
+
+No releases recorded.
+
+Epoch status: unknown.
+<!-- cm:status-end -->
 
 ## How to work
 

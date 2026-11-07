@@ -66,6 +66,10 @@ mod forge_fixture;
 use campaign_fixture::{Campaign, campaign};
 use forge_fixture::FakeForge;
 
+#[path = "support/forge.rs"]
+mod forge_fixture;
+use forge_fixture::FakeForge;
+
 #[path = "support/watch.rs"]
 mod watch_fixture;
 

@@ -21,6 +21,11 @@ mod kickoff_fixture;
 #[path = "support/lifecycle.rs"]
 mod lifecycle_fixture;
 
+#[path = "support/forge.rs"]
+mod forge_fixture;
+#[path = "support/resume.rs"]
+mod resume_fixture;
+
 use campaign_fixture::{Campaign, campaign, git, repo};
 
 struct Fake {
@@ -124,7 +129,7 @@ fn init_never_overwrites_and_adopts_what_lints_clean() {
         cm::templates::LOOP_WITHHELD,
         &template[end..]
     )
-    .replace("Nothing has shipped yet.", "Our own words.");
+    .replace("No releases recorded.", "Our own words.");
     fs::write(root.join("RESUME.md"), &resume).unwrap();
     fs::write(
         root.join("OWNER-QUEUE.md"),
@@ -1608,6 +1613,157 @@ fn resolving_or_withdrawing_the_last_watch_keeps_a_release_on_the_shipping_ladde
         assert!(done.ok(), "{:?}", done.violations);
         let unit = store::load_unit(&c.root.join(&target.unit)).unwrap();
         assert_eq!(unit.steps["1.0.0"].track.state, Phase::Done);
+    }
+}
+
+#[test]
+fn sync_rewrites_only_resume_status_and_is_idempotent() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let forge = c.resume_releases(&host);
+    let path = c.root.join("RESUME.md");
+    fs::write(&path, resume_fixture::resume_text("Stale status.\r\n")).unwrap();
+
+    let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    let status = "| State | Steps |\n|---|---|\n| drafted | 2 |\n| released | 2 |\n| deployed | 1 |\n| done | 1 |\n| superseded | 1 |\n| blocked | 1 |\n\n| Release line | Released | Deployed |\n|---|---|---|\n| alpha | 2.0.0 | — |\n| gizmo | 3.0.0 | 3.0.0 |\n| widget | 1.10.0 | 1.9.0 |\n\nEpoch status: working.\n";
+    let expected = resume_fixture::resume_text(status).into_bytes();
+    assert_eq!(fs::read(&path).unwrap(), expected);
+    let later = Fake::at("2026-10-08T08:00:00Z");
+    let out = cm::sync::sync(&later, &forge, &c.root).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    assert_eq!(fs::read(&path).unwrap(), expected);
+}
+
+#[test]
+fn sync_leaves_resume_without_markers_unchanged() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let text = resume_fixture::resume_text("Owner status.\r\n")
+        .replace("<!-- cm:status -->\r\n", "")
+        .replace("<!-- cm:status-end -->\r\n", "");
+    let path = c.root.join("RESUME.md");
+    fs::write(&path, &text).unwrap();
+    let out = cm::sync::sync(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
+    assert_clean(&c.root);
+}
+
+#[test]
+fn sync_renders_empty_state_and_current_epoch_status() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let path = c.root.join("RESUME.md");
+    fs::write(&path, resume_fixture::resume_text("Stale.\n")).unwrap();
+    for epoch in [
+        None,
+        Some("OPEN"),
+        Some("PLANNING"),
+        Some("WORKING"),
+        Some("CLOSED"),
+    ] {
+        if let Some(epoch) = epoch {
+            fs::write(
+                c.root.join("EPOCH.md"),
+                format!("---\nstatus: {epoch}\n---\n"),
+            )
+            .unwrap();
+        }
+        let out = cm::sync::sync(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
+        assert!(out.ok(), "{:?}", out.violations);
+        let epoch = epoch.unwrap_or("unknown").to_lowercase();
+        let status = format!(
+            "| State | Steps |\n|---|---|\n| — | 0 |\n\nNo releases recorded.\n\nEpoch status: {epoch}.\n"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            resume_fixture::resume_text(&status).as_bytes()
+        );
+    }
+}
+
+#[test]
+fn lint_reports_malformed_resume_status_markers_and_sync_preserves_them() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let original = resume_fixture::resume_text("Old status.\n");
+    let outside = original
+        .replace("<!-- cm:status -->\r\n", "")
+        .replace("<!-- cm:status-end -->\r\n", "")
+        + "\r\n<!-- cm:status -->\r\nOld status.\r\n<!-- cm:status-end -->\r\n";
+    for text in [
+        original.replace("<!-- cm:status -->\r\n", ""),
+        original.replace("<!-- cm:status-end -->\r\n", ""),
+        original
+            .replace("cm:status-end", "cm:temporary")
+            .replace("cm:status", "cm:status-end")
+            .replace("cm:temporary", "cm:status"),
+        original.replace(
+            "<!-- cm:status -->",
+            "<!-- cm:status -->\n<!-- cm:status -->",
+        ),
+        outside,
+    ] {
+        fs::write(c.root.join("RESUME.md"), &text).unwrap();
+        let out = lint(&c.root).unwrap();
+        assert_eq!(rules(&out), vec!["resume-status"], "{:?}", out.violations);
+        assert_eq!(out.violations[0].path, "RESUME.md");
+        let out = cm::sync::sync(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
+        assert!(out.ok(), "{:?}", out.violations);
+        assert_eq!(fs::read(c.root.join("RESUME.md")).unwrap(), text.as_bytes());
+    }
+}
+
+#[test]
+fn close_and_epoch_closed_refresh_resume_without_sync() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    c.resume_working_epoch();
+    let path = c.root.join("RESUME.md");
+    fs::write(&path, resume_fixture::resume_text("Stale status.\n")).unwrap();
+    let out = cm::sync::sync(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    let working = fs::read_to_string(&path).unwrap();
+    assert!(working.contains("Epoch status: working.\n"));
+    let expected = working.replace("Epoch status: working.", "Epoch status: closed.");
+
+    let out = commands::close(&host, &c.root).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+
+    // The epoch transition must refresh stale generated content itself, too.
+    fs::write(&path, &working).unwrap();
+    let out = cm::epoch::epoch(&host, &c.root, cm::epoch::Status::Closed, None, None).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+}
+
+#[test]
+fn sync_and_lint_ignore_fenced_marker_examples() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    for fence in ["```", "~~~"] {
+        for real_span in [false, true] {
+            let c = campaign(&host);
+            let status = real_span.then_some("Stale status.\n");
+            let text = resume_fixture::resume_with_marker_example(fence, status);
+            let path = c.root.join("RESUME.md");
+            fs::write(&path, &text).unwrap();
+            assert_clean(&c.root);
+            let out = cm::sync::sync(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
+            assert!(out.ok(), "{:?}", out.violations);
+            let expected = if real_span {
+                resume_fixture::resume_with_marker_example(
+                    fence,
+                    Some(
+                        "| State | Steps |\n|---|---|\n| — | 0 |\n\nNo releases recorded.\n\nEpoch status: unknown.\n",
+                    ),
+                )
+            } else {
+                text
+            };
+            assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        }
     }
 }
 
