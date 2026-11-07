@@ -109,13 +109,13 @@ fn an_owner_answer_unblocks_parked_work_with_its_evidence() {
     let c = campaign(&host);
     assert!(declare(&host, &c, "01-a/u/S1", Lane::ClaudeCloud, &[]).ok());
     let answer = note(&c, "answer.md");
-    let early = commands::unblock(&host, &c.root, &target("01-a/u/S1"), &answer).unwrap();
+    let early = commands::unblock(&host, &c.root, &target("01-a/u/S1"), Some(&answer)).unwrap();
     assert_eq!(rules(&early), vec!["unblock-state"]);
     assert!(advance(&host, &c, "01-a/u/S1", "blocked:owner", None).ok());
     let missing = c.root.join("nope.md");
-    let refused = commands::unblock(&host, &c.root, &target("01-a/u/S1"), &missing).unwrap();
+    let refused = commands::unblock(&host, &c.root, &target("01-a/u/S1"), Some(&missing)).unwrap();
     assert_eq!(rules(&refused), vec!["evidence-file"]);
-    let done = commands::unblock(&host, &c.root, &target("01-a/u/S1"), &answer).unwrap();
+    let done = commands::unblock(&host, &c.root, &target("01-a/u/S1"), Some(&answer)).unwrap();
     assert!(done.ok(), "{:?}", done.violations);
     assert_eq!(state(&c, "01-a/u/S1"), Phase::Drafted);
     assert_eq!(ready(&c), vec!["01-a/u/S1"]);
@@ -123,6 +123,95 @@ fn an_owner_answer_unblocks_parked_work_with_its_evidence() {
     assert!(journal.contains("unblock 01-a/u/S1: blocked:owner → drafted"));
     assert!(journal.contains("- evidence: file answer.md"));
     assert!(lint(&c.root).unwrap().ok());
+}
+
+#[test]
+fn satisfied_step_condition_unblocks_without_a_file_and_journals_the_condition() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/gate", Lane::Owner, &[]).ok());
+    assert!(declare(&host, &c, "01-a/u/consumer", Lane::Codex, &[]).ok());
+    assert!(launch(&host, &c, "01-a/u/consumer").ok());
+    assert!(advance(&host, &c, "01-a/u/consumer", "blocked:until:gate", None).ok());
+    let answer = note(&c, "answer.md");
+    assert!(advance(&host, &c, "01-a/u/gate", "done", Some(&answer)).ok());
+    let next = plan::next(&c.root, None, None).unwrap();
+    assert_eq!(next.fields["unblock_now"][0]["target"], "01-a/u/consumer");
+    let before = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .current_dir(&c.root)
+        .args(["unblock", "01-a/u/consumer", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let outcome: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(outcome["to"], "launched");
+    assert_eq!(state(&c, "01-a/u/consumer"), Phase::Launched);
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    let expected = cm::journal::entry(
+        &unit.history.last().unwrap().at,
+        "unblock 01-a/u/consumer: blocked:until:01-a/u/gate → launched",
+        Some("- condition: until:01-a/u/gate holds"),
+    );
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    assert_eq!(
+        journal
+            .strip_prefix(&before)
+            .unwrap()
+            .trim_start_matches('\n'),
+        expected
+    );
+}
+
+#[test]
+fn no_evidence_refuses_unmet_conditions_free_text_and_unit_blocks_without_writes() {
+    let host = at("2026-10-19T09:00:00Z");
+    for (blocked, reason) in [
+        ("01-a/u/consumer", "blocked:until:gate"),
+        ("01-a/u/consumer", "blocked:owner"),
+        ("01-a/u", "blocked:until:gate"),
+    ] {
+        let c = campaign(&host);
+        assert!(declare(&host, &c, "01-a/u/gate", Lane::Owner, &[]).ok());
+        assert!(declare(&host, &c, "01-a/u/consumer", Lane::Codex, &[]).ok());
+        if blocked == "01-a/u" {
+            let answer = note(&c, "answer.md");
+            assert!(advance(&host, &c, "01-a/u/gate", "done", Some(&answer)).ok());
+        }
+        assert!(advance(&host, &c, blocked, reason, None).ok());
+        let before = c.files();
+        let refused = commands::unblock(&host, &c.root, &target(blocked), None).unwrap();
+        assert_eq!(rules(&refused), vec!["unblock-evidence"]);
+        assert_eq!(c.files(), before);
+    }
+}
+
+#[test]
+fn explicit_evidence_can_clear_an_unmet_condition() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/gate", Lane::Owner, &[]).ok());
+    assert!(declare(&host, &c, "01-a/u/consumer", Lane::Codex, &[]).ok());
+    assert!(advance(&host, &c, "01-a/u/consumer", "blocked:until:gate", None).ok());
+    let answer = note(&c, "answer.md");
+    let before = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    let unblocked =
+        commands::unblock(&host, &c.root, &target("01-a/u/consumer"), Some(&answer)).unwrap();
+    assert!(unblocked.ok(), "{:?}", unblocked.violations);
+    assert_eq!(state(&c, "01-a/u/consumer"), Phase::Drafted);
+    let expected = cm::journal::entry(
+        "2026-10-19T09:00Z",
+        "unblock 01-a/u/consumer: blocked:until:01-a/u/gate → drafted",
+        Some("- evidence: file answer.md"),
+    );
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    assert_eq!(
+        journal
+            .strip_prefix(&before)
+            .unwrap()
+            .trim_start_matches('\n'),
+        expected
+    );
 }
 
 #[test]
@@ -147,7 +236,8 @@ fn blocked_draft_still_requires_its_after_gate() {
     let direct = launch(&host, &c, "01-a/u/consumer");
     assert_eq!(rules(&direct), vec!["after-unmet"]);
     assert!(direct.violations[0].message.contains("producer"));
-    let unblocked = commands::unblock(&host, &c.root, &target("01-a/u/consumer"), &gate).unwrap();
+    let unblocked =
+        commands::unblock(&host, &c.root, &target("01-a/u/consumer"), Some(&gate)).unwrap();
     assert!(unblocked.ok());
     assert_eq!(unblocked.fields["waits_on"].as_array().unwrap().len(), 1);
     assert!(!ready(&c).contains(&"01-a/u/consumer".to_owned()));
