@@ -907,7 +907,7 @@ pub fn launch_remote(
                 ),
             ));
         }
-        violations.extend(plan::unmet(&full, &plan::gates(&units, step)));
+        violations.extend(plan::unmet(&full, &plan::gates(root, &units, step)));
         if let Some(attempt) = step
             .attempt
             .as_ref()
@@ -1635,7 +1635,7 @@ pub fn advance_gated(
         && let Some(step) = &declared
     {
         let units = plan::load_units(root)?;
-        violations.extend(plan::unmet(&full, &plan::gates(&units, step)));
+        violations.extend(plan::unmet(&full, &plan::gates(root, &units, step)));
     }
     let resuming = matches!(track.state, Phase::Blocked(_)) && track.resting() == to;
     let (required, optional) = if resuming {
@@ -2080,7 +2080,7 @@ pub fn unblock(host: &dyn Host, root: &Path, target: &Target, file: &Path) -> Re
     let units = plan::load_units(root)?;
     let waits: Vec<String> = plan::step(&units, &full)
         .filter(|_| matches!(to, Phase::Drafted | Phase::Launched))
-        .map(|step| plan::unmet(&full, &plan::gates(&units, step)))
+        .map(|step| plan::unmet(&full, &plan::gates(root, &units, step)))
         .unwrap_or_default()
         .into_iter()
         .map(|violation| violation.message)

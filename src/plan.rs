@@ -61,22 +61,40 @@ impl Gate {
     }
 
     pub fn describe(&self) -> String {
-        let state = self.track.as_ref().map_or_else(
-            || "not declared".to_owned(),
-            |track| track.state.to_string(),
-        );
         let stale = if self.stale.is_empty() {
             String::new()
         } else {
             format!("; its pinned evidence is stale: {}", self.stale.join(", "))
         };
+        if let After::Pin(_) = &self.after {
+            let head = self
+                .track
+                .as_ref()
+                .and_then(|track| track.evidence.sha.as_deref())
+                .unwrap_or("none");
+            if !self
+                .track
+                .as_ref()
+                .is_some_and(|track| self.after.met_by(track, self.finish))
+            {
+                return format!("{} (stale pin; recorded head {head}{stale})", self.after);
+            }
+            return format!("{} (recorded head {head}{stale})", self.after);
+        }
+        let state = self.track.as_ref().map_or_else(
+            || "not declared".to_owned(),
+            |track| track.state.to_string(),
+        );
         format!("{} (needs {}, is {state}{stale})", self.after, self.needs())
     }
 
     pub fn to_json(&self) -> Value {
         json!({
             "after": self.after.to_string(),
-            "needs": self.needs().to_string(),
+            "needs": match &self.after {
+                After::Pin(revision) => format!("head {}", revision.sha),
+                _ => self.needs().to_string(),
+            },
             "state": self.track.as_ref().map(|track| track.state.to_string()),
             "met": self.met(),
             "evidence": self.track.as_ref().map(|track| serde_json::to_value(&track.evidence).unwrap_or(Value::Null)),
@@ -131,8 +149,26 @@ pub fn stale_evidence<'a>(units: &'a Units, step: &Step) -> Vec<&'a crate::state
     out
 }
 
-pub fn gates(units: &Units, step: &Step) -> Vec<Gate> {
-    step.after.iter().map(|after| gate(units, after)).collect()
+pub fn gates(root: &Path, units: &Units, step: &Step) -> Vec<Gate> {
+    step.after
+        .iter()
+        .map(|after| {
+            let mut gate = gate(units, after);
+            if let After::Pin(revision) = after
+                && let Some(track) = &mut gate.track
+            {
+                // A sync observation is newer than the SHA recorded when the PR opened.
+                // A multipart step has no single head to pin.
+                track.evidence.sha =
+                    crate::holds::head(root, units, &revision.step).or_else(|| {
+                        self::step(units, &revision.step)
+                            .filter(|step| step.parts.is_empty())
+                            .and_then(|step| step.track.evidence.sha.clone())
+                    });
+            }
+            gate
+        })
+        .collect()
 }
 
 pub fn unmet(target: &str, gates: &[Gate]) -> Vec<Violation> {
@@ -214,7 +250,7 @@ fn candidates<'a>(root: &Path, units: &'a Units) -> Vec<Candidate<'a>> {
         .filter(|(_, step)| step.lane.is_some() && step.track.state == Phase::Drafted)
         .map(|(target, step)| Candidate {
             kickoff: kickoff(root, &target),
-            gates: gates(units, step),
+            gates: gates(root, units, step),
             target,
             step,
         })
@@ -770,7 +806,10 @@ pub(crate) fn block_condition(text: &str, unit: &str) -> Result<String, String> 
         }
         return Ok(format!("owner-queue:{n}"));
     }
-    After::parse(text, unit).map(|after| after.to_string())
+    match After::parse(text, unit)? {
+        After::Pin(_) => Err("pin gates are not supported in blocked:until:".into()),
+        after => Ok(after.to_string()),
+    }
 }
 
 pub(crate) fn block_met(root: &Path, units: &Units, unit: &str, condition: &str) -> bool {

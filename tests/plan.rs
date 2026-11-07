@@ -709,6 +709,177 @@ fn next_hands_out_only_steps_whose_after_is_met() {
 }
 
 #[test]
+fn pin_gate_follows_the_recorded_head_and_round_trips() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let source = "01-a/u/S1";
+    let dependent = "01-a/u/S2";
+    let head = "abcdef0123456789abcdef0123456789abcdef01";
+    assert!(declare(&host, &c, source, Lane::Codex, &[]).ok());
+    assert!(declare(&host, &c, dependent, Lane::Codex, &["pin:S1@ABCDEF0"]).ok());
+    kickoff(&c, dependent);
+    assert!(ready(&c, None).is_empty());
+
+    let path = store::state_path(&c.root.join("01-a/u"));
+    let stored: serde_json::Value = store::read_json(&path).unwrap();
+    assert_eq!(
+        stored["steps"]["S2"]["after"],
+        serde_json::json!(["pin:01-a/u/S1@abcdef0"])
+    );
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    assert_eq!(
+        unit.steps["S2"].after,
+        vec![cm::state::After::Pin(cm::state::Revision {
+            step: source.into(),
+            sha: "abcdef0".into(),
+        })]
+    );
+
+    // Matching is independent of progress through the state machine.
+    for phase in [Phase::Drafted, Phase::PrOpen, Phase::Merged] {
+        c.recorded_head(source, phase, head);
+        assert_eq!(ready(&c, None), [dependent]);
+        let next = next_one(&c, dependent);
+        assert_eq!(next.fields["steps"][0]["after"][0]["met"], true);
+    }
+
+    let moved = "b".repeat(40);
+    c.recorded_head(source, Phase::PrOpen, &moved);
+    let next = next_one(&c, dependent);
+    assert_eq!(rules(&next), ["after-unmet"]);
+    assert_eq!(next.fields["steps"], serde_json::json!([]));
+    assert_eq!(next.fields["waiting"][0]["target"], dependent);
+    assert_eq!(next.fields["waiting"][0]["command"], "cm next 01-a/u/S2");
+    let stale = format!("pin:01-a/u/S1@abcdef0 (stale pin; recorded head {moved})");
+    assert_eq!(
+        next.fields["waiting"][0]["waits_on"],
+        serde_json::json!([stale])
+    );
+    assert_eq!(
+        next.lines,
+        [format!(
+            "1. waits {dependent}: {stale} — `cm next {dependent}`"
+        )]
+    );
+    let all = plan::next(&c.root, None, None).unwrap();
+    assert_eq!(all.fields["steps"], serde_json::json!([]));
+    assert_eq!(all.fields["waiting"][0]["target"], dependent);
+    assert_eq!(
+        rules(
+            &commands::launch(
+                &host,
+                &c.root,
+                &parse_target(dependent, true).unwrap(),
+                None
+            )
+            .unwrap()
+        ),
+        ["after-unmet"]
+    );
+}
+
+#[test]
+fn pin_gate_uses_the_latest_synced_head() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let source = "01-a/u/S1";
+    let dependent = "02-b/v/S2";
+    let head = "a".repeat(40);
+    assert!(declare(&host, &c, source, Lane::Codex, &[]).ok());
+    c.recorded_head(source, Phase::PrOpen, &head);
+    assert!(
+        declare(
+            &host,
+            &c,
+            dependent,
+            Lane::Codex,
+            &[&format!("pin:{source}@{head}")]
+        )
+        .ok()
+    );
+    kickoff(&c, dependent);
+    assert_eq!(ready(&c, None), [dependent]);
+    let moved = "b".repeat(40);
+    c.observed_head(source, &moved);
+    let next = next_one(&c, dependent);
+    assert_eq!(rules(&next), ["after-unmet"]);
+    assert_eq!(
+        next.fields["waiting"][0]["after"][0]["evidence"]["sha"],
+        moved
+    );
+    assert_eq!(next.fields["waiting"][0]["command"], "cm next 02-b/v/S2");
+    // The opening SHA stays unchanged; a newer observation controls the gate.
+    assert_eq!(
+        store::load_unit(&c.root.join("01-a/u")).unwrap().steps["S1"]
+            .track
+            .evidence
+            .sha
+            .as_deref(),
+        Some(head.as_str())
+    );
+    c.observed_head(source, &head);
+    assert_eq!(ready(&c, None), [dependent]);
+}
+
+#[test]
+fn invalid_pin_shas_are_refused_before_init_or_amend_writes() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/S1", Lane::Codex, &[]).ok());
+    assert!(declare(&host, &c, "01-a/u/S2", Lane::Codex, &[]).ok());
+    for pin in [
+        "pin:S1",
+        "pin:S1@",
+        "pin:S1@abcdef",
+        "pin:S1@ghijklm",
+        "pin:S1@abcdef0123456789abcdef0123456789abcdef01234",
+    ] {
+        let before = c.files();
+        let init = declare(&host, &c, "01-a/u/S3", Lane::Codex, &[pin]);
+        assert_eq!(rules(&init), ["after-parse"], "{pin}");
+        let amend = commands::amend(
+            &host,
+            &c.root,
+            &parse_target("01-a/u/S2", true).unwrap(),
+            &commands::Amendment {
+                after: vec![pin.into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rules(&amend), ["after-parse"], "{pin}");
+        assert_eq!(c.files(), before);
+    }
+    for pin in ["pin:unknown@abcdef0", "pin:S3@abcdef0"] {
+        assert_eq!(
+            rules(&declare(&host, &c, "01-a/u/S3", Lane::Codex, &[pin])),
+            ["after-unknown"]
+        );
+    }
+    let target = parse_target("01-a/u/S2", true).unwrap();
+    let amendment = |after, drop_after| {
+        commands::amend(
+            &host,
+            &c.root,
+            &target,
+            &commands::Amendment {
+                after,
+                drop_after,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    assert!(amendment(vec!["pin:S1@abcdef0".into()], vec![]).ok());
+    assert!(amendment(vec![], vec!["pin:S1@ABCDEF0".into()]).ok());
+    assert!(
+        store::load_unit(&c.root.join("01-a/u")).unwrap().steps["S2"]
+            .after
+            .is_empty()
+    );
+}
+
+#[test]
 fn a_kickoff_less_or_paused_step_is_not_next() {
     let host = at("2026-10-17T08:00:00Z");
     let c = campaign(&host);
@@ -3924,6 +4095,7 @@ fn blocked_until_short_step_resolves_against_its_unit() {
     for invalid in [
         "blocked:until:",
         "blocked:until:epoch:OPEN",
+        "blocked:until:pin:S1@abcdef0",
         "blocked:until:owner-queue:0",
         "blocked:until:owner-queue:+2",
     ] {

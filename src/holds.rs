@@ -325,6 +325,14 @@ pub fn known_red(
         ));
     }
     let until = match After::parse(args.until, &target.unit) {
+        Ok(After::Pin(_)) => {
+            violations.push(Violation::new(
+                &full,
+                "after-parse",
+                "pin gates are not supported in known-red --until",
+            ));
+            None
+        }
         Ok(until) => Some(until),
         Err(message) => {
             violations.push(Violation::new(&full, "after-parse", message));
@@ -800,7 +808,7 @@ pub fn revision(
     let refuse = |message: String| Violation::new(flag, "pin-revision", message);
     let step = match After::parse(name, unit) {
         Ok(After::Merged(step)) => step,
-        Ok(After::PrOpen(_) | After::Tag(_) | After::Deployed(_)) | Err(_) => {
+        Ok(After::PrOpen(_) | After::Pin(_) | After::Tag(_) | After::Deployed(_)) | Err(_) => {
             return Err(refuse(format!(
                 "`{text}` is not <step>[#<part>][@<sha>] or <NN-name>/<unit>/<step>[#<part>][@<sha>]"
             )));

@@ -2358,6 +2358,10 @@ fn a_known_red_exception_covers_only_its_failing_check_at_its_head_until_it_clos
     let red = red_at_head(&head, "failure", "failure");
     let why = "red by design until build lands";
     assert_eq!(
+        rules(&known_red(&host, &c, &red, &head, why, "pin:build@abcdef0")),
+        vec!["after-parse"]
+    );
+    assert_eq!(
         rules(&known_red(&host, &c, &red, &head, "", "build")),
         vec!["ledger-field"]
     );
