@@ -9,6 +9,64 @@ use cm::store::{self, parse_target};
 use super::campaign_fixture::Campaign;
 
 impl Campaign {
+    pub fn base_unblock_marker(&self) -> String {
+        let key = r#"{"condition":"epoch:WORKING","since":"2026-10-17T08:00Z","target":"01-a/u/BLOCKED"}"#.to_owned();
+        store::write_json(
+            &self.root.join(".cm/unblock-notified.json"),
+            &std::collections::BTreeSet::from([key.clone()]),
+        )
+        .unwrap();
+        key
+    }
+
+    pub fn stale_revision_inputs(
+        &self,
+        host: &dyn Host,
+        candidate_open: bool,
+        harness_open: bool,
+        candidate_split: bool,
+        harness_split: bool,
+    ) {
+        let dir = self.root.join("01-a/u");
+        let mut unit = store::load_unit(&dir).unwrap();
+        for (name, open, sha) in [("DIRTY", candidate_open, 'a'), ("READY", harness_open, 'c')] {
+            let step = unit.steps.get_mut(name).unwrap();
+            step.track.state = if open { Phase::PrOpen } else { Phase::Drafted };
+            step.track.evidence.sha = Some(sha.to_string().repeat(40));
+        }
+        store::write_json(&store::state_path(&dir), &unit).unwrap();
+        for (name, split) in [("DIRTY", candidate_split), ("READY", harness_split)] {
+            if split {
+                let out = commands::amend(
+                    host,
+                    &self.root,
+                    &parse_target(&format!("01-a/u/{name}"), true).unwrap(),
+                    &commands::Amendment {
+                        parts: vec!["core".into(), "extra".into()],
+                        ..commands::Amendment::default()
+                    },
+                )
+                .unwrap();
+                assert!(out.ok(), "{:?}", out.violations);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn run_next_command(&self, command: &str) -> serde_json::Value {
+        let output = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!("set -- {command}; shift; exec \"$CM_TEST_BIN\" \"$@\" --json"),
+            ])
+            .env("CM_TEST_BIN", env!("CARGO_BIN_EXE_cm"))
+            .current_dir(&self.root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{command}: {output:?}");
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
     pub fn next_actions(&self, host: &dyn Host) {
         for name in [
             "READY",

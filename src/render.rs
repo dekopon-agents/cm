@@ -271,7 +271,6 @@ fn watch_summary(root: &std::path::Path, now: Timestamp, units: &Units) -> Vec<S
     rows
 }
 
-/// The action line shared by `cm next` and CARD.md. Numbering spans all action sections.
 pub(crate) fn next_item(number: &mut usize, description: &str, command: &str) -> String {
     let description: String = description
         .chars()
@@ -320,28 +319,29 @@ pub fn card(
                         .map(|pr| format!(" {pr}"))
                         .unwrap_or_default()
                 )),
-                Phase::Blocked(_) => blocked.push((
-                    target.clone(),
-                    format!(
-                        "`{target}` {} since {}{}",
-                        step.track.state,
-                        step.track.since,
-                        match &step.track.state {
-                            Phase::Blocked(reason) => reason
-                                .strip_prefix("until:")
-                                .map(|condition| format!(
-                                    "; condition {}",
-                                    if crate::plan::block_met(root, units, unit, condition) {
-                                        "holds"
-                                    } else {
-                                        "does not hold"
-                                    }
-                                ))
-                                .unwrap_or_default(),
-                            _ => String::new(),
-                        }
-                    ),
-                )),
+                Phase::Blocked(reason) => {
+                    let met = reason
+                        .strip_prefix("until:")
+                        .map(|condition| crate::plan::block_met(root, units, unit, condition));
+                    let command = if met == Some(false) {
+                        format!("cm next {target}")
+                    } else {
+                        crate::plan::unblock_command(&target)
+                    };
+                    blocked.push((
+                        format!(
+                            "`{target}` {} since {}{}",
+                            step.track.state,
+                            step.track.since,
+                            met.map(|met| format!(
+                                "; condition {}",
+                                if met { "holds" } else { "does not hold" }
+                            ))
+                            .unwrap_or_default(),
+                        ),
+                        command,
+                    ));
+                }
                 _ => {}
             }
         }
@@ -385,6 +385,7 @@ pub fn card(
     let waiting: Vec<String> = next
         .waiting
         .iter()
+        .filter(|(_, on)| !on.is_empty())
         .map(|(target, on)| {
             next_item(
                 &mut number,
@@ -395,7 +396,7 @@ pub fn card(
         .collect();
     let blocked: Vec<String> = blocked
         .iter()
-        .map(|(target, line)| next_item(&mut number, line, &crate::plan::unblock_command(target)))
+        .map(|(line, command)| next_item(&mut number, line, command))
         .collect();
     let moved: Vec<String> = moves
         .iter()

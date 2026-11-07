@@ -923,6 +923,18 @@ pub struct Held {
 }
 
 pub(crate) fn held(units: &Units, now: jiff::Timestamp, root: &Path, number: &mut usize) -> Held {
+    let revision_input = |revision: &Revision, kind: &str| {
+        let mut target = revision.step.clone();
+        if !target.contains('#')
+            && plan::step(units, &target).is_some_and(|step| !step.parts.is_empty())
+        {
+            target.push_str(&format!("#<{kind}-part>"));
+        }
+        if head(root, units, &target).is_none() {
+            target.push_str(&format!("@<{kind}-sha>"));
+        }
+        shell_word(&target)
+    };
     let mut held = Held {
         watches: Vec::new(),
         stale: Vec::new(),
@@ -961,10 +973,13 @@ pub(crate) fn held(units: &Units, now: jiff::Timestamp, root: &Path, number: &mu
                 let why = pin.stale.clone().unwrap_or_default();
                 let mut command = format!(
                     "cm evidence {target} --name '<fresh-evidence-name>' --body-file '<fresh-evidence-file>' --candidate {}",
-                    shell_word(&pin.candidate.step)
+                    revision_input(&pin.candidate, "candidate")
                 );
                 if let Some(harness) = &pin.harness {
-                    command.push_str(&format!(" --harness {}", shell_word(&harness.step)));
+                    command.push_str(&format!(
+                        " --harness {}",
+                        revision_input(harness, "harness")
+                    ));
                 }
                 held.lines.push(crate::render::next_item(
                     number,

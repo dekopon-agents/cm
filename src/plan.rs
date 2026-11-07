@@ -411,6 +411,9 @@ pub struct Next {
 }
 
 pub(crate) fn launch_command(target: &str, lane: Option<Lane>) -> String {
+    if lane == Some(Lane::Owner) {
+        return format!("cm advance {target} done --evidence '<owner-evidence-file>'");
+    }
     let worktree = if lane == Some(Lane::Pi) {
         " --worktree '<worktree-path>'"
     } else {
@@ -538,11 +541,14 @@ pub fn next_at(
             outcome.field("steps", vec![candidate.to_json(root)]);
             outcome.field("waiting", Vec::<Value>::new());
         } else {
-            outcome.line(next_item(
-                &mut number,
-                &format!("waits {full}: {}", candidate.waits_on().join("; ")),
-                &waiting_command(root, &full),
-            ));
+            let on = candidate.waits_on();
+            if !on.is_empty() {
+                outcome.line(next_item(
+                    &mut number,
+                    &format!("waits {full}: {}", on.join("; ")),
+                    &waiting_command(root, &full),
+                ));
+            }
             outcome.field("steps", Vec::<Value>::new());
             outcome.field("waiting", vec![candidate.waiting_json(root)]);
         }
@@ -575,11 +581,13 @@ pub fn next_at(
     }
     for candidate in &waiting {
         let on = candidate.waits_on();
-        outcome.line(next_item(
-            &mut number,
-            &format!("waits {}: {}", candidate.target, on.join("; ")),
-            &waiting_command(root, &candidate.target),
-        ));
+        if !on.is_empty() {
+            outcome.line(next_item(
+                &mut number,
+                &format!("waits {}: {}", candidate.target, on.join("; ")),
+                &waiting_command(root, &candidate.target),
+            ));
+        }
     }
     let tags = untagged(&units);
     for tag in &tags {

@@ -222,12 +222,15 @@ A blocked step meets the gates of the state it was blocked from. A bare step nam
 as `command` on each item. CARD.md uses the same renderer and numbers its Next, Waiting and
 Blocked lines across those sections. Run commands from the campaign folder, or append `-C DIR`.
 Replace quoted placeholders such as `'<watch-evidence-file>'` with the named input.
+Ready owner steps offer `cm advance <step> done --evidence '<owner-evidence-file>'`.
 Ready local steps name a worktree placeholder. Waiting steps offer `cm next <step>` to recheck
 their gates, or `cm amend --kickoff-file` when the kickoff is missing. Stalled launches offer
 `cm attempt <step>` to inspect the attempt before acting; dirty PRs offer `cm attention` with
 worker and coordinator session placeholders. Tags offer `cm sync` to observe the tag after
 it is cut. Stale evidence offers `cm evidence` with a fresh name and body, pinned to the current
-candidate and harness heads.
+candidate and harness heads, or named SHA inputs when no head resolves. A revision whose step
+became multipart also names the required part input. An `until:` block offers `cm next <step>`
+while its condition is unmet, then `cm unblock` once it holds; free-text blocks offer `cm unblock`.
 
 ### Finishing
 

@@ -172,7 +172,7 @@ fn next_and_card_number_actions_with_the_same_commands() {
         (
             "stale",
             0,
-            "cm evidence 01-a/u/STALE --name '<fresh-evidence-name>' --body-file '<fresh-evidence-file>' --candidate 01-a/u/DIRTY --harness 01-a/u/READY",
+            "cm evidence 01-a/u/STALE --name '<fresh-evidence-name>' --body-file '<fresh-evidence-file>' --candidate 01-a/u/DIRTY --harness '01-a/u/READY@<harness-sha>'",
         ),
         (
             "watches",
@@ -283,6 +283,266 @@ fn every_next_command_parses_with_the_cli() {
             assert_eq!(value["ok"], false, "{command}");
         }
     }
+}
+
+#[test]
+fn base_unblock_marker_prevents_a_repeat_notification() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    c.next_actions(&host);
+    let key = c.base_unblock_marker();
+    let marker = c.root.join(".cm/unblock-notified.json");
+    let before = fs::read(&marker).unwrap();
+    let journal = fs::read(c.root.join("JOURNAL.md")).unwrap();
+    let mut forge = FakeForge::default();
+    forge.pulls.insert(
+        "https://github.com/o/r/pull/1".into(),
+        open(&"a".repeat(40)),
+    );
+    let out = sync(&host, &forge, &c.root).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    assert!(!out.fields.contains_key("journal"));
+    assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), journal);
+    assert_eq!(fs::read(&marker).unwrap(), before);
+    assert_eq!(
+        plan::next_at(&c.root, None, None, host.now).unwrap().fields["unblock_now"][0]["command"],
+        "cm unblock 01-a/u/BLOCKED --evidence '<unblock-evidence-file>'"
+    );
+    fs::remove_file(&marker).unwrap();
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    assert_eq!(
+        store::read_json::<BTreeSet<String>>(&marker).unwrap(),
+        BTreeSet::from([key])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_commands_renew_with_named_revision_inputs() {
+    let host = at("2026-10-17T08:00:00Z");
+    for (candidate_open, harness_open, candidate_split, harness_split, revisions) in [
+        (
+            true,
+            true,
+            false,
+            false,
+            "--candidate 01-a/u/DIRTY --harness 01-a/u/READY",
+        ),
+        (
+            false,
+            true,
+            false,
+            false,
+            "--candidate '01-a/u/DIRTY@<candidate-sha>' --harness 01-a/u/READY",
+        ),
+        (
+            true,
+            false,
+            false,
+            false,
+            "--candidate 01-a/u/DIRTY --harness '01-a/u/READY@<harness-sha>'",
+        ),
+        (
+            false,
+            false,
+            false,
+            false,
+            "--candidate '01-a/u/DIRTY@<candidate-sha>' --harness '01-a/u/READY@<harness-sha>'",
+        ),
+        (
+            true,
+            false,
+            true,
+            false,
+            "--candidate '01-a/u/DIRTY#<candidate-part>@<candidate-sha>' --harness '01-a/u/READY@<harness-sha>'",
+        ),
+        (
+            true,
+            true,
+            false,
+            true,
+            "--candidate 01-a/u/DIRTY --harness '01-a/u/READY#<harness-part>@<harness-sha>'",
+        ),
+        (
+            true,
+            true,
+            true,
+            true,
+            "--candidate '01-a/u/DIRTY#<candidate-part>@<candidate-sha>' --harness '01-a/u/READY#<harness-part>@<harness-sha>'",
+        ),
+    ] {
+        let c = campaign(&host);
+        c.next_actions(&host);
+        c.stale_revision_inputs(
+            &host,
+            candidate_open,
+            harness_open,
+            candidate_split,
+            harness_split,
+        );
+        let next = plan::next_at(&c.root, None, None, host.now).unwrap();
+        let command = next.fields["stale"][0]["command"].as_str().unwrap();
+        assert_eq!(
+            command,
+            format!(
+                "cm evidence 01-a/u/STALE --name '<fresh-evidence-name>' --body-file '<fresh-evidence-file>' {revisions}"
+            )
+        );
+        let command = command
+            .replace("<fresh-evidence-name>", "renewed")
+            .replace("<fresh-evidence-file>", "01-a/u/STALE/kickoff.md")
+            .replace("<candidate-sha>", &"a".repeat(40))
+            .replace("<harness-sha>", &"c".repeat(40))
+            .replace("<candidate-part>", "core")
+            .replace("<harness-part>", "core");
+        let renewed = c.run_next_command(&command);
+        assert_eq!(renewed["ok"], true);
+        assert_eq!(
+            renewed["candidate"],
+            format!(
+                "01-a/u/DIRTY{}@{}",
+                if candidate_split { "#core" } else { "" },
+                "a".repeat(40)
+            )
+        );
+        assert_eq!(
+            renewed["harness"],
+            format!(
+                "01-a/u/READY{}@{}",
+                if harness_split { "#core" } else { "" },
+                "c".repeat(40)
+            )
+        );
+        assert_eq!(
+            plan::next_at(&c.root, None, None, host.now).unwrap().fields["stale"],
+            serde_json::json!([])
+        );
+    }
+}
+
+#[test]
+fn paused_or_wrong_lane_steps_without_wait_reasons_print_no_wait_item() {
+    let host = at("2026-10-17T08:00:00Z");
+    for (paused, targeted, lane) in [
+        (true, false, None),
+        (true, true, None),
+        (false, true, Some(Lane::Codex)),
+    ] {
+        let c = campaign(&host);
+        assert!(declare(&host, &c, "01-a/u/READY", Lane::Pi, &[]).ok());
+        kickoff(&c, "01-a/u/READY");
+        if paused {
+            let path = c.root.join("LIMITS.toml");
+            fs::write(
+                &path,
+                fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("paused = false", "paused = true"),
+            )
+            .unwrap();
+        }
+        let target = targeted.then(|| parse_target("01-a/u/READY", true).unwrap());
+        let next = plan::next_at(&c.root, target.as_ref(), lane, host.now).unwrap();
+        assert!(
+            next.lines.iter().all(|line| !line.contains("waits ")),
+            "{:?}",
+            next.lines
+        );
+        assert_eq!(next.fields["waiting"][0]["waits_on"], serde_json::json!([]));
+    }
+}
+
+#[test]
+fn card_rechecks_unmet_until_blocks_and_unblocks_satisfied_or_free_text_blocks() {
+    let host = at("2026-10-17T08:00:00Z");
+    for (reason, queue, command) in [
+        (
+            "until:owner-queue:1",
+            "# Owner queue\n\n## 1. Decision\n",
+            "cm next 01-a/u/park",
+        ),
+        (
+            "until:owner-queue:1",
+            "# Owner queue\n",
+            "cm unblock 01-a/u/park --evidence '<unblock-evidence-file>'",
+        ),
+        (
+            "waiting-owner",
+            "# Owner queue\n",
+            "cm unblock 01-a/u/park --evidence '<unblock-evidence-file>'",
+        ),
+    ] {
+        let c = campaign(&host);
+        assert!(declare(&host, &c, "01-a/u/park", Lane::Codex, &[]).ok());
+        assert!(
+            advance(
+                &host,
+                &c,
+                "01-a/u/park",
+                &format!("blocked:{reason}"),
+                Evidence::default()
+            )
+            .ok()
+        );
+        fs::write(c.root.join("OWNER-QUEUE.md"), queue).unwrap();
+        let units = plan::load_units(&c.root).unwrap();
+        let card = cm::render::card(
+            &c.root,
+            host.now,
+            "campaign",
+            &units,
+            &plan::summary(&c.root, &units),
+            &[],
+        );
+        let blocked = card
+            .split_once("## Blocked\n\n")
+            .unwrap()
+            .1
+            .split("\n## ")
+            .next()
+            .unwrap();
+        assert!(
+            blocked.trim().ends_with(&format!(" — `{command}`")),
+            "{card}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn ready_owner_commands_finish_with_named_evidence() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/owner", Lane::Owner, &[]).ok());
+    kickoff(&c, "01-a/u/owner");
+    let next = next_one(&c, "01-a/u/owner");
+    let command = next.fields["steps"][0]["command"].as_str().unwrap();
+    assert_eq!(
+        command,
+        "cm advance 01-a/u/owner done --evidence '<owner-evidence-file>'"
+    );
+    assert_eq!(
+        next.lines,
+        [format!("1. 01-a/u/owner (owner) is next — `{command}`")]
+    );
+    let units = plan::load_units(&c.root).unwrap();
+    let card = cm::render::card(
+        &c.root,
+        host.now,
+        "campaign",
+        &units,
+        &plan::summary(&c.root, &units),
+        &[],
+    );
+    assert!(
+        card.contains(&format!("1. `01-a/u/owner` (owner) — `{command}`")),
+        "{card}"
+    );
+    assert_eq!(
+        c.run_next_command(&command.replace("<owner-evidence-file>", "01-a/u/owner/kickoff.md"))["ok"],
+        true
+    );
+    assert_eq!(state(&c, "01-a/u/owner"), Phase::Done);
 }
 
 fn advance(host: &Fake, c: &Campaign, target: &str, to: &str, evidence: Evidence) -> Outcome {
@@ -1101,7 +1361,7 @@ fn a_paused_campaign_lists_nothing_next_on_the_card() {
         card.contains("## Next\n\nNothing is launchable.\n"),
         "{card}"
     );
-    assert!(card.contains("1. `01-a/u/S1` waits on"), "{card}");
+    assert!(card.contains("## Waiting\n\nNothing waits.\n"), "{card}");
 }
 
 #[cfg(unix)]
@@ -3548,8 +3808,13 @@ fn blocked_until_epoch_reads_crlf_and_requires_an_exact_closing_delimiter() {
         assert_eq!(
             blocked.trim(),
             format!(
-                "1. `{target}` blocked:until:epoch:WORKING since 2026-10-17T08:00Z; condition {} — `cm unblock {target} --evidence '<unblock-evidence-file>'`",
-                if met { "holds" } else { "does not hold" }
+                "1. `{target}` blocked:until:epoch:WORKING since 2026-10-17T08:00Z; condition {} — `{}`",
+                if met { "holds" } else { "does not hold" },
+                if met {
+                    format!("cm unblock {target} --evidence '<unblock-evidence-file>'")
+                } else {
+                    format!("cm next {target}")
+                }
             )
         );
         let second = sync(&host, &forge, &c.root).unwrap();
