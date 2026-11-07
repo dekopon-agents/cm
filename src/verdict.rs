@@ -1612,7 +1612,7 @@ fn git_out(repo: &Path, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn is_ancestor(repo: &Path, ancestor: &str, of: &str) -> bool {
+pub(crate) fn is_ancestor(repo: &Path, ancestor: &str, of: &str) -> bool {
     Command::new("git")
         .arg("-C")
         .arg(repo)

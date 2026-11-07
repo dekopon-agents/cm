@@ -1487,6 +1487,12 @@ pub fn advance_gated(
                 Some(part) => step.parts.get(part)?,
                 None => &step.track,
             };
+            if track.state == Phase::Merged
+                && part.is_none()
+                && Release::of_target(&step_full).is_some()
+            {
+                return None;
+            }
             let pr = track.evidence.pr.as_deref()?;
             let units = plan::load_units(root).ok()?;
             let standing = crate::holds::standing_names(&units, &step.known_red);
@@ -1627,7 +1633,13 @@ pub fn advance_gated(
     let tag_only = *to == Phase::Released
         && Release::of_target(&full).is_some()
         && matches!(track.resting(), Phase::Drafted | Phase::Launched);
+    let remerge = *to == Phase::Merged
+        && track.state == Phase::Merged
+        && part.is_none()
+        && declared.is_some()
+        && Release::of_target(&step_full).is_some();
     match track.check(to, finish) {
+        Err(_) if remerge => {}
         Err(_) if tag_only && !track.state.is_final() => {}
         Err(_) if finishing_code && track.state != Phase::Done => violations.push(code_finish()),
         Err(message) => violations.push(Violation::new(&full, "advance-refused", message)),
@@ -1782,9 +1794,32 @@ pub fn advance_gated(
                 && sha.bytes().all(|byte| byte.is_ascii_hexdigit());
             match repos
                 .iter()
-                .find_map(|repo| hex.then(|| git_commit(repo, sha)).flatten())
+                .find_map(|repo| {
+                    hex.then(|| git_commit(repo, sha))
+                        .flatten()
+                        .map(|sha| (repo, sha))
+                })
             {
-                Some(full_sha) => evidence.sha = Some(full_sha),
+                Some((repo, full_sha)) => {
+                    if remerge
+                        && !track
+                            .evidence
+                            .sha
+                            .as_deref()
+                            .and_then(|old| git_commit(repo, old))
+                            .is_some_and(|old| crate::verdict::is_ancestor(repo, &old, &full_sha))
+                    {
+                        violations.push(Violation::new(
+                            &full,
+                            "merge-lineage",
+                            format!(
+                                "{full_sha} does not descend from the recorded merge {}; fetch its history first if it was made elsewhere",
+                                track.evidence.sha.as_deref().unwrap_or("(missing)")
+                            ),
+                        ));
+                    }
+                    evidence.sha = Some(full_sha);
+                }
                 None => violations.push(Violation::new(
                     &full,
                     "evidence-sha",
@@ -1812,6 +1847,7 @@ pub fn advance_gated(
         }
     }
     let gated = *to == Phase::Merged
+        && !remerge
         && !resuming
         && declared.as_ref().and_then(|step| step.lane) == Some(Lane::Codex);
     let mut gate_lines = Vec::new();
@@ -1894,6 +1930,7 @@ pub fn advance_gated(
                             root,
                         );
                     }
+                    None if remerge => step.track.evidence.sha.clone_from(&evidence.sha),
                     None => step.track.apply(to.clone(), &at, &evidence),
                 }
                 step.waived.append(&mut waived);
@@ -1918,6 +1955,12 @@ pub fn advance_gated(
     }
     write_unit(&unit_dir, &unit)?;
     let mut body = format!("- evidence: {}\n", evidence.summary());
+    if remerge {
+        body.push_str(&format!(
+            "- previous merge sha: {}\n",
+            track.evidence.sha.as_deref().unwrap_or_default()
+        ));
+    }
     let rolled_lines: Vec<String> = rolled
         .iter()
         .map(|(from, to)| format!("{step_full}: {from} → {to}, every part has reached {to}"))
@@ -1943,6 +1986,9 @@ pub fn advance_gated(
     );
     if gated {
         outcome.field("merge_gate", gate_lines.clone());
+    }
+    if remerge {
+        outcome.field("previous_sha", track.evidence.sha.as_deref());
     }
     outcome.field("target", full);
     outcome.field("from", from.to_string());
