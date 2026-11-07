@@ -304,9 +304,10 @@ ending at the next heading of the same or higher level. Other kickoff sections a
 `coordinator-scope.md` never enter the prompt. `cm brief` remains the worker packet with rulings.
 The template lives in `templates/REVIEW-PROMPT.md`; it accepts no coordinator commentary.
 
-`--head` must be a SHA known in the selected step/part's evidence or recorded reviews for its
-current PR. `--base`, when supplied, is a SHA; otherwise the prompt names the repository's
-default branch. Round 1 includes no reports. `--round 2` appends only the latest recorded
+`--head` must be a SHA known in the selected step/part's evidence, recorded reviews or last
+`cm sync` observation for its current PR. Run `cm sync` after a repair push to recognize the
+new head before recording its review. `--base`, when supplied, is a SHA; otherwise the prompt
+names the repository's default branch. Round 1 includes no reports. `--round 2` appends only the latest recorded
 `astra` report at the first FIX REQUIRED head; later rounds similarly use the preceding fix
 round as [Rounds](#rounds) defines it. Reports from other reviewers never enter the prompt.
 A missing Astra report or a preceding round at the requested head is refused (`review-round`).

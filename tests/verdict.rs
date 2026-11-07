@@ -1571,6 +1571,41 @@ fn second_review_prompt_adds_only_astras_own_first_fix_round_report() {
 }
 
 #[test]
+fn second_review_prompt_recognizes_the_repaired_head_after_sync() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    c.write(&format!("{STEP}/kickoff.md"), review_fixture::KICKOFF);
+    let first = c.report(
+        "first",
+        &c.head(),
+        &review_fixture::BLOCKING[..1],
+        "FIX REQUIRED",
+    );
+    assert!(record(&host, &c, &first, "astra").ok());
+    let head = commit(&c.repo, "repair.txt", "repair\n");
+    assert!(
+        sync(&host, &FakeForge::open(&head, &[]), &c.root)
+            .unwrap()
+            .ok()
+    );
+    let output =
+        review_fixture::review(&c.root, &["prompt", STEP, "--head", &head, "--round", "2"]);
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let prompt = result["prompt"].as_str().unwrap();
+    assert!(prompt.contains(&format!("Head: {head}")));
+    assert!(prompt.ends_with(&fs::read_to_string(first).unwrap()));
+    let mut unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    unit.steps.get_mut("S1").unwrap().track.evidence.pr =
+        Some("https://github.com/o/r/pull/8".into());
+    commands::write_unit(&c.root.join("01-a/u"), &unit).unwrap();
+    let output = review_fixture::review(&c.root, &["prompt", STEP, "--head", &head]);
+    assert_eq!(output.status.code(), Some(1));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["violations"][0]["rule"], "review-head");
+}
+
+#[test]
 fn repair_brief_preserves_every_latest_round_report_verbatim() {
     let host = at("2026-10-25T06:00:00Z");
     let c = campaign(&host, true);

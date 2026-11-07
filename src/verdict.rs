@@ -1433,6 +1433,27 @@ fn kickoff_task(text: &str) -> Option<String> {
     (!task.is_empty()).then(|| task.to_owned())
 }
 
+fn synced_head(
+    root: &Path,
+    target: &Target,
+    part: Option<&str>,
+    pr: Option<&str>,
+) -> Option<String> {
+    let pr = pr?;
+    let seen = read_json::<std::collections::BTreeMap<String, crate::plan::Observed>>(
+        &crate::plan::pulls_path(root),
+    )
+    .ok()?;
+    let observed = seen.get(pr)?;
+    let name = match part {
+        Some(part) => format!("{}#{part}", full_name(target)),
+        None => full_name(target),
+    };
+    (observed.target == name)
+        .then(|| observed.head.clone())
+        .flatten()
+}
+
 pub(crate) fn prompt(
     root: &Path,
     target: &Target,
@@ -1451,12 +1472,14 @@ pub(crate) fn prompt(
             .sha
             .as_deref()
             .is_some_and(|known| same_commit(known, head))
-            || reviews.iter().any(|review| review.at_head(head)))
+            || reviews.iter().any(|review| review.at_head(head))
+            || synced_head(root, target, part, evidence.pr.as_deref())
+                .is_some_and(|known| same_commit(&known, head)))
     {
         return Ok(Outcome::refused(vec![Violation::new(
             &full,
             "review-head",
-            "--head must name a known head in the selected PR/part's evidence or recorded reviews",
+            "--head must name a known head in the selected PR/part's evidence, recorded reviews or last cm sync; run cm sync to refresh it",
         )]));
     }
     if base.is_some_and(|base| !is_sha(base)) {
