@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -700,6 +700,409 @@ fn next_hands_out_only_steps_whose_after_is_met() {
     assert_eq!(rules(&changed), vec!["step-declared"]);
     let lint = lint(&c.root).unwrap();
     assert!(lint.ok(), "{:#?}", lint.violations);
+}
+
+#[test]
+fn pin_gate_follows_the_recorded_head_and_round_trips() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let source = "01-a/u/S1";
+    let dependent = "01-a/u/S2";
+    let head = "abcdef0123456789abcdef0123456789abcdef01";
+    assert!(declare(&host, &c, source, Lane::Codex, &[]).ok());
+    assert!(declare(&host, &c, dependent, Lane::Codex, &["pin:S1@ABCDEF0"]).ok());
+    kickoff(&c, dependent);
+    assert!(ready(&c, None).is_empty());
+
+    let path = store::state_path(&c.root.join("01-a/u"));
+    let stored: serde_json::Value = store::read_json(&path).unwrap();
+    assert_eq!(stored["schema"], 5);
+    let not_recorded = next_one(&c, dependent);
+    assert_eq!(
+        not_recorded.fields["waiting"][0]["waits_on"],
+        serde_json::json!(["pin:01-a/u/S1@abcdef0 (head not recorded)"])
+    );
+    assert_eq!(
+        stored["steps"]["S2"]["after"],
+        serde_json::json!(["pin:01-a/u/S1@abcdef0"])
+    );
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    assert_eq!(
+        unit.steps["S2"].after,
+        vec![cm::state::After::Pin(cm::state::Revision {
+            step: source.into(),
+            sha: "abcdef0".into(),
+        })]
+    );
+
+    c.recorded_head(source, Phase::PrOpen, head);
+    assert_eq!(ready(&c, None), [dependent]);
+    let next = next_one(&c, dependent);
+    assert_eq!(next.fields["steps"][0]["after"][0]["met"], true);
+
+    let moved = "b".repeat(40);
+    c.recorded_head(source, Phase::PrOpen, &moved);
+    let next = next_one(&c, dependent);
+    assert_eq!(rules(&next), ["after-unmet"]);
+    assert_eq!(next.fields["steps"], serde_json::json!([]));
+    assert_eq!(next.fields["waiting"][0]["target"], dependent);
+    assert_eq!(next.fields["waiting"][0]["command"], "cm next 01-a/u/S2");
+    let stale = format!("pin:01-a/u/S1@abcdef0 (stale pin; recorded head {moved})");
+    assert_eq!(
+        next.fields["waiting"][0]["waits_on"],
+        serde_json::json!([stale])
+    );
+    assert_eq!(
+        next.lines,
+        [format!(
+            "1. waits {dependent}: {stale} — `cm next {dependent}`"
+        )]
+    );
+    let all = plan::next(&c.root, None, None).unwrap();
+    assert_eq!(all.fields["steps"], serde_json::json!([]));
+    assert_eq!(all.fields["waiting"][0]["target"], dependent);
+    assert_eq!(
+        rules(
+            &commands::launch(
+                &host,
+                &c.root,
+                &parse_target(dependent, true).unwrap(),
+                None
+            )
+            .unwrap()
+        ),
+        ["after-unmet"]
+    );
+}
+
+#[test]
+fn pin_gate_uses_the_latest_synced_head() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let source = "01-a/u/S1";
+    let dependent = "02-b/v/S2";
+    let head = "a".repeat(40);
+    assert!(declare(&host, &c, source, Lane::Codex, &[]).ok());
+    c.recorded_head(source, Phase::PrOpen, &head);
+    assert!(
+        declare(
+            &host,
+            &c,
+            dependent,
+            Lane::Codex,
+            &[&format!("pin:{source}@{head}")]
+        )
+        .ok()
+    );
+    kickoff(&c, dependent);
+    assert_eq!(ready(&c, None), [dependent]);
+    let moved = "b".repeat(40);
+    c.observed_head(source, Some(&moved));
+    let next = next_one(&c, dependent);
+    assert_eq!(rules(&next), ["after-unmet"]);
+    assert_eq!(
+        next.fields["waiting"][0]["after"][0]["evidence"]["sha"],
+        moved
+    );
+    assert_eq!(next.fields["waiting"][0]["command"], "cm next 02-b/v/S2");
+    assert_eq!(
+        store::load_unit(&c.root.join("01-a/u")).unwrap().steps["S1"]
+            .track
+            .evidence
+            .sha
+            .as_deref(),
+        Some(head.as_str())
+    );
+    c.observed_head(source, None);
+    let unknown = next_one(&c, dependent);
+    assert_eq!(unknown.fields["steps"], serde_json::json!([]));
+    assert_eq!(
+        unknown.fields["waiting"][0]["after"][0]["evidence"]["sha"],
+        serde_json::Value::Null
+    );
+    c.observed_head(source, Some(&head));
+    assert_eq!(ready(&c, None), [dependent]);
+}
+
+#[test]
+fn pin_gate_does_not_revive_a_discarded_or_superseded_head() {
+    let host = at("2026-10-17T08:00:00Z");
+    for phase in ["blocked:owner", "superseded"] {
+        let c = campaign(&host);
+        let source = "01-a/u/S1";
+        let dependent = "01-a/u/S2";
+        let opening = "a".repeat(40);
+        let moved = "b".repeat(40);
+        assert!(declare(&host, &c, source, Lane::Pi, &[]).ok());
+        c.recorded_head(source, Phase::PrOpen, &opening);
+        assert!(declare(&host, &c, dependent, Lane::Codex, &["pin:S1@aaaaaaa"]).ok());
+        kickoff(&c, dependent);
+        assert_eq!(ready(&c, None), [dependent]);
+        c.observed_head(source, Some(&moved));
+        kickoff(&c, source);
+        let evidence = c.root.join(source).join("kickoff.md");
+        let moved_state = commands::advance(
+            &host,
+            &c.root,
+            &parse_target(source, true).unwrap(),
+            &phase.parse().unwrap(),
+            &Evidence::default(),
+            (phase == "superseded").then_some(evidence.as_path()),
+            None,
+        )
+        .unwrap();
+        assert!(moved_state.ok(), "{:?}", moved_state.violations);
+        assert!(sync(&host, &FakeForge::default(), &c.root).unwrap().ok());
+        let observed: BTreeMap<String, plan::Observed> =
+            store::read_json(&plan::pulls_path(&c.root)).unwrap();
+        assert!(observed.is_empty());
+        let next = next_one(&c, dependent);
+        assert_eq!(rules(&next), ["after-unmet"], "{phase}");
+        assert_eq!(next.fields["steps"], serde_json::json!([]));
+        assert_eq!(next.fields["waiting"][0]["after"][0]["met"], false);
+    }
+}
+
+#[test]
+fn pin_gate_warns_after_launch_and_keeps_the_latest_head_without_its_cache() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let source = "01-a/u/S1";
+    let dependent = "01-a/u/S2";
+    let opening = "a".repeat(40);
+    let moved = "b".repeat(40);
+    assert!(declare(&host, &c, source, Lane::Pi, &[]).ok());
+    c.recorded_head(source, Phase::PrOpen, &opening);
+    assert!(declare(&host, &c, dependent, Lane::Codex, &["pin:S1@aaaaaaa"]).ok());
+    kickoff(&c, dependent);
+    assert!(
+        commands::launch(
+            &host,
+            &c.root,
+            &parse_target(dependent, true).unwrap(),
+            None
+        )
+        .unwrap()
+        .ok()
+    );
+    let mut forge = FakeForge::default();
+    forge
+        .pulls
+        .insert("https://github.com/o/r/pull/1".into(), open(&moved));
+    let synced = sync(&host, &forge, &c.root).unwrap();
+    assert!(synced.ok());
+    assert_eq!(synced.fields["moves"], serde_json::json!([]));
+    assert!(synced.fields["journal"].is_string());
+    let stale = format!("pin:01-a/u/S1@aaaaaaa (stale pin; recorded head {moved})");
+    let next = next_one(&c, dependent);
+    assert_eq!(rules(&next), ["after-unmet"]);
+    assert_eq!(next.fields["steps"], serde_json::json!([]));
+    assert_eq!(
+        next.fields["waiting"][0]["waits_on"],
+        serde_json::json!([stale])
+    );
+    assert_eq!(next.fields["waiting"][0]["command"], "cm next 01-a/u/S2");
+    let all = plan::next(&c.root, None, None).unwrap();
+    assert_eq!(all.fields["waiting"][0]["target"], dependent);
+    let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+    assert!(
+        card.lines().any(
+            |line| line == format!("1. `{dependent}` waits on {stale} — `cm next {dependent}`")
+        ),
+        "{card}"
+    );
+    let linted = lint(&c.root).unwrap();
+    assert!(linted.ok(), "{:?}", linted.violations);
+    assert!(
+        linted.fields["warnings"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(format!(
+                "pin-unmet: {dependent}: {stale}; recheck with `cm next {dependent}`"
+            )))
+    );
+    fs::remove_file(plan::pulls_path(&c.root)).unwrap();
+    let next = next_one(&c, dependent);
+    assert_eq!(
+        next.fields["waiting"][0]["after"][0]["evidence"]["sha"],
+        moved
+    );
+    assert_eq!(next.fields["waiting"][0]["after"][0]["met"], false);
+    forge
+        .pulls
+        .get_mut("https://github.com/o/r/pull/1")
+        .unwrap()
+        .head = None;
+    let headless = sync(&host, &forge, &c.root).unwrap();
+    assert!(headless.ok());
+    assert!(headless.fields.get("journal").is_none());
+    assert_eq!(
+        store::load_unit(&c.root.join("01-a/u")).unwrap().steps["S1"]
+            .track
+            .evidence
+            .sha
+            .as_deref(),
+        Some(moved.as_str())
+    );
+}
+
+#[test]
+fn pin_gate_warnings_stop_after_the_dependent_merges() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let source = "01-a/u/S1";
+    let dependent = "01-a/u/S2";
+    let opening = "a".repeat(40);
+    let merge_sha = "b".repeat(40);
+    assert!(declare(&host, &c, source, Lane::Pi, &[]).ok());
+    c.recorded_head(source, Phase::PrOpen, &opening);
+    assert!(declare(&host, &c, dependent, Lane::Pi, &["pin:S1@aaaaaaa"]).ok());
+    kickoff(&c, dependent);
+    open_pr(&host, &c, dependent, "https://github.com/o/r/pull/2");
+    let dependent_head = store::load_unit(&c.root.join("01-a/u")).unwrap().steps["S2"]
+        .track
+        .evidence
+        .sha
+        .clone()
+        .unwrap();
+    let mut forge = FakeForge::default();
+    forge.pulls.insert(
+        "https://github.com/o/r/pull/1".into(),
+        Pull {
+            state: PullState::Merged,
+            merge_commit: Some(CommitSha::new(&merge_sha)),
+            ..open(&opening)
+        },
+    );
+    forge.pulls.insert(
+        "https://github.com/o/r/pull/2".into(),
+        open(&dependent_head),
+    );
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    assert_eq!(state(&c, source), Phase::Merged);
+    let next = next_one(&c, dependent);
+    assert_eq!(next.fields["steps"], serde_json::json!([]));
+    assert_eq!(
+        next.fields["waiting"][0]["after"][0]["evidence"]["sha"],
+        merge_sha
+    );
+    assert_eq!(next.fields["waiting"][0]["after"][0]["met"], false);
+    let assert_quiet = |phase: Phase| {
+        assert_eq!(state(&c, dependent), phase);
+        let next = plan::next(&c.root, None, None).unwrap();
+        assert_eq!(next.fields["waiting"], serde_json::json!([]), "{phase}");
+        let named = next_one(&c, dependent);
+        assert_eq!(rules(&named), ["next-state"], "{phase}");
+        assert!(named.fields.get("waiting").is_none());
+        let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+        assert!(!card.contains("stale pin"), "{phase}: {card}");
+        assert_eq!(
+            lint(&c.root).unwrap().fields["warnings"],
+            serde_json::json!([]),
+            "{phase}"
+        );
+    };
+    assert!(
+        advance(
+            &host,
+            &c,
+            dependent,
+            "merged",
+            Evidence {
+                sha: Some(dependent_head.clone()),
+                ..Evidence::default()
+            }
+        )
+        .ok()
+    );
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    assert_quiet(Phase::Merged);
+
+    let release = "00-release/r/1.0.0";
+    assert!(declare_release(&host, &c, release, "o/r", "v{version}").ok());
+    kickoff(&c, release);
+    let prep = "https://github.com/o/r/pull/3";
+    open_pr(&host, &c, release, prep);
+    forge.pulls.insert(prep.into(), merged("prep"));
+    forge.tags.insert(
+        ("o/r".into(), "v1.0.0".into()),
+        ["prep".into(), dependent_head].into(),
+    );
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    assert_quiet(Phase::Released);
+    assert!(
+        advance(
+            &host,
+            &c,
+            release,
+            "deployed",
+            Evidence {
+                digest: Some(format!("sha256:{}", "d".repeat(64))),
+                ..Evidence::default()
+            }
+        )
+        .ok()
+    );
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    assert_quiet(Phase::Deployed);
+}
+
+#[test]
+fn invalid_pin_shas_are_refused_before_init_or_amend_writes() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/S1", Lane::Codex, &[]).ok());
+    assert!(declare(&host, &c, "01-a/u/S2", Lane::Codex, &[]).ok());
+    for pin in [
+        "pin:S1",
+        "pin:S1@",
+        "pin:S1@abcdef",
+        "pin:S1@ghijklm",
+        "pin:S1@abcdef0123456789abcdef0123456789abcdef01234",
+    ] {
+        let before = c.files();
+        let init = declare(&host, &c, "01-a/u/S3", Lane::Codex, &[pin]);
+        assert_eq!(rules(&init), ["after-parse"], "{pin}");
+        let amend = commands::amend(
+            &host,
+            &c.root,
+            &parse_target("01-a/u/S2", true).unwrap(),
+            &commands::Amendment {
+                after: vec![pin.into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rules(&amend), ["after-parse"], "{pin}");
+        assert_eq!(c.files(), before);
+    }
+    for pin in ["pin:unknown@abcdef0", "pin:S3@abcdef0"] {
+        assert_eq!(
+            rules(&declare(&host, &c, "01-a/u/S3", Lane::Codex, &[pin])),
+            ["after-unknown"]
+        );
+    }
+    let target = parse_target("01-a/u/S2", true).unwrap();
+    let amendment = |after, drop_after| {
+        commands::amend(
+            &host,
+            &c.root,
+            &target,
+            &commands::Amendment {
+                after,
+                drop_after,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    assert!(amendment(vec!["pin:S1@abcdef0".into()], vec![]).ok());
+    assert!(amendment(vec![], vec!["pin:S1@ABCDEF0".into()]).ok());
+    assert!(
+        store::load_unit(&c.root.join("01-a/u")).unwrap().steps["S2"]
+            .after
+            .is_empty()
+    );
 }
 
 #[test]
@@ -3874,6 +4277,7 @@ fn blocked_until_short_step_resolves_against_its_unit() {
     for invalid in [
         "blocked:until:",
         "blocked:until:epoch:OPEN",
+        "blocked:until:pin:S1@abcdef0",
         "blocked:until:owner-queue:0",
         "blocked:until:owner-queue:+2",
     ] {

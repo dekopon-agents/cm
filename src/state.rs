@@ -546,6 +546,7 @@ impl fmt::Display for Release {
 pub enum After {
     Merged(String),
     PrOpen(String),
+    Pin(Revision),
     Tag(Release),
     Deployed(Release),
 }
@@ -562,7 +563,7 @@ impl After {
                 .map(|target| format!("{}/{}", target.unit, target.step.unwrap_or_default()))
                 .map_err(|_| {
                     format!(
-                        "`{text}` is not <step>, <NN-name>/<unit>/<step>, pr-open:<step>, tag:<repo>@<version> or deployed:<repo>@<version>"
+                        "`{text}` is not <step>, <NN-name>/<unit>/<step>, pr-open:<step>, pin:<step>@<sha>, tag:<repo>@<version> or deployed:<repo>@<version>"
                     )
                 })
         };
@@ -575,18 +576,32 @@ impl After {
         if let Some(rest) = text.strip_prefix("pr-open:") {
             return step(rest).map(After::PrOpen);
         }
+        if let Some(rest) = text.strip_prefix("pin:") {
+            let (name, sha) = rest
+                .rsplit_once('@')
+                .ok_or_else(|| format!("`{text}` is not pin:<step>@<sha>"))?;
+            if !is_commit(sha) {
+                return Err(format!("`{sha}` is not a commit (7 to 40 hex digits)"));
+            }
+            return Ok(After::Pin(Revision {
+                step: step(name)?,
+                sha: sha.to_ascii_lowercase(),
+            }));
+        }
         step(text).map(After::Merged)
     }
 
     pub fn target(&self) -> String {
         match self {
             After::Merged(target) | After::PrOpen(target) => target.clone(),
+            After::Pin(revision) => revision.step.clone(),
             After::Tag(release) | After::Deployed(release) => release.target(),
         }
     }
 
     pub fn needs(&self, finish: Finish) -> Phase {
         match (self, finish) {
+            (After::Pin(_), _) => Phase::Drafted,
             (After::Merged(_) | After::PrOpen(_), Finish::Evidence) => Phase::Done,
             (After::Merged(_), Finish::Shipped) => Phase::Merged,
             (After::PrOpen(_), Finish::Shipped) => Phase::PrOpen,
@@ -596,6 +611,14 @@ impl After {
     }
 
     pub fn met_by(&self, track: &Track, finish: Finish) -> bool {
+        if let After::Pin(revision) = self {
+            return track.resting() != &Phase::Superseded
+                && track
+                    .evidence
+                    .sha
+                    .as_deref()
+                    .is_some_and(|head| same_commit(head, &revision.sha));
+        }
         match (track.resting().rank(), self.needs(finish).rank()) {
             (Some(at), Some(needed)) => at >= needed,
             _ => false,
@@ -608,6 +631,7 @@ impl fmt::Display for After {
         match self {
             After::Merged(target) => f.write_str(target),
             After::PrOpen(target) => write!(f, "pr-open:{target}"),
+            After::Pin(revision) => write!(f, "pin:{revision}"),
             After::Tag(release) => write!(f, "tag:{release}"),
             After::Deployed(release) => write!(f, "deployed:{release}"),
         }
@@ -620,6 +644,10 @@ impl TryFrom<String> for After {
     fn try_from(value: String) -> Result<Self, Self::Error> {
         if !value.starts_with("tag:") && !value.starts_with("deployed:") {
             let rest = value.strip_prefix("pr-open:").unwrap_or(&value);
+            let rest = rest
+                .strip_prefix("pin:")
+                .and_then(|pin| pin.rsplit_once('@').map(|(step, _)| step))
+                .unwrap_or(rest);
             if rest.split('/').count() != 3 {
                 return Err(format!("`{value}` names no <NN-name>/<unit>/<step>"));
             }
