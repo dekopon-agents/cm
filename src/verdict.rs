@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -603,10 +604,6 @@ fn full_name(target: &Target) -> String {
     )
 }
 
-fn same_scope(a: &Recorded, b: &Recorded) -> bool {
-    a.step == b.step && a.part == b.part && a.pr == b.pr
-}
-
 fn blocking_count(review: &Recorded) -> usize {
     review
         .findings
@@ -630,29 +627,36 @@ fn previous_review<'a>(
     })
 }
 
-fn converging(previous: &[Recorded], review: &Recorded) -> bool {
-    previous_review(
-        previous,
-        &review.step,
-        review.pr.as_deref(),
-        review.part.as_deref(),
-        review.reviewer.as_deref(),
-    )
-    .is_none_or(|before| blocking_count(review) <= blocking_count(before))
-}
-
-/// Pending independent reads, derived from the reports rather than a second persisted queue.
 pub(crate) fn fresh_readers(verdicts: &Verdicts) -> Vec<&Recorded> {
-    let mut pending: Vec<&Recorded> = Vec::new();
-    for (index, review) in verdicts.reviews.iter().enumerate() {
+    let mut previous = HashMap::new();
+    let mut pending = HashMap::new();
+    for review in &verdicts.reviews {
+        let scope = (
+            review.step.as_str(),
+            review.pr.as_deref(),
+            review.part.as_deref(),
+        );
+        let count = blocking_count(review);
+        let before = previous.insert((scope, review.reviewer.as_deref()), count);
         if review.reviewer.as_deref() == Some("fresh-opus") {
-            pending.retain(|before| !same_scope(before, review));
-        } else if !converging(&verdicts.reviews[..index], review) {
-            pending.retain(|before| !same_scope(before, review));
-            pending.push(review);
+            pending.remove(&scope);
+        } else if before.is_some_and(|before| count > before) {
+            pending.insert(scope, review);
         }
     }
+    let mut pending: Vec<_> = pending.into_values().collect();
+    pending.sort_by_key(|review| review.number);
     pending
+}
+
+fn fix_heads<'a>(reviews: impl Iterator<Item = &'a Recorded>) -> Vec<&'a str> {
+    let mut heads: Vec<&str> = Vec::new();
+    for review in reviews.filter(|review| review.verdict == Verdict::FixRequired) {
+        if !heads.iter().any(|head| same_commit(head, &review.head)) {
+            heads.push(review.head.as_str());
+        }
+    }
+    heads
 }
 
 fn step_pr(root: &Path, target: &Target, part: Option<&str>) -> Result<Option<String>> {
@@ -680,6 +684,7 @@ pub fn record(
 ) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
     let full = full_name(target);
+    let mut can_block = false;
     if !declared(root, target)? {
         violations.push(Violation::new(
             &full,
@@ -689,6 +694,8 @@ pub fn record(
     } else {
         let unit = store::load_unit(&root.join(&target.unit))?;
         let step = &unit.steps[target.step.as_deref().unwrap_or_default()];
+        can_block = !matches!(step.track.state, crate::state::Phase::Blocked(_))
+            && !step.track.state.is_final();
         if let Some(part) = part {
             if !step.parts.contains_key(part) {
                 violations.push(Violation::new(
@@ -733,16 +740,23 @@ pub fn record(
         },
     };
     let mut verdicts = load(root)?;
-    let passes = verdicts
-        .reviews
-        .iter()
-        .filter(|review| review.step == full)
-        .count();
-    if passes >= 10 {
+    let pr = step_pr(root, target, part)?;
+    let heads = fix_heads(
+        verdicts
+            .reviews
+            .iter()
+            .filter(|review| review.step == full && review.pr == pr),
+    );
+    let new_pass = block.as_ref().is_some_and(|(block, _)| {
+        block.verdict() == Verdict::FixRequired
+            && !heads.iter().any(|head| same_commit(head, &block.head))
+    });
+    let passes = heads.len() + usize::from(new_pass);
+    if new_pass && passes > 10 {
         violations.push(Violation::new(
             &full,
             "review-cap",
-            "session cap of 10 passes; an 11th recorded round is refused",
+            "session cap of 10 passes; an 11th fix pass on the current PR is refused",
         ));
     }
     let number = verdicts
@@ -768,7 +782,6 @@ pub fn record(
     if let Some((_, text)) = &block
         && let Some(again) = verdicts.reviews.iter().find(|review| {
             review.step == full
-                && review.part.as_deref() == part
                 && fs::read_to_string(root.join(review.report.as_str()))
                     .ok()
                     .as_ref()
@@ -790,13 +803,15 @@ pub fn record(
     };
     let verdict = block.verdict();
     let at = stamp(host.now());
-    let rounds = verdicts
-        .reviews
-        .iter()
-        .filter(|review| review.step == full && review.part.as_deref() == part)
-        .count()
-        + 1;
-    let pr = step_pr(root, target, part)?;
+    let part_heads =
+        fix_heads(verdicts.reviews.iter().filter(|review| {
+            review.step == full && review.pr == pr && review.part.as_deref() == part
+        }));
+    let rounds = part_heads.len()
+        + usize::from(
+            verdict == Verdict::FixRequired
+                && !part_heads.iter().any(|head| same_commit(head, &block.head)),
+        );
     let findings: Vec<Logged> = block
         .findings
         .iter()
@@ -807,18 +822,19 @@ pub fn record(
             closed: None,
         })
         .collect();
-    let previous = previous_review(&verdicts.reviews, &full, pr.as_deref(), part, reviewer);
+    let previous = if reviewer == Some("fresh-opus") {
+        fresh_readers(&verdicts)
+            .into_iter()
+            .find(|review| review.step == full && review.pr == pr && review.part.as_deref() == part)
+    } else {
+        previous_review(&verdicts.reviews, &full, pr.as_deref(), part, reviewer)
+    };
     let converging = previous.is_none_or(|before| {
         findings.iter().filter(|finding| finding.blocking).count() <= blocking_count(before)
     });
-    let escalate = !converging && reviewer == Some("fresh-opus");
-    let already_escalated = verdicts.reviews.iter().enumerate().any(|(index, review)| {
-        review.step == full
-            && review.reviewer.as_deref() == Some("fresh-opus")
-            && !self::converging(&verdicts.reviews[..index], review)
-    });
+    let escalate = !converging && reviewer == Some("fresh-opus") && can_block;
     let mut queued = None;
-    if escalate && !already_escalated {
+    if escalate {
         let earlier = previous.expect("a non-converging review has a previous round");
         let title = format!("{full}: non-converging fresh reader");
         let context = format!(
@@ -938,7 +954,7 @@ pub fn record(
             },
             queued
                 .as_ref()
-                .map_or_else(|| "already queued".to_owned(), Value::to_string)
+                .map_or_else(|| "—".to_owned(), Value::to_string)
         ));
     }
     outcome.field("id", id);
@@ -950,7 +966,7 @@ pub fn record(
     outcome.field("part", part.map(str::to_owned));
     outcome.field("converging", converging);
     outcome.field("rounds", rounds);
-    outcome.field("passes", passes + 1);
+    outcome.field("passes", passes);
     outcome.field("owner_queue", queued.unwrap_or(Value::Null));
     outcome.field("blocked", blocked.is_some());
     outcome.field("journal", journal);
@@ -1393,7 +1409,11 @@ fn astra_gap(
     verdicts: &Verdicts,
     pr: Option<&str>,
     head: &str,
+    part: Option<&str>,
 ) -> Vec<String> {
+    let part = part
+        .map(|part| format!(" --part={}", crate::commands::shell_word(part)))
+        .unwrap_or_default();
     let mut found = Vec::new();
     receipts(&evidence_dir(root, target), &mut found);
     let repo = pr.and_then(GithubRepo::of_pr).map(|repo| repo.to_string());
@@ -1460,11 +1480,11 @@ fn astra_gap(
                 let report = relative(root, &path.with_file_name("report.md"));
                 unbound.push(if astra.is_empty() {
                     format!(
-                        "{rel} records the Astra review at {head}, but it is not recorded; `cm review record {step} {report} --reviewer {ASTRA_REVIEWER}`"
+                        "{rel} records the Astra review at {head}, but it is not recorded; `cm review record {step} {report} --reviewer {ASTRA_REVIEWER}{part}`"
                     )
                 } else {
                     format!(
-                        "{rel} receipts a report with sha256 {want}, but no Astra review recorded at {head} ({}) is that report; `cm review record {step} {report} --reviewer {ASTRA_REVIEWER}`",
+                        "{rel} receipts a report with sha256 {want}, but no Astra review recorded at {head} ({}) is that report; `cm review record {step} {report} --reviewer {ASTRA_REVIEWER}{part}`",
                         astra
                             .iter()
                             .map(|(review, _)| review.id())
@@ -1500,7 +1520,10 @@ fn astra_gap(
 
 /// Why the recorded reviews do not clear `head`; `None` when at least one review was recorded
 /// there and each is ACCEPT or has every blocking finding resolved.
-fn review_gap(verdicts: &Verdicts, step: &str, head: &str) -> Option<String> {
+fn review_gap(verdicts: &Verdicts, step: &str, head: &str, part: Option<&str>) -> Option<String> {
+    let part = part
+        .map(|part| format!(" --part={}", crate::commands::shell_word(part)))
+        .unwrap_or_default();
     let at_head: Vec<&Recorded> = verdicts
         .reviews
         .iter()
@@ -1508,7 +1531,7 @@ fn review_gap(verdicts: &Verdicts, step: &str, head: &str) -> Option<String> {
         .collect();
     if at_head.is_empty() {
         return Some(format!(
-            "no review of {head} is recorded; `cm review record {step} <report>`"
+            "no review of {head} is recorded; `cm review record {step} <report>{part}`"
         ));
     }
     let open: Vec<String> = at_head
@@ -1678,15 +1701,16 @@ pub struct Cleared {
 pub fn merge_gaps(
     root: &Path,
     target: &Target,
+    part: Option<&str>,
     pr: Option<&str>,
     head: &str,
     lineage: Option<&Lineage>,
 ) -> Result<Cleared> {
     let verdicts = load(root)?;
     let gaps_at = |at: &str| -> Vec<String> {
-        astra_gap(root, target, &verdicts, pr, at)
+        astra_gap(root, target, &verdicts, pr, at, part)
             .into_iter()
-            .chain(review_gap(&verdicts, &full_name(target), at))
+            .chain(review_gap(&verdicts, &full_name(target), at, part))
             .collect()
     };
     let gaps = gaps_at(head);
@@ -1969,7 +1993,7 @@ mod tests {
         }
         let verdicts = Verdicts { reviews };
         HASHES.with(|hashes| hashes.set(0));
-        assert!(astra_gap(root, &target, &verdicts, None, SHA).is_empty());
+        assert!(astra_gap(root, &target, &verdicts, None, SHA, None).is_empty());
         assert_eq!(HASHES.with(Cell::get), 2);
     }
 }

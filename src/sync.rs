@@ -329,6 +329,7 @@ impl<'a> Run<'a> {
     fn gate_holds(
         &mut self,
         target: &str,
+        part: Option<&str>,
         step: &Step,
         url: &str,
         head: Option<&CommitSha>,
@@ -356,6 +357,7 @@ impl<'a> Run<'a> {
         let mut gaps = match crate::verdict::merge_gaps(
             self.root,
             &parsed,
+            part,
             Some(url),
             head.as_str(),
             lineage.as_ref(),
@@ -440,6 +442,7 @@ impl<'a> Run<'a> {
                 }) => {
                     if let Some(used) = self.gate_holds(
                         &tracked.target,
+                        tracked.part.as_deref(),
                         &tracked.step,
                         &url,
                         head.as_ref(),

@@ -1287,6 +1287,7 @@ pub(crate) fn red_checks(
 }
 
 struct Gated<'a> {
+    part: Option<&'a str>,
     track: &'a Track,
     exceptions: &'a [crate::state::KnownRed],
 }
@@ -1310,7 +1311,11 @@ fn merge_gate(
     );
     let mut gaps = Vec::new();
     let mut lines = Vec::new();
-    let Gated { track, exceptions } = gated;
+    let Gated {
+        track,
+        exceptions,
+        part,
+    } = gated;
     let mut red = Vec::new();
     let Some(pr) = track.evidence.pr.clone() else {
         gaps.push("no PR is recorded; the gate reads the PR's head".to_owned());
@@ -1347,7 +1352,8 @@ fn merge_gate(
         repo,
         base: read.base.as_deref(),
     });
-    let cleared = crate::verdict::merge_gaps(root, target, Some(&pr), &head, lineage.as_ref())?;
+    let cleared =
+        crate::verdict::merge_gaps(root, target, part, Some(&pr), &head, lineage.as_ref())?;
     if let Some(reviewed) = &cleared.reviewed {
         lines.push(format!(
             "- reviewed at {reviewed}; every commit since is a clean update from the base branch"
@@ -1819,6 +1825,7 @@ pub fn advance_gated(
             root,
             target,
             Gated {
+                part,
                 track: &track,
                 exceptions,
             },

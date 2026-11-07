@@ -489,9 +489,22 @@ pub fn next_at(
                     None if step.parts.is_empty() => Some(&step.track),
                     None => None,
                 };
-                !step.track.state.is_final()
+                review.pr.is_some()
+                    && step
+                        .track
+                        .resting()
+                        .rank()
+                        .zip(Phase::Merged.rank())
+                        .is_some_and(|(state, merged)| state < merged)
                     && lane.is_none_or(|lane| step.lane == Some(lane))
-                    && track.is_some_and(|track| track.evidence.pr == review.pr)
+                    && track.is_some_and(|track| {
+                        track.evidence.pr == review.pr
+                            && track
+                                .resting()
+                                .rank()
+                                .zip(Phase::Merged.rank())
+                                .is_some_and(|(state, merged)| state < merged)
+                    })
             }) && target.is_none_or(|target| {
                 review.step
                     == format!(
@@ -505,7 +518,7 @@ pub fn next_at(
             let part = review
                 .part
                 .as_ref()
-                .map(|part| format!(" --part {}", shell_word(part)))
+                .map(|part| format!(" --part={}", shell_word(part)))
                 .unwrap_or_default();
             let command = format!(
                 "cm review record {} '<fresh-review-report>' --reviewer fresh-opus{part}",
