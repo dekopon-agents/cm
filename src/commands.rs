@@ -2042,8 +2042,14 @@ fn track_mut<'a>(unit: &'a mut UnitState, target: &Target) -> Option<&'a mut Tra
 }
 
 /// Releases a blocked unit or step to the state it was blocked from, with the evidence that
-/// cleared the block. A step that rests at drafted or launched still waits on every `--after`.
-pub fn unblock(host: &dyn Host, root: &Path, target: &Target, file: &Path) -> Result<Outcome> {
+/// cleared the block, or a step's satisfied until condition. A step that rests at drafted or
+/// launched still waits on every `--after`.
+pub fn unblock(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    file: Option<&Path>,
+) -> Result<Outcome> {
     let _lock = lock(root)?;
     let campaign = store::load_campaign(root)?;
     let mut violations = journal::check(root, &campaign);
@@ -2064,9 +2070,26 @@ pub fn unblock(host: &dyn Host, root: &Path, target: &Target, file: &Path) -> Re
         ));
     }
     let mut evidence = Evidence::default();
-    match CampaignFile::resolve(root, file) {
-        Ok(found) => evidence.file = Some(found),
-        Err(error) => violations.push(Violation::new(&full, "evidence-file", error.to_string())),
+    let mut condition = None;
+    if let Some(file) = file {
+        match CampaignFile::resolve(root, file) {
+            Ok(found) => evidence.file = Some(found),
+            Err(error) => {
+                violations.push(Violation::new(&full, "evidence-file", error.to_string()))
+            }
+        }
+    } else if target.step.is_some()
+        && let Phase::Blocked(reason) = &track.state
+        && let Some(until) = reason.strip_prefix("until:")
+        && plan::block_met(root, &plan::load_units(root)?, &target.unit, until)
+    {
+        condition = Some(format!("until:{until}"));
+    } else {
+        violations.push(Violation::new(
+            &full,
+            "unblock-evidence",
+            "provide --evidence unless the step is blocked:until:<condition> and its condition holds",
+        ));
     }
     if !violations.is_empty() {
         return Ok(Outcome::refused(violations));
@@ -2090,7 +2113,10 @@ pub fn unblock(host: &dyn Host, root: &Path, target: &Target, file: &Path) -> Re
         .into_iter()
         .map(|violation| violation.message)
         .collect();
-    let mut body = format!("- evidence: {}\n", evidence.summary());
+    let mut body = match condition {
+        Some(condition) => format!("- condition: {condition} holds\n"),
+        None => format!("- evidence: {}\n", evidence.summary()),
+    };
     for wait in &waits {
         body.push_str(&format!("- still: {wait}\n"));
     }
