@@ -137,3 +137,16 @@ pub fn repo(dir: &Path) -> (PathBuf, String) {
     let sha = git(&repo, &["rev-parse", "HEAD"]);
     (repo, sha)
 }
+
+/// Tags before and after a merge, followed by a commit neither tag contains.
+pub fn release_repo(dir: &Path) -> (PathBuf, String, String) {
+    let (repo, _) = repo(dir);
+    git(&repo, &["tag", "v0.1.0"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "merge"]);
+    let merged = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "release"]);
+    git(&repo, &["tag", "-a", "v0.2.0", "-m", "release"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "unshipped"]);
+    let unshipped = git(&repo, &["rev-parse", "HEAD"]);
+    (repo, merged, unshipped)
+}

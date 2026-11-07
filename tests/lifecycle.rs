@@ -305,6 +305,124 @@ fn a_step_walks_from_launch_to_done() {
 }
 
 #[test]
+fn a_release_tag_must_contain_the_recorded_merge() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let (repo, sha, _) = campaign_fixture::release_repo(c.root.parent().unwrap());
+    unit_with_step(&c, &host, "Build the thing.\n");
+    let step = "01-first/alpha/BUILD";
+    assert!(
+        commands::launch(&host, &c.root, &target(step), Some(&repo))
+            .unwrap()
+            .ok()
+    );
+    assert!(
+        advance(
+            &host,
+            &c,
+            step,
+            "pr-open",
+            Evidence {
+                pr: Some("https://github.com/o/r/pull/7".into()),
+                sha: Some(sha.clone()),
+                ..Evidence::default()
+            }
+        )
+        .ok()
+    );
+    assert!(
+        advance(
+            &host,
+            &c,
+            step,
+            "merged",
+            Evidence {
+                sha: Some(sha),
+                ..Evidence::default()
+            }
+        )
+        .ok()
+    );
+    let before = c.files();
+    let refused = advance(
+        &host,
+        &c,
+        step,
+        "released",
+        Evidence {
+            tag: Some("v0.1.0".into()),
+            ..Evidence::default()
+        },
+    );
+    assert_eq!(rules(&refused), ["tag-lineage"]);
+    assert_eq!(c.files(), before);
+    let released = advance(
+        &host,
+        &c,
+        step,
+        "released",
+        Evidence {
+            tag: Some("v0.2.0".into()),
+            ..Evidence::default()
+        },
+    );
+    assert!(released.ok(), "{:?}", released.violations);
+}
+
+#[test]
+fn a_tag_only_release_requires_a_sha_contained_in_the_tag() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    for launched in [false, true] {
+        let c = campaign(&host);
+        let (repo, merged, unshipped) = campaign_fixture::release_repo(c.root.parent().unwrap());
+        let step = "00-release/widget/0.2.0";
+        assert!(
+            commands::declare(
+                &host,
+                &c.root.join(step),
+                &commands::Declaration {
+                    lane: Some(Lane::Coordinator),
+                    ..commands::Declaration::default()
+                }
+            )
+            .unwrap()
+            .ok()
+        );
+        c.kickoff(step, "Cut the release.\n");
+        if launched {
+            assert!(
+                commands::launch(&host, &c.root, &target(step), Some(&repo))
+                    .unwrap()
+                    .ok()
+            );
+        }
+        let release = |sha| {
+            commands::advance(
+                &host,
+                &c.root,
+                &target(step),
+                &Phase::Released,
+                &Evidence {
+                    sha,
+                    tag: Some("v0.2.0".into()),
+                    ..Evidence::default()
+                },
+                None,
+                Some(&repo),
+            )
+            .unwrap()
+        };
+        let before = c.files();
+        assert_eq!(rules(&release(None)), ["evidence-missing"]);
+        assert_eq!(rules(&release(Some(unshipped))), ["tag-lineage"]);
+        assert_eq!(c.files(), before);
+        let released = release(Some(merged[..10].into()));
+        assert!(released.ok(), "{:?}", released.violations);
+        assert_eq!(released.fields["evidence"]["sha"], merged);
+    }
+}
+
+#[test]
 fn advance_refuses_a_skip_and_missing_or_unexpected_evidence() {
     let host = Fake::at("2026-10-08T07:00:00Z");
     let c = campaign(&host);
@@ -1264,7 +1382,7 @@ fn resolving_or_withdrawing_the_last_watch_keeps_a_release_on_the_shipping_ladde
     let host = Fake::at("2026-10-08T07:00:00Z");
     for withdraw in [false, true] {
         let c = campaign(&host);
-        let (repo, _) = repo(c.root.parent().unwrap());
+        let (repo, sha) = repo(c.root.parent().unwrap());
         git(&repo, &["tag", "v1.0.0"]);
         let step = "00-release/cm/1.0.0";
         let target = target(step);
@@ -1287,6 +1405,7 @@ fn resolving_or_withdrawing_the_last_watch_keeps_a_release_on_the_shipping_ladde
             &target,
             &Phase::Released,
             &Evidence {
+                sha: Some(sha),
                 tag: Some("v1.0.0".into()),
                 ..Evidence::default()
             },

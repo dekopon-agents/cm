@@ -1640,6 +1640,8 @@ pub fn advance_gated(
     let resuming = matches!(track.state, Phase::Blocked(_)) && track.resting() == to;
     let (required, optional) = if resuming {
         (&[][..], &[][..])
+    } else if tag_only {
+        (&[Flag::Tag, Flag::Sha][..], &[Flag::Digest][..])
     } else {
         evidence_for(to, finish)
     };
@@ -1759,7 +1761,17 @@ pub fn advance_gated(
         .map(|repo| repo.display().to_string())
         .collect();
     let repos: Vec<PathBuf> = repos.into_iter().filter(|repo| repo.exists()).collect();
-    if needs_repo && repos.is_empty() {
+    let remote_repo = (*to == Phase::Released && repo.is_none() && repos.is_empty())
+        .then(|| {
+            track
+                .evidence
+                .pr
+                .as_deref()
+                .and_then(GithubRepo::of_pr)
+                .or_else(|| declared.as_ref().and_then(|step| step.github.clone()))
+        })
+        .flatten();
+    if needs_repo && repos.is_empty() && remote_repo.is_none() {
         let message = if gone.is_empty() {
             "no repository to resolve --sha or --tag in; pass --repo <a checkout of the repo>"
                 .to_owned()
@@ -1780,6 +1792,7 @@ pub fn advance_gated(
                 .find_map(|repo| hex.then(|| git_commit(repo, sha)).flatten())
             {
                 Some(full_sha) => evidence.sha = Some(full_sha),
+                None if hex && remote_repo.is_some() => {}
                 None => violations.push(Violation::new(
                     &full,
                     "evidence-sha",
@@ -1795,6 +1808,7 @@ pub fn advance_gated(
             }
         }
         if let Some(tag) = &given.tag
+            && remote_repo.is_none()
             && !repos
                 .iter()
                 .any(|repo| git_commit(repo, &format!("refs/tags/{tag}")).is_some())
@@ -1803,6 +1817,70 @@ pub fn advance_gated(
                 &full,
                 "evidence-tag",
                 format!("tag `{tag}` does not resolve; `git fetch --tags` first if CI made it, or pass --repo"),
+            ));
+        }
+    }
+    if *to == Phase::Released
+        && !resuming
+        && (tag_only || *track.resting() == Phase::Merged)
+        && let Some(tag) = &given.tag
+        && (remote_repo.is_some() || !repos.is_empty())
+    {
+        let sha = if tag_only {
+            evidence.sha.as_deref()
+        } else {
+            track.evidence.sha.as_deref()
+        };
+        if let Some(sha) = sha {
+            let contains = if let Some(repo) = &remote_repo {
+                match tag.parse::<TagName>() {
+                    Ok(tag) => gate
+                        .forge
+                        .map(|forge| forge.tag_contains(repo, &tag, &CommitSha::new(sha))),
+                    Err(message) => {
+                        violations.push(Violation::new(&full, "evidence-tag", message));
+                        None
+                    }
+                }
+            } else {
+                Some(Ok(repos.iter().any(|repo| {
+                    let Some(sha) = git_commit(repo, sha) else {
+                        return false;
+                    };
+                    let Some(tag) = git_commit(repo, &format!("refs/tags/{tag}")) else {
+                        return false;
+                    };
+                    Command::new("git")
+                        .arg("-C")
+                        .arg(repo)
+                        .args(["merge-base", "--is-ancestor", &sha, &tag])
+                        .output()
+                        .is_ok_and(|output| output.status.success())
+                })))
+            };
+            match contains {
+                Some(Ok(true)) => {}
+                Some(Ok(false)) => violations.push(Violation::new(
+                    &full,
+                    "tag-lineage",
+                    format!("tag `{tag}` does not contain commit {sha}"),
+                )),
+                Some(Err(error)) => violations.push(Violation::new(
+                    &full,
+                    "tag-lineage",
+                    format!("could not check whether tag `{tag}` contains commit {sha}: {error}"),
+                )),
+                None => violations.push(Violation::new(
+                    &full,
+                    "tag-lineage",
+                    "tag containment could not be read; pass --repo <a checkout of the repo>",
+                )),
+            }
+        } else if !tag_only {
+            violations.push(Violation::new(
+                &full,
+                "tag-lineage",
+                "released needs a recorded merge SHA to check tag containment",
             ));
         }
     }
