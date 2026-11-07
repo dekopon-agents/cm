@@ -8,7 +8,7 @@ use cm::commands;
 use cm::host::Host;
 
 pub struct Campaign {
-    _temp: tempfile::TempDir,
+    pub(super) _temp: tempfile::TempDir,
     pub root: PathBuf,
 }
 

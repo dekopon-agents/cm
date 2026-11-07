@@ -642,7 +642,7 @@ impl<'a> Run<'a> {
             target,
             "watch-open",
             format!(
-                "its release deployed, but it stays released until watch {} resolves with evidence",
+                "its release deployed, but it stays released until watch {} resolves with evidence or is withdrawn with a reason",
                 held.join(", ")
             ),
         ));
@@ -813,7 +813,7 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let card = render::card(root, &run.at, &name, &run.units, &next, &run.moves);
+    let card = render::card(root, run.now, &name, &run.units, &next, &run.moves);
     write_atomic(&root.join(CARD), card.as_bytes())?;
     for moved in &run.moves {
         outcome.line(format!(

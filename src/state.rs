@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::evidence::CampaignFile;
 use crate::forge::{GithubRepo, TagName};
 
-pub const SCHEMA: u32 = 3;
+pub const SCHEMA: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -819,6 +819,8 @@ pub struct Watch {
     pub resolved: Option<Resolved>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expired: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdrawn: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -826,6 +828,7 @@ pub enum WatchStatus {
     Open,
     Expired,
     Resolved,
+    Withdrawn,
 }
 
 impl WatchStatus {
@@ -834,12 +837,16 @@ impl WatchStatus {
             WatchStatus::Open => "open",
             WatchStatus::Expired => "expired: unresolved",
             WatchStatus::Resolved => "resolved",
+            WatchStatus::Withdrawn => "withdrawn",
         }
     }
 }
 
 impl Watch {
     pub fn status(&self, now: jiff::Timestamp, root: &Path) -> WatchStatus {
+        if self.withdrawn.is_some() {
+            return WatchStatus::Withdrawn;
+        }
         let past = crate::plan::instant(&self.deadline).is_some_and(|deadline| deadline <= now);
         let resolved = self
             .resolved
@@ -1002,10 +1009,11 @@ impl Step {
 
     pub fn unresolved_watches(&self, root: &Path) -> impl Iterator<Item = &Watch> {
         self.watches.iter().filter(move |watch| {
-            watch
-                .resolved
-                .as_ref()
-                .is_none_or(|resolved| resolved.evidence.check(root).is_err())
+            watch.withdrawn.is_none()
+                && watch
+                    .resolved
+                    .as_ref()
+                    .is_none_or(|resolved| resolved.evidence.check(root).is_err())
         })
     }
 
