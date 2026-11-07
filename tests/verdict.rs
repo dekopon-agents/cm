@@ -22,6 +22,9 @@ use sha2::{Digest, Sha256};
 #[allow(dead_code)]
 mod support;
 
+#[path = "support/verdict.rs"]
+mod review_fixture;
+
 struct Fake {
     now: Timestamp,
 }
@@ -331,7 +334,7 @@ fn target() -> store::Target {
 }
 
 fn record(host: &Fake, c: &Campaign, report: &Path, reviewer: &str) -> Outcome {
-    verdict::record(host, &c.root, &target(), report, Some(reviewer)).unwrap()
+    verdict::record(host, &c.root, &target(), report, Some(reviewer), None).unwrap()
 }
 
 #[test]
@@ -415,8 +418,15 @@ fn record_rejects_a_report_without_a_well_formed_block() {
         "{:?}",
         refused.violations
     );
-    let missing =
-        verdict::record(&host, &c.root, &target(), &c.root.join("nope.md"), None).unwrap();
+    let missing = verdict::record(
+        &host,
+        &c.root,
+        &target(),
+        &c.root.join("nope.md"),
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(rules(&missing), vec!["review-report"]);
     assert!(verdict::load(&c.root).unwrap().reviews.is_empty());
     assert!(!c.root.join(STEP).join("evidence/reviews").exists());
@@ -622,52 +632,340 @@ fn a_pi_step_merges_without_the_gate_and_refuses_its_flags() {
 }
 
 #[test]
-fn the_third_fix_required_round_blocks_the_step_and_asks_the_owner() {
+fn three_fix_required_rounds_with_falling_counts_do_not_block_or_queue() {
     let host = at("2026-10-25T06:00:00Z");
     let c = campaign(&host, true);
-    let blocking = ["F1 | contract | introduced | src/lib.rs:1 | broken"];
-    for (round, head) in ["aaaaaaa1", "bbbbbbb2"].iter().enumerate() {
-        let report = c.report(&format!("r{round}"), head, &blocking, "FIX REQUIRED");
+    let queue = sha256(&c.root.join("OWNER-QUEUE.md"));
+    for (round, count) in [3, 2, 1].into_iter().enumerate() {
+        let report = c.report(
+            &format!("r{round}"),
+            &format!("{round:08x}"),
+            &review_fixture::BLOCKING[..count],
+            "FIX REQUIRED",
+        );
         let recorded = record(&host, &c, &report, "astra");
+        assert!(recorded.ok(), "{:?}", recorded.violations);
         assert_eq!(recorded.fields["rounds"], round + 1);
+        assert_eq!(recorded.fields["converging"], true);
         assert_eq!(recorded.fields["blocked"], false);
+        assert_eq!(recorded.fields["owner_queue"], serde_json::Value::Null);
     }
-    let same_head = c.report(
-        "claude",
-        "bbbbbbb2",
-        &["F1 | contract | exposed | src/lib.rs:2 | also broken"],
+    assert_eq!(c.state(), Phase::PrOpen);
+    assert_eq!(sha256(&c.root.join("OWNER-QUEUE.md")), queue);
+}
+
+#[test]
+fn rising_counts_request_a_fresh_reader_until_one_is_recorded() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let first = c.report(
+        "first",
+        "aaaaaaa1",
+        &review_fixture::BLOCKING[..1],
         "FIX REQUIRED",
     );
-    assert_eq!(record(&host, &c, &same_head, "claude").fields["rounds"], 2);
-    assert_eq!(c.state(), Phase::PrOpen);
-    let third = c.report("r3", "ccccccc3", &blocking, "FIX REQUIRED");
-    let recorded = record(&host, &c, &third, "astra");
-    assert!(recorded.ok(), "{:?}", recorded.violations);
-    assert_eq!(recorded.fields["rounds"], 3);
-    assert_eq!(recorded.fields["blocked"], true);
-    assert_eq!(recorded.fields["owner_queue"], 1);
-    assert_eq!(c.state(), Phase::Blocked("third-fix".into()));
-    let queue = fs::read_to_string(c.root.join("OWNER-QUEUE.md")).unwrap();
-    assert!(
-        queue.contains("## 1. 01-a/u/S1: third FIX REQUIRED"),
-        "{queue}"
+    assert!(record(&host, &c, &first, "astra").ok());
+    let rise = c.report(
+        "rise",
+        "bbbbbbb2",
+        &review_fixture::BLOCKING[..2],
+        "FIX REQUIRED",
     );
+    let recorded = record(&host, &c, &rise, "astra");
+    assert_eq!(recorded.fields["converging"], false);
+    assert_eq!(recorded.fields["blocked"], false);
+    assert_eq!(recorded.fields["owner_queue"], serde_json::Value::Null);
     assert!(
-        queue.contains(
-            "`01-a/u/S1/evidence/reviews/R3-claude.md` and `01-a/u/S1/evidence/reviews/R4-astra.md`"
-        ),
-        "{queue}"
+        recorded
+            .lines
+            .iter()
+            .any(|line| line == "converging: false")
     );
-    assert!(
-        fs::read_to_string(c.root.join("RESUME.md"))
+    let command = format!("cm review record {STEP} '<fresh-review-report>' --reviewer fresh-opus");
+    for target in [None, Some(target())] {
+        let next = plan::next_at(&c.root, target.as_ref(), None, host.now).unwrap();
+        assert!(next.ok(), "{:?}", next.violations);
+        assert_eq!(next.fields["fresh_readers"][0]["command"], command);
+        assert_eq!(next.fields["fresh_readers"][0]["review"], "R2");
+        assert!(next.lines.iter().any(|line| line
+            == &format!("1. fresh reader {STEP}: independent Opus, high effort — `{command}`")));
+    }
+    // Another pass by the original reviewer does not substitute for an independent read.
+    let falling = c.report(
+        "falling",
+        "ccccccc3",
+        &review_fixture::BLOCKING[..1],
+        "FIX REQUIRED",
+    );
+    assert!(record(&host, &c, &falling, "astra").ok());
+    assert_eq!(
+        plan::next(&c.root, None, None).unwrap().fields["fresh_readers"]
+            .as_array()
             .unwrap()
-            .contains("OWNER-QUEUE not drained")
+            .len(),
+        1
     );
+    let fresh = c.report("fresh", "ddddddd4", &[], "ACCEPT");
+    assert!(record(&host, &c, &fresh, "fresh-opus").ok());
+    assert_eq!(
+        plan::next(&c.root, None, None).unwrap().fields["fresh_readers"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn a_non_converging_fresh_opus_round_blocks_and_queues_once() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    for (round, count) in [1, 2, 3].into_iter().enumerate() {
+        let report = c.report(
+            &format!("fresh{round}"),
+            &format!("{round:08x}"),
+            &review_fixture::BLOCKING[..count],
+            "FIX REQUIRED",
+        );
+        let recorded = record(&host, &c, &report, "fresh-opus");
+        assert!(recorded.ok(), "{:?}", recorded.violations);
+        assert_eq!(recorded.fields["converging"], round == 0);
+        assert_eq!(
+            recorded.fields["owner_queue"],
+            if round == 1 {
+                serde_json::json!(1)
+            } else {
+                serde_json::Value::Null
+            }
+        );
+        if round == 1 {
+            assert_eq!(recorded.fields["blocked"], true);
+        }
+    }
+    assert_eq!(c.state(), Phase::Blocked("non-convergence".into()));
+    let queue = fs::read_to_string(c.root.join("OWNER-QUEUE.md")).unwrap();
+    let titles: Vec<_> = cm::markdown::headings(&queue)
+        .into_iter()
+        .filter(|heading| heading.level == 2)
+        .map(|heading| heading.text)
+        .collect();
+    assert_eq!(titles, ["1. 01-a/u/S1: non-converging fresh reader"]);
+}
+
+#[test]
+fn counts_compare_the_same_reviewer_and_pr_and_include_accepted_rounds() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let first = c.report(
+        "first",
+        "aaaaaaa1",
+        &review_fixture::BLOCKING[..1],
+        "FIX REQUIRED",
+    );
+    assert!(record(&host, &c, &first, "astra").ok());
+    let other = c.report(
+        "other",
+        "bbbbbbb2",
+        &review_fixture::BLOCKING,
+        "FIX REQUIRED",
+    );
+    assert_eq!(
+        record(&host, &c, &other, "claude").fields["converging"],
+        true
+    );
+    let equal = c.report(
+        "equal",
+        "ccccccc3",
+        &review_fixture::BLOCKING[..1],
+        "FIX REQUIRED",
+    );
+    assert_eq!(
+        record(&host, &c, &equal, "astra").fields["converging"],
+        true
+    );
+    let accepted = c.report("accepted", "ddddddd4", &[], "ACCEPT");
+    assert!(record(&host, &c, &accepted, "astra").ok());
+    let returned = c.report(
+        "returned",
+        "eeeeeee5",
+        &review_fixture::BLOCKING[..1],
+        "FIX REQUIRED",
+    );
+    assert_eq!(
+        record(&host, &c, &returned, "astra").fields["converging"],
+        false
+    );
+    let mut unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    unit.steps.get_mut("S1").unwrap().track.evidence.pr =
+        Some("https://github.com/o/r/pull/8".into());
+    commands::write_unit(&c.root.join("01-a/u"), &unit).unwrap();
+    let changed_pr = c.report(
+        "changed-pr",
+        "fffffff6",
+        &review_fixture::BLOCKING,
+        "FIX REQUIRED",
+    );
+    assert_eq!(
+        record(&host, &c, &changed_pr, "astra").fields["converging"],
+        true
+    );
+}
+
+#[test]
+fn part_rounds_use_the_parts_pr_and_do_not_mix_counts() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let amendment = commands::Amendment {
+        parts: vec!["one".into(), "two".into()],
+        ..Default::default()
+    };
     assert!(
-        lint(&c.root).unwrap().ok(),
-        "{:?}",
-        lint(&c.root).unwrap().violations
+        commands::amend(&host, &c.root, &target(), &amendment)
+            .unwrap()
+            .ok()
     );
+    let second_pr = "https://github.com/o/r/pull/8";
+    assert!(
+        commands::advance_gated(
+            &host,
+            &c.root,
+            &target(),
+            commands::Advance {
+                to: &Phase::PrOpen,
+                given: &Evidence {
+                    pr: Some(second_pr.into()),
+                    sha: Some(c.head()),
+                    ..Default::default()
+                },
+                file: None,
+                repo: Some(&c.repo),
+                part: Some("two"),
+            },
+            &MergeGate::default()
+        )
+        .unwrap()
+        .ok()
+    );
+    let report = c.report(
+        "first",
+        "aaaaaaa1",
+        &review_fixture::BLOCKING[..1],
+        "FIX REQUIRED",
+    );
+    let before = sha256(&c.root.join(".cm/verdicts.json"));
+    assert_eq!(
+        rules(&record(&host, &c, &report, "astra")),
+        vec!["review-part"]
+    );
+    let unknown = verdict::record(
+        &host,
+        &c.root,
+        &target(),
+        &report,
+        Some("astra"),
+        Some("missing"),
+    )
+    .unwrap();
+    assert_eq!(rules(&unknown), vec!["part-unknown"]);
+    assert_eq!(sha256(&c.root.join(".cm/verdicts.json")), before);
+    for (part, count, round, converging) in [
+        ("one", 1, 1, true),
+        ("two", 3, 1, true),
+        ("one", 2, 2, false),
+        ("two", 2, 2, true),
+    ] {
+        let report = c.report(
+            &format!("{part}{round}"),
+            &format!("{round:08x}"),
+            &review_fixture::BLOCKING[..count],
+            "FIX REQUIRED",
+        );
+        let recorded = verdict::record(
+            &host,
+            &c.root,
+            &target(),
+            &report,
+            Some("astra"),
+            Some(part),
+        )
+        .unwrap();
+        assert!(recorded.ok(), "{:?}", recorded.violations);
+        assert_eq!(recorded.fields["rounds"], round);
+        assert_eq!(recorded.fields["converging"], converging);
+    }
+    let reviews = verdict::load(&c.root).unwrap().reviews;
+    assert_eq!(reviews[0].part.as_deref(), Some("one"));
+    assert_eq!(reviews[0].pr.as_deref(), Some(PR));
+    assert_eq!(reviews[1].part.as_deref(), Some("two"));
+    assert_eq!(reviews[1].pr.as_deref(), Some(second_pr));
+    let next = plan::next(&c.root, None, None).unwrap();
+    assert_eq!(next.fields["fresh_readers"][0]["part"], "one");
+    assert_eq!(
+        next.fields["fresh_readers"][0]["command"],
+        format!("cm review record {STEP} '<fresh-review-report>' --reviewer fresh-opus --part one")
+    );
+}
+
+#[test]
+fn the_eleventh_recorded_pass_on_a_step_is_refused_without_writes() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    for round in 1..=10 {
+        let report = c.report(&format!("r{round}"), &format!("{round:08x}"), &[], "ACCEPT");
+        let recorded = record(&host, &c, &report, "astra");
+        assert!(recorded.ok(), "{:?}", recorded.violations);
+        assert_eq!(recorded.fields["passes"], round);
+    }
+    let report = c.report("r11", "bbbbbbb1", &[], "ACCEPT");
+    let paths = [
+        ".cm/verdicts.json",
+        "JOURNAL.md",
+        "OWNER-QUEUE.md",
+        "RESUME.md",
+    ];
+    let before = paths.map(|path| sha256(&c.root.join(path)));
+    let refused = record(&host, &c, &report, "astra");
+    assert_eq!(rules(&refused), vec!["review-cap"]);
+    assert_eq!(
+        refused.violations[0].message,
+        "session cap of 10 passes; an 11th recorded round is refused"
+    );
+    assert_eq!(paths.map(|path| sha256(&c.root.join(path))), before);
+    assert!(
+        !c.root
+            .join(STEP)
+            .join("evidence/reviews/R11-astra.md")
+            .exists()
+    );
+}
+
+#[test]
+fn a_legacy_third_fix_block_and_review_without_a_part_still_load_and_unblock() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let report = c.report("legacy", "aaaaaaa1", &[], "ACCEPT");
+    assert!(record(&host, &c, &report, "astra").ok());
+    let saved: serde_json::Value = store::read_json(&c.root.join(".cm/verdicts.json")).unwrap();
+    assert!(saved["reviews"][0].get("part").is_none());
+    assert_eq!(verdict::load(&c.root).unwrap().reviews[0].part, None);
+    assert!(
+        commands::advance(
+            &host,
+            &c.root,
+            &target(),
+            &Phase::Blocked("third-fix".into()),
+            &Evidence::default(),
+            None,
+            None
+        )
+        .unwrap()
+        .ok()
+    );
+    assert_eq!(c.state(), Phase::Blocked("third-fix".into()));
+    let evidence = c.write("ruling.md", "Continue the review.\n");
+    assert!(
+        commands::unblock(&host, &c.root, &target(), &evidence)
+            .unwrap()
+            .ok()
+    );
+    assert_eq!(c.state(), Phase::PrOpen);
 }
 
 #[test]

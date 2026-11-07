@@ -16,8 +16,8 @@ use crate::ledger::{
     QueueItem, add_queue_item, declared, evidence_dir, guard, journal_line, one_line, read_existing,
 };
 use crate::outcome::{Outcome, Violation};
+use crate::state::Evidence;
 use crate::state::same_commit;
-use crate::state::{Evidence, Phase};
 use crate::store::{
     self, CM_DIR, Target, create_new, read_json, relative, write_atomic, write_json,
 };
@@ -26,11 +26,12 @@ pub const VERDICTS: &str = "verdicts.json";
 pub const BLOCK: &str = "cm-review";
 pub const SCOPE: &str = "coordinator-scope.md";
 pub const SCOPE_HEADING: &str = "## Coordinator scope and rulings";
-pub const THIRD_FIX: &str = "third-fix";
 pub const ASTRA_MODEL: &str = "gpt-6-astra";
 pub const ASTRA_EFFORT: &str = "xhigh";
 pub const ASTRA_REVIEWER: &str = "astra";
 const RECEIPT: &str = "receipt.json";
+const NON_CONVERGENCE: &str = "non-convergence";
+const RULING: &str = "Fix passes: when a review round closes fewer blocking findings than it opens, or a finding marked fixed returns, one fresh independent reader (Opus, high effort) reviews the head; the PR or design escalates to the owner only if that round also fails to converge. A third FIX REQUIRED by count alone escalates nothing. The session cap of 10 passes stands.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -506,6 +507,8 @@ pub struct Recorded {
     pub reviewer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<String>,
     pub head: String,
     pub verdict: Verdict,
     /// The verdict line the report ends with, when it has one.
@@ -600,22 +603,41 @@ fn full_name(target: &Target) -> String {
     )
 }
 
-/// The heads of the step's computed FIX REQUIRED reviews, each one round.
-fn fix_rounds<'a>(verdicts: &'a Verdicts, step: &str) -> Vec<&'a str> {
-    let mut heads: Vec<&str> = Vec::new();
-    for review in verdicts
-        .reviews
-        .iter()
-        .filter(|review| review.step == step && review.verdict == Verdict::FixRequired)
-    {
-        if !heads.iter().any(|head| same_commit(head, &review.head)) {
-            heads.push(&review.head);
-        }
-    }
-    heads
+fn same_scope(a: &Recorded, b: &Recorded) -> bool {
+    a.step == b.step && a.part == b.part && a.pr == b.pr
 }
 
-fn step_pr(root: &Path, target: &Target) -> Result<Option<String>> {
+fn blocking_count(review: &Recorded) -> usize {
+    review
+        .findings
+        .iter()
+        .filter(|finding| finding.blocking)
+        .count()
+}
+
+fn converging(previous: &[Recorded], review: &Recorded) -> bool {
+    previous
+        .iter()
+        .rev()
+        .find(|before| same_scope(before, review) && before.reviewer == review.reviewer)
+        .is_none_or(|before| blocking_count(review) <= blocking_count(before))
+}
+
+/// Pending independent reads, derived from the reports rather than a second persisted queue.
+pub(crate) fn fresh_readers(verdicts: &Verdicts) -> Vec<&Recorded> {
+    let mut pending: Vec<&Recorded> = Vec::new();
+    for (index, review) in verdicts.reviews.iter().enumerate() {
+        if review.reviewer.as_deref() == Some("fresh-opus") {
+            pending.retain(|before| !same_scope(before, review));
+        } else if !converging(&verdicts.reviews[..index], review) {
+            pending.retain(|before| !same_scope(before, review));
+            pending.push(review);
+        }
+    }
+    pending
+}
+
+fn step_pr(root: &Path, target: &Target, part: Option<&str>) -> Result<Option<String>> {
     let dir = root.join(&target.unit);
     if !store::is_unit(&dir) {
         return Ok(None);
@@ -623,7 +645,11 @@ fn step_pr(root: &Path, target: &Target) -> Result<Option<String>> {
     Ok(store::load_unit(&dir)?
         .steps
         .get(target.step.as_deref().unwrap_or_default())
-        .and_then(|step| step.track.evidence.pr.clone()))
+        .and_then(|step| match part {
+            Some(part) => step.parts.get(part),
+            None => Some(&step.track),
+        })
+        .and_then(|track| track.evidence.pr.clone()))
 }
 
 pub fn record(
@@ -632,6 +658,7 @@ pub fn record(
     target: &Target,
     report: &Path,
     reviewer: Option<&str>,
+    part: Option<&str>,
 ) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
     let full = full_name(target);
@@ -641,6 +668,24 @@ pub fn record(
             "step-unknown",
             "the step is not declared",
         ));
+    } else {
+        let unit = store::load_unit(&root.join(&target.unit))?;
+        let step = &unit.steps[target.step.as_deref().unwrap_or_default()];
+        if let Some(part) = part {
+            if !step.parts.contains_key(part) {
+                violations.push(Violation::new(
+                    &full,
+                    "part-unknown",
+                    format!("the step declares no part `{part}`"),
+                ));
+            }
+        } else if !step.parts.is_empty() {
+            violations.push(Violation::new(
+                &full,
+                "review-part",
+                "the step has parts; select the reviewed part with --part NAME",
+            ));
+        }
     }
     if let Some(kind) = reviewer.filter(|kind| !store::is_name(kind)) {
         violations.push(Violation::new(
@@ -670,6 +715,18 @@ pub fn record(
         },
     };
     let mut verdicts = load(root)?;
+    let passes = verdicts
+        .reviews
+        .iter()
+        .filter(|review| review.step == full)
+        .count();
+    if passes >= 10 {
+        violations.push(Violation::new(
+            &full,
+            "review-cap",
+            "session cap of 10 passes; an 11th recorded round is refused",
+        ));
+    }
     let number = verdicts
         .reviews
         .iter()
@@ -693,6 +750,7 @@ pub fn record(
     if let Some((_, text)) = &block
         && let Some(again) = verdicts.reviews.iter().find(|review| {
             review.step == full
+                && review.part.as_deref() == part
                 && fs::read_to_string(root.join(review.report.as_str()))
                     .ok()
                     .as_ref()
@@ -714,68 +772,12 @@ pub fn record(
     };
     let verdict = block.verdict();
     let at = stamp(host.now());
-    let heads = fix_rounds(&verdicts, &full);
-    let before = heads.len();
-    let new_round =
-        verdict == Verdict::FixRequired && !heads.iter().any(|head| same_commit(head, &block.head));
-    let rounds = before + usize::from(new_round);
-    let third = new_round && rounds == 3;
-    let blockable = third && {
-        let unit = store::load_unit(&root.join(&target.unit))?;
-        unit.steps
-            .get(target.step.as_deref().unwrap_or_default())
-            .is_some_and(|step| {
-                let blocked = match step.track.state {
-                    Phase::Blocked(_) => true,
-                    Phase::Drafted
-                    | Phase::Launched
-                    | Phase::PrOpen
-                    | Phase::Merged
-                    | Phase::Released
-                    | Phase::Deployed
-                    | Phase::Done
-                    | Phase::Superseded => false,
-                };
-                !blocked && !step.track.state.is_final()
-            })
-    };
-    let mut queued = None;
-    if third {
-        let earlier = verdicts
-            .reviews
-            .iter()
-            .rev()
-            .find(|review| review.step == full && review.verdict == Verdict::FixRequired)
-            .map(|review| review.report.to_string());
-        let reports = earlier
-            .iter()
-            .map(|path| format!("`{path}`"))
-            .chain([format!("`{copy_rel}`")])
-            .collect::<Vec<_>>()
-            .join(" and ");
-        let title = format!("{full}: third FIX REQUIRED");
-        let context = format!(
-            "{full} has a computed FIX REQUIRED verdict on {rounds} reviewed heads{}; the latest reports are {reports}",
-            if blockable {
-                format!("; cm blocked it `blocked:{THIRD_FIX}`")
-            } else {
-                String::new()
-            }
-        );
-        let question = format!("Should {full} take another fix round, be re-scoped, or stop?");
-        let recommendation = "Read the two reports; rule in the step's evidence/coordinator-scope.md, then `cm unblock` it or re-scope it";
-        let item = QueueItem {
-            title: &title,
-            context: &context,
-            question: &question,
-            recommendation,
-        };
-        let outcome = add_queue_item(host, root, &item, Vec::new())?;
-        if !outcome.ok() {
-            return Ok(outcome);
-        }
-        queued = outcome.fields.get("item").cloned();
-    }
+    let rounds = verdicts
+        .reviews
+        .iter()
+        .filter(|review| review.step == full && review.part.as_deref() == part)
+        .count()
+        + 1;
     fs::create_dir_all(copy.parent().unwrap_or(root))?;
     if !create_new(&copy, text.as_bytes())? {
         return Ok(Outcome::refused(vec![Violation::new(
@@ -785,7 +787,7 @@ pub fn record(
         )]));
     }
     let report_file = CampaignFile::resolve(root, &copy).map_err(anyhow::Error::from)?;
-    let pr = step_pr(root, target)?;
+    let pr = step_pr(root, target, part)?;
     let findings: Vec<Logged> = block
         .findings
         .iter()
@@ -802,12 +804,47 @@ pub fn record(
         step: full.clone(),
         reviewer: reviewer.map(str::to_owned),
         pr: pr.clone(),
+        part: part.map(str::to_owned),
         head: block.head.clone(),
         verdict,
         stated: block.stated,
         report: report_file.clone(),
         findings,
     };
+    let converging = converging(&verdicts.reviews, &recorded);
+    let escalate = !converging && reviewer == Some("fresh-opus");
+    let already_escalated = verdicts.reviews.iter().enumerate().any(|(index, review)| {
+        review.step == full
+            && review.reviewer.as_deref() == Some("fresh-opus")
+            && !self::converging(&verdicts.reviews[..index], review)
+    });
+    let mut queued = None;
+    if escalate && !already_escalated {
+        let earlier = verdicts
+            .reviews
+            .iter()
+            .rev()
+            .find(|review| same_scope(review, &recorded) && review.reviewer == recorded.reviewer)
+            .expect("a non-converging review has a previous round");
+        let title = format!("{full}: non-converging fresh reader");
+        let context = format!(
+            "{full}{} still fails to converge after an independent Opus read; the reports are `{}` and `{copy_rel}`. Ruling: {RULING}",
+            part.map(|part| format!(" part {part}")).unwrap_or_default(),
+            earlier.report,
+        );
+        let question = format!("Should {full} take another fix round, be re-scoped, or stop?");
+        let item = QueueItem {
+            title: &title,
+            context: &context,
+            question: &question,
+            recommendation: "Read the reports; rule in the step's evidence/coordinator-scope.md, then `cm unblock` it or re-scope it",
+        };
+        let outcome = add_queue_item(host, root, &item, Vec::new())?;
+        if !outcome.ok() {
+            return Ok(outcome);
+        }
+        queued = outcome.fields.get("item").cloned();
+    }
     let id = recorded.id();
     let blocking: Vec<String> = recorded
         .findings
@@ -842,6 +879,12 @@ pub fn record(
             "- the report says {stated}; cm computes {verdict} from its findings\n"
         ));
     }
+    if let Some(part) = part {
+        body.push_str(&format!("- part: {part}\n"));
+    }
+    if !converging {
+        body.push_str(&format!("- converging: false; ruling: “{RULING}”\n"));
+    }
     let journal = journal_line(
         root,
         &at,
@@ -849,12 +892,12 @@ pub fn record(
         &body,
     )?;
     let mut blocked = None;
-    if blockable {
+    if escalate {
         let evidence = Evidence {
             file: Some(report_file),
             ..Evidence::default()
         };
-        blocked = crate::commands::block_step(root, target, THIRD_FIX, &at, &evidence)?;
+        blocked = crate::commands::block_step(root, target, NON_CONVERGENCE, &at, &evidence)?;
     }
     let mut outcome = Outcome::default();
     outcome.line(format!(
@@ -868,17 +911,18 @@ pub fn record(
             "the report says {stated}; cm computes {verdict}: only an introduced or exposed contract finding blocks"
         ));
     }
-    if third {
+    outcome.line(format!("converging: {converging}"));
+    if escalate {
         outcome.line(format!(
-            "third FIX REQUIRED round: {full}{}; owner-queue item {}",
+            "non-converging fresh reader: {full}{}; owner-queue item {}",
             if blocked.is_some() {
-                format!(" → blocked:{THIRD_FIX}")
+                format!(" → blocked:{NON_CONVERGENCE}")
             } else {
                 String::new()
             },
             queued
                 .as_ref()
-                .map_or_else(|| "—".to_owned(), Value::to_string)
+                .map_or_else(|| "already queued".to_owned(), Value::to_string)
         ));
     }
     outcome.field("id", id);
@@ -887,7 +931,10 @@ pub fn record(
     outcome.field("report", copy_rel);
     outcome.field("blocking", blocking);
     outcome.field("followups", followups);
+    outcome.field("part", part.map(str::to_owned));
+    outcome.field("converging", converging);
     outcome.field("rounds", rounds);
+    outcome.field("passes", passes + 1);
     outcome.field("owner_queue", queued.unwrap_or(Value::Null));
     outcome.field("blocked", blocked.is_some());
     outcome.field("journal", journal);
@@ -1896,6 +1943,7 @@ mod tests {
                 step: full_name(&target),
                 reviewer: Some(ASTRA_REVIEWER.to_owned()),
                 pr: None,
+                part: None,
                 head: SHA.to_owned(),
                 verdict: Verdict::Accept,
                 stated: None,

@@ -479,12 +479,61 @@ pub fn next_at(
     let mut outcome = Outcome::default();
     let mut number = 1;
     outcome.field("paused", paused);
+    let verdicts = crate::verdict::load(root)?;
+    let fresh_readers: Vec<Value> = crate::verdict::fresh_readers(&verdicts)
+        .into_iter()
+        .filter(|review| {
+            step(&units, &review.step).is_some_and(|step| {
+                !step.track.state.is_final() && lane.is_none_or(|lane| step.lane == Some(lane))
+            }) && target.is_none_or(|target| {
+                review.step
+                    == format!(
+                        "{}/{}",
+                        target.unit,
+                        target.step.as_deref().unwrap_or_default()
+                    )
+            })
+        })
+        .map(|review| {
+            let part = review
+                .part
+                .as_ref()
+                .map(|part| format!(" --part {}", shell_word(part)))
+                .unwrap_or_default();
+            let command = format!(
+                "cm review record {} '<fresh-review-report>' --reviewer fresh-opus{part}",
+                shell_word(&review.step)
+            );
+            outcome.line(next_item(
+                &mut number,
+                &format!(
+                    "fresh reader {}{}: independent Opus, high effort",
+                    review.step,
+                    review
+                        .part
+                        .as_ref()
+                        .map(|part| format!(" part {part}"))
+                        .unwrap_or_default()
+                ),
+                &command,
+            ));
+            json!({"target": review.step, "part": review.part, "pr": review.pr,
+                "review": review.id(), "converging": false, "command": command})
+        })
+        .collect();
+    let has_fresh_reader = !fresh_readers.is_empty();
+    outcome.field("fresh_readers", fresh_readers);
     if let Some(target) = target {
         let full = format!(
             "{}/{}",
             target.unit,
             target.step.as_deref().unwrap_or_default()
         );
+        if has_fresh_reader {
+            outcome.field("steps", Vec::<Value>::new());
+            outcome.field("waiting", Vec::<Value>::new());
+            return Ok(outcome);
+        }
         let Some(candidate) = all.iter().find(|candidate| candidate.target == full) else {
             let message = match step(&units, &full) {
                 Some(step) if step.lane.is_none() => format!(
@@ -604,7 +653,7 @@ pub fn next_at(
             "cm sync",
         ));
     }
-    if ready.is_empty() && waiting.is_empty() && tags.is_empty() {
+    if ready.is_empty() && waiting.is_empty() && tags.is_empty() && !has_fresh_reader {
         outcome.line("nothing is declared and drafted");
     }
     let limit = stall_hours(root);

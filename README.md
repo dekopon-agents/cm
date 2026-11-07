@@ -69,7 +69,7 @@ error.
 | `cm mac-lane add "<title>" [--body-file F]`, `cm mac-lane done N --receipt T`, `cm mac-lane list` | The queue of work only the owner's Mac can do, `MAC-LANE.md`: one numbered list item per request, starting at column 0: `N. **<title>** <body>`. `add` appends the next number (creating the file with `# Mac lane queue` when it is missing), indents the body's continuation lines four spaces and journals the item; a title holding `**` or beginning with a status word (`DONE`, `WITHDRAWN`, `HELD`, `RUNNING`, `Receipt`) is `mac-lane-title`, so a new request cannot be mistaken for a status. An exhausted item number is `mac-lane-number`. An item is done once its leading bold is `**DONE …**` (or `**WITHDRAWN …**`); any other item is open, `held` (a leading `**HELD …**` or a `**Receipt …**` naming a hold), `running` (`**RUNNING …**`) or plain `open`, and its title is its first other bold span. `done` writes `**DONE <YYYY-MM-DD>** (<receipt>). ` after `N. `, replacing a leading open status, keeps the remaining item text, trims trailing whitespace on a status-only first line and journals it; an absent item is `mac-lane-item`, a done one `mac-lane-closed`. `list` prints each open item as `N. <title> (<state>)` (`items` in `--json`). `cm sync` summarizes the open count and at most 10 items under `## Mac lane` on `CARD.md`, with titles limited to 80 characters and a pointer to `MAC-LANE.md` for the rest; omitted when none is open. Unreadable queues fail the read, report `mac-lane-unreadable` in lint and refuse campaign close. An unreadable or invalid lane leaves sync running and renders `Mac lane: invalid, see cm lint` on CARD.md. |
 | `cm evidence <NN-name>/<unit>/<step> --name NAME --body-file F [--candidate STEP[@SHA] [--harness STEP[@SHA]]]` | Writes `<step>/evidence/<NAME>.md` once from a non-empty body and journals the path. `cm advance <step> done` without `--evidence` takes the step's one evidence file when it has exactly one. `--candidate` and `--harness` pin the file to the commits it was produced against (see [Pinned evidence](#pinned-evidence)). |
 | `cm review <step> --pr URL --head SHA --model ID --effort E --verdict accept\|fix-required --findings C/F --cost USD --wall MIN [--delta FROM_SHA]`, `cm review --import` | Appends one row to the review ledger `.cm/reviews.json` and renders `REVIEW-OFF.md` from it, rows in PR order with a delta review under its PR, and journals the row. The rows a hand-written `REVIEW-OFF.md` already holds are imported once, kept cell for cell, and the text before and after the table (per-PR adjudications, rules) is kept byte for byte (`--import`, or the first `cm review`). The step must be declared (`step-unknown`); an imported delta row is the one whose `#` cell carries `Δ`. After that a hand edit is `review-hand-edit`, as for `STATE.md`. |
-| `cm review record <step> <report-file> [--reviewer KIND]` | Parses the `cm-review` block that ends the report (see [Review verdicts](#review-verdicts)), computes the verdict, copies the report to `<step>/evidence/reviews/R<n>[-KIND].md` and records the review in `.cm/verdicts.json` as `R<n>`, its findings as `R<n>.<id>`. Refuses a report with no block or a malformed one (`review-block`, one per problem, with its line), an undeclared step and a report already recorded for the step (`review-duplicate`). A report whose own verdict line disagrees with the computed one is recorded with the computed verdict and the disagreement printed and journaled. The step's third FIX REQUIRED round blocks it (see [Rounds](#rounds)). |
+| `cm review record <step> <report-file> [--reviewer KIND] [--part NAME]` | Parses the `cm-review` block that ends the report (see [Review verdicts](#review-verdicts)), computes the verdict, copies the report to `<step>/evidence/reviews/R<n>[-KIND].md` and records the review in `.cm/verdicts.json` as `R<n>`, its findings as `R<n>.<id>`. Refuses a report with no block or a malformed one (`review-block`, one per problem, with its line), an undeclared step and a report already recorded for the step (`review-duplicate`). A report whose own verdict line disagrees with the computed one is recorded with the computed verdict and the disagreement printed and journaled. `--part` selects a declared part and its PR; it is required on multipart steps. Reports count toward the ten-pass step cap; rising blocking counts request an independent reader and only a non-converging `fresh-opus` round blocks the step (see [Rounds](#rounds)). |
 | `cm review resolve <step> <finding> --by <commit\|ruling-file>` | Records what resolved a blocking finding: `R<n>.<id>`, or `<id>` in the step's latest review holding it; an id whose `R<n>` is not a review number names no finding (`finding-unknown`). `--by` is a ruling file in the campaign when that path exists, else a commit SHA. A follow-up is `resolve-not-blocking`; a second resolution is `resolve-done`. |
 | `cm ruling <step> "<text>"` | Appends `- YYYY-MM-DD: <text>` to `<step>/evidence/coordinator-scope.md`, creating it with `# Scope and coordinator rulings: <step>` when it is missing, and journals the line. |
 | `cm brief <step>` | Prints the step's `kickoff.md`, then `## Coordinator scope and rulings` and the step's `evidence/coordinator-scope.md` (or a line saying none is recorded): the brief for `astra-review.sh start` and review packets. `--json` puts it in `brief`. Refuses a step with no `kickoff.md`. |
@@ -320,16 +320,35 @@ fenced blocks may come before it.
 
 The verdict is computed: FIX REQUIRED iff a finding is `contract` and `introduced` or `exposed`.
 Those findings block; every other finding is a follow-up (`cm followups`). `.cm/verdicts.json`
-holds each review (`R<n>`: step, reviewer, PR, head, verdict, the report's own verdict line,
+holds each review (`R<n>`: step, reviewer, PR, optional part, head, verdict, the report's own verdict line,
 the report copy) and each finding with its resolution or closure.
 
 ### Rounds
 
-Each reviewed head with a computed FIX REQUIRED is one round, however many reviewers reviewed it.
-The `cm review record` that makes a step's third round blocks the step `blocked:third-fix` and adds
-an owner-queue item (as `cm owner-queue add` does, withholding RESUME.md's `/loop`) naming the
-latest two FIX REQUIRED reports. `cm unblock` releases it once the owner has answered; a fourth
-round does not queue again.
+Each recorded report is one round, including ACCEPT and another report at the same head.
+`rounds` counts reports for the selected part (or the unpartitioned step); `passes` counts every
+report on the step across parts and reviewers. The 11th report on a step is refused with
+`review-cap`: `session cap of 10 passes`.
+
+A round fails to converge when it has more blocking findings than the previous report from the
+same reviewer kind on the same PR and part. The first report in that scope converges; equal or
+falling counts converge. Counts use the report's original blocking findings, including findings
+later resolved. A finding marked fixed returning remains the reviewer's prose: cm does not
+track finding identity across reports.
+
+A non-converging round prints `converging: false` and journals the owner's ruling:
+
+> Fix passes: when a review round closes fewer blocking findings than it opens, or a finding marked fixed returns, one fresh independent reader (Opus, high effort) reviews the head; the PR or design escalates to the owner only if that round also fails to converge. A third FIX REQUIRED by count alone escalates nothing. The session cap of 10 passes stands.
+
+`cm next` lists a `fresh reader` item with
+`cm review record <step> '<fresh-review-report>' --reviewer fresh-opus [--part NAME]`.
+Have an independent Opus reader at high effort review the head, then record its report with that
+command. The item remains until a `fresh-opus` report is recorded for that PR and part. Reviewer
+kinds have separate count histories, including `fresh-opus`; a rise over its previous report
+blocks the step `blocked:non-convergence` and adds one owner-queue item per step. Further
+non-converging fresh reports do not queue again. `cm unblock` releases the block with evidence.
+Three FIX REQUIRED rounds by count alone never block or queue. Existing `blocked:third-fix`
+states still load and can be released with `cm unblock`.
 
 ### Merge gate
 
