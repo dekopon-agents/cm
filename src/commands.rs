@@ -895,14 +895,19 @@ pub fn launch_remote(
         .cloned();
     if let Some(step) = &existing {
         let fresh = step.track.state == Phase::Drafted;
-        let relaunch = matches!(step.track.state, Phase::Blocked(_))
-            && matches!(step.track.resting(), Phase::Drafted | Phase::Launched);
+        let relaunch = (matches!(step.track.state, Phase::Blocked(_))
+            && matches!(step.track.resting(), Phase::Drafted | Phase::Launched))
+            || (step.track.state == Phase::Launched
+                && step
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.ended.is_some()));
         if !fresh && !relaunch {
             violations.push(Violation::new(
                 &full,
                 "launch-state",
                 format!(
-                    "the step is {}; launch takes a new step or one blocked before its PR opened",
+                    "the step is {}; launch takes a new step, one blocked before its PR opened, or a launched step whose last attempt ended",
                     step.track.state
                 ),
             ));
