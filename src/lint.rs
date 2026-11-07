@@ -15,7 +15,7 @@ use crate::state::{CampaignState, Phase, Track, UnitState};
 use crate::store::{
     self, JOURNAL, UNIT_STATE, find_root, is_name, is_subcampaign_name, relative, state_path,
 };
-use crate::templates::{self, Banner, QUEUE_FILE, ROOT_FILES};
+use crate::templates::{self, Banner, MAC_LANE_FILE, QUEUE_FILE, ROOT_FILES};
 
 pub fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
@@ -667,7 +667,17 @@ fn ledger_size(root: &Path) -> Vec<String> {
 pub fn root_files(root: &Path, state: Option<&CampaignState>) -> Vec<Violation> {
     let mut out = tracked_runtime(root);
     let closed = state.is_some_and(|state| state.closed.is_some());
-    let banner = Banner::of(root, closed);
+    let banner = match Banner::of(root, closed) {
+        Ok(banner) => banner,
+        Err(error) => {
+            out.push(Violation::new(
+                QUEUE_FILE,
+                "queue-unreadable",
+                format!("{error}; restore readable OWNER-QUEUE.md before continuing"),
+            ));
+            Banner::Withheld
+        }
+    };
     for (name, _) in ROOT_FILES {
         if name == JOURNAL {
             continue;
@@ -713,12 +723,44 @@ fn open_track(out: &mut Vec<Violation>, target: &str, track: &Track) {
 
 pub fn unsealed(root: &Path) -> Vec<Violation> {
     let mut out = Vec::new();
-    if templates::queue_open_in(root) {
-        out.push(Violation::new(
+    match templates::queue_open_in(root) {
+        Ok(true) => out.push(Violation::new(
             QUEUE_FILE,
             "closed-queue",
             "OWNER-QUEUE.md has an open item; answer it or move it to the successor before the campaign closes",
-        ));
+        )),
+        Ok(false) => {}
+        Err(error) => out.push(Violation::new(
+            QUEUE_FILE,
+            "queue-unreadable",
+            format!("{error}; restore readable OWNER-QUEUE.md before continuing"),
+        )),
+    }
+    let mac_violations = crate::ledger::lint_mac_lane(root);
+    let invalid_mac_lane = !mac_violations.is_empty();
+    out.extend(mac_violations);
+    match crate::ledger::mac_lane_open(root) {
+        Ok(items) => {
+            for item in items {
+                out.push(
+                    Violation::new(
+                        MAC_LANE_FILE,
+                        "closed-mac-lane",
+                        format!(
+                            "item #{} ({}) is {}; close it with `cm mac-lane done {} --receipt <receipt>`, or copy it to the successor and stamp `**WITHDRAWN <date>: carried to <successor>**` after its number (replacing any leading status and preserving the title), keeping its number in place",
+                            item.number, item.title, item.state.name(), item.number,
+                        ),
+                    )
+                    .at(item.line),
+                );
+            }
+        }
+        Err(error) if !invalid_mac_lane => out.push(Violation::new(
+            MAC_LANE_FILE,
+            "mac-lane-unreadable",
+            format!("{error:#}; restore readable MAC-LANE.md before continuing"),
+        )),
+        Err(_) => {}
     }
     for dir in unit_dirs(root) {
         let Ok(unit) = store::load_unit(&dir) else {
@@ -761,6 +803,9 @@ pub fn lint_at(start: &Path, now: jiff::Timestamp) -> Result<Outcome> {
     violations.extend(root_files(&root, state.as_ref()));
     let units = unit_dirs(&root);
     violations.extend(crate::ledger::lint_feedback(&root));
+    if !state.as_ref().is_some_and(|state| state.closed.is_some()) {
+        violations.extend(crate::ledger::lint_mac_lane(&root));
+    }
     violations.extend(crate::review::lint_reviews(&root));
     violations.extend(orphan_units(&root));
     violations.extend(ignored(&root, &units));

@@ -274,6 +274,11 @@ enum Commands {
         #[command(subcommand)]
         act: QueueAct,
     },
+    /// File work only the owner's Mac can do as the next numbered MAC-LANE.md item, mark one done, or list the open ones.
+    MacLane {
+        #[command(subcommand)]
+        act: MacLaneAct,
+    },
     /// Write <step>/evidence/<NAME>.md once from a non-empty body.
     Evidence {
         /// <NN-name>/<unit>/<step>
@@ -499,6 +504,25 @@ enum QueueAct {
         #[arg(long, value_name = "FILE")]
         body_file: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum MacLaneAct {
+    /// Append `N. **<title>** <body>`, numbering on from the highest item.
+    Add {
+        title: String,
+        /// A file holding the body; `-` reads stdin.
+        #[arg(long, value_name = "FILE")]
+        body_file: Option<PathBuf>,
+    },
+    /// Stamp item N `**DONE <date>** (<receipt>).`, replacing a leading HELD, RUNNING or Receipt span.
+    Done {
+        number: u32,
+        #[arg(long)]
+        receipt: String,
+    },
+    /// List the open items: number, title and state (open, held or running).
+    List,
 }
 
 fn step_target(text: &str) -> Result<Target, String> {
@@ -832,6 +856,21 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             let body = read_body(body_file, None)?;
             crate::ledger::owner_queue_edit(host, &root()?, *number, &body)
         }
+        Commands::MacLane {
+            act: MacLaneAct::Add { title, body_file },
+        } => {
+            let body = body_file
+                .as_deref()
+                .map(|path| read_body(path, None))
+                .transpose()?;
+            crate::ledger::mac_lane_add(host, &root()?, title, body.as_deref().unwrap_or_default())
+        }
+        Commands::MacLane {
+            act: MacLaneAct::Done { number, receipt },
+        } => crate::ledger::mac_lane_done(host, &root()?, *number, receipt),
+        Commands::MacLane {
+            act: MacLaneAct::List,
+        } => crate::ledger::mac_lane_list(&root()?),
         Commands::Evidence {
             target,
             name,
@@ -951,6 +990,7 @@ fn name(command: &Commands) -> &'static str {
         Commands::Watch { .. } => "watch",
         Commands::Feedback { .. } => "feedback",
         Commands::OwnerQueue { .. } => "owner-queue",
+        Commands::MacLane { .. } => "mac-lane",
         Commands::Evidence { .. } => "evidence",
         Commands::Review { .. } => "review",
         Commands::Ruling { .. } => "ruling",

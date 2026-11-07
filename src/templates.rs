@@ -1,4 +1,5 @@
 use std::fs;
+use std::io;
 use std::path::Path;
 
 use crate::limits;
@@ -9,6 +10,7 @@ pub const RESUME: &str = include_str!("../templates/RESUME.md");
 pub const JOURNAL: &str = include_str!("../templates/JOURNAL.md");
 pub const LIMITS: &str = include_str!("../templates/LIMITS.toml");
 pub const OWNER_QUEUE: &str = include_str!("../templates/OWNER-QUEUE.md");
+pub const MAC_LANE: &str = include_str!("../templates/MAC-LANE.md");
 
 pub const ROOT_FILES: [(&str, &str); 4] = [
     ("RESUME.md", RESUME),
@@ -26,6 +28,8 @@ pub const RESUME_HEADINGS: [&str; 4] = [
 
 pub const QUEUE_FILE: &str = "OWNER-QUEUE.md";
 
+pub const MAC_LANE_FILE: &str = "MAC-LANE.md";
+
 pub const QUEUE_FIELDS: [&str; 3] = ["Context:", "Recommendation:", "Answer:"];
 
 pub const LOOP_WITHHELD: &str = "OWNER-QUEUE not drained: /loop withheld";
@@ -38,14 +42,14 @@ pub enum Banner {
 }
 
 impl Banner {
-    pub fn of(root: &Path, closed: bool) -> Banner {
-        if closed {
+    pub fn of(root: &Path, closed: bool) -> io::Result<Banner> {
+        Ok(if closed {
             Banner::Closed
-        } else if queue_open_in(root) {
+        } else if queue_open_in(root)? {
             Banner::Withheld
         } else {
             Banner::Loop
-        }
+        })
     }
 }
 
@@ -63,8 +67,12 @@ pub fn queue_open(queue: &str) -> bool {
     headings(queue).iter().any(|heading| heading.level == 2)
 }
 
-pub fn queue_open_in(root: &Path) -> bool {
-    fs::read_to_string(root.join(QUEUE_FILE)).is_ok_and(|queue| queue_open(&queue))
+pub fn queue_open_in(root: &Path) -> io::Result<bool> {
+    match fs::read_to_string(root.join(QUEUE_FILE)) {
+        Ok(queue) => Ok(queue_open(&queue)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn resume(text: &str, expected: Banner) -> Vec<Violation> {

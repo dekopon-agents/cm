@@ -1,3 +1,6 @@
+#[path = "support/campaign.rs"]
+mod campaign_fixture;
+
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -13,9 +16,6 @@ use cm::state::{Evidence, Lane, Phase};
 use cm::store::parse_target;
 use cm::templates::LOOP_WITHHELD;
 use jiff::Timestamp;
-
-#[path = "support/campaign.rs"]
-mod campaign_fixture;
 
 struct Fake;
 
@@ -710,7 +710,7 @@ fn owner_queue_numbers_increase_after_answering_the_highest_item_and_draining() 
                 .ok()
         );
     }
-    assert!(!cm::templates::queue_open_in(&c.root));
+    assert!(!cm::templates::queue_open_in(&c.root).unwrap());
     let added =
         ledger::owner_queue_add(&Fake, &c.root, &queue_fixture::item("After drain", "Yes."))
             .unwrap();
@@ -1215,4 +1215,483 @@ fn an_interrupted_first_review_journal_entry_can_be_recovered() {
     assert_eq!(recover_reviews(&root)["ok"], true);
     assert_eq!(review_entries(&root), 1);
     assert!(lint(&root).unwrap().ok());
+}
+
+const MAC_FIXTURE: &str = include_str!("fixtures/mac-lane/MAC-LANE.md");
+
+fn mac_lane(root: &Path) -> String {
+    fs::read_to_string(root.join("MAC-LANE.md")).unwrap()
+}
+
+fn card(root: &Path) -> String {
+    let next = cm::plan::Next {
+        paused: false,
+        ready: Vec::new(),
+        waiting: Vec::new(),
+    };
+    cm::render::card(root, Fake.now(), "c", &Default::default(), &next, &[])
+}
+
+#[test]
+fn mac_lane_add_numbers_on_and_indents_the_body() {
+    let fixture = campaign_fixture::campaign(&Fake);
+    let root = fixture.root.clone();
+    assert_eq!(
+        rules(&ledger::mac_lane_add(&Fake, &root, " ", "").unwrap()),
+        vec!["ledger-field"]
+    );
+    assert_eq!(
+        rules(&ledger::mac_lane_add(&Fake, &root, "a **b**", "").unwrap()),
+        vec!["mac-lane-title"]
+    );
+    assert!(!root.join("MAC-LANE.md").exists());
+    let added = ledger::mac_lane_add(&Fake, &root, "Mint the key", "").unwrap();
+    assert!(added.ok(), "{:?}", added.violations);
+    assert_eq!(added.fields["item"], 1);
+    let added = ledger::mac_lane_add(
+        &Fake,
+        &root,
+        "Re-save the script",
+        "Paste it.\n- Read back its sha256.\n\n- Update the State row.\n",
+    )
+    .unwrap();
+    assert_eq!(added.fields["item"], 2);
+    let text = mac_lane(&root);
+    assert!(text.starts_with("# Mac lane queue\n\n"));
+    assert!(text.ends_with(
+        ".\n\n1. **Mint the key**\n2. **Re-save the script** Paste it.\n    - Read back its sha256.\n\n    - Update the State row.\n"
+    ));
+    let journal = fs::read_to_string(root.join("JOURNAL.md")).unwrap();
+    assert!(journal.contains("mac-lane add 2. Re-save the script"));
+    fs::write(root.join("MAC-LANE.md"), MAC_FIXTURE).unwrap();
+    let added = ledger::mac_lane_add(&Fake, &root, "Next", "").unwrap();
+    assert_eq!(added.fields["item"], 8);
+    assert_eq!(mac_lane(&root), format!("{MAC_FIXTURE}8. **Next**\n"));
+    assert!(lint(&root).unwrap().ok());
+}
+
+#[test]
+fn mac_lane_done_replaces_an_open_status_and_refuses_a_second_done() {
+    let fixture = campaign_fixture::campaign(&Fake);
+    let root = fixture.root.clone();
+    assert_eq!(
+        rules(&ledger::mac_lane_done(&Fake, &root, 1, "r").unwrap()),
+        vec!["mac-lane-item"]
+    );
+    fs::write(root.join("MAC-LANE.md"), MAC_FIXTURE).unwrap();
+    for (number, rule) in [
+        (1, "mac-lane-closed"),
+        (2, "mac-lane-closed"),
+        (9, "mac-lane-item"),
+    ] {
+        assert_eq!(
+            rules(&ledger::mac_lane_done(&Fake, &root, number, "r").unwrap()),
+            vec![rule]
+        );
+    }
+    assert_eq!(
+        rules(&ledger::mac_lane_done(&Fake, &root, 5, "a\nb").unwrap()),
+        vec!["ledger-field"]
+    );
+    assert_eq!(mac_lane(&root), MAC_FIXTURE);
+    let done = ledger::mac_lane_done(&Fake, &root, 5, "script landed as abc1234").unwrap();
+    assert!(done.ok(), "{:?}", done.violations);
+    let held = "5. **HELD 2000-01-04; owner kept it held the same day** (starts";
+    let stamped = "5. **DONE 2026-10-23** (script landed as abc1234). (starts";
+    assert_eq!(mac_lane(&root), MAC_FIXTURE.replace(held, stamped));
+    assert_eq!(
+        rules(&ledger::mac_lane_done(&Fake, &root, 5, "again").unwrap()),
+        vec!["mac-lane-closed"]
+    );
+    for number in [4, 6, 7] {
+        assert!(
+            ledger::mac_lane_done(&Fake, &root, number, "r")
+                .unwrap()
+                .ok()
+        );
+    }
+    let text = mac_lane(&root);
+    assert!(text.contains(
+        "\n4. **DONE 2026-10-23** (r). The checks would never run. **After the sample restart"
+    ));
+    assert!(text.contains("\n6. **DONE 2026-10-23** (r). (owner go 17:44Z). **Second sample"));
+    assert!(text.ends_with(
+        "\n7. **DONE 2026-10-23** (r). **Store the sample configuration with the widget rule** (owner, 2000-01-04). Same steps as item 1.\n"
+    ));
+    let journal = fs::read_to_string(root.join("JOURNAL.md")).unwrap();
+    assert!(journal.contains("mac-lane done 5. Build `tools/sample-widget.sh`"));
+    assert!(lint(&root).unwrap().ok());
+}
+
+#[test]
+fn mac_lane_list_shows_open_items_with_their_state() {
+    let fixture = campaign_fixture::campaign(&Fake);
+    let root = fixture.root.clone();
+    let empty = ledger::mac_lane_list(&root).unwrap();
+    assert_eq!(empty.lines, vec!["no open Mac lane item"]);
+    fs::write(root.join("MAC-LANE.md"), MAC_FIXTURE).unwrap();
+    let listed = ledger::mac_lane_list(&root).unwrap();
+    assert_eq!(
+        listed.lines,
+        vec![
+            "4. After the sample restart (after the dry run) (held)",
+            "5. Build `tools/sample-widget.sh` (held)",
+            "6. Second sample widget matrix (running)",
+            "7. Store the sample configuration with the widget rule (open)",
+        ]
+    );
+    assert_eq!(
+        listed.to_json("mac-lane")["items"][1],
+        serde_json::json!({"item": 5, "state": "held", "title": "Build `tools/sample-widget.sh`"})
+    );
+}
+
+#[test]
+fn the_card_lists_open_mac_lane_items_only_when_there_are_some() {
+    let fixture = campaign_fixture::campaign(&Fake);
+    let root = fixture.root.clone();
+    assert!(!card(&root).contains("## Mac lane"));
+    fs::write(root.join("MAC-LANE.md"), MAC_FIXTURE).unwrap();
+    assert!(card(&root).contains(
+        "\n## Mac lane\n\n4 open items\n\n- #4 After the sample restart (after the dry run) (held)\n- #5 Build `tools/sample-widget.sh` (held)\n- #6 Second sample widget matrix (running)\n- #7 Store the sample configuration with the widget rule (open)\n\n## Next\n"
+    ));
+    let done = MAC_FIXTURE.split("\n4. ").next().unwrap().to_owned() + "\n";
+    fs::write(root.join("MAC-LANE.md"), done).unwrap();
+    assert!(!card(&root).contains("## Mac lane"));
+}
+
+#[test]
+fn close_refuses_an_open_mac_lane_item() {
+    let fixture = campaign_fixture::campaign(&Fake);
+    let root = fixture.root.clone();
+    assert!(
+        ledger::mac_lane_add(&Fake, &root, "Tick the setting", "")
+            .unwrap()
+            .ok()
+    );
+    assert_eq!(
+        rules(&commands::close(&Fake, &root).unwrap()),
+        vec!["closed-mac-lane"]
+    );
+    assert!(
+        ledger::mac_lane_done(&Fake, &root, 1, "ticked")
+            .unwrap()
+            .ok()
+    );
+    assert!(commands::close(&Fake, &root).unwrap().ok());
+}
+
+#[test]
+fn lint_checks_mac_lane_numbering_only() {
+    let fixture = campaign_fixture::campaign(&Fake);
+    let root = fixture.root.clone();
+    fs::write(root.join("MAC-LANE.md"), MAC_FIXTURE).unwrap();
+    assert!(lint(&root).unwrap().ok());
+    fs::write(
+        root.join("MAC-LANE.md"),
+        "# Mac lane queue\n\nIntro.\n\n2. **A**\n3. **B**\n3. **C**\n5. **D**\n6. anything at all\n",
+    )
+    .unwrap();
+    let linted = lint(&root).unwrap();
+    assert_eq!(
+        rules(&linted),
+        vec!["mac-lane-number", "mac-lane-number", "mac-lane-number"]
+    );
+    let lines: Vec<_> = linted.violations.iter().map(|v| v.line).collect();
+    assert_eq!(lines, vec![Some(5), Some(7), Some(8)]);
+}
+
+#[test]
+fn mac_lane_add_refuses_titles_that_would_be_parsed_as_statuses() {
+    let fixture = campaign_fixture::campaign(&Fake);
+    let root = &fixture.root;
+    let journal = fs::read(root.join("JOURNAL.md")).unwrap();
+    for title in [
+        "DONE checklist",
+        "WITHDRAWN sample",
+        "HELD request",
+        "RUNNING example",
+        "Receipt for sample",
+    ] {
+        let added = ledger::mac_lane_add(&Fake, root, title, "").unwrap();
+        assert_eq!(rules(&added), vec!["mac-lane-title"], "{title}");
+        assert!(!root.join("MAC-LANE.md").exists());
+        assert_eq!(fs::read(root.join("JOURNAL.md")).unwrap(), journal);
+    }
+}
+
+#[test]
+fn mac_lane_number_exhaustion_is_reported_without_writing() {
+    let fixture = campaign_fixture::campaign(&Fake);
+    let root = &fixture.root;
+    let text = "# Mac lane queue\n\n4294967295. **Sample**\n1. **Another**\n";
+    fs::write(root.join("MAC-LANE.md"), text).unwrap();
+    let journal = fs::read(root.join("JOURNAL.md")).unwrap();
+    let linted = ledger::lint_mac_lane(root);
+    assert_eq!(linted.len(), 2);
+    assert!(linted.iter().all(|v| v.rule == "mac-lane-number"));
+    let added = ledger::mac_lane_add(&Fake, root, "Next", "").unwrap();
+    assert_eq!(rules(&added), vec!["mac-lane-number"]);
+    assert_eq!(mac_lane(root), text);
+    assert_eq!(fs::read(root.join("JOURNAL.md")).unwrap(), journal);
+}
+
+#[test]
+fn unreadable_mac_lane_reports_errors_and_renders_lint_guidance() {
+    let fixture = campaign_fixture::campaign(&Fake);
+    let root = &fixture.root;
+    let path = root.join("MAC-LANE.md");
+    let state = fs::read(root.join(".cm/state.json")).unwrap();
+    let journal = fs::read(root.join("JOURNAL.md")).unwrap();
+    for directory in [false, true] {
+        if directory {
+            fs::create_dir(&path).unwrap();
+        } else {
+            fs::write(&path, b"# Mac lane queue\n\n1. **Pending** \xff\n").unwrap();
+        }
+        let error = ledger::mac_lane_open(root).err().unwrap();
+        assert!(error.downcast_ref::<io::Error>().is_some());
+        assert!(ledger::mac_lane_list(root).is_err());
+        assert!(
+            card(root)
+                .lines()
+                .any(|line| line == "Mac lane: invalid, see cm lint")
+        );
+        let linted = lint(root).unwrap();
+        assert_eq!(rules(&linted), vec!["mac-lane-unreadable"]);
+        assert_eq!(linted.violations[0].path, "MAC-LANE.md");
+        let closed = commands::close(&Fake, root).unwrap();
+        assert_eq!(rules(&closed), vec!["mac-lane-unreadable"]);
+        assert_eq!(fs::read(root.join(".cm/state.json")).unwrap(), state);
+        assert_eq!(fs::read(root.join("JOURNAL.md")).unwrap(), journal);
+        if directory {
+            fs::remove_dir(&path).unwrap();
+        } else {
+            fs::remove_file(&path).unwrap();
+        }
+    }
+}
+
+#[test]
+fn unreadable_owner_queue_blocks_banner_lint_and_close() {
+    let fixture = campaign_fixture::campaign(&Fake);
+    let root = &fixture.root;
+    let state = fs::read(root.join(".cm/state.json")).unwrap();
+    let journal = fs::read(root.join("JOURNAL.md")).unwrap();
+    fs::write(
+        root.join("OWNER-QUEUE.md"),
+        b"# Owner queue\n\n## Pending\n\xff\n",
+    )
+    .unwrap();
+    assert_eq!(
+        cm::templates::queue_open_in(root).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert!(cm::templates::Banner::of(root, false).is_err());
+    assert!(
+        lint(root)
+            .unwrap()
+            .violations
+            .iter()
+            .any(|v| v.rule == "queue-unreadable" && v.path == "OWNER-QUEUE.md")
+    );
+    assert_eq!(
+        rules(&commands::close(&Fake, root).unwrap()),
+        vec!["queue-unreadable"]
+    );
+    assert_eq!(fs::read(root.join(".cm/state.json")).unwrap(), state);
+    assert_eq!(fs::read(root.join("JOURNAL.md")).unwrap(), journal);
+}
+
+#[test]
+fn mac_lane_prose_and_indented_steps_are_item_text() {
+    let fixture = campaign_fixture::campaign(&Fake);
+    let root = &fixture.root;
+    for prose in [
+        "2000 was the year (see below).",
+        "   2000-01-02: sample continuation.",
+        "1.5 GiB left",
+        "   1. step",
+        " 1. indented request",
+        "  2. indented request",
+        "  999999999999999999999999999999. indented request",
+        "2x. sample",
+        "-2. sample",
+        "2) sample",
+        "2.sample",
+    ] {
+        let text = format!(
+            "# Mac lane queue\n\n1. **Request**\n{prose}\n2. **DONE 2000-01-01** **Earlier**\n"
+        );
+        fs::write(root.join("MAC-LANE.md"), &text).unwrap();
+        assert!(lint(root).unwrap().ok(), "{prose}");
+        let listed = ledger::mac_lane_list(root).unwrap();
+        assert_eq!(
+            listed.fields["items"],
+            serde_json::json!([{"item": 1, "state": "open", "title": "Request"}]),
+            "{prose}"
+        );
+        let added = ledger::mac_lane_add(&Fake, root, "Next", "").unwrap();
+        assert_eq!(added.fields["item"], 3, "{prose}");
+        assert_eq!(mac_lane(root), format!("{text}3. **Next**\n"));
+    }
+}
+
+#[test]
+fn overflowing_mac_lane_numbers_are_reported_before_any_write() {
+    let fixture = campaign_fixture::campaign(&Fake);
+    let root = &fixture.root;
+    let state = fs::read(root.join(".cm/state.json")).unwrap();
+    let journal = fs::read(root.join("JOURNAL.md")).unwrap();
+    for heading in [
+        "4294967296. **Pending**",
+        "999999999999999999999999999999. **Pending**",
+        "4294967296.",
+    ] {
+        let text = format!("# Mac lane queue\n\n1. **DONE 2000-01-01** **Earlier**\n{heading}\n");
+        fs::write(root.join("MAC-LANE.md"), &text).unwrap();
+        let linted = lint(root).unwrap();
+        assert_eq!(rules(&linted), vec!["mac-lane-number"], "{heading}");
+        assert_eq!(linted.violations[0].line, Some(4));
+        let listed = ledger::mac_lane_list(root).unwrap();
+        assert_eq!(rules(&listed), vec!["mac-lane-number"]);
+        assert!(
+            card(root)
+                .lines()
+                .any(|line| line == "Mac lane: invalid, see cm lint")
+        );
+        assert_eq!(
+            rules(&commands::close(&Fake, root).unwrap()),
+            vec!["mac-lane-number"]
+        );
+        assert_eq!(
+            rules(&ledger::mac_lane_add(&Fake, root, "Next", "").unwrap()),
+            vec!["mac-lane-number"]
+        );
+        assert_eq!(
+            rules(&ledger::mac_lane_done(&Fake, root, 1, "receipt").unwrap()),
+            vec!["mac-lane-number"]
+        );
+        assert_eq!(mac_lane(root), text);
+        assert_eq!(fs::read(root.join(".cm/state.json")).unwrap(), state);
+        assert_eq!(fs::read(root.join("JOURNAL.md")).unwrap(), journal);
+    }
+}
+
+#[test]
+fn close_names_every_open_mac_lane_item_and_keeps_the_numbers() {
+    let fixture = campaign_fixture::campaign(&Fake);
+    let root = &fixture.root;
+    fs::write(
+        root.join("MAC-LANE.md"),
+        "# Mac lane queue\n\n1. **First request**\n2. **Second request**\n",
+    )
+    .unwrap();
+    let closed = commands::close(&Fake, root).unwrap();
+    assert_eq!(rules(&closed), vec!["closed-mac-lane"; 2]);
+    for (index, title) in ["First request", "Second request"].iter().enumerate() {
+        let violation = &closed.violations[index];
+        assert_eq!(violation.line, Some(index + 3));
+        assert!(
+            violation
+                .message
+                .contains(&format!("item #{} ({title})", index + 1))
+        );
+        assert!(violation.message.contains(&format!(
+            "cm mac-lane done {} --receipt <receipt>",
+            index + 1
+        )));
+        assert!(
+            violation
+                .message
+                .contains("**WITHDRAWN <date>: carried to <successor>**")
+        );
+        assert!(violation.message.contains("keeping its number in place"));
+    }
+    assert!(
+        ledger::mac_lane_done(&Fake, root, 1, "finished")
+            .unwrap()
+            .ok()
+    );
+    let text = mac_lane(root).replace(
+        "2. **Second request**",
+        "2. **WITHDRAWN 2000-01-01: carried to sample successor** **Second request**",
+    );
+    fs::write(root.join("MAC-LANE.md"), text).unwrap();
+    assert!(ledger::lint_mac_lane(root).is_empty());
+    assert!(commands::close(&Fake, root).unwrap().ok());
+}
+
+#[test]
+fn card_bounds_mac_lane_rows_and_normalizes_titles() {
+    let fixture = campaign_fixture::campaign(&Fake);
+    let root = &fixture.root;
+    let long = "é".repeat(100);
+    let mut text =
+        format!("# Mac lane queue\n\n1. **One\tTwo\u{001b}Three\nFour**\n2. **{long}**\n");
+    for number in 3..=15 {
+        text.push_str(&format!("{number}. **Request {number}**\n"));
+    }
+    fs::write(root.join("MAC-LANE.md"), text).unwrap();
+    let rendered = card(root);
+    let section = rendered
+        .split("## Mac lane\n\n")
+        .nth(1)
+        .unwrap()
+        .split("\n## Next")
+        .next()
+        .unwrap();
+    assert!(section.starts_with("15 open items\n\n"));
+    let rows: Vec<_> = section
+        .lines()
+        .filter(|line| line.starts_with("- #"))
+        .collect();
+    assert_eq!(rows.len(), 10);
+    assert_eq!(rows[0], "- #1 One Two Three Four (open)");
+    assert_eq!(rows[1], format!("- #2 {} (open)", "é".repeat(80)));
+    assert_eq!(rows[9], "- #10 Request 10 (open)");
+    assert!(
+        section
+            .lines()
+            .any(|line| line == "- … and 5 more: see MAC-LANE.md")
+    );
+}
+
+#[test]
+fn mac_lane_done_on_empty_headings_keeps_them_parseable_and_prints_the_number() {
+    let fixture = campaign_fixture::campaign(&Fake);
+    let root = &fixture.root;
+    for heading in [
+        "1.",
+        "1.\n",
+        "1.\r\n",
+        "1. \n",
+        "1. **HELD 2000-01-01**\n",
+        "1. **RUNNING 2000-01-01**   \n",
+        "1. **RUNNING 2000-01-01**   \n    Sample body.\n",
+    ] {
+        fs::write(
+            root.join("MAC-LANE.md"),
+            format!("# Mac lane queue\n\n{heading}"),
+        )
+        .unwrap();
+        let done = ledger::mac_lane_done(&Fake, root, 1, "receipt").unwrap();
+        assert!(done.ok(), "{heading:?}: {:?}", done.violations);
+        assert_eq!(done.lines, vec!["1: **DONE 2026-10-23** (receipt)."]);
+        let text = mac_lane(root);
+        assert_eq!(
+            text.lines().nth(2),
+            Some("1. **DONE 2026-10-23** (receipt).")
+        );
+        let items = ledger::mac_lane_items(&text).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].state, ledger::MacState::Done, "{heading:?}");
+        assert!(ledger::lint_mac_lane(root).is_empty());
+        assert!(
+            done.fields["journal"]
+                .as_str()
+                .unwrap()
+                .ends_with("mac-lane done 1")
+        );
+    }
 }

@@ -378,6 +378,45 @@ pub fn card(
             )
         })
         .collect();
+    match crate::ledger::mac_lane_open(root) {
+        Ok(mac) if crate::ledger::lint_mac_lane(root).is_empty() => {
+            if !mac.is_empty() {
+                let mut rows = vec![
+                    format!(
+                        "{} open {}",
+                        mac.len(),
+                        if mac.len() == 1 { "item" } else { "items" }
+                    ),
+                    String::new(),
+                ];
+                rows.extend(mac.iter().take(10).map(|item| {
+                    let title: String = item
+                        .title
+                        .chars()
+                        .map(|character| {
+                            if character.is_whitespace() || character.is_control() {
+                                ' '
+                            } else {
+                                character
+                            }
+                        })
+                        .take(80)
+                        .collect();
+                    format!("- #{} {} ({})", item.number, title, item.state.name())
+                }));
+                if mac.len() > 10 {
+                    rows.push(format!("- … and {} more: see MAC-LANE.md", mac.len() - 10));
+                }
+                section(&mut out, "Mac lane", &rows, "");
+            }
+        }
+        Ok(_) | Err(_) => section(
+            &mut out,
+            "Mac lane",
+            &["Mac lane: invalid, see cm lint".to_owned()],
+            "",
+        ),
+    }
     section(&mut out, "Next", &ready, "Nothing is launchable.");
     section(&mut out, "Waiting", &waiting, "Nothing waits.");
     section(&mut out, "In flight", &flight, "Nothing is in flight.");
