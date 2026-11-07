@@ -747,6 +747,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 tag: tag.clone(),
                 digest: digest.clone(),
                 file: None,
+                merged_at: None,
             };
             let file = file.as_deref().map(|file| under_root(cli, file));
             let forge = crate::forge::Gh::default();

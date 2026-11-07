@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::evidence::CampaignFile;
 use crate::forge::{GithubRepo, TagName};
 
-pub const SCHEMA: u32 = 4;
+pub const SCHEMA: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -117,6 +117,8 @@ impl std::str::FromStr for Phase {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Evidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<String>,
@@ -135,6 +137,7 @@ impl Evidence {
 
     pub fn absorb(&mut self, other: &Evidence) {
         for (mine, theirs) in [
+            (&mut self.merged_at, &other.merged_at),
             (&mut self.sha, &other.sha),
             (&mut self.pr, &other.pr),
             (&mut self.tag, &other.tag),
@@ -153,6 +156,7 @@ impl Evidence {
         let parts: Vec<String> = [
             ("pr", &self.pr),
             ("sha", &self.sha),
+            ("merged_at", &self.merged_at),
             ("tag", &self.tag),
             ("digest", &self.digest),
         ]
@@ -204,7 +208,7 @@ impl Flag {
 pub fn evidence_for(phase: &Phase, finish: Finish) -> (&'static [Flag], &'static [Flag]) {
     match (phase, finish) {
         (Phase::PrOpen, _) => (&[Flag::Pr, Flag::Sha], &[]),
-        (Phase::Merged, _) => (&[Flag::Sha], &[]),
+        (Phase::Merged, _) => (&[Flag::Sha], &[Flag::Pr]),
         (Phase::Released, _) => (&[Flag::Tag], &[Flag::Digest]),
         (Phase::Deployed, _) => (&[Flag::Digest], &[]),
         (Phase::Done, Finish::Evidence) | (Phase::Superseded, _) => (&[Flag::File], &[]),

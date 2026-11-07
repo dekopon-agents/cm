@@ -5,7 +5,7 @@ use std::process::Command;
 use anyhow::Result;
 
 use crate::evidence::CampaignFile;
-use crate::forge::{CheckState, CommitSha, Forge, GithubRepo, TagName, ci_green};
+use crate::forge::{CheckState, CommitSha, Forge, GithubRepo, PullState, TagName, ci_green};
 use crate::host::{Host, stamp};
 use crate::journal;
 use crate::limits::{self, Limits};
@@ -671,8 +671,22 @@ pub fn close(host: &dyn Host, root: &Path) -> Result<Outcome> {
     let mut campaign = store::load_campaign(root)?;
     let mut violations = journal::check(root, &campaign);
     violations.extend(closed(root, &campaign));
+    let mut body = String::from(
+        "- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n",
+    );
     for dir in lint::unit_dirs(root) {
-        store::load_unit(&dir)?;
+        let unit = store::load_unit(&dir)?;
+        for moved in unit
+            .history
+            .iter()
+            .filter(|moved| moved.to == Phase::Merged)
+        {
+            body.push_str(&format!(
+                "- merged: {} at {}\n",
+                moved.target,
+                moved.evidence.merged_at.as_deref().unwrap_or(&moved.at)
+            ));
+        }
     }
     violations.extend(lint::unsealed(root));
     if !violations.is_empty() {
@@ -681,12 +695,7 @@ pub fn close(host: &dyn Host, root: &Path) -> Result<Outcome> {
     let at = stamp(host.now());
     campaign.closed = Some(at.clone());
     write_json(&state_path(root), &campaign)?;
-    let heading = record(
-        root,
-        &at,
-        "cm close",
-        "- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n",
-    )?;
+    let heading = record(root, &at, "cm close", &body)?;
     let mut outcome = Outcome::default();
     outcome.field("closed", at);
     outcome.field("journal", heading.clone());
@@ -1161,6 +1170,7 @@ impl MergeGate<'_> {
 /// What GitHub says of a PR for its merge gate, read before cm takes the lock.
 struct GithubRead {
     pr: String,
+    merged_at: Option<String>,
     head: String,
     base: Option<String>,
     checks: Result<Vec<CheckState>, String>,
@@ -1238,6 +1248,10 @@ fn read_github(
     };
     GithubRead {
         pr: pr.to_owned(),
+        merged_at: pull
+            .ok()
+            .filter(|pull| pull.state == PullState::Merged)
+            .and_then(|pull| pull.merged_at),
         head,
         base,
         checks,
@@ -1481,7 +1495,7 @@ pub fn advance_gated(
         .then(|| store::load_unit(&root.join(&target.unit)).ok())
         .flatten()
         .and_then(|unit| unit.steps.get(target.step.as_deref()?).cloned())
-        .filter(|step| step.lane == Some(Lane::Codex))
+        .filter(|step| step.lane == Some(Lane::Codex) || given.pr.is_some())
         .and_then(|step| {
             let track = match part {
                 Some(part) => step.parts.get(part)?,
@@ -1490,10 +1504,11 @@ pub fn advance_gated(
             if track.state == Phase::Merged
                 && part.is_none()
                 && Release::of_target(&step_full).is_some()
+                && given.pr.is_none()
             {
                 return None;
             }
-            let pr = track.evidence.pr.as_deref()?;
+            let pr = given.pr.as_deref().or(track.evidence.pr.as_deref())?;
             let units = plan::load_units(root).ok()?;
             let standing = crate::holds::standing_names(&units, &step.known_red);
             Some(read_github(
@@ -1698,6 +1713,12 @@ pub fn advance_gated(
     };
     let mut evidence = given.clone();
     evidence.file = None;
+    evidence.merged_at = read
+        .as_ref()
+        .filter(|read| {
+            Some(read.pr.as_str()) == given.pr.as_deref().or(track.evidence.pr.as_deref())
+        })
+        .and_then(|read| read.merged_at.clone());
     if let Some(file) = file {
         match CampaignFile::resolve(root, file) {
             Ok(found) => {
@@ -1732,6 +1753,16 @@ pub fn advance_gated(
             &full,
             "evidence-pr",
             format!("`{pr}` is not https://github.com/<owner>/<repo>/pull/<number>"),
+        ));
+    }
+    if *to == Phase::Merged
+        && let (Some(given), Some(recorded)) = (&given.pr, &track.evidence.pr)
+        && given != recorded
+    {
+        violations.push(Violation::new(
+            &full,
+            "evidence-pr",
+            format!("{given} is not the recorded PR {recorded}"),
         ));
     }
     if let Some(digest) = &given.digest
@@ -1930,7 +1961,7 @@ pub fn advance_gated(
                             root,
                         );
                     }
-                    None if remerge => step.track.evidence.sha.clone_from(&evidence.sha),
+                    None if remerge => step.track.evidence.absorb(&evidence),
                     None => step.track.apply(to.clone(), &at, &evidence),
                 }
                 step.waived.append(&mut waived);

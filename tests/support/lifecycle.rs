@@ -37,3 +37,24 @@ impl Campaign {
         commands::write_unit(&dir, &unit).unwrap();
     }
 }
+
+pub const MERGED_AT: &str = "2026-10-08T07:15:42Z";
+
+pub fn merged_pull(sha: &str, merged_at: Option<&str>) -> super::support::FakeGh {
+    let mut pull = serde_json::json!({
+        "state": "closed", "merged": true, "merge_commit_sha": sha,
+        "head": { "sha": sha },
+    });
+    if let Some(merged_at) = merged_at {
+        pull["merged_at"] = merged_at.into();
+    }
+    super::support::FakeGh::new(&format!(
+        r#"case "$2" in
+  repos/o/r/pulls/7) echo '{pull}' ;;
+  */check-runs*) echo '{{"total_count":0,"check_runs":[]}}' ;;
+  */status*) echo '{{"total_count":0,"statuses":[]}}' ;;
+  *) exit 1 ;;
+esac
+"#
+    ))
+}

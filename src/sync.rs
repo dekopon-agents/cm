@@ -436,6 +436,7 @@ impl<'a> Run<'a> {
                 Ok(Pull {
                     state: PullState::Merged,
                     merge_commit: Some(sha),
+                    merged_at,
                     head,
                     base,
                     ..
@@ -458,6 +459,7 @@ impl<'a> Run<'a> {
                             Phase::Merged,
                             Evidence {
                                 sha: Some(sha.to_string()),
+                                merged_at,
                                 ..Evidence::default()
                             },
                         );

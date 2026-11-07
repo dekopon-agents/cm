@@ -53,6 +53,7 @@ fn at(now: &str) -> Fake {
 struct FakeForge {
     head: String,
     state: PullState,
+    merged_at: Option<String>,
     mergeable: &'static str,
     checks: Vec<(&'static str, &'static str)>,
     down: bool,
@@ -66,6 +67,7 @@ impl FakeForge {
         FakeForge {
             head: head.to_owned(),
             state: PullState::Open,
+            merged_at: None,
             mergeable: "clean",
             checks: checks.to_vec(),
             down: false,
@@ -86,6 +88,7 @@ impl Forge for FakeForge {
         }
         Ok(Pull {
             state: self.state,
+            merged_at: self.merged_at.clone(),
             merge_commit: (self.state == PullState::Merged)
                 .then(|| CommitSha::new(self.head.clone())),
             head: Some(CommitSha::new(self.head.clone())),
@@ -1621,27 +1624,107 @@ fn followups_list_every_non_blocking_finding_and_close_one() {
 
 #[test]
 fn sync_holds_a_codex_merge_at_pr_open_until_its_gate_holds() {
-    let host = at("2026-10-25T06:00:00Z");
-    let c = campaign(&host, true);
-    let head = c.head();
-    let merged = FakeForge {
-        state: PullState::Merged,
-        ..FakeForge::open(&head, &[("fmt, clippy, test", "success")])
-    };
-    let held = sync(&host, &merged, &c.root).unwrap();
-    assert_eq!(
-        rules(&held),
-        vec!["merge-gate", "merge-gate"],
-        "{:?}",
-        held.violations
-    );
-    assert_eq!(c.state(), Phase::PrOpen);
-    let accept = c.report("astra-review-7", &head, &[], "ACCEPT");
-    c.receipt("astra-review-7", &head, "gpt-6-astra", "xhigh");
-    assert!(record(&host, &c, &accept, "astra").ok());
-    let moved = sync(&host, &merged, &c.root).unwrap();
-    assert!(moved.ok(), "{:?}", moved.violations);
-    assert_eq!(c.state(), Phase::Merged);
+    for merged_at in [Some(review_fixture::MERGED_AT), None] {
+        let host = at("2026-10-25T06:00:00Z");
+        let c = campaign(&host, true);
+        let head = c.head();
+        let merged = FakeForge {
+            state: PullState::Merged,
+            merged_at: merged_at.map(str::to_owned),
+            ..FakeForge::open(&head, &[("fmt, clippy, test", "success")])
+        };
+        let held = sync(&host, &merged, &c.root).unwrap();
+        assert_eq!(
+            rules(&held),
+            vec!["merge-gate", "merge-gate"],
+            "{:?}",
+            held.violations
+        );
+        assert_eq!(c.state(), Phase::PrOpen);
+        let accept = c.report("astra-review-7", &head, &[], "ACCEPT");
+        c.receipt("astra-review-7", &head, "gpt-6-astra", "xhigh");
+        assert!(record(&host, &c, &accept, "astra").ok());
+        let later = at("2026-10-25T07:00:00Z");
+        let moved = sync(&later, &merged, &c.root).unwrap();
+        assert!(moved.ok(), "{:?}", moved.violations);
+        assert_eq!(c.state(), Phase::Merged);
+        let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+        let track = &unit.steps["S1"].track;
+        assert_eq!(track.evidence.merged_at.as_deref(), merged_at);
+        assert_eq!(track.since, cm::host::stamp(later.now()));
+        assert_eq!(
+            unit.history.last().unwrap().evidence.merged_at.as_deref(),
+            merged_at
+        );
+        // A later sync with no moves still shows the stored merge date on the card.
+        assert!(sync(&later, &merged, &c.root).unwrap().ok());
+        let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+        assert_eq!(
+            card.lines()
+                .find(|line| line.starts_with("- `01-a/u/S1` merged since ")),
+            Some(
+                format!(
+                    "- `{STEP}` merged since {}",
+                    merged_at.unwrap_or(&track.since)
+                )
+                .as_str()
+            ),
+        );
+    }
+}
+
+#[test]
+fn advance_merged_with_pr_records_github_merge_time() {
+    for (state, reported, expected) in [
+        (
+            PullState::Merged,
+            Some(review_fixture::MERGED_AT),
+            Some(review_fixture::MERGED_AT),
+        ),
+        (PullState::Merged, None, None),
+        (PullState::Open, Some(review_fixture::MERGED_AT), None),
+    ] {
+        let host = at("2026-10-25T06:00:00Z");
+        let c = campaign(&host, true);
+        let head = c.head();
+        let report = c.report("astra-review-7", &head, &[], "ACCEPT");
+        c.receipt("astra-review-7", &head, "gpt-6-astra", "xhigh");
+        assert!(record(&host, &c, &report, "astra").ok());
+        let forge = FakeForge {
+            state,
+            merged_at: reported.map(str::to_owned),
+            ..FakeForge::open(&head, &[("test", "success")])
+        };
+        let later = at("2026-10-25T07:00:00Z");
+        let moved = commands::advance_gated(
+            &later,
+            &c.root,
+            &target(),
+            commands::Advance {
+                to: &Phase::Merged,
+                given: &Evidence {
+                    sha: Some(head),
+                    pr: Some(PR.into()),
+                    ..Evidence::default()
+                },
+                file: None,
+                repo: Some(&c.repo),
+                part: None,
+            },
+            &MergeGate {
+                forge: Some(&forge),
+                ..MergeGate::default()
+            },
+        )
+        .unwrap();
+        assert!(moved.ok(), "{:?}", moved.violations);
+        let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+        assert_eq!(
+            unit.steps["S1"].track.evidence.merged_at.as_deref(),
+            expected
+        );
+        assert_eq!(unit.steps["S1"].track.since, cm::host::stamp(later.now()));
+    }
 }
 
 #[test]
