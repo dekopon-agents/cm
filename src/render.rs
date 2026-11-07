@@ -324,7 +324,7 @@ pub fn card(
                         .strip_prefix("until:")
                         .map(|condition| crate::plan::block_met(root, units, unit, condition));
                     let command = if met == Some(false) {
-                        format!("cm next {target}")
+                        "cm next".to_owned()
                     } else {
                         crate::plan::unblock_command(&target)
                     };

@@ -229,8 +229,9 @@ their gates, or `cm amend --kickoff-file` when the kickoff is missing. Stalled l
 worker and coordinator session placeholders. Tags offer `cm sync` to observe the tag after
 it is cut. Stale evidence offers `cm evidence` with a fresh name and body, pinned to the current
 candidate and harness heads, or named SHA inputs when no head resolves. A revision whose step
-became multipart also names the required part input. An `until:` block offers `cm next <step>`
-while its condition is unmet, then `cm unblock` once it holds; free-text blocks offer `cm unblock`.
+became multipart also names the required part input. An `until:` block offers `cm next`
+while its condition is unmet; that command lists the unblock action once it holds. Free-text
+blocks offer `cm unblock`.
 
 ### Finishing
 

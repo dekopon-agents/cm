@@ -459,7 +459,7 @@ fn card_rechecks_unmet_until_blocks_and_unblocks_satisfied_or_free_text_blocks()
         (
             "until:owner-queue:1",
             "# Owner queue\n\n## 1. Decision\n",
-            "cm next 01-a/u/park",
+            "cm next",
         ),
         (
             "until:owner-queue:1",
@@ -505,6 +505,27 @@ fn card_rechecks_unmet_until_blocks_and_unblocks_satisfied_or_free_text_blocks()
             blocked.trim().ends_with(&format!(" — `{command}`")),
             "{card}"
         );
+        #[cfg(unix)]
+        if command == "cm next" {
+            let printed = blocked
+                .trim()
+                .rsplit_once(" — `")
+                .unwrap()
+                .1
+                .strip_suffix('`')
+                .unwrap();
+            assert_eq!(
+                c.run_next_command(printed)["unblock_now"],
+                serde_json::json!([])
+            );
+            fs::write(c.root.join("OWNER-QUEUE.md"), "# Owner queue\n").unwrap();
+            let next = c.run_next_command(printed);
+            assert_eq!(next["unblock_now"][0]["target"], "01-a/u/park");
+            assert_eq!(
+                next["unblock_now"][0]["command"],
+                "cm unblock 01-a/u/park --evidence '<unblock-evidence-file>'"
+            );
+        }
     }
 }
 
@@ -3813,7 +3834,7 @@ fn blocked_until_epoch_reads_crlf_and_requires_an_exact_closing_delimiter() {
                 if met {
                     format!("cm unblock {target} --evidence '<unblock-evidence-file>'")
                 } else {
-                    format!("cm next {target}")
+                    "cm next".to_owned()
                 }
             )
         );
