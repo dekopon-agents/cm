@@ -33,6 +33,50 @@ pub fn campaign(host: &dyn Host) -> Campaign {
 }
 
 impl Campaign {
+    pub fn files(&self) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(
+            root: &Path,
+            dir: &Path,
+            files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+        ) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path == root.join(".git") {
+                    continue;
+                }
+                if entry.file_type().unwrap().is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut files = std::collections::BTreeMap::new();
+        visit(&self.root, &self.root, &mut files);
+        files
+    }
+
+    /// A synthetic release declaration from before release tags were persisted.
+    pub fn legacy_release(&self, host: &dyn Host, full: &str) {
+        let target = cm::store::parse_target(full, true).unwrap();
+        assert!(cm::state::Release::of_target(full).is_some());
+        let at = cm::host::stamp(host.now());
+        let mut unit = cm::state::UnitState::new(&target.unit, &at);
+        unit.schema = 1;
+        let mut step = cm::state::Step::new(&at);
+        step.lane = Some(cm::state::Lane::Pi);
+        unit.steps.insert(target.step.unwrap(), step);
+        let dir = self.root.join(target.unit);
+        fs::create_dir_all(dir.join(cm::store::CM_DIR)).unwrap();
+        fs::create_dir_all(self.root.join(full)).unwrap();
+        cm::store::write_json(&cm::store::state_path(&dir), &unit).unwrap();
+        fs::write(dir.join(cm::store::UNIT_STATE), cm::render::unit(&unit)).unwrap();
+    }
+
     pub fn kickoff(&self, target: &str, text: &str) {
         fs::create_dir_all(self.root.join(target)).unwrap();
         fs::write(self.root.join(target).join("kickoff.md"), text).unwrap();

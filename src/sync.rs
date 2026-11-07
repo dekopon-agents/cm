@@ -142,7 +142,12 @@ impl<'a> Run<'a> {
         for (unit_name, unit) in self.units.iter_mut() {
             for (name, step) in unit.steps.iter_mut() {
                 let target = format!("{unit_name}/{name}");
-                for (from, to) in step.roll_up_all(&self.at, &Evidence::default(), self.root) {
+                for (from, to) in step.roll_up_all(
+                    Release::of_target(&target).is_some(),
+                    &self.at,
+                    &Evidence::default(),
+                    self.root,
+                ) {
                     unit.history.push(Move {
                         at: self.at.clone(),
                         target: target.clone(),
@@ -221,7 +226,7 @@ impl<'a> Run<'a> {
         let Some(step) = unit.steps.get_mut(step_name) else {
             return;
         };
-        let finish = step.finish();
+        let finish = step.finish(Release::of_target(target).is_some());
         let (track, name) = match part {
             Some(part) => match step.parts.get_mut(part) {
                 Some(track) => (track, format!("{target}#{part}")),
@@ -241,7 +246,12 @@ impl<'a> Run<'a> {
             evidence: evidence.clone(),
         }];
         if part.is_some() {
-            for (from, to) in step.roll_up_all(&self.at, &evidence, self.root) {
+            for (from, to) in step.roll_up_all(
+                Release::of_target(target).is_some(),
+                &self.at,
+                &evidence,
+                self.root,
+            ) {
                 moved.push(Moved {
                     target: target.to_owned(),
                     from,

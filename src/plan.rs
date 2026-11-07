@@ -89,7 +89,9 @@ pub fn gate(units: &Units, after: &After) -> Gate {
     Gate {
         after: after.clone(),
         track: target.map(|step| step.track.clone()),
-        finish: target.map_or(Finish::Shipped, Step::finish),
+        finish: target.map_or(Finish::Shipped, |step| {
+            step.finish(Release::of_target(&after.target()).is_some())
+        }),
         stale: target
             .map(|step| {
                 stale_evidence(units, step)

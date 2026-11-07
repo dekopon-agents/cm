@@ -8,7 +8,7 @@ use cm::commands;
 use cm::host::Host;
 use cm::lint::lint;
 use cm::outcome::Outcome;
-use cm::state::{Evidence, Phase, UnitState};
+use cm::state::{After, Evidence, Lane, Phase, UnitState};
 use cm::store::{self, Target, parse_target};
 use jiff::Timestamp;
 
@@ -977,5 +977,362 @@ fn kickoff_inputs_accept_the_byte_limit_and_refuse_larger_files_and_stdin() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn coordinator_steps_without_a_pr_finish_with_evidence_from_drafted_and_launched() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    for launched in [false, true] {
+        let c = campaign(&host);
+        let step = "01-first/alpha/BUILD";
+        let declared = commands::declare(
+            &host,
+            &c.root.join(step),
+            &commands::Declaration {
+                lane: Some(Lane::Coordinator),
+                ..commands::Declaration::default()
+            },
+        )
+        .unwrap();
+        assert!(declared.ok(), "{:?}", declared.violations);
+        c.kickoff(step, "Go.\n");
+        if launched {
+            assert!(
+                commands::launch(&host, &c.root, &target(step), None)
+                    .unwrap()
+                    .ok()
+            );
+        }
+        let missing = advance(&host, &c, step, "done", Evidence::default());
+        assert_eq!(rules(&missing), vec!["evidence-missing"]);
+        let file = c.root.join(step).join("result.md");
+        fs::write(&file, "Completed.\n").unwrap();
+        let finished = commands::advance(
+            &host,
+            &c.root,
+            &target(step),
+            &Phase::Done,
+            &Evidence::default(),
+            Some(&file),
+            None,
+        )
+        .unwrap();
+        assert!(finished.ok(), "{:?}", finished.violations);
+        let unit = store::load_unit(&c.root.join("01-first/alpha")).unwrap();
+        assert_eq!(unit.steps["BUILD"].track.state, Phase::Done);
+        assert_eq!(
+            unit.steps["BUILD"]
+                .track
+                .evidence
+                .file
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "01-first/alpha/BUILD/result.md"
+        );
+    }
+}
+
+#[test]
+fn coordinator_release_and_codex_steps_keep_the_code_completion_ladder() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    for (step, lane, legacy) in [
+        ("00-release/cm/1.0.0", Lane::Coordinator, false),
+        ("00-release/cm/1.0.0", Lane::Coordinator, true),
+        ("01-first/alpha/BUILD", Lane::Codex, false),
+    ] {
+        for launched in [false, true] {
+            let c = campaign(&host);
+            if legacy {
+                c.legacy_release(&host, step);
+                let amended = commands::amend(
+                    &host,
+                    &c.root,
+                    &target(step),
+                    &commands::Amendment {
+                        lane: Some(lane),
+                        ..commands::Amendment::default()
+                    },
+                )
+                .unwrap();
+                assert!(amended.ok(), "{:?}", amended.violations);
+                let unit = store::load_unit(&c.root.join(target(step).unit)).unwrap();
+                assert!(unit.steps["1.0.0"].tag.is_none());
+            } else {
+                assert!(
+                    commands::declare(
+                        &host,
+                        &c.root.join(step),
+                        &commands::Declaration {
+                            lane: Some(lane),
+                            ..commands::Declaration::default()
+                        },
+                    )
+                    .unwrap()
+                    .ok()
+                );
+            }
+            c.kickoff(step, "Go.\n");
+            if launched {
+                assert!(
+                    commands::launch(&host, &c.root, &target(step), None)
+                        .unwrap()
+                        .ok()
+                );
+            }
+            let file = c.root.join(step).join("result.md");
+            fs::write(&file, "Completed.\n").unwrap();
+            let refused = commands::advance(
+                &host,
+                &c.root,
+                &target(step),
+                &Phase::Done,
+                &Evidence::default(),
+                Some(&file),
+                None,
+            )
+            .unwrap();
+            assert_eq!(rules(&refused), vec!["done-code-step"], "{step}");
+            let unit = store::load_unit(&c.root.join(target(step).unit)).unwrap();
+            assert_eq!(
+                unit.steps[target(step).step.as_deref().unwrap()]
+                    .track
+                    .state,
+                if launched {
+                    Phase::Launched
+                } else {
+                    Phase::Drafted
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn coordinator_pr_steps_keep_their_ladder_and_gates() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let (repo, sha) = repo(c.root.parent().unwrap());
+    let step = "01-first/alpha/BUILD";
+    assert!(
+        commands::declare(
+            &host,
+            &c.root.join(step),
+            &commands::Declaration {
+                lane: Some(Lane::Coordinator),
+                ..commands::Declaration::default()
+            },
+        )
+        .unwrap()
+        .ok()
+    );
+    c.kickoff(step, "Go.\n");
+    assert!(
+        commands::launch(&host, &c.root, &target(step), Some(&repo))
+            .unwrap()
+            .ok()
+    );
+    let units = cm::plan::load_units(&c.root).unwrap();
+    let gate = cm::plan::gate(&units, &After::Merged(step.into()));
+    assert_eq!(gate.needs(), Phase::Done);
+    assert!(!gate.met());
+    assert!(
+        advance(
+            &host,
+            &c,
+            step,
+            "pr-open",
+            Evidence {
+                pr: Some("https://github.com/o/r/pull/7".into()),
+                sha: Some(sha.clone()),
+                ..Evidence::default()
+            }
+        )
+        .ok()
+    );
+    let units = cm::plan::load_units(&c.root).unwrap();
+    let gate = cm::plan::gate(&units, &After::PrOpen(step.into()));
+    assert_eq!(gate.needs(), Phase::PrOpen);
+    assert!(gate.met());
+    assert!(
+        advance(
+            &host,
+            &c,
+            step,
+            "merged",
+            Evidence {
+                sha: Some(sha),
+                ..Evidence::default()
+            }
+        )
+        .ok()
+    );
+    for (keep_pr, keep_sha) in [(true, false), (false, true), (true, true)] {
+        let mut units = cm::plan::load_units(&c.root).unwrap();
+        let evidence = &mut units
+            .get_mut("01-first/alpha")
+            .unwrap()
+            .steps
+            .get_mut("BUILD")
+            .unwrap()
+            .track
+            .evidence;
+        if !keep_pr {
+            evidence.pr = None;
+        }
+        if !keep_sha {
+            evidence.sha = None;
+        }
+        let gate = cm::plan::gate(&units, &After::Merged(step.into()));
+        assert_eq!(gate.needs(), Phase::Merged);
+        assert!(gate.met());
+    }
+    git(&repo, &["tag", "v0.1.0"]);
+    assert!(
+        advance(
+            &host,
+            &c,
+            step,
+            "released",
+            Evidence {
+                tag: Some("v0.1.0".into()),
+                ..Evidence::default()
+            }
+        )
+        .ok()
+    );
+    assert!(
+        advance(
+            &host,
+            &c,
+            step,
+            "deployed",
+            Evidence {
+                digest: Some(format!("sha256:{}", "a".repeat(64))),
+                ..Evidence::default()
+            }
+        )
+        .ok()
+    );
+    let done = advance(&host, &c, step, "done", Evidence::default());
+    assert!(done.ok(), "{:?}", done.violations);
+    let unit = store::load_unit(&c.root.join("01-first/alpha")).unwrap();
+    assert_eq!(unit.steps["BUILD"].track.state, Phase::Done);
+}
+
+#[test]
+fn coordinator_steps_can_declare_and_amend_pr_parts() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let step = "01-first/alpha/BUILD";
+    let declared = commands::declare(
+        &host,
+        &c.root.join(step),
+        &commands::Declaration {
+            lane: Some(Lane::Coordinator),
+            parts: vec!["first".into()],
+            ..commands::Declaration::default()
+        },
+    )
+    .unwrap();
+    assert!(declared.ok(), "{:?}", declared.violations);
+    let amended = commands::amend(
+        &host,
+        &c.root,
+        &target(step),
+        &commands::Amendment {
+            parts: vec!["second".into()],
+            ..commands::Amendment::default()
+        },
+    )
+    .unwrap();
+    assert!(amended.ok(), "{:?}", amended.violations);
+    let unit = store::load_unit(&c.root.join("01-first/alpha")).unwrap();
+    assert_eq!(
+        unit.steps["BUILD"]
+            .parts
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+}
+
+#[test]
+fn resolving_or_withdrawing_the_last_watch_keeps_a_release_on_the_shipping_ladder() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    for withdraw in [false, true] {
+        let c = campaign(&host);
+        let (repo, _) = repo(c.root.parent().unwrap());
+        git(&repo, &["tag", "v1.0.0"]);
+        let step = "00-release/cm/1.0.0";
+        let target = target(step);
+        assert!(
+            commands::declare(
+                &host,
+                &c.root.join(step),
+                &commands::Declaration {
+                    lane: Some(Lane::Coordinator),
+                    ..commands::Declaration::default()
+                },
+            )
+            .unwrap()
+            .ok()
+        );
+        c.kickoff(step, "Release check.\n");
+        let released = commands::advance(
+            &host,
+            &c.root,
+            &target,
+            &Phase::Released,
+            &Evidence {
+                tag: Some("v1.0.0".into()),
+                ..Evidence::default()
+            },
+            None,
+            Some(&repo),
+        )
+        .unwrap();
+        assert!(released.ok(), "{:?}", released.violations);
+        assert!(
+            cm::holds::watch_add(&host, &c.root, &target, "log:release", "2026-10-09T07:00Z",)
+                .unwrap()
+                .ok()
+        );
+        let deployed = Evidence {
+            digest: Some(format!("sha256:{}", "a".repeat(64))),
+            ..Evidence::default()
+        };
+        assert_eq!(
+            rules(&advance(&host, &c, step, "deployed", deployed.clone())),
+            ["watch-open"]
+        );
+        let closed = if withdraw {
+            cm::holds::watch_withdraw(&host, &c.root, &target, 1, "signal replaced")
+        } else {
+            cm::holds::watch_resolve(
+                &host,
+                &c.root,
+                &target,
+                1,
+                &c.root.join(step).join("kickoff.md"),
+            )
+        }
+        .unwrap();
+        assert!(closed.ok(), "{:?}", closed.violations);
+        let unit = store::load_unit(&c.root.join(&target.unit)).unwrap();
+        let release = &unit.steps["1.0.0"];
+        assert_eq!(release.unresolved_watches(&c.root).count(), 0);
+        assert_eq!(release.track.state, Phase::Released);
+        assert_eq!(
+            rules(&advance(&host, &c, step, "done", Evidence::default())),
+            ["done-code-step"]
+        );
+        assert!(advance(&host, &c, step, "deployed", deployed).ok());
+        let done = advance(&host, &c, step, "done", Evidence::default());
+        assert!(done.ok(), "{:?}", done.violations);
+        let unit = store::load_unit(&c.root.join(&target.unit)).unwrap();
+        assert_eq!(unit.steps["1.0.0"].track.state, Phase::Done);
     }
 }
