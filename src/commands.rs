@@ -1481,11 +1481,12 @@ pub fn advance_gated(
                 &full,
                 "watch-open",
                 format!(
-                    "{full}#{} ({}, deadline {}) is {}; resolve it with `cm watch {full} resolve {} --evidence <path>`",
+                    "{full}#{} ({}, deadline {}) is {}; resolve it with `cm watch {full} resolve {} --evidence <path>` or withdraw it with `cm watch {full} withdraw {} --reason <text>`",
                     watch.id,
                     watch.signal,
                     watch.deadline,
                     watch.status(host.now(), root).name(),
+                    watch.id,
                     watch.id
                 ),
             ));

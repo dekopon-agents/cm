@@ -475,7 +475,8 @@ fn lint_holds(root: &Path, unit: &UnitState, seen: &mut Seen, out: &mut Vec<Viol
             ));
         }
         for watch in &step.watches {
-            if let Some(resolved) = &watch.resolved
+            if watch.withdrawn.is_none()
+                && let Some(resolved) = &watch.resolved
                 && let Err(error) = resolved.evidence.check(root)
             {
                 out.push(Violation::new(
@@ -494,7 +495,9 @@ fn lint_holds(root: &Path, unit: &UnitState, seen: &mut Seen, out: &mut Vec<Viol
                     "{target}#{}: expired: unresolved ({}, deadline {}); it holds the step below deployed",
                     watch.id, watch.signal, watch.deadline
                 )),
-                crate::state::WatchStatus::Open | crate::state::WatchStatus::Resolved => {}
+                crate::state::WatchStatus::Open
+                | crate::state::WatchStatus::Resolved
+                | crate::state::WatchStatus::Withdrawn => {}
             }
         }
         for waived in &step.waived {
