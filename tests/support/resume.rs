@@ -14,7 +14,36 @@ pub fn resume_text(status: &str) -> String {
     format!("{BEFORE}{status}{AFTER}")
 }
 
+pub fn resume_with_marker_example(fence: &str, status: Option<&str>) -> String {
+    let example = format!(
+        "{fence}markdown\n<!-- cm:status -->\nExample status, kept literally.\n<!-- cm:status-end -->\n{fence}\n\n"
+    );
+    let mut text = resume_text(status.unwrap_or_default()).replace(
+        "<!-- cm:status -->\r\n",
+        &format!(
+            "{example}{}",
+            if status.is_some() {
+                "<!-- cm:status -->\r\n"
+            } else {
+                ""
+            }
+        ),
+    );
+    if status.is_none() {
+        text = text.replace("<!-- cm:status-end -->\r\n", "");
+    }
+    text
+}
+
 impl Campaign {
+    pub fn resume_working_epoch(&self) {
+        fs::write(
+            self.root.join("EPOCH.md"),
+            "---\nstatus: WORKING\nskill_revision: synthetic-skill\napproved_plan_revision: synthetic-plan\n---\n",
+        )
+        .unwrap();
+    }
+
     pub fn resume_releases(&self, host: &dyn Host) -> FakeForge {
         let at = stamp(host.now());
         let mut work = UnitState::new("01-first/alpha", &at);

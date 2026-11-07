@@ -687,6 +687,7 @@ pub fn close(host: &dyn Host, root: &Path) -> Result<Outcome> {
         "cm close",
         "- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n",
     )?;
+    crate::sync::render_resume(root, &plan::load_units(root)?, true)?;
     let mut outcome = Outcome::default();
     outcome.field("closed", at);
     outcome.field("journal", heading.clone());

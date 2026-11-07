@@ -1440,3 +1440,55 @@ fn lint_reports_malformed_resume_status_markers_and_sync_preserves_them() {
         assert_eq!(fs::read(c.root.join("RESUME.md")).unwrap(), text.as_bytes());
     }
 }
+
+#[test]
+fn close_and_epoch_closed_refresh_resume_without_sync() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    c.resume_working_epoch();
+    let path = c.root.join("RESUME.md");
+    fs::write(&path, resume_fixture::resume_text("Stale status.\n")).unwrap();
+    let out = cm::sync::sync(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    let working = fs::read_to_string(&path).unwrap();
+    assert!(working.contains("Epoch status: working.\n"));
+    let expected = working.replace("Epoch status: working.", "Epoch status: closed.");
+
+    let out = commands::close(&host, &c.root).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+
+    // The epoch transition must refresh stale generated content itself, too.
+    fs::write(&path, &working).unwrap();
+    let out = cm::epoch::epoch(&host, &c.root, cm::epoch::Status::Closed, None, None).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+}
+
+#[test]
+fn sync_and_lint_ignore_fenced_marker_examples() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    for fence in ["```", "~~~"] {
+        for real_span in [false, true] {
+            let c = campaign(&host);
+            let status = real_span.then_some("Stale status.\n");
+            let text = resume_fixture::resume_with_marker_example(fence, status);
+            let path = c.root.join("RESUME.md");
+            fs::write(&path, &text).unwrap();
+            assert_clean(&c.root);
+            let out = cm::sync::sync(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
+            assert!(out.ok(), "{:?}", out.violations);
+            let expected = if real_span {
+                resume_fixture::resume_with_marker_example(
+                    fence,
+                    Some(
+                        "| State | Steps |\n|---|---|\n| — | 0 |\n\nNo releases recorded.\n\nEpoch status: unknown.\n",
+                    ),
+                )
+            } else {
+                text
+            };
+            assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        }
+    }
+}

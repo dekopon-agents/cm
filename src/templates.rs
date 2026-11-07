@@ -78,10 +78,13 @@ pub fn queue_open_in(root: &Path) -> io::Result<bool> {
 // Byte offsets keep owner-written prose and marker lines unchanged during sync.
 pub(crate) fn status_span(text: &str) -> Result<Option<std::ops::Range<usize>>, Violation> {
     let mut markers = Vec::new();
+    let mut fences = crate::markdown::Fences::default();
     let mut offset = 0;
     for (index, line) in text.split_inclusive('\n').enumerate() {
         let marker = line.trim_end_matches(['\r', '\n']);
-        if matches!(marker, "<!-- cm:status -->" | "<!-- cm:status-end -->") {
+        if !fences.contains(marker)
+            && matches!(marker, "<!-- cm:status -->" | "<!-- cm:status-end -->")
+        {
             markers.push((marker, index + 1, offset, offset + line.len()));
         }
         offset += line.len();
