@@ -117,6 +117,7 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         worktree: Option<PathBuf>,
         /// A remote launch: the coordinator session that claims its attempt (generation 1).
+        /// Defaults to trimmed CLAUDE_CODE_REMOTE_SESSION_ID (cse_ becomes session_), else —.
         #[arg(long, value_name = "LABEL")]
         coordinator: Option<String>,
         /// A remote launch: its cap in minutes, stored as an absolute deadline a replacement inherits.
@@ -389,6 +390,21 @@ enum WatchAct {
     },
 }
 
+fn coordinator_label(given: &Option<String>) -> Option<String> {
+    given.clone().or_else(|| {
+        let value = std::env::var("CLAUDE_CODE_REMOTE_SESSION_ID").ok()?;
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(match value.strip_prefix("cse_") {
+                Some(id) => format!("session_{id}"),
+                None => value.to_owned(),
+            })
+        }
+    })
+}
+
 #[derive(Subcommand)]
 enum AttemptAct {
     /// End an unknown attempt as relaned and dispatch its successor under the same claim and cap.
@@ -400,8 +416,9 @@ enum AttemptAct {
     },
     /// Fence the generation that holds the attempt and take it over; --expect is that generation.
     Claim {
-        #[arg(long, value_name = "LABEL")]
-        coordinator: String,
+        /// Defaults to trimmed CLAUDE_CODE_REMOTE_SESSION_ID (cse_ becomes session_); otherwise required.
+        #[arg(long, value_name = "LABEL", required = coordinator_label(&None).is_none())]
+        coordinator: Option<String>,
         #[arg(long, value_name = "GENERATION")]
         expect: u32,
     },
@@ -641,7 +658,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             worktree.as_deref(),
             &commands::Remote {
                 no_parts: no_parts.clone(),
-                coordinator: coordinator.clone(),
+                coordinator: coordinator_label(coordinator),
                 cap_min: *cap_min,
             },
         ),
@@ -686,7 +703,8 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                     coordinator,
                     expect,
                 }) => Act::Claim {
-                    coordinator: coordinator.clone(),
+                    coordinator: coordinator_label(coordinator)
+                        .expect("clap requires --coordinator without a session default"),
                     expect: *expect,
                 },
                 Some(AttemptAct::Restart { lane, evidence }) => Act::Restart {

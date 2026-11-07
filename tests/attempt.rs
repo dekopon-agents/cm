@@ -41,25 +41,9 @@ fn rules(outcome: &Outcome) -> Vec<&'static str> {
     rules
 }
 
-struct Campaign {
-    _temp: tempfile::TempDir,
-    root: PathBuf,
-}
-
-fn campaign(host: &Fake) -> Campaign {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("campaign");
-    assert!(commands::init(host, &root).unwrap().ok());
-    let git = std::process::Command::new("git")
-        .args(["init", "-q"])
-        .arg(&root)
-        .status();
-    assert!(
-        git.unwrap().success(),
-        "a campaign lives in a git repository"
-    );
-    Campaign { _temp: temp, root }
-}
+#[path = "support/campaign.rs"]
+mod campaign_fixture;
+use campaign_fixture::{Campaign, campaign};
 
 fn declare(host: &Fake, c: &Campaign, target: &str, lane: Lane, after: &[&str]) -> Outcome {
     let declaration = Declaration {
@@ -560,4 +544,113 @@ fn begin_and_record_each_journal_one_line_with_every_action_field() {
             "## 2026-10-19T09:00Z — attempt 01-a/u/S1: 01-a/u/S1#1 begins thread (generation 1)",
         ]
     );
+}
+
+#[test]
+fn launch_and_claim_default_to_the_remote_session_unless_a_label_is_given() {
+    let host = at("2026-10-08T07:00:00Z");
+    for (session, label, expected) in [
+        (Some("session_cloud"), None, Some("session_cloud")),
+        (Some("cse_cloud"), None, Some("session_cloud")),
+        (Some(" \tcse_cloud\n"), None, Some("session_cloud")),
+        (Some(" session_cloud "), None, Some("session_cloud")),
+        (Some(" custom "), None, Some("custom")),
+        (None, None, None),
+        (Some(""), None, None),
+        (Some(" \t\n"), None, None),
+        (Some("cse_cloud"), Some("explicit"), Some("explicit")),
+        (
+            Some("cse_cloud"),
+            Some("cse_explicit"),
+            Some("cse_explicit"),
+        ),
+        (None, Some("explicit"), Some("explicit")),
+        (
+            Some("session_cloud\n## stray"),
+            Some("explicit"),
+            Some("explicit"),
+        ),
+    ] {
+        let c = campaign(&host);
+        let step = "01-a/u/S1";
+        assert!(declare(&host, &c, step, Lane::ClaudeCloud, &[]).ok());
+        for args in [
+            vec!["launch", step],
+            vec!["attempt", step, "claim", "--expect", "1"],
+        ] {
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_cm"));
+            command
+                .arg("--json")
+                .arg("-C")
+                .arg(&c.root)
+                .args(&args)
+                .env_remove("CLAUDE_CODE_REMOTE_SESSION_ID")
+                .env("CLAUDE_CODE_SESSION_ID", "local_session");
+            if let Some(session) = session {
+                command.env("CLAUDE_CODE_REMOTE_SESSION_ID", session);
+            }
+            if let Some(label) = label {
+                command.args(["--coordinator", label]);
+            }
+            let output = command.output().unwrap();
+            if args[0] == "attempt" && expected.is_none() {
+                assert_eq!(output.status.code(), Some(2), "{output:?}");
+                let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+                assert_eq!(unit.steps["S1"].attempt.as_ref().unwrap().generation, 1);
+                continue;
+            }
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["ok"], true, "{report}");
+            let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+            assert_eq!(
+                unit.steps["S1"].attempt.as_ref().unwrap().coordinator,
+                expected.unwrap_or("—")
+            );
+        }
+    }
+}
+
+#[test]
+fn launch_refuses_invalid_coordinator_labels_without_changing_state_or_journal() {
+    let host = at("2026-10-08T07:00:00Z");
+    for (session, label) in [
+        (Some("session_cloud\n## stray"), None),
+        (Some("session_cloud\r## stray"), None),
+        (Some(" cse_cloud\n## stray "), None),
+        (Some("session_cloud"), Some("session_flag\n## stray")),
+        (Some("session_cloud"), Some("session_flag\r## stray")),
+        (None, Some("")),
+        (None, Some(" \t")),
+    ] {
+        let c = campaign(&host);
+        let step = "01-a/u/S1";
+        assert!(declare(&host, &c, step, Lane::ClaudeCloud, &[]).ok());
+        let before = c.files();
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_cm"));
+        command
+            .arg("--json")
+            .arg("-C")
+            .arg(&c.root)
+            .args(["launch", step])
+            .env_remove("CLAUDE_CODE_REMOTE_SESSION_ID");
+        if let Some(session) = session {
+            command.env("CLAUDE_CODE_REMOTE_SESSION_ID", session);
+        }
+        if let Some(label) = label {
+            command.args(["--coordinator", label]);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["ok"], false, "{report}");
+        let rules: Vec<_> = report["violations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["rule"].as_str().unwrap())
+            .collect();
+        assert_eq!(rules, ["attempt-claim"], "{report}");
+        assert_eq!(c.files(), before);
+    }
 }

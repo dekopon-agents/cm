@@ -35,6 +35,11 @@ pub enum Act {
     },
 }
 
+pub(crate) fn check_coordinator(full: &str, coordinator: &str) -> Option<Violation> {
+    (coordinator.trim().is_empty() || coordinator.contains(['\n', '\r']))
+        .then(|| Violation::new(full, "attempt-claim", "--coordinator is one non-empty line"))
+}
+
 /// Past the deadline; a deadline cm cannot read counts as past.
 fn expired(attempt: &Attempt, now: Timestamp) -> bool {
     attempt.deadline.as_deref().is_some_and(|deadline| {
@@ -199,13 +204,7 @@ pub fn attempt(
             if *expect != attempt.generation {
                 violations.push(fenced(&format!("generation {expect}")));
             }
-            if coordinator.trim().is_empty() || coordinator.contains('\n') {
-                violations.push(Violation::new(
-                    &full,
-                    "attempt-claim",
-                    "--coordinator is one non-empty line",
-                ));
-            }
+            violations.extend(check_coordinator(&full, coordinator));
             Some(format!(
                 "claim {} for generation {} ({coordinator})",
                 attempt.id,
