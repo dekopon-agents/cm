@@ -63,7 +63,6 @@ fn git(repo: &Path, args: &[&str]) -> String {
 }
 
 #[path = "support/campaign.rs"]
-#[allow(dead_code)] // This suite shares the campaign fixture; its lint helpers serve other suites.
 mod campaign_fixture;
 use campaign_fixture::{Campaign, campaign};
 
