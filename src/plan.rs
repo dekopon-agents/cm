@@ -484,7 +484,14 @@ pub fn next_at(
         .into_iter()
         .filter(|review| {
             step(&units, &review.step).is_some_and(|step| {
-                !step.track.state.is_final() && lane.is_none_or(|lane| step.lane == Some(lane))
+                let track = match review.part.as_deref() {
+                    Some(part) => step.parts.get(part),
+                    None if step.parts.is_empty() => Some(&step.track),
+                    None => None,
+                };
+                !step.track.state.is_final()
+                    && lane.is_none_or(|lane| step.lane == Some(lane))
+                    && track.is_some_and(|track| track.evidence.pr == review.pr)
             }) && target.is_none_or(|target| {
                 review.step
                     == format!(

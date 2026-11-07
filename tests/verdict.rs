@@ -750,6 +750,39 @@ fn a_non_converging_fresh_opus_round_blocks_and_queues_once() {
 }
 
 #[test]
+fn a_refused_owner_queue_escalation_leaves_no_orphan_report() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let first = c.report(
+        "first",
+        "aaaaaaa1",
+        &review_fixture::BLOCKING[..1],
+        "FIX REQUIRED",
+    );
+    assert!(record(&host, &c, &first, "fresh-opus").ok());
+    let resume = fs::read_to_string(c.root.join("RESUME.md")).unwrap();
+    fs::write(c.root.join("RESUME.md"), "Missing banner.\n").unwrap();
+    let report = c.report(
+        "rise",
+        "bbbbbbb2",
+        &review_fixture::BLOCKING[..2],
+        "FIX REQUIRED",
+    );
+    let refused = record(&host, &c, &report, "fresh-opus");
+    assert_eq!(rules(&refused), vec!["resume-banner"]);
+    assert!(
+        !c.root
+            .join(STEP)
+            .join("evidence/reviews/R2-fresh-opus.md")
+            .exists()
+    );
+    fs::write(c.root.join("RESUME.md"), resume).unwrap();
+    let retried = record(&host, &c, &report, "fresh-opus");
+    assert!(retried.ok(), "{:?}", retried.violations);
+    assert_eq!(retried.fields["owner_queue"], 1);
+}
+
+#[test]
 fn counts_compare_the_same_reviewer_and_pr_and_include_accepted_rounds() {
     let host = at("2026-10-25T06:00:00Z");
     let c = campaign(&host, true);
@@ -805,6 +838,10 @@ fn counts_compare_the_same_reviewer_and_pr_and_include_accepted_rounds() {
     assert_eq!(
         record(&host, &c, &changed_pr, "astra").fields["converging"],
         true
+    );
+    assert_eq!(
+        plan::next(&c.root, None, None).unwrap().fields["fresh_readers"],
+        serde_json::json!([])
     );
 }
 
@@ -901,15 +938,55 @@ fn part_rounds_use_the_parts_pr_and_do_not_mix_counts() {
         next.fields["fresh_readers"][0]["command"],
         format!("cm review record {STEP} '<fresh-review-report>' --reviewer fresh-opus --part one")
     );
+    let report = c.report("cli-part", "ccccccc3", &[], "ACCEPT");
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args(["--json", "review", "record", STEP])
+        .arg(&report)
+        .args(["--reviewer", "astra", "--part", "two"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let saved: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(saved["part"], "two");
+    assert_eq!(
+        verdict::load(&c.root)
+            .unwrap()
+            .reviews
+            .last()
+            .unwrap()
+            .pr
+            .as_deref(),
+        Some(second_pr)
+    );
 }
 
 #[test]
 fn the_eleventh_recorded_pass_on_a_step_is_refused_without_writes() {
     let host = at("2026-10-25T06:00:00Z");
     let c = campaign(&host, true);
+    let amendment = commands::Amendment {
+        parts: vec!["one".into(), "two".into()],
+        ..Default::default()
+    };
+    assert!(
+        commands::amend(&host, &c.root, &target(), &amendment)
+            .unwrap()
+            .ok()
+    );
     for round in 1..=10 {
         let report = c.report(&format!("r{round}"), &format!("{round:08x}"), &[], "ACCEPT");
-        let recorded = record(&host, &c, &report, "astra");
+        let part = if round % 2 == 0 { "one" } else { "two" };
+        let recorded = verdict::record(
+            &host,
+            &c.root,
+            &target(),
+            &report,
+            Some("astra"),
+            Some(part),
+        )
+        .unwrap();
         assert!(recorded.ok(), "{:?}", recorded.violations);
         assert_eq!(recorded.fields["passes"], round);
     }
@@ -921,7 +998,15 @@ fn the_eleventh_recorded_pass_on_a_step_is_refused_without_writes() {
         "RESUME.md",
     ];
     let before = paths.map(|path| sha256(&c.root.join(path)));
-    let refused = record(&host, &c, &report, "astra");
+    let refused = verdict::record(
+        &host,
+        &c.root,
+        &target(),
+        &report,
+        Some("astra"),
+        Some("one"),
+    )
+    .unwrap();
     assert_eq!(rules(&refused), vec!["review-cap"]);
     assert_eq!(
         refused.violations[0].message,

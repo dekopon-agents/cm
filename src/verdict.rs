@@ -615,12 +615,30 @@ fn blocking_count(review: &Recorded) -> usize {
         .count()
 }
 
+fn previous_review<'a>(
+    previous: &'a [Recorded],
+    step: &str,
+    pr: Option<&str>,
+    part: Option<&str>,
+    reviewer: Option<&str>,
+) -> Option<&'a Recorded> {
+    previous.iter().rev().find(|before| {
+        before.step == step
+            && before.pr.as_deref() == pr
+            && before.part.as_deref() == part
+            && before.reviewer.as_deref() == reviewer
+    })
+}
+
 fn converging(previous: &[Recorded], review: &Recorded) -> bool {
-    previous
-        .iter()
-        .rev()
-        .find(|before| same_scope(before, review) && before.reviewer == review.reviewer)
-        .is_none_or(|before| blocking_count(review) <= blocking_count(before))
+    previous_review(
+        previous,
+        &review.step,
+        review.pr.as_deref(),
+        review.part.as_deref(),
+        review.reviewer.as_deref(),
+    )
+    .is_none_or(|before| blocking_count(review) <= blocking_count(before))
 }
 
 /// Pending independent reads, derived from the reports rather than a second persisted queue.
@@ -778,15 +796,6 @@ pub fn record(
         .filter(|review| review.step == full && review.part.as_deref() == part)
         .count()
         + 1;
-    fs::create_dir_all(copy.parent().unwrap_or(root))?;
-    if !create_new(&copy, text.as_bytes())? {
-        return Ok(Outcome::refused(vec![Violation::new(
-            &copy_rel,
-            "review-exists",
-            "written meanwhile",
-        )]));
-    }
-    let report_file = CampaignFile::resolve(root, &copy).map_err(anyhow::Error::from)?;
     let pr = step_pr(root, target, part)?;
     let findings: Vec<Logged> = block
         .findings
@@ -798,20 +807,10 @@ pub fn record(
             closed: None,
         })
         .collect();
-    let recorded = Recorded {
-        number,
-        at: at.clone(),
-        step: full.clone(),
-        reviewer: reviewer.map(str::to_owned),
-        pr: pr.clone(),
-        part: part.map(str::to_owned),
-        head: block.head.clone(),
-        verdict,
-        stated: block.stated,
-        report: report_file.clone(),
-        findings,
-    };
-    let converging = converging(&verdicts.reviews, &recorded);
+    let previous = previous_review(&verdicts.reviews, &full, pr.as_deref(), part, reviewer);
+    let converging = previous.is_none_or(|before| {
+        findings.iter().filter(|finding| finding.blocking).count() <= blocking_count(before)
+    });
     let escalate = !converging && reviewer == Some("fresh-opus");
     let already_escalated = verdicts.reviews.iter().enumerate().any(|(index, review)| {
         review.step == full
@@ -820,12 +819,7 @@ pub fn record(
     });
     let mut queued = None;
     if escalate && !already_escalated {
-        let earlier = verdicts
-            .reviews
-            .iter()
-            .rev()
-            .find(|review| same_scope(review, &recorded) && review.reviewer == recorded.reviewer)
-            .expect("a non-converging review has a previous round");
+        let earlier = previous.expect("a non-converging review has a previous round");
         let title = format!("{full}: non-converging fresh reader");
         let context = format!(
             "{full}{} still fails to converge after an independent Opus read; the reports are `{}` and `{copy_rel}`. Ruling: {RULING}",
@@ -845,6 +839,28 @@ pub fn record(
         }
         queued = outcome.fields.get("item").cloned();
     }
+    fs::create_dir_all(copy.parent().unwrap_or(root))?;
+    if !create_new(&copy, text.as_bytes())? {
+        return Ok(Outcome::refused(vec![Violation::new(
+            &copy_rel,
+            "review-exists",
+            "written meanwhile",
+        )]));
+    }
+    let report_file = CampaignFile::resolve(root, &copy).map_err(anyhow::Error::from)?;
+    let recorded = Recorded {
+        number,
+        at: at.clone(),
+        step: full.clone(),
+        reviewer: reviewer.map(str::to_owned),
+        pr: pr.clone(),
+        part: part.map(str::to_owned),
+        head: block.head.clone(),
+        verdict,
+        stated: block.stated,
+        report: report_file.clone(),
+        findings,
+    };
     let id = recorded.id();
     let blocking: Vec<String> = recorded
         .findings
