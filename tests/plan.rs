@@ -1,5 +1,4 @@
-use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -8,9 +7,7 @@ use std::process::Command;
 use cm::commands;
 use cm::commands::{Declaration, Ships};
 use cm::epoch::{self, Status};
-use cm::forge::{
-    CheckState, CommitSha, Forge, ForgeError, Gh, GithubRepo, Pull, PullState, TagName,
-};
+use cm::forge::{CommitSha, Forge, ForgeError, Gh, Pull, PullState};
 use cm::host::Host;
 use cm::lint::lint;
 use cm::outcome::Outcome;
@@ -65,6 +62,10 @@ fn git(repo: &Path, args: &[&str]) -> String {
 #[path = "support/campaign.rs"]
 mod campaign_fixture;
 use campaign_fixture::{Campaign, campaign};
+
+#[path = "support/forge.rs"]
+mod forge_fixture;
+use forge_fixture::FakeForge;
 
 #[path = "support/watch.rs"]
 mod watch_fixture;
@@ -762,53 +763,6 @@ fn release_steps_name_increasing_versions_and_their_tags() {
     );
     let lint = lint(&c.root).unwrap();
     assert!(lint.ok(), "{:#?}", lint.violations);
-}
-
-#[derive(Default)]
-struct FakeForge {
-    pulls: BTreeMap<String, Pull>,
-    tags: BTreeMap<(String, String), BTreeSet<String>>,
-    broken: BTreeSet<String>,
-    calls: RefCell<usize>,
-    containment_queries: RefCell<Vec<(String, String, String)>>,
-}
-
-impl Forge for FakeForge {
-    fn pull(&self, url: &str) -> Result<Pull, ForgeError> {
-        *self.calls.borrow_mut() += 1;
-        if self.broken.contains(url) {
-            return Err(ForgeError::Exit(Some(1)));
-        }
-        self.pulls.get(url).cloned().ok_or(ForgeError::Json)
-    }
-
-    fn tag_exists(&self, repo: &GithubRepo, tag: &TagName) -> Result<bool, ForgeError> {
-        Ok(self.tags.contains_key(&(repo.to_string(), tag.to_string())))
-    }
-
-    fn tag_contains(
-        &self,
-        repo: &GithubRepo,
-        tag: &TagName,
-        sha: &CommitSha,
-    ) -> Result<bool, ForgeError> {
-        self.containment_queries.borrow_mut().push((
-            repo.to_string(),
-            tag.to_string(),
-            sha.to_string(),
-        ));
-        if self.broken.contains(tag.as_str()) {
-            return Err(ForgeError::Exit(Some(1)));
-        }
-        Ok(self
-            .tags
-            .get(&(repo.to_string(), tag.to_string()))
-            .is_some_and(|shas| shas.contains(sha.as_str())))
-    }
-
-    fn checks(&self, _: &GithubRepo, _: &CommitSha) -> Result<Vec<CheckState>, ForgeError> {
-        Err(ForgeError::Spawn)
-    }
 }
 
 fn merged(sha: &str) -> Pull {
