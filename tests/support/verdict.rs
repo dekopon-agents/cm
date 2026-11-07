@@ -98,3 +98,21 @@ pub fn stale_pin(root: &std::path::Path, dependent: &str) -> String {
         "b".repeat(40)
     )
 }
+
+pub fn block_multipart_parent(c: &super::Campaign, host: &super::Fake) {
+    let dir = c.root.join("01-a/u");
+    let mut unit = cm::store::load_unit(&dir).unwrap();
+    unit.steps.get_mut("S1").unwrap().track.evidence.pr = Some(OTHER_PR.into());
+    cm::commands::write_unit(&dir, &unit).unwrap();
+    let blocked = cm::commands::advance(
+        host,
+        &c.root,
+        &super::target(),
+        &cm::state::Phase::Blocked("parts".into()),
+        &cm::state::Evidence::default(),
+        None,
+        Some(&c.repo),
+    )
+    .unwrap();
+    assert!(blocked.ok(), "{:?}", blocked.violations);
+}

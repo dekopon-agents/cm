@@ -290,10 +290,10 @@ named successor, and is a usage error with any state other than `superseded`. `-
 remains required. Superseding meets no gate; amend consumers to name the replacement work.
 
 cm 0.10 raises SCHEMA from 4 to 5 for persisted pin dependency gates and `superseded_by`
-successor references, and optional merge times. It writes every unit state, and a new campaign state, as schema 5.
-Schema 1 through 4 state remains readable; missing successor references default to an empty
-list and missing merge times remain absent. cm 0.9 refuses schema 5 as newer state. Upgrade every reader before writing shared
-state with cm 0.10.
+successor references, and optional merge times. It writes every unit state, and a new campaign
+state, as schema 5. Schema 1 through 4 state remains readable; missing successor references
+default to an empty list and missing merge times remain absent. cm 0.9 refuses schema 5 as
+newer state. Upgrade every reader before writing shared state with cm 0.10.
 
 cm 0.9 raises SCHEMA from 3 to 4 for watch withdrawal and writes every unit state, and a new
 campaign state, as schema 4. Units written by 0.9 cannot be read by cm 0.8.x; upgrade every

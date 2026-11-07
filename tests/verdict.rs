@@ -2010,7 +2010,7 @@ fn advance_merged_with_pr_records_merge_time_and_refuses_a_different_pr() {
 
 #[test]
 fn multipart_merge_time_uses_latest_part_and_requires_every_time() {
-    for mode in ["sync", "advance", "settle"] {
+    for mode in ["sync", "advance", "settle", "blocked-pr", "blocked-no-pr"] {
         for (first, second, expected) in [
             (
                 Some(review_fixture::MERGED_AT),
@@ -2022,6 +2022,10 @@ fn multipart_merge_time_uses_latest_part_and_requires_every_time() {
         ] {
             let host = at("2026-10-25T06:00:00Z");
             let c = review_fixture::multipart_campaign(&host);
+            let blocked = mode.starts_with("blocked-");
+            if blocked {
+                review_fixture::block_multipart_parent(&c, &host);
+            }
             let head = c.head();
             let mut forge = FakeForge {
                 state: PullState::Merged,
@@ -2057,7 +2061,9 @@ fn multipart_merge_time_uses_latest_part_and_requires_every_time() {
                 assert!(moved.ok(), "{:?}", moved.violations);
             };
             match mode {
-                "sync" => assert!(sync(&host, &forge, &c.root).unwrap().ok()),
+                "sync" | "blocked-pr" | "blocked-no-pr" => {
+                    assert!(sync(&host, &forge, &c.root).unwrap().ok())
+                }
                 "advance" => advance_part(&host, "one", PR, &forge),
                 _ => review_fixture::parts_at(&c, &host, Phase::Merged, [first, second]),
             }
@@ -2070,20 +2076,55 @@ fn multipart_merge_time_uses_latest_part_and_requires_every_time() {
             } else {
                 assert!(sync(&later, &forge, &c.root).unwrap().ok());
             }
+            let parent_at = if blocked {
+                at("2026-10-25T08:00:00Z")
+            } else {
+                later
+            };
+            if blocked {
+                assert_eq!(c.state(), Phase::Blocked("parts".into()));
+                let moved = commands::advance_gated(
+                    &parent_at,
+                    &c.root,
+                    &target(),
+                    commands::Advance {
+                        to: &Phase::Merged,
+                        given: &Evidence {
+                            sha: Some(head.clone()),
+                            pr: (mode == "blocked-pr").then(|| review_fixture::OTHER_PR.into()),
+                            ..Default::default()
+                        },
+                        file: None,
+                        repo: Some(&c.repo),
+                        part: None,
+                        by: &[],
+                    },
+                    &MergeGate {
+                        forge: Some(&forge),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert!(moved.ok(), "{:?}", moved.violations);
+                assert_eq!(
+                    moved.fields["evidence"]["merged_at"],
+                    serde_json::json!(expected)
+                );
+            }
             let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
             let track = &unit.steps["S1"].track;
             assert_eq!(track.state, Phase::Merged);
             assert_eq!(track.evidence.merged_at.as_deref(), expected, "{mode}");
-            assert_eq!(track.since, cm::host::stamp(later.now()));
+            assert_eq!(track.since, cm::host::stamp(parent_at.now()));
             let moved = unit
                 .history
                 .iter()
                 .find(|moved| moved.target == STEP && moved.to == Phase::Merged)
                 .unwrap();
             assert_eq!(moved.evidence.merged_at.as_deref(), expected, "{mode}");
-            assert_eq!(moved.at, cm::host::stamp(later.now()));
-            review_fixture::parts_at(&c, &later, Phase::Released, [first, second]);
-            assert!(sync(&later, &forge, &c.root).unwrap().ok());
+            assert_eq!(moved.at, cm::host::stamp(parent_at.now()));
+            review_fixture::parts_at(&c, &parent_at, Phase::Released, [first, second]);
+            assert!(sync(&parent_at, &forge, &c.root).unwrap().ok());
             let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
             assert_eq!(unit.steps["S1"].track.state, Phase::Released);
             assert_eq!(

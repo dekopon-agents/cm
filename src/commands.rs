@@ -2170,7 +2170,16 @@ pub fn advance_gated(
                         );
                     }
                     None if remerge => step.track.evidence.absorb(&evidence),
-                    None => step.track.apply(to.clone(), &at, &evidence),
+                    None => {
+                        if *to == Phase::Merged && !step.parts.is_empty() {
+                            evidence.merged_at = step.merged_at();
+                            step.track
+                                .evidence
+                                .merged_at
+                                .clone_from(&evidence.merged_at);
+                        }
+                        step.track.apply(to.clone(), &at, &evidence);
+                    }
                 }
                 step.waived.append(&mut waived);
             }

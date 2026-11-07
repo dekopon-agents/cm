@@ -1058,6 +1058,20 @@ impl Step {
         })
     }
 
+    pub(crate) fn merged_at(&self) -> Option<String> {
+        let times: Option<Vec<_>> = self
+            .parts
+            .values()
+            .map(|part| {
+                let at = part.evidence.merged_at.as_ref()?;
+                Some((crate::plan::instant(at)?, at))
+            })
+            .collect();
+        times
+            .and_then(|times| times.into_iter().max())
+            .map(|(_, at)| at.clone())
+    }
+
     pub fn roll_up_all(
         &mut self,
         release: bool,
@@ -1096,17 +1110,7 @@ impl Step {
             evidence
         };
         self.track.apply(reach.clone(), at, evidence);
-        let times: Option<Vec<_>> = self
-            .parts
-            .values()
-            .map(|part| {
-                let at = part.evidence.merged_at.as_ref()?;
-                Some((crate::plan::instant(at)?, at))
-            })
-            .collect();
-        self.track.evidence.merged_at = times
-            .and_then(|times| times.into_iter().max())
-            .map(|(_, at)| at.clone());
+        self.track.evidence.merged_at = self.merged_at();
         Some((from, reach))
     }
 
