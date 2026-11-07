@@ -70,9 +70,11 @@ error.
 | `cm evidence <NN-name>/<unit>/<step> --name NAME --body-file F [--candidate STEP[@SHA] [--harness STEP[@SHA]]]` | Writes `<step>/evidence/<NAME>.md` once from a non-empty body and journals the path. `cm advance <step> done` without `--evidence` takes the step's one evidence file when it has exactly one. `--candidate` and `--harness` pin the file to the commits it was produced against (see [Pinned evidence](#pinned-evidence)). |
 | `cm review <step> --pr URL --head SHA --model ID --effort E --verdict accept\|fix-required --findings C/F --cost USD --wall MIN [--delta FROM_SHA]`, `cm review --import` | Appends one row to the review ledger `.cm/reviews.json` and renders `REVIEW-OFF.md` from it, rows in PR order with a delta review under its PR, and journals the row. The rows a hand-written `REVIEW-OFF.md` already holds are imported once, kept cell for cell, and the text before and after the table (per-PR adjudications, rules) is kept byte for byte (`--import`, or the first `cm review`). The step must be declared (`step-unknown`); an imported delta row is the one whose `#` cell carries `Δ`. After that a hand edit is `review-hand-edit`, as for `STATE.md`. |
 | `cm review record <step> <report-file> [--reviewer KIND] [--part NAME]` | Parses the `cm-review` block that ends the report (see [Review verdicts](#review-verdicts)), computes the verdict, copies the report to `<step>/evidence/reviews/R<n>[-KIND].md` and records the review in `.cm/verdicts.json` as `R<n>`, its findings as `R<n>.<id>`. Refuses a report with no block or a malformed one (`review-block`, one per problem, with its line), an undeclared step and a report already recorded for the step (`review-duplicate`). A report whose own verdict line disagrees with the computed one is recorded with the computed verdict and the disagreement printed and journaled. `--part` selects a declared part and its PR; it is required on multipart steps. Distinct FIX REQUIRED heads on the current PR count toward the ten-pass step cap; rising blocking counts request an independent reader and only a non-converging `fresh-opus` round blocks the step (see [Rounds](#rounds)). |
+| `cm review prompt <step> --head SHA [--base SHA] [--round N] [--part NAME]` | Prints a blind reviewer prompt from a fixed template: only the kickoff's Outcome, base and head. Round 2 adds only Astra's own report from the first fix round. No coordinator rulings or worker brief are read. Refuses an unknown head (`review-head`) or missing task (`review-outcome`). See [Review verdicts](#review-verdicts). |
+| `cm review repair-brief <step> [--part NAME]` | Prints a fixed repair header followed by every report at the latest reviewed head of the current PR/part, verbatim and in recording order. Does not call a round the last; convergence decides the next action. Refuses when no round is recorded (`review-round`). |
 | `cm review resolve <step> <finding> --by <commit\|ruling-file>` | Records what resolved a blocking finding: `R<n>.<id>`, or `<id>` in the step's latest review holding it; an id whose `R<n>` is not a review number names no finding (`finding-unknown`). `--by` is a ruling file in the campaign when that path exists, else a commit SHA. A follow-up is `resolve-not-blocking`; a second resolution is `resolve-done`. |
 | `cm ruling <step> "<text>"` | Appends `- YYYY-MM-DD: <text>` to `<step>/evidence/coordinator-scope.md`, creating it with `# Scope and coordinator rulings: <step>` when it is missing, and journals the line. |
-| `cm brief <step>` | Prints the step's `kickoff.md`, then `## Coordinator scope and rulings` and the step's `evidence/coordinator-scope.md` (or a line saying none is recorded): the brief for `astra-review.sh start` and review packets. `--json` puts it in `brief`. Refuses a step with no `kickoff.md`. |
+| `cm brief <step>` | Prints the step's `kickoff.md`, then `## Coordinator scope and rulings` and the step's `evidence/coordinator-scope.md` (or a line saying none is recorded): the worker packet. Use `cm review prompt` for reviewers. `--json` puts it in `brief`. Refuses a step with no `kickoff.md`. |
 | `cm followups [--epoch]`, `cm followups close <id> --by <commit\|reason>` | Lists every non-blocking finding `cm review record` kept, across steps: id, step, PR, type, origin, `file:line`, summary and status (`open` or `closed`). `--epoch` lists only the open ones, grouped by repository as Markdown checklist lines, for the epoch's cleanup PR. `close` closes one with the commit that fixed it or the reason it stays, and journals it; a blocking finding is `followup-blocking`, a closed one `followup-closed`. |
 | `cm lint [DIR]` | Template conformance, cm-owned files against `.cm/state.json`, the journal against git, `.cm/JOURNAL.md` and `.cm/lock` out of git (`cm-tracked`), the path check for every drafted or launched packet, a unit or step folder git ignores (`git-ignored`, or `git-ignored-unknown` when `git check-ignore` cannot answer, as outside a repository), and a unit folder holding `STATE.md` but no `.cm/state.json` (`unit-state-json-missing`), which is never counted as a smaller campaign; unique `FEEDBACK.md` ids whose follow-ups name existing ones; `MAC-LANE.md` items numbered 1, 2, 3… with no gap or repeat (`mac-lane-number`), nothing about their text; `REVIEW-OFF.md` against its ledger; stale pinned evidence (`evidence-stale`). It warns, without failing, on an expired watch and on an `--override` of a red check no known-red exception names. In a closed campaign, also an empty owner queue, no open Mac lane item and every track done or blocked; its packets are no longer checked, since nothing launches there. |
 
@@ -295,6 +297,24 @@ lane unchanged. Begin, record and restart each write one stamped journal line; b
 and record include the attempt id, action kind, generation and returned id when present.
 
 ### Review verdicts
+
+Use `cm review prompt <step> --head SHA [--base SHA]` for a blind review. The task is the
+single non-empty Markdown `Outcome` section in `kickoff.md`, including its subheadings and
+ending at the next heading of the same or higher level. Other kickoff sections and
+`coordinator-scope.md` never enter the prompt. `cm brief` remains the worker packet with rulings.
+The template lives in `templates/REVIEW-PROMPT.md`; it accepts no coordinator commentary.
+
+`--head` must be a SHA known in the selected step/part's evidence or recorded reviews for its
+current PR. `--base`, when supplied, is a SHA; otherwise the prompt names the repository's
+default branch. Round 1 includes no reports. `--round 2` appends only the latest recorded
+`astra` report at the first FIX REQUIRED head; later rounds similarly use the preceding fix
+round as [Rounds](#rounds) defines it. Reports from other reviewers never enter the prompt.
+A missing Astra report or a preceding round at the requested head is refused (`review-round`).
+
+Use `cm review repair-brief <step>` to hand the worker the latest round's reports under the
+fixed header in `templates/REPAIR-BRIEF.md`. Both commands require `--part NAME` for multipart
+steps and scope reports to that part's current PR. Both only print: they write no state or
+journal entries and launch no reviewers.
 
 A review report ends with one fenced `cm-review` block, followed by nothing but blank lines and, at
 most, the final `ACCEPT` or `FIX REQUIRED` line that `astra-review.sh` reads:

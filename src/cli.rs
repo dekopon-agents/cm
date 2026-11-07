@@ -339,7 +339,7 @@ enum Commands {
         /// The ruling, one line.
         text: String,
     },
-    /// Print the step's kickoff, then its coordinator-scope.md under a fixed heading: a reviewer's brief.
+    /// Print the step's kickoff, then its coordinator-scope.md under a fixed heading: the worker packet.
     Brief {
         /// <NN-name>/<unit>/<step>
         #[arg(value_parser = step_target)]
@@ -436,6 +436,32 @@ enum AttemptAct {
 
 #[derive(Subcommand)]
 enum ReviewAct {
+    /// Print a blind review prompt containing only the kickoff Outcome, base and head.
+    Prompt {
+        /// <NN-name>/<unit>/<step>
+        #[arg(value_parser = step_target)]
+        target: Target,
+        #[arg(long, value_name = "SHA")]
+        head: String,
+        #[arg(long, value_name = "SHA")]
+        base: Option<String>,
+        /// Review round; later rounds include only Astra's own previous-round report.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        round: u32,
+        /// The declared part being reviewed.
+        #[arg(long, value_name = "NAME")]
+        part: Option<String>,
+    },
+    /// Print a fixed repair header and the latest round's reports verbatim.
+    #[command(name = "repair-brief")]
+    Repair {
+        /// <NN-name>/<unit>/<step>
+        #[arg(value_parser = step_target)]
+        target: Target,
+        /// The declared part being repaired.
+        #[arg(long, value_name = "NAME")]
+        part: Option<String>,
+    },
     /// Recover an interrupted review save from persisted rows and reconcile the journal.
     Render,
     /// Parse a report's `cm-review` block, compute its verdict and record it under the step's evidence.
@@ -888,6 +914,28 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             };
             crate::ledger::evidence_pinned(host, &root()?, target, name, &body, &pin)
         }
+        Commands::Review {
+            act:
+                Some(ReviewAct::Prompt {
+                    target,
+                    head,
+                    base,
+                    round,
+                    part,
+                }),
+            ..
+        } => crate::verdict::prompt(
+            &root()?,
+            target,
+            head,
+            base.as_deref(),
+            *round,
+            part.as_deref(),
+        ),
+        Commands::Review {
+            act: Some(ReviewAct::Repair { target, part }),
+            ..
+        } => crate::verdict::repair_brief(&root()?, target, part.as_deref()),
         Commands::Review {
             act:
                 Some(ReviewAct::Record {

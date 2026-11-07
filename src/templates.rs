@@ -11,6 +11,8 @@ pub const JOURNAL: &str = include_str!("../templates/JOURNAL.md");
 pub const LIMITS: &str = include_str!("../templates/LIMITS.toml");
 pub const OWNER_QUEUE: &str = include_str!("../templates/OWNER-QUEUE.md");
 pub const MAC_LANE: &str = include_str!("../templates/MAC-LANE.md");
+pub(crate) const REVIEW_PROMPT: &str = include_str!("../templates/REVIEW-PROMPT.md");
+pub(crate) const REPAIR_BRIEF: &str = include_str!("../templates/REPAIR-BRIEF.md");
 
 pub const ROOT_FILES: [(&str, &str); 4] = [
     ("RESUME.md", RESUME),

@@ -1335,7 +1335,7 @@ pub fn ruling(host: &dyn Host, root: &Path, target: &Target, text: &str) -> Resu
 }
 
 /// The step's kickoff, then its scope file under [`SCOPE_HEADING`]: the brief the coordinator
-/// hands every reviewer.
+/// hands the worker.
 pub fn brief(root: &Path, target: &Target) -> Result<Outcome> {
     let full = full_name(target);
     let kickoff = root.join(&full).join("kickoff.md");
@@ -1362,6 +1362,167 @@ pub fn brief(root: &Path, target: &Target) -> Result<Outcome> {
     outcome.field("brief", text);
     outcome.field("kickoff", relative(root, &kickoff));
     outcome.field("scope", scope.is_some().then_some(rel));
+    Ok(outcome)
+}
+
+// Reviewer prompts read only the kickoff Outcome and the selected PR/part's reports.
+
+fn prompt_scope(
+    root: &Path,
+    target: &Target,
+    part: Option<&str>,
+) -> Result<Result<(Evidence, Vec<Recorded>), Violation>> {
+    let full = full_name(target);
+    if !declared(root, target)? {
+        return Ok(Err(Violation::new(
+            &full,
+            "step-unknown",
+            "the step is not declared",
+        )));
+    }
+    let unit = store::load_unit(&root.join(&target.unit))?;
+    let step = &unit.steps[target.step.as_deref().unwrap_or_default()];
+    let track = match part {
+        Some(part) => match step.parts.get(part) {
+            Some(track) => track,
+            None => {
+                return Ok(Err(Violation::new(
+                    &full,
+                    "part-unknown",
+                    format!("the step declares no part `{part}`"),
+                )));
+            }
+        },
+        None if !step.parts.is_empty() => {
+            return Ok(Err(Violation::new(
+                &full,
+                "review-part",
+                "the step has parts; select the reviewed part with --part NAME",
+            )));
+        }
+        None => &step.track,
+    };
+    let reviews = load(root)?
+        .reviews
+        .into_iter()
+        .filter(|review| {
+            review.step == full && review.pr == track.evidence.pr && review.part.as_deref() == part
+        })
+        .collect();
+    Ok(Ok((track.evidence.clone(), reviews)))
+}
+
+fn kickoff_task(text: &str) -> Option<String> {
+    let headings = crate::markdown::headings(text);
+    let mut outcomes = headings.iter().filter(|heading| heading.text == "Outcome");
+    let heading = outcomes.next()?;
+    if outcomes.next().is_some() {
+        return None;
+    }
+    let end = headings
+        .iter()
+        .find(|next| next.line > heading.line && next.level <= heading.level)
+        .map_or(text.lines().count(), |next| next.line - 1);
+    let task = text
+        .lines()
+        .skip(heading.line)
+        .take(end - heading.line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let task = task.trim();
+    (!task.is_empty()).then(|| task.to_owned())
+}
+
+pub(crate) fn prompt(
+    root: &Path,
+    target: &Target,
+    head: &str,
+    base: Option<&str>,
+    round: u32,
+    part: Option<&str>,
+) -> Result<Outcome> {
+    let full = full_name(target);
+    let (evidence, reviews) = match prompt_scope(root, target, part)? {
+        Ok(scope) => scope,
+        Err(violation) => return Ok(Outcome::refused(vec![violation])),
+    };
+    if !is_sha(head)
+        || !(evidence
+            .sha
+            .as_deref()
+            .is_some_and(|known| same_commit(known, head))
+            || reviews.iter().any(|review| review.at_head(head)))
+    {
+        return Ok(Outcome::refused(vec![Violation::new(
+            &full,
+            "review-head",
+            "--head must name a known head in the selected PR/part's evidence or recorded reviews",
+        )]));
+    }
+    if base.is_some_and(|base| !is_sha(base)) {
+        return Ok(Outcome::refused(vec![Violation::new(
+            &full,
+            "review-base",
+            "--base must be a commit SHA (7 to 40 hex digits)",
+        )]));
+    }
+    let kickoff = root.join(&full).join("kickoff.md");
+    let task = read_existing(&kickoff)?.and_then(|text| kickoff_task(&text));
+    let Some(task) = task else {
+        return Ok(Outcome::refused(vec![Violation::new(
+            &full,
+            "review-outcome",
+            "kickoff.md must contain one non-empty Outcome section",
+        )]));
+    };
+    let mut text = crate::templates::REVIEW_PROMPT
+        .replace("{base}", base.unwrap_or("the repository's default branch"))
+        .replace("{head}", head)
+        .replace("{task}", &task);
+    if round > 1 {
+        let heads = fix_heads(reviews.iter());
+        let previous = heads.get((round - 2) as usize).and_then(|head| {
+            reviews.iter().rev().find(|review| {
+                review.at_head(head) && review.reviewer.as_deref() == Some(ASTRA_REVIEWER)
+            })
+        });
+        let Some(previous) = previous.filter(|previous| !previous.at_head(head)) else {
+            return Ok(Outcome::refused(vec![Violation::new(
+                &full,
+                "review-round",
+                "the preceding fix round must have Astra's own report at a different head",
+            )]));
+        };
+        text.push_str("\n## Your previous-round report\n\n");
+        text.push_str(&fs::read_to_string(root.join(previous.report.as_str()))?);
+    }
+    let mut outcome = Outcome::default();
+    outcome.line(text.clone());
+    outcome.field("prompt", text);
+    Ok(outcome)
+}
+
+pub(crate) fn repair_brief(root: &Path, target: &Target, part: Option<&str>) -> Result<Outcome> {
+    let full = full_name(target);
+    let (_, reviews) = match prompt_scope(root, target, part)? {
+        Ok(scope) => scope,
+        Err(violation) => return Ok(Outcome::refused(vec![violation])),
+    };
+    let Some(latest) = reviews.last() else {
+        return Ok(Outcome::refused(vec![Violation::new(
+            &full,
+            "review-round",
+            "no review round is recorded for the selected PR/part",
+        )]));
+    };
+    let mut text = crate::templates::REPAIR_BRIEF.to_owned();
+    for review in reviews.iter().filter(|review| review.at_head(&latest.head)) {
+        text.push_str("\n\n");
+        text.push_str(&fs::read_to_string(root.join(review.report.as_str()))?);
+    }
+    let mut outcome = Outcome::default();
+    outcome.line(text.clone());
+    outcome.field("repair_brief", text);
     Ok(outcome)
 }
 

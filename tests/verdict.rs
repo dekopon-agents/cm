@@ -1500,6 +1500,258 @@ fn rulings_append_to_the_scope_file_and_the_brief_carries_it() {
 }
 
 #[test]
+fn review_prompt_contains_only_the_task_and_commit_range() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    c.write(&format!("{STEP}/kickoff.md"), review_fixture::KICKOFF);
+    assert!(
+        verdict::ruling(&host, &c.root, &target(), review_fixture::RULING)
+            .unwrap()
+            .ok()
+    );
+    let journal = sha256(&c.root.join("JOURNAL.md"));
+    let state = sha256(&c.root.join("01-a/u/.cm/state.json"));
+    let ledger = sha256(&c.root.join(".cm/verdicts.json"));
+    let head = c.head();
+    let output = review_fixture::review(
+        &c.root,
+        &["prompt", STEP, "--head", &head, "--base", "1234567"],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let prompt = result["prompt"].as_str().unwrap();
+    assert!(prompt.contains(review_fixture::TASK));
+    assert!(prompt.contains(&format!("Head: {head}")));
+    assert!(prompt.contains("Base: 1234567"));
+    assert!(!prompt.contains(review_fixture::OUTSIDE_TASK));
+    assert!(!prompt.contains(review_fixture::RULING));
+    assert!(!prompt.contains("A fenced decoy."));
+    assert_eq!(sha256(&c.root.join("JOURNAL.md")), journal);
+    assert_eq!(sha256(&c.root.join("01-a/u/.cm/state.json")), state);
+    assert_eq!(sha256(&c.root.join(".cm/verdicts.json")), ledger);
+}
+
+#[test]
+fn second_review_prompt_adds_only_astras_own_first_fix_round_report() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    c.write(&format!("{STEP}/kickoff.md"), review_fixture::KICKOFF);
+    assert!(
+        verdict::ruling(&host, &c.root, &target(), review_fixture::RULING)
+            .unwrap()
+            .ok()
+    );
+    let accepted = c.report("accepted", "bbbbbbb2", &[], "ACCEPT");
+    assert!(record(&host, &c, &accepted, "astra").ok());
+    let astra = c.report(
+        "first-astra",
+        "aaaaaaa1",
+        &review_fixture::BLOCKING[..1],
+        "FIX REQUIRED",
+    );
+    assert!(record(&host, &c, &astra, "astra").ok());
+    let other = c.report(
+        "first-other",
+        "aaaaaaa1",
+        &review_fixture::BLOCKING[1..2],
+        "FIX REQUIRED",
+    );
+    assert!(record(&host, &c, &other, "claude").ok());
+    let output = review_fixture::review(
+        &c.root,
+        &["prompt", STEP, "--head", &c.head(), "--round", "2"],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let prompt = result["prompt"].as_str().unwrap();
+    assert!(prompt.ends_with(&fs::read_to_string(astra).unwrap()));
+    assert!(!prompt.contains(&fs::read_to_string(other).unwrap()));
+    assert!(!prompt.contains(&fs::read_to_string(accepted).unwrap()));
+    assert!(!prompt.contains(review_fixture::RULING));
+}
+
+#[test]
+fn repair_brief_preserves_every_latest_round_report_verbatim() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let old = c.report("old", "aaaaaaa1", &review_fixture::BLOCKING, "FIX REQUIRED");
+    assert!(record(&host, &c, &old, "astra").ok());
+    let astra = c.report(
+        "latest-astra",
+        "bbbbbbb2",
+        &review_fixture::BLOCKING[..1],
+        "FIX REQUIRED",
+    );
+    let astra_text = review_fixture::verbatim(&fs::read_to_string(&astra).unwrap());
+    fs::write(&astra, &astra_text).unwrap();
+    assert!(record(&host, &c, &astra, "astra").ok());
+    let other = c.report("latest-other", "bbbbbbb2", &[], "ACCEPT");
+    assert!(record(&host, &c, &other, "claude").ok());
+    let journal = sha256(&c.root.join("JOURNAL.md"));
+    let ledger = sha256(&c.root.join(".cm/verdicts.json"));
+    let output = review_fixture::review(&c.root, &["repair-brief", STEP]);
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let brief = result["repair_brief"].as_str().unwrap();
+    assert!(brief.ends_with(&format!(
+        "\n\n{astra_text}\n\n{}",
+        fs::read_to_string(other).unwrap()
+    )));
+    assert!(!brief.contains(&fs::read_to_string(old).unwrap()));
+    assert!(!brief.to_lowercase().contains("final round"));
+    assert!(!brief.to_lowercase().contains("last round"));
+    assert_eq!(sha256(&c.root.join("JOURNAL.md")), journal);
+    assert_eq!(sha256(&c.root.join(".cm/verdicts.json")), ledger);
+}
+
+#[test]
+fn review_prompt_refuses_unknown_heads_and_missing_outcomes_or_prior_reports() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    c.write(&format!("{STEP}/kickoff.md"), review_fixture::KICKOFF);
+    for head in ["0000000000000000000000000000000000000000", "main"] {
+        let output = review_fixture::review(&c.root, &["prompt", STEP, "--head", head]);
+        assert_eq!(output.status.code(), Some(1));
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["violations"][0]["rule"], "review-head");
+        assert!(result.get("prompt").is_none());
+    }
+    for kickoff in review_fixture::BAD_KICKOFFS {
+        c.write(&format!("{STEP}/kickoff.md"), kickoff);
+        let output = review_fixture::review(&c.root, &["prompt", STEP, "--head", &c.head()]);
+        assert_eq!(output.status.code(), Some(1));
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["violations"][0]["rule"], "review-outcome");
+    }
+    c.write(&format!("{STEP}/kickoff.md"), review_fixture::KICKOFF);
+    let other = c.report(
+        "other",
+        "aaaaaaa1",
+        &review_fixture::BLOCKING[..1],
+        "FIX REQUIRED",
+    );
+    assert!(record(&host, &c, &other, "claude").ok());
+    let output = review_fixture::review(
+        &c.root,
+        &["prompt", STEP, "--head", &c.head(), "--round", "2"],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["violations"][0]["rule"], "review-round");
+}
+
+#[test]
+fn review_prompts_and_repairs_scope_rounds_to_the_current_pr_and_part() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    c.write(&format!("{STEP}/kickoff.md"), review_fixture::KICKOFF);
+    let old = c.report(
+        "old-pr",
+        "aaaaaaa1",
+        &review_fixture::BLOCKING,
+        "FIX REQUIRED",
+    );
+    assert!(record(&host, &c, &old, "astra").ok());
+    let mut unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    unit.steps.get_mut("S1").unwrap().track.evidence.pr =
+        Some("https://github.com/o/r/pull/8".into());
+    commands::write_unit(&c.root.join("01-a/u"), &unit).unwrap();
+    let amendment = commands::Amendment {
+        parts: vec!["one".into(), "two".into()],
+        ..Default::default()
+    };
+    assert!(
+        commands::amend(&host, &c.root, &target(), &amendment)
+            .unwrap()
+            .ok()
+    );
+    let one = c.report(
+        "part-one",
+        "bbbbbbb2",
+        &review_fixture::BLOCKING[..1],
+        "FIX REQUIRED",
+    );
+    assert!(
+        verdict::record(&host, &c.root, &target(), &one, Some("astra"), Some("one"))
+            .unwrap()
+            .ok()
+    );
+    let two = c.report(
+        "part-two",
+        "ccccccc3",
+        &review_fixture::BLOCKING[1..2],
+        "FIX REQUIRED",
+    );
+    assert!(
+        verdict::record(&host, &c.root, &target(), &two, Some("astra"), Some("two"))
+            .unwrap()
+            .ok()
+    );
+    let output = review_fixture::review(
+        &c.root,
+        &[
+            "prompt",
+            STEP,
+            "--part",
+            "one",
+            "--head",
+            &c.head(),
+            "--round",
+            "2",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let prompt = result["prompt"].as_str().unwrap();
+    assert!(prompt.ends_with(&fs::read_to_string(&one).unwrap()));
+    assert!(!prompt.contains(&fs::read_to_string(&two).unwrap()));
+    assert!(!prompt.contains(&fs::read_to_string(&old).unwrap()));
+    let output = review_fixture::review(&c.root, &["repair-brief", STEP, "--part", "one"]);
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let brief = result["repair_brief"].as_str().unwrap();
+    assert!(brief.ends_with(&fs::read_to_string(&one).unwrap()));
+    assert!(!brief.contains(&fs::read_to_string(&two).unwrap()));
+    assert!(!brief.contains(&fs::read_to_string(&old).unwrap()));
+    for (args, rule) in [
+        (
+            vec!["prompt", STEP, "--head", "ccccccc3", "--part", "one"],
+            "review-head",
+        ),
+        (vec!["repair-brief", STEP], "review-part"),
+        (
+            vec!["repair-brief", STEP, "--part", "missing"],
+            "part-unknown",
+        ),
+    ] {
+        let output = review_fixture::review(&c.root, &args);
+        assert_eq!(output.status.code(), Some(1));
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["violations"][0]["rule"], rule);
+    }
+    let mut unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    unit.steps
+        .get_mut("S1")
+        .unwrap()
+        .parts
+        .get_mut("one")
+        .unwrap()
+        .evidence
+        .pr = Some("https://github.com/o/r/pull/9".into());
+    commands::write_unit(&c.root.join("01-a/u"), &unit).unwrap();
+    for args in [
+        vec!["repair-brief", STEP, "--part", "one"],
+        vec!["prompt", STEP, "--part", "one", "--head", "bbbbbbb2"],
+    ] {
+        let output = review_fixture::review(&c.root, &args);
+        assert_eq!(output.status.code(), Some(1));
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(result.get("prompt").is_none());
+        assert!(result.get("repair_brief").is_none());
+    }
+}
+
+#[test]
 fn next_and_sync_flag_a_stalled_codex_launch_and_a_dirty_pr() {
     let host = at("2026-10-25T06:00:00Z");
     let c = campaign(&host, false);
