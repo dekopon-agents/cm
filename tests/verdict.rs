@@ -1009,7 +1009,7 @@ fn a_failing_fresh_read_queues_the_owner_without_replacing_an_unrelated_block() 
     assert_eq!(titles, ["1. 01-a/u/S1: non-converging fresh reader"]);
     let evidence = c.write("ci-fixed.md", "CI is green.\n");
     assert!(
-        commands::unblock(&host, &c.root, &target(), &evidence)
+        commands::unblock(&host, &c.root, &target(), Some(&evidence))
             .unwrap()
             .ok()
     );
@@ -1193,7 +1193,7 @@ fn a_fresh_round_compares_with_its_trigger_and_each_block_queues_the_owner() {
             );
             let evidence = c.write("decision.md", "Continue with the fix.\n");
             assert!(
-                commands::unblock(&host, &c.root, &target(), &evidence)
+                commands::unblock(&host, &c.root, &target(), Some(&evidence))
                     .unwrap()
                     .ok()
             );
@@ -1651,7 +1651,7 @@ fn a_legacy_third_fix_block_and_review_without_a_part_still_load_and_unblock() {
     assert_eq!(c.state(), Phase::Blocked("third-fix".into()));
     let evidence = c.write("ruling.md", "Continue the review.\n");
     assert!(
-        commands::unblock(&host, &c.root, &target(), &evidence)
+        commands::unblock(&host, &c.root, &target(), Some(&evidence))
             .unwrap()
             .ok()
     );
