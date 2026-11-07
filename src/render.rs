@@ -183,7 +183,7 @@ pub fn card(
     units: &Units,
     next: &Next,
     moves: &[Moved],
-) -> String {
+) -> anyhow::Result<String> {
     let mut out = format!(
         "Last run: {at}\n\n# {name} card\n\nRendered by `cm sync` from cm state after reading GitHub; the next sync overwrites it.\n\n"
     );
@@ -282,17 +282,40 @@ pub fn card(
             )
         })
         .collect();
-    let mac: Vec<String> = crate::ledger::mac_lane_open(root)
-        .iter()
-        .map(|item| format!("- {}. {} ({})", item.number, item.title, item.state.name()))
-        .collect();
+    let mac = crate::ledger::mac_lane_open(root)?;
     if !mac.is_empty() {
-        section(&mut out, "Mac lane", &mac, "");
+        let mut rows = vec![
+            format!(
+                "{} open {}",
+                mac.len(),
+                if mac.len() == 1 { "item" } else { "items" }
+            ),
+            String::new(),
+        ];
+        rows.extend(mac.iter().take(10).map(|item| {
+            let title: String = item
+                .title
+                .chars()
+                .map(|character| {
+                    if character.is_whitespace() || character.is_control() {
+                        ' '
+                    } else {
+                        character
+                    }
+                })
+                .take(80)
+                .collect();
+            format!("- #{} {} ({})", item.number, title, item.state.name())
+        }));
+        if mac.len() > 10 {
+            rows.push(format!("- … and {} more: see MAC-LANE.md", mac.len() - 10));
+        }
+        section(&mut out, "Mac lane", &rows, "");
     }
     section(&mut out, "Next", &ready, "Nothing is launchable.");
     section(&mut out, "Waiting", &waiting, "Nothing waits.");
     section(&mut out, "In flight", &flight, "Nothing is in flight.");
     section(&mut out, "Blocked", &blocked, "Nothing is blocked.");
     section(&mut out, "Moved this run", &moved, "No moves.");
-    out
+    Ok(out)
 }

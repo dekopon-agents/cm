@@ -1,7 +1,3 @@
-//! The campaign files people used to append by hand, written through cm: FEEDBACK.md,
-//! OWNER-QUEUE.md and MAC-LANE.md items, step evidence and the REVIEW-OFF.md ledger. Every writer
-//! appends, except `cm mac-lane done`, which stamps one item's leading status.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -444,11 +440,13 @@ impl MacState {
     }
 
     pub fn open(self) -> bool {
-        matches!(self, MacState::Open | MacState::Held | MacState::Running)
+        match self {
+            MacState::Open | MacState::Held | MacState::Running => true,
+            MacState::Done | MacState::Withdrawn => false,
+        }
     }
 }
 
-/// One `N. ` item, from its line to the next item's.
 pub struct MacItem {
     pub line: usize,
     pub number: u32,
@@ -458,14 +456,43 @@ pub struct MacItem {
     status_end: Option<usize>,
 }
 
-fn list_number(line: &str) -> Option<u32> {
-    let (number, _) = line.split_once(". ")?;
-    (!number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
-        .then(|| number.parse().ok())
-        .flatten()
+fn list_number(line: &str) -> Option<(usize, Result<u32, String>)> {
+    let trimmed = line.trim_start_matches(' ');
+    let indent = line.len() - trimmed.len();
+    if indent > 3 {
+        return None;
+    }
+    let first = trimmed.trim_start_matches(['+', '-']).as_bytes().first()?;
+    if !first.is_ascii_digit() {
+        return None;
+    }
+    let marker = trimmed.find(['.', ')'])?;
+    let number = &trimmed[..marker];
+    let rest = &trimmed[marker + 1..];
+    let head = indent + marker + 1 + rest.len() - rest.trim_start_matches([' ', '\t']).len();
+    let parsed = if trimmed.as_bytes()[marker] == b'.'
+        && (rest.starts_with([' ', '\t', '\r', '\n']) || rest.is_empty())
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        number
+            .parse::<u32>()
+            .ok()
+            .filter(|number| *number > 0)
+            .ok_or_else(|| {
+                format!(
+                    "item number `{number}` is outside the supported range 1..={}",
+                    u32::MAX
+                )
+            })
+    } else {
+        Err(format!(
+            "malformed item number `{number}`; use `N. ` with an integer in 1..={}",
+            u32::MAX
+        ))
+    };
+    Some((head, parsed))
 }
 
-/// The byte range of the first `**…**` span, markers included.
 fn bold(text: &str) -> Option<(usize, usize)> {
     let start = text.find("**")?;
     let end = start + 2 + text[start + 2..].find("**")? + 2;
@@ -485,21 +512,28 @@ fn mac_status(span: &str) -> Option<MacState> {
     }
 }
 
-pub fn mac_lane_items(text: &str) -> Vec<MacItem> {
+pub fn mac_lane_items(text: &str) -> Result<Vec<MacItem>, Vec<Violation>> {
     let mut starts = Vec::new();
+    let mut violations = Vec::new();
     let mut offset = 0;
     for (index, line) in text.split_inclusive('\n').enumerate() {
-        if let Some(number) = list_number(line) {
-            starts.push((index + 1, offset, number));
+        if let Some((head, number)) = list_number(line) {
+            match number {
+                Ok(number) => starts.push((index + 1, offset, offset + head, number)),
+                Err(message) => violations
+                    .push(Violation::new(MAC_LANE_FILE, "mac-lane-number", message).at(index + 1)),
+            }
         }
         offset += line.len();
     }
-    starts
+    if !violations.is_empty() {
+        return Err(violations);
+    }
+    Ok(starts
         .iter()
         .enumerate()
-        .map(|(index, &(line, start, number))| {
+        .map(|(index, &(line, _, head, number))| {
             let end = starts.get(index + 1).map_or(text.len(), |next| next.1);
-            let head = start + text[start..end].find(". ").unwrap_or(0) + 2;
             let item = &text[head..end];
             let status = bold(item)
                 .filter(|(open, _)| *open == 0)
@@ -527,26 +561,35 @@ pub fn mac_lane_items(text: &str) -> Vec<MacItem> {
                     .map(|(_, close)| head + close + usize::from(item[close..].starts_with(' '))),
             }
         })
-        .collect()
+        .collect())
 }
 
-/// The open items of the campaign's MAC-LANE.md; none when it is absent.
-pub fn mac_lane_open(root: &Path) -> Vec<MacItem> {
-    fs::read_to_string(root.join(MAC_LANE_FILE))
-        .map(|text| mac_lane_items(&text))
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|item| item.state.open())
-        .collect()
+pub fn mac_lane_open(root: &Path) -> Result<Vec<MacItem>> {
+    let text = read_existing(&root.join(MAC_LANE_FILE))?.unwrap_or_default();
+    let items = mac_lane_items(&text)
+        .map_err(|violations| anyhow::Error::msg(violations.into_iter().next().unwrap()))?;
+    Ok(items.into_iter().filter(|item| item.state.open()).collect())
 }
 
 pub fn lint_mac_lane(root: &Path) -> Vec<Violation> {
-    let Ok(text) = fs::read_to_string(root.join(MAC_LANE_FILE)) else {
-        return Vec::new();
+    let text = match read_existing(&root.join(MAC_LANE_FILE)) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Vec::new(),
+        Err(error) => {
+            return vec![Violation::new(
+                MAC_LANE_FILE,
+                "mac-lane-unreadable",
+                format!("{error:#}; restore readable MAC-LANE.md before continuing"),
+            )];
+        }
+    };
+    let items = match mac_lane_items(&text) {
+        Ok(items) => items,
+        Err(violations) => return violations,
     };
     let mut out = Vec::new();
     let mut last = 0_u32;
-    for item in mac_lane_items(&text) {
+    for item in items {
         if last.checked_add(1) != Some(item.number) {
             let place = match last {
                 0 => "the first item".to_owned(),
@@ -584,7 +627,10 @@ pub fn mac_lane_add(host: &dyn Host, root: &Path, title: &str, body: &str) -> Re
     }
     let path = root.join(MAC_LANE_FILE);
     let mut text = read_existing(&path)?.unwrap_or_else(|| MAC_LANE.to_owned());
-    let items = mac_lane_items(&text);
+    let items = match mac_lane_items(&text) {
+        Ok(items) => items,
+        Err(violations) => return Ok(Outcome::refused(violations)),
+    };
     let Some(number) = items
         .iter()
         .map(|item| item.number)
@@ -640,7 +686,10 @@ pub fn mac_lane_done(host: &dyn Host, root: &Path, number: u32, receipt: &str) -
     one_line("--receipt", receipt, &mut violations, MAC_LANE_FILE);
     let path = root.join(MAC_LANE_FILE);
     let text = read_existing(&path)?.unwrap_or_default();
-    let items = mac_lane_items(&text);
+    let items = match mac_lane_items(&text) {
+        Ok(items) => items,
+        Err(violations) => return Ok(Outcome::refused(violations)),
+    };
     let found: Vec<&MacItem> = items.iter().filter(|item| item.number == number).collect();
     let item = match found[..] {
         [item] if item.state.open() => Some(item),
@@ -696,11 +745,10 @@ pub fn mac_lane_done(host: &dyn Host, root: &Path, number: u32, receipt: &str) -
 }
 
 pub fn mac_lane_list(root: &Path) -> Result<Outcome> {
-    let text = read_existing(&root.join(MAC_LANE_FILE))?.unwrap_or_default();
-    let open: Vec<MacItem> = mac_lane_items(&text)
-        .into_iter()
-        .filter(|item| item.state.open())
-        .collect();
+    let open = match mac_lane_open(root) {
+        Ok(open) => open,
+        Err(error) => return Ok(Outcome::refused(vec![error.downcast::<Violation>()?])),
+    };
     let mut outcome = Outcome::default();
     for item in &open {
         outcome.line(format!(

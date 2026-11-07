@@ -1,4 +1,5 @@
 use std::fs;
+use std::io;
 use std::path::Path;
 
 use crate::limits;
@@ -41,14 +42,14 @@ pub enum Banner {
 }
 
 impl Banner {
-    pub fn of(root: &Path, closed: bool) -> Banner {
-        if closed {
+    pub fn of(root: &Path, closed: bool) -> io::Result<Banner> {
+        Ok(if closed {
             Banner::Closed
-        } else if queue_open_in(root) {
+        } else if queue_open_in(root)? {
             Banner::Withheld
         } else {
             Banner::Loop
-        }
+        })
     }
 }
 
@@ -66,8 +67,12 @@ pub fn queue_open(queue: &str) -> bool {
     headings(queue).iter().any(|heading| heading.level == 2)
 }
 
-pub fn queue_open_in(root: &Path) -> bool {
-    fs::read_to_string(root.join(QUEUE_FILE)).is_ok_and(|queue| queue_open(&queue))
+pub fn queue_open_in(root: &Path) -> io::Result<bool> {
+    match fs::read_to_string(root.join(QUEUE_FILE)) {
+        Ok(queue) => Ok(queue_open(&queue)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn resume(text: &str, expected: Banner) -> Vec<Violation> {

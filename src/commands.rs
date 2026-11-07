@@ -179,7 +179,7 @@ fn init_campaign(host: &dyn Host, dir: &Path) -> Result<Outcome> {
         let found = templates::conform(
             name,
             &text,
-            templates::Banner::of(dir, state.closed.is_some()),
+            templates::Banner::of(dir, state.closed.is_some())?,
         );
         if !found.is_empty() {
             violations.extend(found);
