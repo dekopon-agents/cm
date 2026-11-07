@@ -448,6 +448,9 @@ enum ReviewAct {
         /// Who reviewed: astra, claude, …
         #[arg(long, value_name = "KIND")]
         reviewer: Option<String>,
+        /// The declared part reviewed by this report.
+        #[arg(long, value_name = "NAME")]
+        part: Option<String>,
     },
     /// Record what resolved a blocking finding: a commit, or a ruling file in the campaign.
     Resolve {
@@ -891,6 +894,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                     target,
                     report,
                     reviewer,
+                    part,
                 }),
             ..
         } => crate::verdict::record(
@@ -899,6 +903,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             target,
             &under_root(cli, report),
             reviewer.as_deref(),
+            part.as_deref(),
         ),
         Commands::Review {
             act:
