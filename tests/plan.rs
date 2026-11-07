@@ -2192,6 +2192,7 @@ fn advance_part(
             file: None,
             repo: None,
             part: Some(part),
+            by: &[],
         },
         &commands::MergeGate::default(),
     )

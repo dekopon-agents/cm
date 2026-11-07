@@ -322,6 +322,7 @@ impl Campaign {
                 file: None,
                 repo: Some(&self.repo),
                 part: None,
+                by: &[],
             },
             gate,
         )
@@ -1137,6 +1138,7 @@ fn part_rounds_use_the_parts_pr_and_do_not_mix_counts() {
                 file: None,
                 repo: Some(&c.repo),
                 part: Some("two"),
+                by: &[],
             },
             &MergeGate::default()
         )
@@ -1378,6 +1380,7 @@ fn merge_gate_repair_commands_select_the_part_in_advance_and_sync() {
                 file: None,
                 repo: Some(&c.repo),
                 part: Some("-one"),
+                by: &[],
             },
             &gate,
         )
@@ -2807,6 +2810,7 @@ fn standing_registration_tries_each_parts_pr_without_changing_commit_selection()
             file: None,
             repo: Some(&c.repo),
             part: Some("two"),
+            by: &[],
         },
         &MergeGate::default(),
     )

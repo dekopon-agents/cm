@@ -299,6 +299,7 @@ pub fn card(
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut flight = Vec::new();
     let mut blocked = Vec::new();
+    let mut superseded = Vec::new();
     let mut number = 1;
     for (unit, state) in units {
         for (step_name, step) in &state.steps {
@@ -319,6 +320,19 @@ pub fn card(
                         .map(|pr| format!(" {pr}"))
                         .unwrap_or_default()
                 )),
+                Phase::Superseded if !step.track.evidence.superseded_by.is_empty() => {
+                    let successors: Vec<String> = step
+                        .track
+                        .evidence
+                        .superseded_by
+                        .iter()
+                        .map(|successor| format!("`{successor}`"))
+                        .collect();
+                    superseded.push(format!(
+                        "- `{target}` superseded by {}",
+                        successors.join(", ")
+                    ));
+                }
                 Phase::Blocked(reason) => {
                     let met = reason
                         .strip_prefix("until:")
@@ -453,6 +467,9 @@ pub fn card(
     section(&mut out, "Waiting", &waiting, "Nothing waits.");
     section(&mut out, "In flight", &flight, "Nothing is in flight.");
     section(&mut out, "Blocked", &blocked, "Nothing is blocked.");
+    if !superseded.is_empty() {
+        section(&mut out, "Superseded", &superseded, "");
+    }
     section(&mut out, "Watches", &watch_summary(root, now, units), "");
     section(&mut out, "Moved this run", &moved, "No moves.");
     out

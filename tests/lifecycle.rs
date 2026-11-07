@@ -1336,3 +1336,170 @@ fn resolving_or_withdrawing_the_last_watch_keeps_a_release_on_the_shipping_ladde
         assert_eq!(unit.steps["1.0.0"].track.state, Phase::Done);
     }
 }
+
+#[test]
+fn superseded_records_one_or_two_successors_in_state_journal_and_card() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    for (by, successors) in [
+        ("NEW", vec!["01-first/alpha/NEW"]),
+        (
+            "NEW,02-next/beta/NEXT",
+            vec!["01-first/alpha/NEW", "02-next/beta/NEXT"],
+        ),
+        (
+            "NEW,01-first/alpha/NEW,02-next/beta/NEXT",
+            vec!["01-first/alpha/NEW", "02-next/beta/NEXT"],
+        ),
+    ] {
+        let c = campaign(&host);
+        c.supersession(&host);
+        let before = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .current_dir(&c.root)
+            .args([
+                "--json",
+                "advance",
+                "01-first/alpha/OLD",
+                "superseded",
+                "--evidence",
+                "replacement.md",
+                "--by",
+                by,
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            result["evidence"]["superseded_by"],
+            serde_json::json!(successors)
+        );
+
+        let dir = c.root.join("01-first/alpha");
+        let state = store::load_unit(&dir).unwrap();
+        let retired = &state.steps["OLD"].track;
+        assert_eq!(state.schema, cm::state::SCHEMA);
+        assert_eq!(retired.state, Phase::Superseded);
+        assert_eq!(retired.evidence.superseded_by, successors);
+        let moved = state.history.last().unwrap();
+        assert_eq!(moved.evidence.superseded_by, successors);
+        let round_trip: UnitState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(round_trip, state);
+        let summary = format!(
+            "file replacement.md; superseded by {}",
+            successors.join(", ")
+        );
+        let rendered = fs::read_to_string(dir.join("STATE.md")).unwrap();
+        assert_eq!(
+            rendered
+                .lines()
+                .find(|line| line.starts_with("| OLD |"))
+                .unwrap(),
+            format!(
+                "| OLD | superseded | {} | 0 | — | {summary} |",
+                retired.since
+            )
+        );
+        let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+        assert_eq!(
+            journal.strip_prefix(&before).unwrap().trim_start(),
+            format!(
+                "{}\n\n- evidence: {summary}\n",
+                result["journal"].as_str().unwrap()
+            )
+        );
+
+        let synced = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .current_dir(&c.root)
+            .args(["--json", "sync"])
+            .output()
+            .unwrap();
+        assert!(synced.status.success(), "{synced:?}");
+        let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+        let links: Vec<_> = successors.iter().map(|step| format!("`{step}`")).collect();
+        assert_eq!(
+            card.lines()
+                .find(|line| line.starts_with("- `01-first/alpha/OLD`"))
+                .unwrap(),
+            format!("- `01-first/alpha/OLD` superseded by {}", links.join(", "))
+        );
+    }
+}
+
+#[test]
+fn superseded_refuses_undeclared_self_or_invalid_successors_without_writing() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    c.supersession(&host);
+    let before = c.files();
+    for by in [
+        "NEW,MISSING",
+        "03-absent/unit/MISSING",
+        "OLD",
+        "01-first/alpha/OLD",
+        "NEW,01-first/alpha/OLD",
+        "01-first/alpha",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .current_dir(&c.root)
+            .args([
+                "--json",
+                "advance",
+                "01-first/alpha/OLD",
+                "superseded",
+                "--evidence",
+                "replacement.md",
+                "--by",
+                by,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{by}: {output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["violations"][0]["rule"], "superseded-by", "{result}");
+        assert_eq!(c.files(), before, "{by}");
+    }
+}
+
+#[test]
+fn by_is_a_usage_error_outside_superseded_and_does_not_replace_evidence() {
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    c.supersession(&host);
+    let before = c.files();
+    for state in [
+        "drafted",
+        "launched",
+        "pr-open",
+        "merged",
+        "released",
+        "deployed",
+        "done",
+        "blocked:waiting",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .current_dir(&c.root)
+            .args(["advance", "01-first/alpha/OLD", state, "--by", "NEW"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{state}: {output:?}");
+        assert_eq!(c.files(), before, "{state}");
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .current_dir(&c.root)
+        .args([
+            "--json",
+            "advance",
+            "01-first/alpha/OLD",
+            "superseded",
+            "--by",
+            "NEW",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["violations"][0]["rule"], "evidence-missing");
+    assert_eq!(c.files(), before);
+}
