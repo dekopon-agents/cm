@@ -1,0 +1,720 @@
+use std::fs;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
+use clap::ValueEnum;
+
+use crate::epoch::{self, EPOCH, Status};
+use crate::host::{Host, stamp};
+use crate::journal;
+use crate::markdown::{Fences, headings};
+use crate::outcome::{Outcome, Violation};
+use crate::store::{self, JOURNAL, lock, relative, write_atomic};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+pub(crate) enum Maturity {
+    Captured,
+    Exploring,
+    Designed,
+}
+
+impl Maturity {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Captured => "captured",
+            Self::Exploring => "exploring",
+            Self::Designed => "designed",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        [Self::Captured, Self::Exploring, Self::Designed]
+            .into_iter()
+            .find(|value| value.label() == text)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum Word {
+    Landed,
+    Partial,
+    Deferred,
+    Superseded,
+    Cancelled,
+}
+
+impl Word {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Landed => "landed",
+            Self::Partial => "partial",
+            Self::Deferred => "deferred",
+            Self::Superseded => "superseded",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn terminal(self) -> bool {
+        matches!(self, Self::Landed | Self::Superseded | Self::Cancelled)
+    }
+}
+
+pub(crate) enum Action<'a> {
+    Admit,
+    Move(Maturity),
+    Outcome {
+        word: Word,
+        to: Option<&'a str>,
+        by: Option<&'a str>,
+        note: Option<&'a str>,
+    },
+}
+
+fn field(text: &str, key: &str) -> Option<String> {
+    let lines: Vec<_> = text.lines().map(str::to_owned).collect();
+    let front = epoch::front(&lines)?;
+    epoch::value(&lines, &front, key).map(|value| value.trim_matches(['\'', '"']).to_owned())
+}
+
+fn id_valid(id: &str) -> bool {
+    id.rsplit_once('-').is_some_and(|(prefix, number)| {
+        !prefix.is_empty()
+            && prefix.bytes().all(|byte| byte.is_ascii_alphabetic())
+            && !number.is_empty()
+            && number.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn epoch_valid(name: &str) -> bool {
+    store::is_name(name)
+}
+
+struct Manifest {
+    text: String,
+    name: String,
+    status: Status,
+    dir: PathBuf,
+    ids: Vec<String>,
+}
+
+/// Existing campaigns without ideas_dir have no idea lint rules.
+fn manifest(root: &Path, required: bool, out: &mut Vec<Violation>) -> Option<Manifest> {
+    let text = fs::read_to_string(root.join(EPOCH)).unwrap_or_default();
+    let Some(dir) = field(&text, "ideas_dir").filter(|value| !value.is_empty()) else {
+        if required {
+            out.push(Violation::new(
+                EPOCH,
+                "idea-dir",
+                "set `ideas_dir: <relative path>` in EPOCH.md",
+            ));
+        }
+        return None;
+    };
+    if Path::new(&dir).is_absolute() {
+        out.push(Violation::new(
+            EPOCH,
+            "idea-dir",
+            "ideas_dir is relative to the campaign folder",
+        ));
+        return None;
+    }
+    let name = field(&text, "epoch").unwrap_or_default();
+    if !epoch_valid(&name) {
+        out.push(Violation::new(
+            EPOCH,
+            "idea-epoch",
+            "epoch: names this epoch with letters, digits, `.`, `_` and `-`",
+        ));
+        return None;
+    }
+    let Some(status) = epoch::status(&text) else {
+        out.push(Violation::new(
+            EPOCH,
+            "epoch-status",
+            "status: is OPEN, PLANNING, WORKING or CLOSED",
+        ));
+        return None;
+    };
+    let ids = match field(&text, "ideas") {
+        None => Vec::new(),
+        Some(list) => {
+            let Some(inner) = list
+                .strip_prefix('[')
+                .and_then(|list| list.strip_suffix(']'))
+            else {
+                out.push(Violation::new(
+                    EPOCH,
+                    "idea-list-form",
+                    "ideas: is a flow list, for example [IDEA-9003, IDEA-9001]",
+                ));
+                return None;
+            };
+            let ids: Vec<String> = if inner.trim().is_empty() {
+                Vec::new()
+            } else {
+                inner.split(',').map(|id| id.trim().to_owned()).collect()
+            };
+            if ids.iter().any(|id| !id_valid(id)) {
+                out.push(Violation::new(
+                    EPOCH,
+                    "idea-list-form",
+                    "ideas: holds comma-separated idea ids",
+                ));
+                return None;
+            }
+            ids
+        }
+    };
+    Some(Manifest {
+        text,
+        name,
+        status,
+        dir: root.join(dir),
+        ids,
+    })
+}
+
+struct Idea {
+    path: PathBuf,
+    text: String,
+    id: Option<String>,
+    maturity: Option<String>,
+    current: Option<String>,
+}
+
+fn read_ideas(root: &Path, dir: &Path, out: &mut Vec<Violation>) -> Vec<Idea> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            out.push(Violation::new(
+                EPOCH,
+                "idea-dir",
+                format!("cannot read ideas_dir {}: {error}", dir.display()),
+            ));
+            return Vec::new();
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                let path = entry.path();
+                if path.is_file() && path.extension().is_some_and(|ext| ext == "md") {
+                    paths.push(path);
+                }
+            }
+            Err(error) => out.push(Violation::new(
+                EPOCH,
+                "idea-dir",
+                format!("cannot list ideas_dir: {error}"),
+            )),
+        }
+    }
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|path| match fs::read_to_string(&path) {
+            Ok(text) => Some(Idea {
+                id: field(&text, "id"),
+                maturity: field(&text, "maturity"),
+                current: field(&text, "current_epoch"),
+                path,
+                text,
+            }),
+            Err(error) => {
+                out.push(Violation::new(
+                    relative(root, &path),
+                    "idea-front-matter",
+                    format!("cannot read idea: {error}"),
+                ));
+                None
+            }
+        })
+        .collect()
+}
+
+fn validate(root: &Path, idea: &Idea) -> Vec<Violation> {
+    let path = relative(root, &idea.path);
+    let mut out = Vec::new();
+    if idea.id.as_deref().is_none_or(|id| !id_valid(id)) || idea.maturity.is_none() {
+        out.push(Violation::new(
+            &path,
+            "idea-front-matter",
+            "front matter needs id: <PREFIX>-<digits> and maturity:",
+        ));
+    }
+    if let Some(maturity) = &idea.maturity
+        && Maturity::parse(maturity).is_none()
+    {
+        out.push(Violation::new(
+            &path,
+            "idea-maturity",
+            "maturity: is captured, exploring or designed",
+        ));
+    }
+    if let Some(id) = &idea.id {
+        let filename = idea.path.file_name().unwrap_or_default().to_string_lossy();
+        if filename != format!("{id}.md") && !filename.starts_with(&format!("{id}-")) {
+            out.push(Violation::new(
+                &path,
+                "idea-filename",
+                format!("file name starts with {id}.md or {id}-"),
+            ));
+        }
+    }
+    out
+}
+
+fn resolve<'a>(
+    root: &Path,
+    ideas: &'a [Idea],
+    id: &str,
+    out: &mut Vec<Violation>,
+) -> Option<&'a Idea> {
+    let found: Vec<_> = ideas
+        .iter()
+        .filter(|idea| idea.id.as_deref() == Some(id))
+        .collect();
+    match found.as_slice() {
+        [] => {
+            out.push(Violation::new(
+                EPOCH,
+                "idea-unknown",
+                format!("{id} has no file in ideas_dir"),
+            ));
+            None
+        }
+        [one] => Some(one),
+        _ => {
+            for idea in &found {
+                let other = found.iter().find(|other| other.path != idea.path).unwrap();
+                out.push(Violation::new(
+                    relative(root, &idea.path),
+                    "idea-duplicate-id",
+                    format!("{id} also appears in {}", relative(root, &other.path)),
+                ));
+            }
+            None
+        }
+    }
+}
+
+fn offset(text: &str, line: usize) -> usize {
+    text.split_inclusive('\n').take(line).map(str::len).sum()
+}
+
+fn history(text: &str) -> Option<Range<usize>> {
+    let headings = headings(text);
+    let mut sections = headings
+        .iter()
+        .enumerate()
+        .filter(|(_, heading)| heading.level == 2 && heading.text == "Epoch history");
+    let (index, heading) = sections.next()?;
+    if sections.next().is_some() {
+        return None;
+    }
+    let end = headings[index + 1..]
+        .iter()
+        .find(|heading| heading.level <= 2)
+        .map(|heading| offset(text, heading.line - 1))
+        .unwrap_or(text.len());
+    Some(offset(text, heading.line)..end)
+}
+
+fn entry_text(line: &str) -> Option<&str> {
+    let (stamp, text) = line.strip_prefix("- ")?.split_once(": ")?;
+    let valid = if stamp.len() == 10 {
+        stamp.parse::<jiff::civil::Date>().is_ok()
+    } else {
+        stamp.parse::<jiff::Timestamp>().is_ok()
+    };
+    valid.then_some(text)
+}
+
+fn destination(text: &str) -> bool {
+    text == "unassigned"
+        || text
+            .strip_prefix('`')
+            .and_then(|text| text.strip_suffix('`'))
+            .is_some_and(epoch_valid)
+}
+
+fn outcome_text(text: &str) -> Option<(&str, Word)> {
+    let (name, text) = text.strip_prefix("outcome in `")?.split_once("`: ")?;
+    let text = text.strip_suffix('.')?;
+    let word = if text
+        .strip_prefix("landed; ")
+        .is_some_and(|note| !note.trim().is_empty())
+    {
+        Word::Landed
+    } else if text
+        .strip_prefix("cancelled; ")
+        .is_some_and(|note| !note.trim().is_empty())
+    {
+        Word::Cancelled
+    } else if text.strip_prefix("superseded by ").is_some_and(id_valid) {
+        Word::Superseded
+    } else if text.strip_prefix("deferred to ").is_some_and(destination) {
+        Word::Deferred
+    } else if text
+        .strip_prefix("partial, remainder to ")
+        .and_then(|text| text.split_once("; "))
+        .is_some_and(|(target, note)| destination(target) && !note.trim().is_empty())
+    {
+        Word::Partial
+    } else {
+        return None;
+    };
+    epoch_valid(name).then_some((name, word))
+}
+
+impl Idea {
+    fn entries(&self) -> Vec<&str> {
+        let Some(range) = history(&self.text) else {
+            return Vec::new();
+        };
+        let mut fences = Fences::default();
+        self.text[range]
+            .lines()
+            .filter(|line| !fences.contains(line))
+            .filter_map(entry_text)
+            .collect()
+    }
+
+    fn outcomes(&self) -> Vec<(&str, Word)> {
+        self.entries()
+            .into_iter()
+            .filter_map(outcome_text)
+            .collect()
+    }
+
+    fn admitted(&self, name: &str) -> bool {
+        [
+            Status::Open,
+            Status::Planning,
+            Status::Working,
+            Status::Closed,
+        ]
+        .iter()
+        .any(|status| {
+            let text = format!("admitted to `{name}` ({}).", status.label());
+            self.entries().contains(&text.as_str())
+        })
+    }
+
+    fn open(&self, name: &str) -> bool {
+        self.current.as_deref() == Some(name)
+            && !self.outcomes().iter().any(|(epoch, _)| *epoch == name)
+    }
+}
+
+/// Only cm's exact history format is state; dated free prose remains untouched.
+pub(crate) fn lint(root: &Path) -> Vec<Violation> {
+    let mut out = Vec::new();
+    let Some(manifest) = manifest(root, false, &mut out) else {
+        return out;
+    };
+    let ideas = read_ideas(root, &manifest.dir, &mut out);
+    for idea in &ideas {
+        out.extend(validate(root, idea));
+        if let Some(id) = &idea.id {
+            if let Some(other) = ideas
+                .iter()
+                .find(|other| other.path != idea.path && other.id == idea.id)
+            {
+                out.push(Violation::new(
+                    relative(root, &idea.path),
+                    "idea-duplicate-id",
+                    format!("{id} also appears in {}", relative(root, &other.path)),
+                ));
+            }
+            if idea.open(&manifest.name) && !manifest.ids.contains(id) {
+                out.push(Violation::new(
+                    relative(root, &idea.path),
+                    "idea-epoch-list",
+                    format!("{id} is open here but missing from ideas:; run `cm idea admit {id}`"),
+                ));
+            }
+        }
+    }
+    for id in &manifest.ids {
+        let found: Vec<_> = ideas
+            .iter()
+            .filter(|idea| idea.id.as_deref() == Some(id))
+            .collect();
+        if found.is_empty()
+            || found
+                .iter()
+                .any(|idea| idea.current.as_deref() != Some(&manifest.name))
+        {
+            out.push(Violation::new(
+                EPOCH,
+                "idea-epoch-list",
+                format!(
+                    "{id} has no file or names another current_epoch; run `cm idea admit {id}`"
+                ),
+            ));
+        }
+    }
+    out
+}
+
+fn append_history(text: &str, line: &str) -> String {
+    let range = history(text).expect("history checked before writing");
+    let section = &text[range.clone()];
+    // Insert before trailing blank lines, keeping every existing byte in place.
+    let mut at = range.start;
+    let mut end = range.start;
+    for line in section.split_inclusive('\n') {
+        end += line.len();
+        if !line.trim().is_empty() {
+            at = end;
+        }
+    }
+    let ending = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut next = text[..at].to_owned();
+    if !next.ends_with('\n') {
+        next.push_str(ending);
+    }
+    next.push_str(line);
+    next.push_str(ending);
+    next.push_str(&text[at..]);
+    next
+}
+
+fn journaled(root: &Path, title: &str, body: &str) -> Result<bool> {
+    let text = fs::read_to_string(root.join(JOURNAL))?;
+    let headings = headings(&text);
+    Ok(headings.iter().enumerate().any(|(index, heading)| {
+        let line = text.lines().nth(heading.line - 1).unwrap_or_default();
+        if heading.level != 2
+            || !journal::is_stamped(line)
+            || !line.ends_with(&format!(" — {title}"))
+        {
+            return false;
+        }
+        let end = headings[index + 1..]
+            .iter()
+            .find(|heading| heading.level <= 2)
+            .map(|heading| offset(&text, heading.line - 1))
+            .unwrap_or(text.len());
+        text[offset(&text, heading.line)..end].trim() == body.trim()
+    }))
+}
+
+pub(crate) fn run(host: &dyn Host, root: &Path, id: &str, action: Action<'_>) -> Result<Outcome> {
+    let _lock = lock(root)?;
+    let campaign = store::load_campaign(root)?;
+    let mut violations = journal::check(root, &campaign);
+    let Some(mut manifest) = manifest(root, true, &mut violations) else {
+        return Ok(Outcome::refused(violations));
+    };
+    let ideas = read_ideas(root, &manifest.dir, &mut violations);
+    let Some(idea) = resolve(root, &ideas, id, &mut violations) else {
+        return Ok(Outcome::refused(violations));
+    };
+    violations.extend(validate(root, idea));
+    let path = relative(root, &idea.path);
+    if history(&idea.text).is_none() {
+        violations.push(Violation::new(
+            &path,
+            "idea-history",
+            "the idea needs exactly one `## Epoch history` section",
+        ));
+    }
+    let at = stamp(host.now());
+    let date = &at[..10];
+    let mut next = idea.text.clone();
+    let mut result = Outcome::default();
+    result.field("id", id);
+    result.field("epoch", manifest.name.clone());
+    result.field("at", at.clone());
+    let (act, record, body) = match action {
+        Action::Admit => {
+            violations.extend(crate::commands::closed(root, &campaign));
+            if manifest.status == Status::Closed {
+                violations.push(Violation::new(
+                    EPOCH,
+                    "epoch-closed",
+                    "an idea cannot be admitted to a CLOSED epoch",
+                ));
+            }
+            let outcomes = idea.outcomes();
+            if outcomes.last().is_some_and(|(_, word)| word.terminal()) {
+                violations.push(Violation::new(
+                    &path,
+                    "idea-terminal",
+                    "the last outcome is terminal",
+                ));
+            }
+            if let Some(current) = idea.current.as_deref().filter(|current| {
+                !current.is_empty()
+                    && *current != "unassigned"
+                    && *current != "null"
+                    && *current != "~"
+                    && *current != manifest.name
+            }) && !outcomes.iter().any(|(name, _)| *name == current)
+            {
+                violations.push(Violation::new(
+                    &path,
+                    "idea-open-elsewhere",
+                    format!("the idea is still open in `{current}`"),
+                ));
+            }
+            let record = (!idea.admitted(&manifest.name)).then(|| {
+                format!(
+                    "admitted to `{}` ({}).",
+                    manifest.name,
+                    manifest.status.label()
+                )
+            });
+            if violations.is_empty() {
+                next = epoch::set_text(&next, "current_epoch", &manifest.name)
+                    .expect("validated front matter");
+            }
+            (
+                "admit",
+                record,
+                format!("- idea: {id}\n- epoch: {}\n", manifest.name),
+            )
+        }
+        Action::Move(to) => {
+            let from = idea.maturity.as_deref().and_then(Maturity::parse);
+            if from.is_some_and(|from| to <= from) {
+                violations.push(Violation::new(
+                    &path,
+                    "idea-maturity",
+                    "maturity moves forward only: captured → exploring → designed",
+                ));
+            }
+            if violations.is_empty() {
+                next =
+                    epoch::set_text(&next, "maturity", to.label()).expect("validated front matter");
+            }
+            result.field("maturity", to.label());
+            let from = from.map(Maturity::label).unwrap_or_default();
+            let record = format!("maturity {from} → {} in `{}`.", to.label(), manifest.name);
+            (
+                "move",
+                Some(record),
+                format!(
+                    "- idea: {id}\n- epoch: {}\n- maturity: {from} → {}\n",
+                    manifest.name,
+                    to.label()
+                ),
+            )
+        }
+        Action::Outcome { word, to, by, note } => {
+            if idea
+                .outcomes()
+                .iter()
+                .any(|(name, _)| *name == manifest.name)
+            {
+                violations.push(Violation::new(
+                    &path,
+                    "idea-outcome-twice",
+                    "this idea already has an outcome in this epoch",
+                ));
+            }
+            let needs_to = matches!(word, Word::Partial | Word::Deferred);
+            let needs_note = matches!(word, Word::Landed | Word::Partial | Word::Cancelled);
+            let needs_by = word == Word::Superseded;
+            if needs_to != to.is_some() || needs_note != note.is_some() || needs_by != by.is_some()
+            {
+                violations.push(Violation::new(&path, "idea-outcome-flags", "landed/cancelled need only --note; partial needs --to and --note; deferred needs only --to; superseded needs only --by"));
+            }
+            if let Some(target) = to
+                && !epoch_valid(target)
+            {
+                violations.push(Violation::new(
+                    &path,
+                    "idea-outcome-flags",
+                    "--to names an epoch or unassigned",
+                ));
+            }
+            if let Some(note) = note
+                && (note.trim().is_empty() || note.contains(['\r', '\n']))
+            {
+                violations.push(Violation::new(
+                    &path,
+                    "idea-outcome-flags",
+                    "--note is one non-empty line",
+                ));
+            }
+            if let Some(by) = by {
+                resolve(root, &ideas, by, &mut violations);
+            }
+            let target = to
+                .map(|target| {
+                    if target == "unassigned" {
+                        target.to_owned()
+                    } else {
+                        format!("`{target}`")
+                    }
+                })
+                .unwrap_or_default();
+            let details = match word {
+                Word::Landed => format!("landed; {}", note.unwrap_or_default()),
+                Word::Partial => format!(
+                    "partial, remainder to {target}; {}",
+                    note.unwrap_or_default()
+                ),
+                Word::Deferred => format!("deferred to {target}"),
+                Word::Superseded => format!("superseded by {}", by.unwrap_or_default()),
+                Word::Cancelled => format!("cancelled; {}", note.unwrap_or_default()),
+            };
+            let record = format!("outcome in `{}`: {details}.", manifest.name);
+            result.field("outcome", word.label());
+            result.field("to", to);
+            result.field("by", by);
+            result.field("note", note);
+            (
+                "outcome",
+                Some(record),
+                format!(
+                    "- idea: {id}\n- epoch: {}\n- outcome: {details}\n",
+                    manifest.name
+                ),
+            )
+        }
+    };
+    if act != "admit" && idea.current.as_deref() != Some(&manifest.name) {
+        violations.push(Violation::new(
+            &path,
+            "idea-not-here",
+            "current_epoch must name this epoch; run `cm idea admit` first",
+        ));
+    }
+    if !violations.is_empty() {
+        return Ok(Outcome::refused(violations));
+    }
+    if let Some(record) = record {
+        next = append_history(&next, &format!("- {date}: {record}"));
+    }
+    let mut changed = next != idea.text;
+    if changed {
+        write_atomic(&idea.path, next.as_bytes())?;
+    }
+    if act == "admit" && !manifest.ids.iter().any(|listed| listed == id) {
+        manifest.ids.push(id.to_owned());
+        let list = format!("[{}]", manifest.ids.join(", "));
+        let text = epoch::set_text(&manifest.text, "ideas", &list).expect("validated front matter");
+        write_atomic(&root.join(EPOCH), text.as_bytes())?;
+        changed = true;
+    }
+    let title = format!("idea {act} {id}");
+    if act != "admit" || !journaled(root, &title, &body)? {
+        let heading = crate::ledger::journal_line(root, &at, &title, &body)?;
+        result.field("journal", heading);
+        changed = true;
+    }
+    result.field("action", act);
+    result.field("changed", changed);
+    result.line(if changed {
+        format!("idea {act} {id}")
+    } else {
+        format!("{id} is already admitted")
+    });
+    Ok(result)
+}

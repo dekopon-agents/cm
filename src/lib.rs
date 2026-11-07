@@ -7,6 +7,7 @@ pub mod evidence;
 pub mod forge;
 pub mod holds;
 pub mod host;
+pub(crate) mod idea;
 pub mod journal;
 pub mod ledger;
 pub mod limits;

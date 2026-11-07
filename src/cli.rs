@@ -9,6 +9,7 @@ use crate::commands;
 use crate::epoch::{self, Status};
 use crate::forge::GithubRepo;
 use crate::host::{Host, System};
+use crate::idea::{self, Maturity, Word};
 use crate::lint;
 use crate::outcome::{Outcome, Violation};
 use crate::state::{Evidence, Lane, Phase, Work};
@@ -97,6 +98,11 @@ enum Commands {
         /// The approved plan revision to pin (`approved_plan_revision`).
         #[arg(long, value_name = "SHA")]
         plan_revision: Option<String>,
+    },
+    /// Admit an idea, move its maturity forward, or record its outcome.
+    Idea {
+        #[command(subcommand)]
+        act: IdeaAct,
     },
     /// Seal the campaign. Refuses while OWNER-QUEUE.md has an open item or any unit or step is short of done or blocked; afterwards unit init, launch and advance refuse and RESUME.md's banner holds no `/loop`.
     Close,
@@ -367,6 +373,28 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+enum IdeaAct {
+    /// Admit an idea to this epoch, completing an interrupted admission when needed.
+    Admit { id: String },
+    /// Move maturity forward: captured, exploring or designed; skipping is allowed.
+    Move { id: String, maturity: Maturity },
+    /// Record one outcome for this idea in this epoch.
+    Outcome {
+        id: String,
+        word: Word,
+        /// A later epoch or unassigned; required for partial and deferred.
+        #[arg(long)]
+        to: Option<String>,
+        /// An existing idea id; required for superseded.
+        #[arg(long)]
+        by: Option<String>,
+        /// One line of evidence or reason; required for landed, partial and cancelled.
+        #[arg(long)]
+        note: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum WatchAct {
     /// Close an unresolved watch with a reason, releasing its hold.
     Withdraw {
@@ -605,6 +633,28 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             coordinator,
             *record,
         ),
+        Commands::Idea { act } => {
+            let (id, action) = match act {
+                IdeaAct::Admit { id } => (id, idea::Action::Admit),
+                IdeaAct::Move { id, maturity } => (id, idea::Action::Move(*maturity)),
+                IdeaAct::Outcome {
+                    id,
+                    word,
+                    to,
+                    by,
+                    note,
+                } => (
+                    id,
+                    idea::Action::Outcome {
+                        word: *word,
+                        to: to.as_deref(),
+                        by: by.as_deref(),
+                        note: note.as_deref(),
+                    },
+                ),
+            };
+            idea::run(host, &root()?, id, action)
+        }
         Commands::Close => commands::close(host, &root()?),
         Commands::Init {
             part,
@@ -1001,6 +1051,7 @@ fn name(command: &Commands) -> &'static str {
         Commands::Next { .. } => "next",
         Commands::Sync => "sync",
         Commands::Epoch { .. } => "epoch",
+        Commands::Idea { .. } => "idea",
         Commands::Journal { .. } => "journal",
         Commands::Launch { .. } => "launch",
         Commands::Unblock { .. } => "unblock",

@@ -21,7 +21,7 @@ pub enum Status {
 }
 
 impl Status {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Status::Open => "OPEN",
             Status::Planning => "PLANNING",
@@ -102,12 +102,12 @@ impl Pin {
     }
 }
 
-struct Front {
+pub(crate) struct Front {
     start: usize,
     end: usize,
 }
 
-fn front(lines: &[String]) -> Option<Front> {
+pub(crate) fn front(lines: &[String]) -> Option<Front> {
     if lines.first().map(String::as_str) != Some("---") {
         return None;
     }
@@ -115,7 +115,7 @@ fn front(lines: &[String]) -> Option<Front> {
     Some(Front { start: 1, end })
 }
 
-fn value<'a>(lines: &'a [String], front: &Front, key: &str) -> Option<&'a str> {
+pub(crate) fn value<'a>(lines: &'a [String], front: &Front, key: &str) -> Option<&'a str> {
     lines[front.start..front.end].iter().find_map(|line| {
         line.strip_prefix(key)
             .and_then(|rest| rest.strip_prefix(':'))
@@ -142,6 +142,35 @@ fn set(lines: &mut Vec<String>, front: &mut Front, key: &str, text: &str) {
             front.end += 1;
         }
     }
+}
+
+/// Set one front-matter line without rewriting any other bytes.
+pub(crate) fn set_text(text: &str, key: &str, value: &str) -> Option<String> {
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let mut front = front(&lines)?;
+    let index = (front.start..front.end).find(|index| {
+        lines[*index]
+            .strip_prefix(key)
+            .is_some_and(|rest| rest.starts_with(':'))
+    });
+    let at = index.unwrap_or(front.end);
+    set(&mut lines, &mut front, key, value);
+    let start: usize = text.split_inclusive('\n').take(at).map(str::len).sum();
+    let original = text[start..].split_inclusive('\n').next()?;
+    let ending = if original.ends_with("\r\n") {
+        "\r\n"
+    } else if original.ends_with('\n') || index.is_none() {
+        "\n"
+    } else {
+        ""
+    };
+    let end = start + if index.is_some() { original.len() } else { 0 };
+    Some(format!(
+        "{}{}{ending}{}",
+        &text[..start],
+        lines[at],
+        &text[end..]
+    ))
 }
 
 fn is_null(text: Option<&str>) -> bool {
