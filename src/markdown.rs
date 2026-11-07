@@ -15,12 +15,12 @@ pub fn first_difference(now: &str, then: &str) -> usize {
 }
 
 #[derive(Default)]
-struct Fences {
+pub(crate) struct Fences {
     open: Option<(u8, usize)>,
 }
 
 impl Fences {
-    fn contains(&mut self, line: &str) -> bool {
+    pub(crate) fn contains(&mut self, line: &str) -> bool {
         let trimmed = line.trim_start_matches(' ');
         if line.len() - trimmed.len() > 3 {
             return self.open.is_some();

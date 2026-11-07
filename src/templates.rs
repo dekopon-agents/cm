@@ -75,8 +75,56 @@ pub fn queue_open_in(root: &Path) -> io::Result<bool> {
     }
 }
 
+// Byte offsets keep owner-written prose and marker lines unchanged during sync.
+pub(crate) fn status_span(text: &str) -> Result<Option<std::ops::Range<usize>>, Violation> {
+    let mut markers = Vec::new();
+    let mut fences = crate::markdown::Fences::default();
+    let mut offset = 0;
+    for (index, line) in text.split_inclusive('\n').enumerate() {
+        let marker = line.trim_end_matches(['\r', '\n']);
+        if !fences.contains(marker)
+            && matches!(marker, "<!-- cm:status -->" | "<!-- cm:status-end -->")
+        {
+            markers.push((marker, index + 1, offset, offset + line.len()));
+        }
+        offset += line.len();
+    }
+    if markers.is_empty() {
+        return Ok(None);
+    }
+    let found = headings(text);
+    let section = found
+        .iter()
+        .position(|heading| heading.level == 2 && heading.text == "State today")
+        .map(|index| {
+            let start = found[index].line;
+            let end = found[index + 1..]
+                .iter()
+                .find(|heading| heading.level <= 2)
+                .map_or(usize::MAX, |heading| heading.line);
+            start..end
+        });
+    if let [
+        ("<!-- cm:status -->", start_line, _, start),
+        ("<!-- cm:status-end -->", end_line, end, _),
+    ] = markers.as_slice()
+        && section.is_some_and(|section| *start_line > section.start && section.contains(end_line))
+    {
+        return Ok(Some(*start..*end));
+    }
+    Err(Violation::new(
+        "RESUME.md",
+        "resume-status",
+        "use one ordered pair of standalone `<!-- cm:status -->` and `<!-- cm:status-end -->` lines inside `## State today`, or omit both",
+    )
+    .at(markers[0].1))
+}
+
 pub fn resume(text: &str, expected: Banner) -> Vec<Violation> {
     let mut out = Vec::new();
+    if let Err(violation) = status_span(text) {
+        out.push(violation);
+    }
     let lines: Vec<&str> = text.lines().collect();
     let first = lines.iter().position(|line| !line.trim().is_empty());
     let banner: Vec<&str> = match first {

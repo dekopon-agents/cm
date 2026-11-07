@@ -279,6 +279,11 @@ pub fn epoch(
     }
     let title = format!("epoch {to}");
     journal::append(root, &journal::entry(&at, &title, Some(&body)))?;
+    crate::sync::render_resume(
+        root,
+        &crate::plan::load_units(root)?,
+        campaign.closed.is_some(),
+    )?;
     let heading = journal::heading(&at, &title);
     let mut outcome = Outcome::default();
     outcome.line(format!("EPOCH.md: {current} → {}", to.label()));
