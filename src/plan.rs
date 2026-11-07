@@ -466,8 +466,12 @@ pub(crate) fn waiting_command(root: &Path, target: &str) -> String {
     }
 }
 
-pub(crate) fn unblock_command(target: &str) -> String {
-    format!("cm unblock {target} --evidence '<unblock-evidence-file>'")
+pub(crate) fn unblock_command(target: &str, condition_met: bool) -> String {
+    if condition_met {
+        format!("cm unblock {target}")
+    } else {
+        format!("cm unblock {target} --evidence '<unblock-evidence-file>'")
+    }
 }
 
 pub fn summary(root: &Path, units: &Units) -> Next {
@@ -838,7 +842,7 @@ pub(crate) fn unblock_now(root: &Path, units: &Units, lane: Option<Lane>) -> Vec
         (lane.is_none_or(|l| step.lane == Some(l)) && block_met(root, units, unit, condition))
             .then(|| {
                 let target = format!("{unit}/{name}");
-                json!({"command": unblock_command(&target), "target": target, "condition": condition, "since": step.track.since})
+                json!({"command": unblock_command(&target, true), "target": target, "condition": condition, "since": step.track.since})
             })
     })).collect()
 }

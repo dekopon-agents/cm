@@ -326,7 +326,7 @@ pub fn card(
                     let command = if met == Some(false) {
                         "cm next".to_owned()
                     } else {
-                        crate::plan::unblock_command(&target)
+                        crate::plan::unblock_command(&target, met == Some(true))
                     };
                     blocked.push((
                         format!(
