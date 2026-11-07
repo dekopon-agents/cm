@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::{Value, json};
 
+use crate::commands::shell_word;
 use crate::commands::write_unit;
 use crate::evidence::CampaignFile;
 use crate::forge::{CheckState, CommitSha, Conclusion, Forge, GithubRepo};
@@ -743,6 +744,19 @@ pub fn watch_resolve(
 }
 
 pub fn head(root: &Path, units: &Units, target: &str) -> Option<String> {
+    resolve_head(units, target, |pr| {
+        store::read_json::<BTreeMap<String, plan::Observed>>(&plan::pulls_path(root))
+            .ok()?
+            .remove(pr)?
+            .head
+    })
+}
+
+fn resolve_head(
+    units: &Units,
+    target: &str,
+    observed: impl FnOnce(&str) -> Option<String>,
+) -> Option<String> {
     let (name, part) = match target.split_once('#') {
         Some((name, part)) => (name, Some(part)),
         None => (target, None),
@@ -764,12 +778,7 @@ pub fn head(root: &Path, units: &Units, target: &str) -> Option<String> {
         | Phase::Superseded
         | Phase::Blocked(_) => return None,
     }
-    let observed = track.evidence.pr.as_deref().and_then(|pr| {
-        store::read_json::<BTreeMap<String, plan::Observed>>(&plan::pulls_path(root))
-            .ok()?
-            .remove(pr)?
-            .head
-    });
+    let observed = track.evidence.pr.as_deref().and_then(observed);
     observed.or_else(|| track.evidence.sha.clone())
 }
 
@@ -921,7 +930,22 @@ pub struct Held {
     pub lines: Vec<String>,
 }
 
-pub fn held(units: &Units, now: jiff::Timestamp, root: &Path) -> Held {
+pub(crate) fn held(units: &Units, now: jiff::Timestamp, root: &Path, number: &mut usize) -> Held {
+    let observations =
+        store::read_json::<BTreeMap<String, plan::Observed>>(&plan::pulls_path(root))
+            .unwrap_or_default();
+    let revision_input = |revision: &Revision, kind: &str| {
+        let mut target = revision.step.clone();
+        if !target.contains('#')
+            && plan::step(units, &target).is_some_and(|step| !step.parts.is_empty())
+        {
+            target.push_str(&format!("#<{kind}-part>"));
+        }
+        if resolve_head(units, &target, |pr| observations.get(pr)?.head.clone()).is_none() {
+            target.push_str(&format!("@<{kind}-sha>"));
+        }
+        shell_word(&target)
+    };
     let mut held = Held {
         watches: Vec::new(),
         stale: Vec::new(),
@@ -932,15 +956,24 @@ pub fn held(units: &Units, now: jiff::Timestamp, root: &Path) -> Held {
             let target = format!("{unit_name}/{name}");
             for watch in step.unresolved_watches(root) {
                 let status = watch.status(now, root);
-                held.lines.push(format!(
-                    "watch {target}#{} {}: {} (deadline {})",
-                    watch.id,
-                    status.name(),
-                    watch.signal,
-                    watch.deadline
+                let command = format!(
+                    "cm watch {target} resolve {} --evidence '<watch-evidence-file>'",
+                    watch.id
+                );
+                held.lines.push(crate::render::next_item(
+                    number,
+                    &format!(
+                        "watch {target}#{} {}: {} (deadline {})",
+                        watch.id,
+                        status.name(),
+                        watch.signal,
+                        watch.deadline
+                    ),
+                    &command,
                 ));
                 held.watches.push(json!({
                     "target": target,
+                    "command": command,
                     "id": watch.id,
                     "signal": watch.signal.to_string(),
                     "deadline": watch.deadline,
@@ -949,10 +982,24 @@ pub fn held(units: &Units, now: jiff::Timestamp, root: &Path) -> Held {
             }
             for pin in plan::stale_evidence(units, step) {
                 let why = pin.stale.clone().unwrap_or_default();
-                held.lines
-                    .push(format!("stale {target}: {} ({why})", pin.file));
+                let mut command = format!(
+                    "cm evidence {target} --name '<fresh-evidence-name>' --body-file '<fresh-evidence-file>' --candidate {}",
+                    revision_input(&pin.candidate, "candidate")
+                );
+                if let Some(harness) = &pin.harness {
+                    command.push_str(&format!(
+                        " --harness {}",
+                        revision_input(harness, "harness")
+                    ));
+                }
+                held.lines.push(crate::render::next_item(
+                    number,
+                    &format!("stale {target}: {} ({why})", pin.file),
+                    &command,
+                ));
                 held.stale.push(json!({
                     "target": target,
+                    "command": command,
                     "file": pin.file.to_string(),
                     "candidate": pin.candidate.to_string(),
                     "harness": pin.harness.as_ref().map(ToString::to_string),

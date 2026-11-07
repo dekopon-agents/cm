@@ -779,7 +779,11 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
     };
     let mut changed = false;
     for item in plan::unblock_now(root, &run.units, None) {
-        let key = serde_json::to_string(&item)?;
+        let key = serde_json::to_string(&json!({
+            "target": item["target"],
+            "condition": item["condition"],
+            "since": item["since"],
+        }))?;
         if notified.insert(key) {
             changed = true;
             run.notes.push((

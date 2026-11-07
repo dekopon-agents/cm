@@ -720,7 +720,7 @@ pub fn journal(host: &dyn Host, root: &Path, title: &str, body: Option<&str>) ->
     Ok(outcome)
 }
 
-fn shell_word(text: &str) -> String {
+pub(crate) fn shell_word(text: &str) -> String {
     if !text.is_empty()
         && text
             .chars()

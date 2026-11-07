@@ -6,10 +6,12 @@ use anyhow::Result;
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
+use crate::commands::shell_word;
 use crate::forge::{GithubRepo, MergeableState, TagName};
 use crate::limits;
 use crate::lint::unit_dirs;
 use crate::outcome::{Outcome, Violation};
+use crate::render::next_item;
 use crate::state::{After, Finish, Lane, Phase, Release, Step, Track, UnitState};
 use crate::store::{self, Target, relative, state_path};
 
@@ -184,6 +186,7 @@ impl Candidate<'_> {
     fn to_json(&self, root: &Path) -> Value {
         json!({
             "target": self.target,
+            "command": launch_command(&self.target, self.lane()),
             "lane": self.lane().map(Lane::name),
             "dir": self.target,
             "kickoff": self.kickoff.as_ref().map(|path| relative(root, path)),
@@ -194,6 +197,7 @@ impl Candidate<'_> {
     fn waiting_json(&self, root: &Path) -> Value {
         let mut value = self.to_json(root);
         value["waits_on"] = json!(self.waits_on());
+        value["command"] = json!(waiting_command(root, &self.target));
         value
     }
 }
@@ -331,6 +335,7 @@ pub fn stalls(units: &Units, now: Timestamp, limit: f64) -> Vec<Stall> {
 pub fn stall_json(stall: &Stall, limit: f64) -> Value {
     json!({
         "target": stall.target,
+        "command": format!("cm attempt {}", stall.target),
         "since": stall.since,
         "hours": stall.hours,
         "limit_hours": limit,
@@ -384,6 +389,7 @@ pub fn dirty(root: &Path, units: &Units) -> Vec<(String, Observed)> {
 pub fn dirty_json(url: &str, observed: &Observed) -> Value {
     json!({
         "target": observed.target,
+        "command": format!("cm attention --pr {} --worker '<worker-session>' --coordinator '<coordinator-session>'", shell_word(url)),
         "pr": url,
         "head": observed.head,
         "mergeable_state": observed.mergeable_state,
@@ -402,6 +408,30 @@ pub struct Next {
     pub paused: bool,
     pub ready: Vec<(String, Option<Lane>)>,
     pub waiting: Vec<(String, Vec<String>)>,
+}
+
+pub(crate) fn launch_command(target: &str, lane: Option<Lane>) -> String {
+    if lane == Some(Lane::Owner) {
+        return format!("cm advance {target} done --evidence '<owner-evidence-file>'");
+    }
+    let worktree = if lane == Some(Lane::Pi) {
+        " --worktree '<worktree-path>'"
+    } else {
+        ""
+    };
+    format!("cm launch {target}{worktree}")
+}
+
+pub(crate) fn waiting_command(root: &Path, target: &str) -> String {
+    if kickoff(root, target).is_none() {
+        format!("cm amend {target} --kickoff-file '<kickoff-file>'")
+    } else {
+        format!("cm next {target}")
+    }
+}
+
+pub(crate) fn unblock_command(target: &str) -> String {
+    format!("cm unblock {target} --evidence '<unblock-evidence-file>'")
 }
 
 pub fn summary(root: &Path, units: &Units) -> Next {
@@ -447,6 +477,7 @@ pub fn next_at(
     let units = load_units(root)?;
     let all = candidates(root, &units);
     let mut outcome = Outcome::default();
+    let mut number = 1;
     outcome.field("paused", paused);
     if let Some(target) = target {
         let full = format!(
@@ -499,13 +530,25 @@ pub fn next_at(
             ));
         }
         if outcome.ok() {
-            outcome.line(format!(
-                "{full} ({}) is next",
-                candidate.lane().map_or("—", Lane::name)
+            outcome.line(next_item(
+                &mut number,
+                &format!(
+                    "{full} ({}) is next",
+                    candidate.lane().map_or("—", Lane::name)
+                ),
+                &launch_command(&full, candidate.lane()),
             ));
             outcome.field("steps", vec![candidate.to_json(root)]);
             outcome.field("waiting", Vec::<Value>::new());
         } else {
+            let on = candidate.waits_on();
+            if !on.is_empty() {
+                outcome.line(next_item(
+                    &mut number,
+                    &format!("waits {full}: {}", on.join("; ")),
+                    &waiting_command(root, &full),
+                ));
+            }
             outcome.field("steps", Vec::<Value>::new());
             outcome.field("waiting", vec![candidate.waiting_json(root)]);
         }
@@ -526,27 +569,39 @@ pub fn next_at(
         outcome.line("paused: nothing is next while LIMITS.toml has `paused = true`");
     }
     for candidate in &ready {
-        outcome.line(format!(
-            "next {} ({})",
-            candidate.target,
-            candidate.lane().map_or("—", Lane::name)
+        outcome.line(next_item(
+            &mut number,
+            &format!(
+                "next {} ({})",
+                candidate.target,
+                candidate.lane().map_or("—", Lane::name)
+            ),
+            &launch_command(&candidate.target, candidate.lane()),
         ));
     }
     for candidate in &waiting {
         let on = candidate.waits_on();
         if !on.is_empty() {
-            outcome.line(format!("waits {}: {}", candidate.target, on.join("; ")));
+            outcome.line(next_item(
+                &mut number,
+                &format!("waits {}: {}", candidate.target, on.join("; ")),
+                &waiting_command(root, &candidate.target),
+            ));
         }
     }
     let tags = untagged(&units);
     for tag in &tags {
-        outcome.line(format!(
-            "tag {} {} at {}",
-            tag.repo
-                .as_ref()
-                .map_or_else(|| tag.release.line.clone(), ToString::to_string),
-            tag.tag,
-            tag.sha.as_deref().unwrap_or("—")
+        outcome.line(next_item(
+            &mut number,
+            &format!(
+                "tag {} {} at {}",
+                tag.repo
+                    .as_ref()
+                    .map_or_else(|| tag.release.line.clone(), ToString::to_string),
+                tag.tag,
+                tag.sha.as_deref().unwrap_or("—")
+            ),
+            "cm sync",
         ));
     }
     if ready.is_empty() && waiting.is_empty() && tags.is_empty() {
@@ -556,24 +611,36 @@ pub fn next_at(
     let stalled = stalls(&units, now, limit);
     let dirty = dirty(root, &units);
     for stall in &stalled {
-        outcome.line(stall_line(stall, limit));
+        outcome.line(next_item(
+            &mut number,
+            &stall_line(stall, limit),
+            stall_json(stall, limit)["command"].as_str().unwrap(),
+        ));
     }
     for (url, observed) in &dirty {
-        outcome.line(dirty_line(url, observed));
+        outcome.line(next_item(
+            &mut number,
+            &dirty_line(url, observed),
+            dirty_json(url, observed)["command"].as_str().unwrap(),
+        ));
     }
     let unblock = unblock_now(root, &units, lane);
     if !unblock.is_empty() {
         outcome.line("unblock now");
     }
     for item in &unblock {
-        outcome.line(format!(
-            "  {}: {} holds",
-            item["target"].as_str().unwrap(),
-            item["condition"].as_str().unwrap()
+        outcome.line(next_item(
+            &mut number,
+            &format!(
+                "{}: {} holds",
+                item["target"].as_str().unwrap(),
+                item["condition"].as_str().unwrap()
+            ),
+            item["command"].as_str().unwrap(),
         ));
     }
     outcome.field("unblock_now", unblock);
-    let held = crate::holds::held(&units, now, root);
+    let held = crate::holds::held(&units, now, root, &mut number);
     outcome.lines.extend(held.lines);
     outcome.field("watches", held.watches);
     outcome.field("stale", held.stale);
@@ -611,6 +678,7 @@ pub fn next_at(
             .map(|tag| {
                 json!({
                     "target": tag.target,
+                    "command": "cm sync",
                     "repo": tag.repo.as_ref().map(ToString::to_string),
                     "version": tag.release.version.to_string(),
                     "tags": [tag.tag.to_string()],
@@ -662,6 +730,9 @@ pub(crate) fn unblock_now(root: &Path, units: &Units, lane: Option<Lane>) -> Vec
         let Phase::Blocked(reason) = &step.track.state else { return None; };
         let condition = reason.strip_prefix("until:")?;
         (lane.is_none_or(|l| step.lane == Some(l)) && block_met(root, units, unit, condition))
-            .then(|| json!({"target": format!("{unit}/{name}"), "condition": condition, "since": step.track.since}))
+            .then(|| {
+                let target = format!("{unit}/{name}");
+                json!({"command": unblock_command(&target), "target": target, "condition": condition, "since": step.track.since})
+            })
     })).collect()
 }
