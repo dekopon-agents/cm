@@ -345,9 +345,10 @@ A non-converging round prints `converging: false` and journals the owner's rulin
 `cm review record <step> '<fresh-review-report>' --reviewer fresh-opus [--part=NAME]`.
 Have an independent Opus reader at high effort review the head, then record its report with that
 command. The item appears before the step is merged, including when no PR is recorded, and
-remains until a `fresh-opus` report is recorded for that PR and part. That fresh round compares
-its blocking count with the report that triggered the request, or the latest report for the
-same step, PR and part when no request is pending. Without either baseline, `converging` is
+remains until a `fresh-opus` report is recorded for that PR and part. The fresh round's baseline
+is the trigger head, or the latest previously reviewed head for the same step, PR and part when
+no request is pending. Its blocking count is the maximum across all reports at that head, so
+recording order does not affect the fresh round's convergence. Without either baseline, `converging` is
 null and no convergence verdict is printed. A failing fresh round writes an owner-queue item
 and blocks the step `blocked:non-convergence` when it can change phase. An unrelated block and
 its resume phase stay intact; clearing that block leaves the owner decision pending. An

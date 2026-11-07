@@ -846,6 +846,19 @@ pub fn record(
                     review.step == full && review.pr == pr && review.part.as_deref() == part
                 })
             })
+            .map(|baseline| {
+                verdicts
+                    .reviews
+                    .iter()
+                    .filter(|review| {
+                        review.step == full
+                            && review.pr == pr
+                            && review.part.as_deref() == part
+                            && review.at_head(&baseline.head)
+                    })
+                    .max_by_key(|review| blocking_count(review))
+                    .unwrap_or(baseline)
+            })
     } else {
         previous_review(&verdicts.reviews, &full, pr.as_deref(), part, reviewer)
     };

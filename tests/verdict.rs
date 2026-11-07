@@ -864,6 +864,82 @@ fn a_fresh_read_without_a_pending_request_uses_the_previous_report() {
 }
 
 #[test]
+fn fresh_read_baselines_use_the_head_maximum_in_either_recording_order() {
+    let host = at("2026-10-25T06:00:00Z");
+    for pending in [false, true] {
+        for reverse in [false, true] {
+            for fresh_count in [2, 3] {
+                let c = campaign(&host, true);
+                let older = c.report(
+                    "older",
+                    "eeeeeee0",
+                    &review_fixture::BLOCKING,
+                    "FIX REQUIRED",
+                );
+                assert!(record(&host, &c, &older, "other").ok());
+                if pending {
+                    for (reviewer, head) in [("astra", "aaaaaaa0"), ("claude", "bbbbbbb0")] {
+                        let report = c.report(&format!("initial-{reviewer}"), head, &[], "ACCEPT");
+                        assert!(record(&host, &c, &report, reviewer).ok());
+                    }
+                }
+                let mut reports = [("astra", 1), ("claude", 2)];
+                if reverse {
+                    reports.reverse();
+                }
+                for (reviewer, count) in reports {
+                    let report = c.report(
+                        reviewer,
+                        "ccccccc1",
+                        &review_fixture::BLOCKING[..count],
+                        "FIX REQUIRED",
+                    );
+                    assert!(record(&host, &c, &report, reviewer).ok());
+                }
+                assert_eq!(
+                    plan::next(&c.root, None, None).unwrap().fields["fresh_readers"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    usize::from(pending)
+                );
+                let fresh = c.report(
+                    "fresh",
+                    "ddddddd2",
+                    &review_fixture::BLOCKING[..fresh_count],
+                    "FIX REQUIRED",
+                );
+                let recorded = record(&host, &c, &fresh, "fresh-opus");
+                assert!(recorded.ok(), "{:?}", recorded.violations);
+                let escalating = fresh_count > 2;
+                assert_eq!(
+                    recorded.fields["converging"], !escalating,
+                    "pending={pending}, reverse={reverse}, fresh_count={fresh_count}"
+                );
+                assert_eq!(recorded.fields["blocked"], escalating);
+                assert_eq!(
+                    recorded.fields["owner_queue"],
+                    if escalating {
+                        serde_json::json!(1)
+                    } else {
+                        serde_json::Value::Null
+                    }
+                );
+                assert_eq!(
+                    c.state(),
+                    if escalating {
+                        Phase::Blocked("non-convergence".into())
+                    } else {
+                        Phase::PrOpen
+                    }
+                );
+                assert_eq!(cm::templates::queue_open_in(&c.root).unwrap(), escalating);
+            }
+        }
+    }
+}
+
+#[test]
 fn a_fresh_read_without_a_previous_report_has_no_convergence_verdict() {
     let host = at("2026-10-25T06:00:00Z");
     let c = campaign(&host, true);
