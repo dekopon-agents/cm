@@ -36,7 +36,7 @@ pub enum Act {
 }
 
 pub(crate) fn check_coordinator(full: &str, coordinator: &str) -> Option<Violation> {
-    (coordinator.trim().is_empty() || coordinator.contains('\n'))
+    (coordinator.trim().is_empty() || coordinator.contains(['\n', '\r']))
         .then(|| Violation::new(full, "attempt-claim", "--coordinator is one non-empty line"))
 }
 

@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cm::commands;
@@ -33,6 +33,33 @@ pub fn campaign(host: &dyn Host) -> Campaign {
 }
 
 impl Campaign {
+    pub fn files(&self) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(
+            root: &Path,
+            dir: &Path,
+            files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+        ) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path == root.join(".git") {
+                    continue;
+                }
+                if entry.file_type().unwrap().is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut files = std::collections::BTreeMap::new();
+        visit(&self.root, &self.root, &mut files);
+        files
+    }
+
     /// A synthetic release declaration from before release tags were persisted.
     pub fn legacy_release(&self, host: &dyn Host, full: &str) {
         let target = cm::store::parse_target(full, true).unwrap();
@@ -51,7 +78,15 @@ impl Campaign {
     }
 
     pub fn kickoff(&self, target: &str, text: &str) {
+        fs::create_dir_all(self.root.join(target)).unwrap();
         fs::write(self.root.join(target).join("kickoff.md"), text).unwrap();
+    }
+
+    pub fn legacy_release_tag(&self, unit: &str, version: &str, tag: &str) {
+        let path = cm::store::state_path(&self.root.join(unit));
+        let mut value: serde_json::Value = cm::store::read_json(&path).unwrap();
+        value["steps"][version]["tag"] = tag.into();
+        cm::store::write_json(&path, &value).unwrap();
     }
 
     pub fn sized_file(&self, name: &str, bytes: u64, tracked: bool) {
@@ -80,4 +115,25 @@ impl Campaign {
             );
         }
     }
+}
+
+pub fn git(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "user.name=cm", "-c", "user.email=cm@example.com"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+pub fn repo(dir: &Path) -> (PathBuf, String) {
+    let repo = dir.join("wt");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    let sha = git(&repo, &["rev-parse", "HEAD"]);
+    (repo, sha)
 }

@@ -616,23 +616,17 @@ fn launch_refuses_invalid_coordinator_labels_without_changing_state_or_journal()
     let host = at("2026-10-08T07:00:00Z");
     for (session, label) in [
         (Some("session_cloud\n## stray"), None),
+        (Some("session_cloud\r## stray"), None),
         (Some(" cse_cloud\n## stray "), None),
         (Some("session_cloud"), Some("session_flag\n## stray")),
+        (Some("session_cloud"), Some("session_flag\r## stray")),
         (None, Some("")),
         (None, Some(" \t")),
     ] {
         let c = campaign(&host);
         let step = "01-a/u/S1";
         assert!(declare(&host, &c, step, Lane::ClaudeCloud, &[]).ok());
-        let before: Vec<_> = [
-            ".cm/state.json",
-            "01-a/u/.cm/state.json",
-            "01-a/u/STATE.md",
-            "JOURNAL.md",
-        ]
-        .into_iter()
-        .map(|name| (name, fs::read(c.root.join(name)).unwrap()))
-        .collect();
+        let before = c.files();
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_cm"));
         command
             .arg("--json")
@@ -657,8 +651,6 @@ fn launch_refuses_invalid_coordinator_labels_without_changing_state_or_journal()
             .map(|v| v["rule"].as_str().unwrap())
             .collect();
         assert_eq!(rules, ["attempt-claim"], "{report}");
-        for (name, bytes) in before {
-            assert_eq!(fs::read(c.root.join(name)).unwrap(), bytes, "{name}");
-        }
+        assert_eq!(c.files(), before);
     }
 }
