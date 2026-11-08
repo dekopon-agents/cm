@@ -1743,3 +1743,31 @@ fn partial_stays_open_and_done_replaces_the_entire_receipt() {
         serde_json::json!([])
     );
 }
+
+#[test]
+fn mac_lane_receipt_line_breaks_refuse_without_changing_lane_or_journal() {
+    let fixture = campaign_fixture::campaign(&Fake);
+    let path = fixture.root.join("MAC-LANE.md");
+    fs::write(
+        &path,
+        format!("# Mac lane queue\n\n1. {}", partial_fixture::INSTRUCTIONS),
+    )
+    .unwrap();
+    let lane = fs::read(&path).unwrap();
+    let journal = fs::read(fixture.root.join("JOURNAL.md")).unwrap();
+    for action in ["partial", "done"] {
+        for receipt in partial_fixture::INVALID_RECEIPTS {
+            let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+                .arg("-C")
+                .arg(&fixture.root)
+                .args(["--json", "mac-lane", action, "1", "--receipt", receipt])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1), "{action}: {output:?}");
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(json["violations"][0]["rule"], "ledger-field");
+            assert_eq!(fs::read(&path).unwrap(), lane);
+            assert_eq!(fs::read(fixture.root.join("JOURNAL.md")).unwrap(), journal);
+        }
+    }
+}

@@ -25,7 +25,7 @@ pub(crate) fn guard(root: &Path) -> Result<(store::Lock, Vec<Violation>)> {
 }
 
 pub(crate) fn one_line(field: &str, text: &str, out: &mut Vec<Violation>, path: &str) {
-    if text.trim().is_empty() || text.contains('\n') {
+    if text.trim().is_empty() || text.contains(['\n', '\r']) {
         out.push(Violation::new(
             path,
             "ledger-field",
