@@ -596,6 +596,7 @@ fn crate_read(
     struct Published {
         num: String,
         yanked: bool,
+        #[serde(default)]
         checksum: String,
     }
     let response: Response = serde_json::from_str(body).map_err(|_| ForgeError::Json)?;
@@ -623,7 +624,8 @@ pub fn parse_formula(
         line.strip_prefix(key)?
             .trim_start()
             .strip_prefix('"')?
-            .strip_suffix('"')
+            .split_once('"')
+            .map(|(value, _)| value)
     }
     let lines: Vec<_> = body
         .lines()

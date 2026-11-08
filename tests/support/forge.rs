@@ -7,6 +7,7 @@ use cm::forge::{
 
 #[derive(Default)]
 pub struct FakeForge {
+    pub root: Option<std::path::PathBuf>,
     pub crates: BTreeMap<(String, String), Read>,
     pub formulas: BTreeMap<(String, String), String>,
     pub images: BTreeMap<(String, String), Read>,
@@ -18,10 +19,27 @@ pub struct FakeForge {
     pub containment_queries: RefCell<Vec<(String, String, String)>>,
 }
 
+impl FakeForge {
+    fn artifact_query(&self, key: &str) {
+        if let Some(root) = &self.root {
+            let lock = std::fs::OpenOptions::new()
+                .write(true)
+                .open(root.join(cm::store::CM_DIR).join(cm::store::LOCK))
+                .unwrap();
+            assert!(
+                rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                    .is_ok(),
+                "publication read held the campaign lock"
+            );
+        }
+        self.artifact_queries.borrow_mut().push(key.to_owned());
+    }
+}
+
 impl Forge for FakeForge {
     fn crate_version(&self, name: &str, version: &cm::state::Version) -> Result<Read, ForgeError> {
         let key = format!("crate:{name}");
-        self.artifact_queries.borrow_mut().push(key.clone());
+        self.artifact_query(&key);
         if self.broken.contains(&key) {
             return Err(ForgeError::Exit(Some(1)));
         }
@@ -41,7 +59,7 @@ impl Forge for FakeForge {
         version: &cm::state::Version,
     ) -> Result<Read, ForgeError> {
         let key = format!("tap:{tap}/{formula}");
-        self.artifact_queries.borrow_mut().push(key.clone());
+        self.artifact_query(&key);
         if self.broken.contains(&key) {
             return Err(ForgeError::Exit(Some(1)));
         }
@@ -53,7 +71,7 @@ impl Forge for FakeForge {
 
     fn image_manifest(&self, image: &ImageRef, tag: &str) -> Result<Read, ForgeError> {
         let key = format!("image:{image}");
-        self.artifact_queries.borrow_mut().push(key.clone());
+        self.artifact_query(&key);
         if self.broken.contains(&key) {
             return Err(ForgeError::Exit(Some(1)));
         }

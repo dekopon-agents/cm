@@ -186,3 +186,20 @@ impl Campaign {
         commands::write_unit(&dir, &unit).unwrap();
     }
 }
+
+impl Campaign {
+    pub fn publication_consumer(&self, host: &dyn Host) {
+        self.merged_step(
+            host,
+            "01-build/widget/BUILD",
+            Lane::Pi,
+            Path::new(""),
+            super::publication_fixture::SHA,
+        );
+        let dir = self.root.join("01-build/widget");
+        let mut unit = store::load_unit(&dir).unwrap();
+        unit.steps.get_mut("BUILD").unwrap().track.evidence.pr =
+            Some("https://github.com/o/widget/pull/8".into());
+        commands::write_unit(&dir, &unit).unwrap();
+    }
+}

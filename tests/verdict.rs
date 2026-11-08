@@ -3386,6 +3386,7 @@ fn hand_release_checks_publication_for_merged_tag_only_and_resumed_steps() {
             assert_eq!(c.files(), before);
         }
         let mut forge = p::present();
+        forge.root = Some(c.root.clone());
         forge.broken.insert("image:ghcr.io/acme/widget".into());
         let out = p::advance(&host, &c, &forge, tag_only, resuming);
         assert_eq!(rules(&out), ["publication-unread"]);
@@ -3395,4 +3396,19 @@ fn hand_release_checks_publication_for_merged_tag_only_and_resumed_steps() {
         assert_eq!(p::step(&c).track.state, Phase::Released);
         assert_eq!(p::step(&c).track.evidence.published.len(), 3);
     }
+}
+
+#[test]
+fn a_forge_without_publication_support_refuses_the_hand_release_as_unread() {
+    use publication_fixture as p;
+    let host = at("2026-10-25T06:00:00Z");
+    let c = p::campaign(&host, Phase::Merged, &p::ARTIFACTS);
+    let before = c.files();
+    let mut forge = FakeForge::open(p::SHA, &[]);
+    forge
+        .tags
+        .insert(("o/widget".into(), p::TAG.into()), [p::SHA.into()].into());
+    let out = p::advance(&host, &c, &forge, false, false);
+    assert_eq!(rules(&out), ["publication-unread"]);
+    assert_eq!(c.files(), before);
 }

@@ -2608,7 +2608,8 @@ fn release_sync_records_every_publication_in_one_move() {
     use publication_fixture as p;
     let host = Fake::at("2026-10-08T07:00:00Z");
     let c = p::campaign(&host, Phase::Merged, &p::ARTIFACTS);
-    let forge = p::present();
+    let mut forge = p::present();
+    forge.root = Some(c.root.clone());
     let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
     assert!(out.ok(), "{:?}", out.violations);
     let step = p::step(&c);
@@ -2640,21 +2641,39 @@ fn missing_yanked_or_stale_publications_stay_merged_and_are_retried() {
     use cm::forge::Read;
     use publication_fixture as p;
     let host = Fake::at("2026-10-08T07:00:00Z");
-    for read in [Read::Missing, Read::Yanked, Read::Stale("1.3.0".into())] {
+    for fault in 0..6 {
         let c = p::campaign(&host, Phase::Merged, &p::ARTIFACTS);
         let mut forge = p::present();
-        forge
-            .crates
-            .insert(("acme-sdk".into(), "1.4.0".into()), read);
+        match fault {
+            0..=2 => {
+                forge.crates.insert(
+                    ("acme-sdk".into(), "1.4.0".into()),
+                    match fault {
+                        0 => Read::Missing,
+                        1 => Read::Yanked,
+                        _ => Read::Stale("1.3.0".into()),
+                    },
+                );
+            }
+            3 => {
+                forge.formulas.clear();
+            }
+            4 => {
+                forge.formulas.insert(
+                    ("o/homebrew-tap".into(), "widget".into()),
+                    p::formula("widget-1.3.0"),
+                );
+            }
+            _ => {
+                forge.images.clear();
+            }
+        }
         let before = p::step(&c);
         let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
         assert_eq!(rules(&out), ["release-unpublished"]);
         assert_eq!(p::step(&c), before);
         assert_eq!(out.fields["moves"], serde_json::json!([]));
-        forge.crates.insert(
-            ("acme-sdk".into(), "1.4.0".into()),
-            Read::Present("checksum".into()),
-        );
+        let forge = p::present();
         let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
         assert!(out.ok(), "{:?}", out.violations);
         assert_eq!(p::step(&c).track.state, Phase::Released);
@@ -2798,4 +2817,30 @@ fn artifacts_persist_in_order_and_can_only_be_removed_by_amend_before_released()
     .unwrap();
     assert_eq!(rules(&refused), ["amend-state"]);
     assert_eq!(c.files(), before);
+}
+
+#[test]
+fn an_unpublished_release_ships_no_other_merged_steps() {
+    use publication_fixture as p;
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = p::campaign(&host, Phase::Merged, &p::ARTIFACTS);
+    c.publication_consumer(&host);
+    let mut forge = p::present();
+    forge.images.clear();
+    let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(rules(&out), ["release-unpublished"]);
+    let code = || {
+        store::load_unit(&c.root.join("01-build/widget"))
+            .unwrap()
+            .steps
+            .remove("BUILD")
+            .unwrap()
+            .track
+            .state
+    };
+    assert_eq!(code(), Phase::Merged);
+    assert_eq!(out.fields["moves"], serde_json::json!([]));
+    let out = cm::sync::sync(&host, &p::present(), &c.root).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    assert_eq!(code(), Phase::Released);
 }

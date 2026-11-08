@@ -63,6 +63,10 @@ fn formula_reads_check_every_url_checksum_and_explicit_version() {
         read(&format!("version \"1.4.0\"\n{good}{good}")),
         Ok(Read::Present("blob-sha".into()))
     );
+    assert_eq!(
+        read(&good.replace("widget.tar.gz\"", "widget.tar.gz\", using: :curl")),
+        Ok(Read::Present("blob-sha".into()))
+    );
     let stale = good.replace("widget-1.4.0", "widget-1.3.0");
     assert_eq!(
         read(&format!("{good}{stale}")),
