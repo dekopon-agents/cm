@@ -73,6 +73,7 @@ struct Run<'a> {
     now: jiff::Timestamp,
     heads: BTreeMap<String, String>,
     notes: Vec<(String, String)>,
+    owner_unread: Vec<String>,
 }
 
 struct Tracked {
@@ -104,6 +105,7 @@ impl<'a> Run<'a> {
         reads: Reads,
         now: jiff::Timestamp,
         units: Units,
+        owner_unread: Vec<String>,
     ) -> Self {
         Run {
             root,
@@ -119,6 +121,7 @@ impl<'a> Run<'a> {
             now,
             heads: BTreeMap::new(),
             notes: Vec::new(),
+            owner_unread,
         }
     }
 
@@ -190,6 +193,20 @@ impl<'a> Run<'a> {
         for (unit_name, unit) in self.units.iter_mut() {
             for (name, step) in unit.steps.iter_mut() {
                 let target = format!("{unit_name}/{name}");
+                if !self.owner_unread.is_empty()
+                    && step.track.state == Phase::PrOpen
+                    && step.parts_reach() == Some(Phase::Merged)
+                {
+                    self.violations.push(Violation::new(
+                        crate::templates::QUEUE_FILE,
+                        "owner-queue-unread",
+                        format!(
+                            "{target} waits for `cm owner-queue read`: {}",
+                            self.owner_unread.join(", ")
+                        ),
+                    ));
+                    continue;
+                }
                 for (from, to) in step.roll_up_all(
                     Release::of_target(&target).is_some(),
                     &self.at,
@@ -273,6 +290,19 @@ impl<'a> Run<'a> {
     }
 
     fn advance(&mut self, target: &str, part: Option<&str>, to: Phase, evidence: Evidence) {
+        if !self.owner_unread.is_empty()
+            && (to == Phase::Merged || Release::of_target(target).is_some())
+        {
+            self.violations.push(Violation::new(
+                crate::templates::QUEUE_FILE,
+                "owner-queue-unread",
+                format!(
+                    "{target} waits for `cm owner-queue read`: {}",
+                    self.owner_unread.join(", ")
+                ),
+            ));
+            return;
+        }
         let Some((unit_name, step_name)) = plan::split(target) else {
             return;
         };
@@ -898,6 +928,7 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
         Reads::default(),
         now,
         plan::load_units(root)?,
+        crate::ledger::unread_owner_queue(root)?,
     );
     read.walk();
     let _lock = lock(root)?;
@@ -905,7 +936,14 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
     if !found.is_empty() {
         return Ok(Outcome::refused(found));
     }
-    let mut run = Run::new(root, None, read.reads, now, plan::load_units(root)?);
+    let mut run = Run::new(
+        root,
+        None,
+        read.reads,
+        now,
+        plan::load_units(root)?,
+        crate::ledger::unread_owner_queue(root)?,
+    );
     run.walk();
     for name in &run.dirty {
         write_unit(&root.join(name), &run.units[name])?;
@@ -926,6 +964,7 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
     store::write_json(&store::state_path(root), &campaign)?;
     store::write_json(&plan::pulls_path(root), &open)?;
     let mut outcome = Outcome::refused(std::mem::take(&mut run.violations));
+    crate::ledger::owner_queue_banner(root, &mut outcome)?;
     let marker_path = root.join(store::CM_DIR).join("unblock-notified.json");
     let mut notified: BTreeSet<String> = if marker_path.exists() {
         store::read_json(&marker_path)?

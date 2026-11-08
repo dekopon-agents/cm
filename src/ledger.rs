@@ -289,6 +289,94 @@ pub fn feedback(host: &dyn Host, root: &Path, entry: &Feedback) -> Result<Outcom
 
 // OWNER-QUEUE.md
 
+fn queue_items(text: &str) -> Vec<String> {
+    headings(text)
+        .into_iter()
+        .filter(|heading| heading.level == 2)
+        .map(|heading| heading.text.to_owned())
+        .collect()
+}
+
+pub(crate) fn unread_owner_queue(root: &Path) -> Result<Vec<String>> {
+    let Ok(text) = fs::read_to_string(root.join(QUEUE_FILE)) else {
+        return Ok(Vec::new());
+    };
+    if !templates::owner_queue(&text).is_empty() {
+        return Ok(Vec::new());
+    }
+    let campaign = store::load_campaign(root)?;
+    let read = campaign.owner_queue_read.as_ref();
+    Ok(queue_items(&text)
+        .into_iter()
+        .filter(|heading| read.is_none_or(|read| !read.items.contains(heading)))
+        .collect())
+}
+
+pub(crate) fn owner_queue_refusal(root: &Path, target: &str) -> Result<Option<Violation>> {
+    let items = unread_owner_queue(root)?;
+    Ok((!items.is_empty()).then(|| {
+        Violation::new(
+            QUEUE_FILE,
+            "owner-queue-unread",
+            format!(
+                "{target} waits for `cm owner-queue read`: {}",
+                items.join(", ")
+            ),
+        )
+    }))
+}
+
+pub(crate) fn owner_queue_banner(root: &Path, outcome: &mut Outcome) -> Result<()> {
+    let items = unread_owner_queue(root)?;
+    if !items.is_empty() {
+        outcome.line(format!(
+            "NEW OWNER-QUEUE since last read: {}",
+            items.join(", ")
+        ));
+    }
+    outcome.field("owner_queue_unread", serde_json::json!(items));
+    Ok(())
+}
+
+pub(crate) fn owner_queue_read(host: &dyn Host, root: &Path) -> Result<Outcome> {
+    let (_lock, mut violations) = guard(root)?;
+    let Some(text) = read_existing(&root.join(QUEUE_FILE))? else {
+        violations.push(Violation::new(
+            QUEUE_FILE,
+            "missing-file",
+            "restore OWNER-QUEUE.md before acknowledging a read",
+        ));
+        return Ok(Outcome::refused(violations));
+    };
+    violations.extend(templates::owner_queue(&text));
+    if !violations.is_empty() {
+        return Ok(Outcome::refused(violations));
+    }
+    let at = stamp(host.now());
+    let items = queue_items(&text);
+    let body = items
+        .iter()
+        .map(|item| format!("- {item}\n"))
+        .collect::<String>();
+    // Journal first: a failed journal write must never clear the unread refusal.
+    let journal = journal_line(root, &at, "owner-queue read", &body)?;
+    let mut campaign = store::load_campaign(root)?;
+    campaign.schema = crate::state::SCHEMA;
+    campaign.owner_queue_read = Some(crate::state::OwnerQueueRead {
+        at: at.clone(),
+        items: items.clone(),
+    });
+    store::write_json(&store::state_path(root), &campaign)?;
+    let mut outcome = Outcome::default();
+    outcome.line(text.clone());
+    outcome.line(format!("acknowledged owner queue at {at}"));
+    outcome.field("queue", text);
+    outcome.field("acknowledged", serde_json::json!(items));
+    outcome.field("at", at);
+    outcome.field("journal", journal);
+    Ok(outcome)
+}
+
 fn item_number(text: &str) -> Option<u32> {
     text.split_once(". ")?.0.parse().ok()
 }
