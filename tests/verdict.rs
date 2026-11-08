@@ -3337,6 +3337,40 @@ fn standing_registration_tries_each_parts_pr_without_changing_commit_selection()
     assert!(!known_red(&host, &c, &green, "", "red by design", "build").ok());
 }
 
+#[test]
+fn cli_step_review_wait_on_multipart_work_has_no_part_identity() {
+    let host = at("2026-10-25T00:00Z");
+    let c = review_fixture::multipart_campaign(&host);
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    let step = &unit.steps["S1"];
+    assert_eq!(step.parts.len(), 2);
+    assert!(step.track.evidence.pr.is_some());
+    assert!(step.track.evidence.sha.is_some());
+    assert_eq!(step.track.evidence.pr, step.parts["two"].evidence.pr);
+    let blocked = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args(["--json", "advance", STEP, "blocked:REVIEW_BLOCKED"])
+        .output()
+        .unwrap();
+    assert!(blocked.status.success(), "{blocked:?}");
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args(["--json", "next"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let waits = json["review_waits"].as_array().unwrap();
+    assert_eq!(waits.len(), 1);
+    assert_eq!(waits[0]["target"], STEP);
+    assert_eq!(waits[0]["reason"], "REVIEW_BLOCKED");
+    assert!(waits[0]["part"].is_null());
+    assert!(waits[0]["pr"].is_null());
+    assert!(waits[0]["head"].is_null());
+}
+
 #[allow(dead_code)]
 #[path = "support/publication.rs"]
 mod publication_fixture;
