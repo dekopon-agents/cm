@@ -335,7 +335,7 @@ in `EPOCH.md`'s `ideas:` list. Close lists every missing outcome as `idea-outcom
 `cm lint` reports the same gap on a sealed campaign as `closed-ideas`. Outcomes come
 from the idea file's `## Epoch history` for this epoch, including deferred and partial
 outcomes. The close journal lists each idea's outcome and any `to` or `by` target in
-admission order. Without an `ideas:` key, close behaves as before. The prose
+admission order. Without an `ideas_dir` key or an `ideas:` list, close behaves as before. The prose
 `## Outcome accounting` table is still written by hand. `cm idea move` and
 `cm idea outcome` remain available after sealing, subject to their usual checks.
 
