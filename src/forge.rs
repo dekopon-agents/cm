@@ -1,7 +1,7 @@
 use std::fmt;
-use std::io::Read;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
@@ -13,25 +13,73 @@ pub enum ForgeError {
     Exit(Option<i32>),
     Timeout(Duration),
     Json,
+    Http(u16),
     Url,
 }
 
 impl fmt::Display for ForgeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ForgeError::Spawn => f.write_str("could not execute gh; check installation"),
-            ForgeError::Exit(Some(code)) => write!(f, "gh exited {code}; check access with gh"),
-            ForgeError::Exit(None) => f.write_str("gh exited by signal"),
+            ForgeError::Http(status) => write!(f, "HTTP {status}; retry the publication read"),
+            ForgeError::Spawn => f.write_str("could not execute forge reader; check installation"),
+            ForgeError::Exit(Some(code)) => write!(f, "forge reader exited {code}; check access"),
+            ForgeError::Exit(None) => f.write_str("forge reader exited by signal"),
             ForgeError::Timeout(after) => {
                 write!(
                     f,
-                    "gh did not answer within {}s; killed it",
+                    "forge reader did not answer within {}s; killed it",
                     after.as_secs()
                 )
             }
-            ForgeError::Json => f.write_str("gh returned JSON cm cannot read"),
+            ForgeError::Json => f.write_str("forge reader returned data cm cannot read"),
             ForgeError::Url => f.write_str("not a https://github.com/<owner>/<repo>/pull/<n> URL"),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Read {
+    Present(String),
+    Yanked,
+    Missing,
+    Stale(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageRef(String);
+
+impl ImageRef {
+    fn path(&self) -> &str {
+        self.0.strip_prefix("ghcr.io/").unwrap_or_default()
+    }
+}
+
+impl std::str::FromStr for ImageRef {
+    type Err = String;
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let path = text.strip_prefix("ghcr.io/").unwrap_or_default();
+        if path.split('/').count() >= 2
+            && path.split('/').all(|part| {
+                !part.is_empty()
+                    && part.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+                    && part.ends_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+                    && part.bytes().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || b"._-".contains(&c)
+                    })
+            })
+        {
+            Ok(Self(text.to_owned()))
+        } else {
+            Err(format!(
+                "`{text}` is not a ghcr.io image reference without a tag or digest"
+            ))
+        }
+    }
+}
+
+impl fmt::Display for ImageRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -299,6 +347,26 @@ pub trait Forge {
     ) -> Result<Vec<CheckState>, ForgeError> {
         Err(ForgeError::Json)
     }
+    fn crate_version(
+        &self,
+        _name: &str,
+        _version: &crate::state::Version,
+    ) -> Result<Read, ForgeError> {
+        Err(ForgeError::Json)
+    }
+    fn tap_formula(
+        &self,
+        _tap: &GithubRepo,
+        _formula: &str,
+        _repo: &GithubRepo,
+        _tag: &TagName,
+        _version: &crate::state::Version,
+    ) -> Result<Read, ForgeError> {
+        Err(ForgeError::Json)
+    }
+    fn image_manifest(&self, _image: &ImageRef, _tag: &str) -> Result<Read, ForgeError> {
+        Err(ForgeError::Json)
+    }
     fn tag_exists(&self, repo: &GithubRepo, tag: &TagName) -> Result<bool, ForgeError>;
     fn tag_contains(
         &self,
@@ -448,42 +516,240 @@ impl Gh {
     }
 
     fn json<T: DeserializeOwned>(&self, args: &[&str]) -> Result<T, ForgeError> {
-        let mut child = Command::new(&self.program)
-            .args(args)
-            .env("GH_PROMPT_DISABLED", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| ForgeError::Spawn)?;
-        let mut stdout = child.stdout.take().ok_or(ForgeError::Spawn)?;
-        let reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes).map(|_| bytes)
-        });
-        let deadline = Instant::now() + self.timeout;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Ok(None) | Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(ForgeError::Timeout(self.timeout));
+        let output = run(&self.program, args, self.timeout)?;
+        if !output.status.success() {
+            return Err(ForgeError::Exit(output.status.code()));
+        }
+        serde_json::from_slice(&output.stdout).map_err(|_| ForgeError::Json)
+    }
+
+    fn http(&self, args: &[&str]) -> Result<(u16, String), ForgeError> {
+        let mut request = vec!["-sS", "--max-time", "60", "--write-out", "\n%{http_code}"];
+        request.extend_from_slice(args);
+        let output = run(Path::new("curl"), &request, self.timeout.min(GH_TIMEOUT))?;
+        if !output.status.success() {
+            return Err(ForgeError::Exit(output.status.code()));
+        }
+        let text = String::from_utf8(output.stdout).map_err(|_| ForgeError::Json)?;
+        let (body, status) = text.rsplit_once('\n').ok_or(ForgeError::Json)?;
+        Ok((
+            status.trim().parse().map_err(|_| ForgeError::Json)?,
+            body.to_owned(),
+        ))
+    }
+}
+
+fn run(program: &Path, args: &[&str], timeout: Duration) -> Result<Output, ForgeError> {
+    let mut child = Command::new(program)
+        .args(args)
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| ForgeError::Spawn)?;
+    let mut stdout = child.stdout.take().ok_or(ForgeError::Spawn)?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ForgeError::Timeout(timeout));
+            }
+        }
+    };
+    let stdout = reader
+        .join()
+        .map_err(|_| ForgeError::Json)?
+        .map_err(|_| ForgeError::Json)?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    })
+}
+
+fn crate_read(
+    status: u16,
+    body: &str,
+    version: &crate::state::Version,
+) -> Result<Read, ForgeError> {
+    if status == 404 {
+        serde_json::from_str::<serde_json::Value>(body).map_err(|_| ForgeError::Json)?;
+        return Ok(Read::Missing);
+    }
+    if status != 200 {
+        return Err(ForgeError::Http(status));
+    }
+    #[derive(Deserialize)]
+    struct Response {
+        version: Published,
+    }
+    #[derive(Deserialize)]
+    struct Published {
+        num: String,
+        yanked: bool,
+        checksum: String,
+    }
+    let response: Response = serde_json::from_str(body).map_err(|_| ForgeError::Json)?;
+    if response.version.num != version.to_string() {
+        return Err(ForgeError::Json);
+    }
+    if response.version.yanked {
+        return Ok(Read::Yanked);
+    }
+    if response.version.checksum.is_empty() {
+        return Err(ForgeError::Json);
+    }
+    Ok(Read::Present(response.version.checksum))
+}
+
+/// Parse every formula URL and its following checksum, shared with the fake Forge.
+pub fn parse_formula(
+    body: &str,
+    sha: &str,
+    repo: &GithubRepo,
+    tag: &TagName,
+    version: &crate::state::Version,
+) -> Result<Read, ForgeError> {
+    fn quoted<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        line.strip_prefix(key)?
+            .trim_start()
+            .strip_prefix('"')?
+            .strip_suffix('"')
+    }
+    let lines: Vec<_> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let prefix = format!("https://github.com/{repo}/releases/download/");
+    let mut urls = 0;
+    for (index, line) in lines.iter().enumerate() {
+        if line
+            .strip_prefix("url")
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+        {
+            urls += 1;
+            let url = quoted(line, "url").ok_or(ForgeError::Json)?;
+            let (named, asset) = url
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.rsplit_once('/'))
+                .ok_or(ForgeError::Json)?;
+            if named != tag.as_str() {
+                return Ok(Read::Stale(named.to_owned()));
+            }
+            if asset.is_empty() {
+                return Err(ForgeError::Json);
+            }
+            let checksum = lines
+                .get(index + 1)
+                .and_then(|line| quoted(line, "sha256"))
+                .ok_or(ForgeError::Json)?;
+            if checksum.len() != 64
+                || !checksum
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            {
+                return Err(ForgeError::Json);
+            }
+        }
+        if line
+            .strip_prefix("version")
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+        {
+            let named = quoted(line, "version").ok_or(ForgeError::Json)?;
+            if named != version.to_string() {
+                return Ok(Read::Stale(named.to_owned()));
+            }
+        }
+    }
+    if urls == 0 || sha.is_empty() {
+        return Err(ForgeError::Json);
+    }
+    Ok(Read::Present(sha.to_owned()))
+}
+
+fn image_read(status: u16, headers: &str) -> Result<Read, ForgeError> {
+    match status {
+        404 => Ok(Read::Missing),
+        200 => headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, value)| {
+                key.eq_ignore_ascii_case("docker-content-digest") && !value.trim().is_empty()
+            })
+            .map(|(_, value)| Read::Present(value.trim().to_owned()))
+            .ok_or(ForgeError::Json),
+        _ => Err(ForgeError::Http(status)),
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct Publication {
+    pub published: Vec<String>,
+    pub missing: Vec<String>,
+    pub unknown: Vec<String>,
+}
+
+pub(crate) fn publication(
+    forge: Option<&dyn Forge>,
+    artifacts: &[crate::state::Artifact],
+    repo: Option<&GithubRepo>,
+    version: &crate::state::Version,
+    tag: &TagName,
+) -> Publication {
+    use crate::state::Artifact;
+    let mut out = Publication::default();
+    for artifact in artifacts {
+        let read = (|| {
+            let forge = forge.ok_or(ForgeError::Json)?;
+            match artifact {
+                Artifact::Crate(name) => forge
+                    .crate_version(name, version)
+                    .map(|read| (read, artifact.to_string(), Some(version.to_string()))),
+                Artifact::Image(image) => forge
+                    .image_manifest(image, &format!("v{version}"))
+                    .map(|read| (read, artifact.to_string(), None)),
+                Artifact::Tap(spec) => {
+                    let repo = repo.ok_or(ForgeError::Json)?;
+                    let (tap, formula) = match spec.rsplit_once('/') {
+                        Some((tap, formula)) => {
+                            (tap.parse().map_err(|_| ForgeError::Json)?, formula)
+                        }
+                        None => (
+                            format!("{}/homebrew-tap", repo.owner)
+                                .parse()
+                                .map_err(|_| ForgeError::Json)?,
+                            spec.as_str(),
+                        ),
+                    };
+                    forge
+                        .tap_formula(&tap, formula, repo, tag, version)
+                        .map(|read| (read, format!("tap:{tap}/{formula}"), None))
                 }
             }
-        };
-        let stdout = reader
-            .join()
-            .map_err(|_| ForgeError::Json)?
-            .map_err(|_| ForgeError::Json)?;
-        if !status.success() {
-            return Err(ForgeError::Exit(status.code()));
+        })();
+        match read {
+            Ok((Read::Present(value), name, fixed)) => out
+                .published
+                .push(format!("{name}@{}", fixed.unwrap_or(value))),
+            Ok((Read::Missing, _, _)) => {
+                out.missing.push(format!("{artifact} {version} is missing"))
+            }
+            Ok((Read::Yanked, _, _)) => out.missing.push(format!("{artifact} {version} is yanked")),
+            Ok((Read::Stale(named), _, _)) => out.missing.push(format!("{artifact} names {named}")),
+            Err(error) => out.unknown.push(format!("{artifact}: {error}")),
         }
-        serde_json::from_slice(&stdout).map_err(|_| ForgeError::Json)
     }
+    out
 }
 
 impl Forge for Gh {
@@ -576,6 +842,95 @@ impl Forge for Gh {
         Ok(found)
     }
 
+    fn crate_version(
+        &self,
+        name: &str,
+        version: &crate::state::Version,
+    ) -> Result<Read, ForgeError> {
+        let (status, body) = self.http(&[
+            "--header",
+            concat!(
+                "User-Agent: cm/",
+                env!("CARGO_PKG_VERSION"),
+                " (+https://github.com/dekopon-agents/cm)"
+            ),
+            &format!("https://crates.io/api/v1/crates/{name}/{version}"),
+        ])?;
+        crate_read(status, &body, version)
+    }
+
+    fn tap_formula(
+        &self,
+        tap: &GithubRepo,
+        formula: &str,
+        repo: &GithubRepo,
+        tag: &TagName,
+        version: &crate::state::Version,
+    ) -> Result<Read, ForgeError> {
+        let output = run(
+            &self.program,
+            &[
+                "api",
+                "--include",
+                &format!("repos/{tap}/contents/Formula/{formula}.rb"),
+                "--jq",
+                "{sha, content: (.content | @base64d)}",
+            ],
+            self.timeout.min(GH_TIMEOUT),
+        )?;
+        let text = String::from_utf8(output.stdout).map_err(|_| ForgeError::Json)?;
+        let (headers, body) = text
+            .split_once("\r\n\r\n")
+            .or_else(|| text.split_once("\n\n"))
+            .ok_or(ForgeError::Json)?;
+        let status: u16 = headers
+            .split_whitespace()
+            .nth(1)
+            .ok_or(ForgeError::Json)?
+            .parse()
+            .map_err(|_| ForgeError::Json)?;
+        if status == 404 {
+            return Ok(Read::Missing);
+        }
+        if status != 200 {
+            return Err(ForgeError::Http(status));
+        }
+        if !output.status.success() {
+            return Err(ForgeError::Exit(output.status.code()));
+        }
+        #[derive(Deserialize)]
+        struct Formula {
+            sha: String,
+            content: String,
+        }
+        let formula: Formula = serde_json::from_str(body).map_err(|_| ForgeError::Json)?;
+        parse_formula(&formula.content, &formula.sha, repo, tag, version)
+    }
+
+    fn image_manifest(&self, image: &ImageRef, tag: &str) -> Result<Read, ForgeError> {
+        let (status, body) = self.http(&[&format!(
+            "https://ghcr.io/token?scope=repository:{}:pull",
+            image.path()
+        )])?;
+        if status != 200 {
+            return Err(ForgeError::Http(status));
+        }
+        #[derive(Deserialize)]
+        struct Token {
+            token: String,
+        }
+        let token: Token = serde_json::from_str(&body).map_err(|_| ForgeError::Json)?;
+        if token.token.is_empty() || token.token.contains(['\r', '\n']) {
+            return Err(ForgeError::Json);
+        }
+        let (status, headers) = self.http(&[
+            "--head", "--header", &format!("Authorization: Bearer {}", token.token),
+            "--header", "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json",
+            &format!("https://ghcr.io/v2/{}/manifests/{tag}", image.path()),
+        ])?;
+        image_read(status, &headers)
+    }
+
     fn tag_exists(&self, repo: &GithubRepo, tag: &TagName) -> Result<bool, ForgeError> {
         #[derive(Deserialize)]
         struct Ref {
@@ -649,3 +1004,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/publication_reads.rs"]
+mod publication_reads;

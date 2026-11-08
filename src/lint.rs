@@ -425,6 +425,12 @@ pub(crate) fn undeclared_parts(
 fn lint_holds(root: &Path, unit: &UnitState, seen: &mut Seen, out: &mut Vec<Violation>) {
     for (name, step) in &unit.steps {
         let target = format!("{}/{name}", unit.unit);
+        if crate::state::Release::of_target(&target).is_some()
+            && step.artifacts.is_empty()
+            && matches!(step.track.state, Phase::Drafted | Phase::Launched)
+        {
+            seen.warnings.push(format!("release-artifacts-undeclared: {target} declares no artifacts; cm amend {target} --artifact <spec>"));
+        }
         if let Phase::Blocked(reason) = &step.track.state
             && !reason.starts_with("until:")
             && crate::plan::instant(&step.track.since)

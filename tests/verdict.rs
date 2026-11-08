@@ -3336,3 +3336,63 @@ fn standing_registration_tries_each_parts_pr_without_changing_commit_selection()
     );
     assert!(!known_red(&host, &c, &green, "", "red by design", "build").ok());
 }
+
+#[path = "support/publication.rs"]
+mod publication_fixture;
+
+#[path = "support/campaign.rs"]
+mod campaign_fixture;
+#[allow(dead_code)]
+#[path = "support/forge.rs"]
+mod forge_fixture;
+
+#[test]
+fn hand_release_checks_publication_for_merged_tag_only_and_resumed_steps() {
+    use cm::forge::Read;
+    use publication_fixture as p;
+    let host = at("2026-10-25T06:00:00Z");
+    for phase in [
+        Phase::Merged,
+        Phase::Drafted,
+        Phase::Launched,
+        Phase::Blocked("retry".into()),
+    ] {
+        let tag_only = matches!(phase, Phase::Drafted | Phase::Launched);
+        let resuming = matches!(phase, Phase::Blocked(_));
+        let c = p::campaign(
+            &host,
+            if resuming { Phase::Released } else { phase },
+            &p::ARTIFACTS,
+        );
+        if resuming {
+            let mut unit = p::unit(&c);
+            let track = &mut unit.steps.get_mut("1.4.0").unwrap().track;
+            track.evidence.tag = Some(p::TAG.into());
+            track.apply(
+                Phase::Blocked("retry".into()),
+                "2026-10-25T06:00Z",
+                &Evidence::default(),
+            );
+            commands::write_unit(&c.root.join("00-release/widget"), &unit).unwrap();
+        }
+        let before = c.files();
+        for read in [Read::Missing, Read::Yanked, Read::Stale("1.3.0".into())] {
+            let mut forge = p::present();
+            forge
+                .crates
+                .insert(("acme-sdk".into(), "1.4.0".into()), read);
+            let out = p::advance(&host, &c, &forge, tag_only, resuming);
+            assert_eq!(rules(&out), ["release-unpublished"]);
+            assert_eq!(c.files(), before);
+        }
+        let mut forge = p::present();
+        forge.broken.insert("image:ghcr.io/acme/widget".into());
+        let out = p::advance(&host, &c, &forge, tag_only, resuming);
+        assert_eq!(rules(&out), ["publication-unread"]);
+        assert_eq!(c.files(), before);
+        let out = p::advance(&host, &c, &p::present(), tag_only, resuming);
+        assert!(out.ok(), "{:?}", out.violations);
+        assert_eq!(p::step(&c).track.state, Phase::Released);
+        assert_eq!(p::step(&c).track.evidence.published.len(), 3);
+    }
+}

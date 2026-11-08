@@ -83,6 +83,19 @@ pub fn unit(state: &UnitState) -> String {
         }
         out.push('\n');
     }
+    if state.steps.values().any(|step| !step.artifacts.is_empty()) {
+        out.push_str("## Artifacts\n\n| Step | Artifact |\n|---|---|\n");
+        for (name, step) in &state.steps {
+            for artifact in &step.artifacts {
+                out.push_str(&format!(
+                    "| {} | {} |\n",
+                    cell(name),
+                    cell(&artifact.to_string())
+                ));
+            }
+        }
+        out.push('\n');
+    }
     if state.steps.values().any(|step| !step.parts.is_empty()) {
         out.push_str(
             "## Parts\n\n| Step | Part | State | Since | Evidence |\n|---|---|---|---|---|\n",
