@@ -3550,48 +3550,55 @@ fn review_wait_validation_exits_two_and_state_decode_failures_exit_four() {
 }
 
 #[test]
-fn review_wait_distinguishes_bad_campaign_state_from_a_missing_campaign() {
+fn review_wait_follows_a_pr_opened_while_waiting() {
     let host = at("2026-10-25T00:00Z");
-    for kind in 0..4 {
-        let c = campaign(&host, true);
-        let head = c.head();
-        let path = store::state_path(&c.root);
-        match kind {
-            0 | 1 => fs::write(&path, review_fixture::MALFORMED_CAMPAIGN_STATES[kind]).unwrap(),
-            2 => {
-                fs::remove_file(&path).unwrap();
-                fs::create_dir(&path).unwrap();
-            }
-            _ => fs::remove_file(&path).unwrap(),
-        }
-        for start in [&c.root, &c.root.join("01-a/u")] {
-            let output = Command::new(env!("CARGO_BIN_EXE_cm"))
-                .arg("-C")
-                .arg(start)
-                .args([
-                    "--json",
-                    "review",
-                    "wait",
-                    STEP,
-                    "--head",
-                    &head,
-                    "--reviewer",
-                    "astra",
-                    "--deadline",
-                    &jiff::Timestamp::now().to_string(),
-                ])
-                .output()
-                .unwrap();
-            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-            if kind == 3 {
-                assert_eq!(output.status.code(), Some(2), "{output:?}");
-                assert_eq!(json["wait_status"], "refused");
-                assert_eq!(json["violations"][0]["rule"], "no-campaign");
-            } else {
-                assert_eq!(output.status.code(), Some(4), "{output:?}");
-                assert_eq!(json["wait_status"], "unreadable");
-                assert_eq!(json["violations"][0]["rule"], "review-wait-unreadable");
-            }
-        }
-    }
+    let c = campaign(&host, false);
+    let head = c.head();
+    let report = c.report("wait-for-pr", &head, &[], "ACCEPT");
+    let deadline = (jiff::Timestamp::now() + jiff::SignedDuration::from_secs(10)).to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args([
+            "--json",
+            "review",
+            "wait",
+            STEP,
+            "--head",
+            &head,
+            "--reviewer",
+            "astra",
+            "--deadline",
+            &deadline,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(child.try_wait().unwrap().is_none());
+    let opened = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args([
+            "--json", "advance", STEP, "pr-open", "--pr", PR, "--sha", &head, "--repo",
+        ])
+        .arg(&c.repo)
+        .output()
+        .unwrap();
+    assert!(opened.status.success(), "{opened:?}");
+    let recorded = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args(["--json", "review", "record", STEP])
+        .arg(&report)
+        .args(["--reviewer", "astra"])
+        .output()
+        .unwrap();
+    assert!(recorded.status.success(), "{recorded:?}");
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["wait_status"], "recorded");
+    assert_eq!(json["review"]["pr"], PR);
+    assert_eq!(json["review"]["head"], head);
 }
