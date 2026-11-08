@@ -483,9 +483,9 @@ enum ReviewAct {
     Wait {
         #[arg(value_parser = step_target)]
         target: Target,
-        #[arg(long)]
+        #[arg(long, value_parser = commit_sha)]
         head: String,
-        #[arg(long)]
+        #[arg(long, value_parser = reviewer_name)]
         reviewer: String,
         #[arg(long)]
         deadline: jiff::Timestamp,
@@ -590,6 +590,18 @@ enum MacLaneAct {
     List,
 }
 
+fn commit_sha(text: &str) -> Result<String, String> {
+    crate::state::is_commit(text)
+        .then(|| text.to_owned())
+        .ok_or_else(|| "expected a commit SHA (7 to 40 hexadecimal digits)".into())
+}
+
+fn reviewer_name(text: &str) -> Result<String, String> {
+    crate::store::is_name(text)
+        .then(|| text.to_owned())
+        .ok_or_else(|| "expected a reviewer name of letters, digits, `.`, `_` and `-`".into())
+}
+
 fn step_target(text: &str) -> Result<Target, String> {
     parse_target(text, true)
 }
@@ -644,9 +656,9 @@ fn read_body(path: &Path, limit: Option<usize>) -> Result<String> {
     String::from_utf8(bytes).with_context(|| format!("reading {}", path.display()))
 }
 
-fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
+fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
     let root = || store::root_or_cwd(cli.root.as_deref());
-    match &cli.command {
+    let outcome = match &cli.command {
         Commands::Attention {
             pr,
             worker,
@@ -1001,7 +1013,18 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                     part,
                 }),
             ..
-        } => crate::review::wait(&root()?, target, head, reviewer, part.as_deref(), *deadline),
+        } => {
+            let waited = match root() {
+                Ok(root) => {
+                    crate::review::wait(&root, target, head, reviewer, part.as_deref(), *deadline)
+                        .unwrap_or_else(crate::review::WaitOutcome::unreadable)
+                }
+                Err(error) => {
+                    crate::review::WaitOutcome::refused(".cm", "no-campaign", format!("{error:#}"))
+                }
+            };
+            return Ok(waited.finish());
+        }
         Commands::Review {
             act:
                 Some(ReviewAct::Record {
@@ -1088,7 +1111,13 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             };
             lint::lint_at(&start, host.now())
         }
-    }
+    }?;
+    let exit = if outcome.ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    };
+    Ok((outcome, exit))
 }
 
 fn name(command: &Commands) -> &'static str {
@@ -1133,26 +1162,22 @@ pub fn main() -> ExitCode {
             )
             .exit();
     }
-    let review_wait = matches!(
-        &cli.command,
-        Commands::Review {
-            act: Some(ReviewAct::Wait { .. }),
-            ..
-        }
-    );
     let command = name(&cli.command);
     let outcome = run(&cli, &System).or_else(|error| {
         if let Some(large) = error.downcast_ref::<InputTooLarge>() {
-            return Ok(Outcome::refused(vec![Violation::new(
-                large.path.to_string_lossy(),
-                "kickoff-size",
-                large.to_string(),
-            )]));
+            return Ok((
+                Outcome::refused(vec![Violation::new(
+                    large.path.to_string_lossy(),
+                    "kickoff-size",
+                    large.to_string(),
+                )]),
+                ExitCode::from(1),
+            ));
         }
         Err(error)
     });
     match outcome {
-        Ok(outcome) => {
+        Ok((outcome, exit)) => {
             if cli.json {
                 println!("{}", outcome.to_json(command));
             } else {
@@ -1163,34 +1188,18 @@ pub fn main() -> ExitCode {
                     println!("{line}");
                 }
             }
-            if review_wait
-                && outcome
-                    .fields
-                    .get("wait_status")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("deadline")
-            {
-                ExitCode::from(3)
-            } else if outcome.ok() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            }
+            exit
         }
         Err(error) => {
             if cli.json {
                 println!(
                     "{}",
-                    if review_wait {
-                        serde_json::json!({ "command": command, "ok": false, "violations": [], "wait_status": "unreadable", "error": format!("{error:#}") })
-                    } else {
-                        serde_json::json!({ "command": command, "ok": false, "violations": [], "error": format!("{error:#}") })
-                    }
+                    serde_json::json!({ "command": command, "ok": false, "violations": [], "error": format!("{error:#}") })
                 );
             } else {
                 eprintln!("cm {command}: {error:#}");
             }
-            ExitCode::from(if review_wait { 4 } else { 1 })
+            ExitCode::from(1)
         }
     }
 }
