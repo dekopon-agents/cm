@@ -480,6 +480,69 @@ pub fn dirty_line(url: &str, observed: &Observed) -> String {
     )
 }
 
+pub(crate) fn review_waits(
+    units: &Units,
+    now: Timestamp,
+    target: Option<&Target>,
+    lane: Option<Lane>,
+) -> Vec<Value> {
+    let mut waits = Vec::new();
+    for (unit_name, unit) in units {
+        for (name, step) in &unit.steps {
+            let full = format!("{unit_name}/{name}");
+            if lane.is_some_and(|lane| step.lane != Some(lane))
+                || target.is_some_and(|target| {
+                    target.unit != *unit_name || target.step.as_deref() != Some(name.as_str())
+                })
+            {
+                continue;
+            }
+            let tracks: Vec<_> = if step.parts.is_empty() {
+                vec![(None, &step.track)]
+            } else {
+                step.parts
+                    .iter()
+                    .map(|(part, track)| (Some(part), track))
+                    .collect()
+            };
+            for (part, track) in tracks {
+                let Phase::Blocked(reason) = &track.state else {
+                    continue;
+                };
+                if !["EVIDENCE-BLOCKED", "REVIEW_BLOCKED"].contains(&reason.as_str()) {
+                    continue;
+                }
+                let elapsed =
+                    instant(&track.since).map(|since| now.duration_since(since).as_secs().max(0));
+                waits.push(json!({
+                    "target": full, "part": part, "pr": track.evidence.pr, "head": track.evidence.sha,
+                    "reason": reason, "since": track.since, "waited_seconds": elapsed,
+                    "command": format!("cm next {}", shell_word(&full)),
+                }));
+            }
+        }
+    }
+    waits
+}
+
+pub(crate) fn review_wait_line(wait: &Value) -> String {
+    let part = wait["part"]
+        .as_str()
+        .map(|part| format!("#{part}"))
+        .unwrap_or_default();
+    let elapsed = wait["waited_seconds"]
+        .as_i64()
+        .map(|seconds| format!("{seconds}s"))
+        .unwrap_or_else(|| "unknown duration".into());
+    format!(
+        "reviewer blocked {}{part}: {}, waited {elapsed} since {} (head {})",
+        wait["target"].as_str().unwrap(),
+        wait["reason"].as_str().unwrap(),
+        wait["since"].as_str().unwrap(),
+        wait["head"].as_str().unwrap_or("unknown")
+    )
+}
+
 pub struct Next {
     pub paused: bool,
     pub ready: Vec<(String, Option<Lane>, Finish)>,
@@ -563,6 +626,15 @@ pub fn next_at(
     let mut outcome = Outcome::default();
     let mut number = 1;
     outcome.field("paused", paused);
+    let review_waits = review_waits(&units, now, target, lane);
+    for wait in &review_waits {
+        outcome.line(next_item(
+            &mut number,
+            &review_wait_line(wait),
+            wait["command"].as_str().unwrap(),
+        ));
+    }
+    outcome.field("review_waits", review_waits);
     let verdicts = crate::verdict::load(root)?;
     let fresh_readers: Vec<Value> = crate::verdict::fresh_readers(&verdicts)
         .into_iter()
@@ -650,11 +722,10 @@ pub fn next_at(
                     "{full} is not declared; declare it with `cm init {full} --lane <lane> [--after …]`"
                 ),
             };
-            return Ok(Outcome::refused(vec![Violation::new(
-                &full,
-                "next-state",
-                message,
-            )]));
+            outcome
+                .violations
+                .push(Violation::new(&full, "next-state", message));
+            return Ok(outcome);
         };
         if lane.is_some_and(|lane| candidate.lane() != Some(lane)) {
             outcome.violations.push(Violation::new(

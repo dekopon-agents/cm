@@ -4544,3 +4544,38 @@ fn sync_completes_and_writes_card_with_an_invalid_mac_lane() {
         assert_eq!(rules(&linted), vec![rule], "{:?}", linted.violations);
     }
 }
+
+#[test]
+fn reviewer_wait_timers_include_parts_filter_scope_and_only_warn_in_lint() {
+    let host = at("2026-10-17T10:00Z");
+    let c = campaign(&host);
+    c.review_blocks(&host);
+    let next = plan::next_at(&c.root, None, None, host.now()).unwrap();
+    assert!(next.ok(), "{:?}", next.violations);
+    let waits = next.fields["review_waits"].as_array().unwrap();
+    assert_eq!(waits.len(), 3);
+    assert_eq!(waits[0]["waited_seconds"], 0);
+    assert_eq!(waits[1]["waited_seconds"], 7200);
+    assert_eq!(waits[1]["part"], "core");
+    assert_eq!(waits[1]["head"], "a".repeat(40));
+    assert_eq!(waits[2]["reason"], "EVIDENCE-BLOCKED");
+    let filtered = plan::next_at(
+        &c.root,
+        Some(&parse_target("01-a/u/REVIEW", true).unwrap()),
+        Some(Lane::Codex),
+        host.now(),
+    )
+    .unwrap();
+    assert_eq!(filtered.fields["review_waits"].as_array().unwrap().len(), 2);
+    let linted = cm::lint::lint_at(&c.root, host.now()).unwrap();
+    assert!(linted.ok(), "{:?}", linted.violations);
+    assert_eq!(
+        linted.fields["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|warning| warning.as_str().unwrap().starts_with("reviewer-blocked:"))
+            .count(),
+        3
+    );
+}

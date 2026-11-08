@@ -214,3 +214,39 @@ impl Campaign {
         store::write_json(&store::state_path(dir), &unit).unwrap();
     }
 }
+
+impl Campaign {
+    pub fn review_blocks(&self, host: &dyn Host) {
+        for (name, lane) in [("REVIEW", Lane::Codex), ("LOCAL", Lane::Pi)] {
+            assert!(
+                commands::declare(
+                    host,
+                    &self.root.join(format!("01-a/u/{name}")),
+                    &Declaration {
+                        lane: Some(lane),
+                        ..Default::default()
+                    }
+                )
+                .unwrap()
+                .ok()
+            );
+        }
+        let dir = self.root.join("01-a/u");
+        let mut unit = store::load_unit(&dir).unwrap();
+        let review = unit.steps.get_mut("REVIEW").unwrap();
+        review.track.state = Phase::Blocked("EVIDENCE-BLOCKED".into());
+        review.track.blocked_from = Some(Phase::PrOpen);
+        review.track.since = "2026-10-17T08:00Z".into();
+        review.track.evidence.pr = Some("https://github.com/o/r/pull/1".into());
+        review.track.evidence.sha = Some("a".repeat(40));
+        let mut part = review.track.clone();
+        part.state = Phase::Blocked("REVIEW_BLOCKED".into());
+        review.parts.insert("core".into(), part);
+        review.parts.insert("evidence".into(), review.track.clone());
+        let local = unit.steps.get_mut("LOCAL").unwrap();
+        local.track.state = Phase::Blocked("REVIEW_BLOCKED".into());
+        local.track.blocked_from = Some(Phase::PrOpen);
+        local.track.since = "2099-01-01T00:00Z".into();
+        commands::write_unit(&dir, &unit).unwrap();
+    }
+}
