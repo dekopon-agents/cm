@@ -3548,3 +3548,50 @@ fn review_wait_validation_exits_two_and_state_decode_failures_exit_four() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["wait_status"], "unreadable");
 }
+
+#[test]
+fn review_wait_distinguishes_bad_campaign_state_from_a_missing_campaign() {
+    let host = at("2026-10-25T00:00Z");
+    for kind in 0..4 {
+        let c = campaign(&host, true);
+        let head = c.head();
+        let path = store::state_path(&c.root);
+        match kind {
+            0 | 1 => fs::write(&path, review_fixture::MALFORMED_CAMPAIGN_STATES[kind]).unwrap(),
+            2 => {
+                fs::remove_file(&path).unwrap();
+                fs::create_dir(&path).unwrap();
+            }
+            _ => fs::remove_file(&path).unwrap(),
+        }
+        for start in [&c.root, &c.root.join("01-a/u")] {
+            let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+                .arg("-C")
+                .arg(start)
+                .args([
+                    "--json",
+                    "review",
+                    "wait",
+                    STEP,
+                    "--head",
+                    &head,
+                    "--reviewer",
+                    "astra",
+                    "--deadline",
+                    &jiff::Timestamp::now().to_string(),
+                ])
+                .output()
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if kind == 3 {
+                assert_eq!(output.status.code(), Some(2), "{output:?}");
+                assert_eq!(json["wait_status"], "refused");
+                assert_eq!(json["violations"][0]["rule"], "no-campaign");
+            } else {
+                assert_eq!(output.status.code(), Some(4), "{output:?}");
+                assert_eq!(json["wait_status"], "unreadable");
+                assert_eq!(json["violations"][0]["rule"], "review-wait-unreadable");
+            }
+        }
+    }
+}
