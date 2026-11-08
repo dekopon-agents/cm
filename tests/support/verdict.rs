@@ -120,3 +120,5 @@ pub fn block_multipart_parent(c: &super::Campaign, host: &super::Fake) {
 pub const INVALID_WAIT_HEAD: &str = "not-a-sha";
 pub const INVALID_WAIT_REVIEWER: &str = "bad/name";
 pub const UNKNOWN_WAIT_STEPS: [&str; 2] = ["01-a/u/MISSING", "02-missing/unit/MISSING"];
+
+pub const MALFORMED_CAMPAIGN_STATES: [&str; 2] = ["not JSON", r#"{"kind":"campaign"}"#];
