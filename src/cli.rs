@@ -1019,9 +1019,10 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                     crate::review::wait(&root, target, head, reviewer, part.as_deref(), *deadline)
                         .unwrap_or_else(crate::review::WaitOutcome::unreadable)
                 }
-                Err(error) => {
+                Err(error) if error.is::<store::NoCampaign>() => {
                     crate::review::WaitOutcome::refused(".cm", "no-campaign", format!("{error:#}"))
                 }
+                Err(error) => crate::review::WaitOutcome::unreadable(error),
             };
             return Ok(waited.finish());
         }

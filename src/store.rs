@@ -19,32 +19,60 @@ pub fn state_path(dir: &Path) -> PathBuf {
     dir.join(CM_DIR).join(STATE_FILE)
 }
 
-fn kind_of(dir: &Path) -> Option<Kind> {
+fn kind_of(dir: &Path) -> Result<Option<Kind>> {
     #[derive(serde::Deserialize)]
     struct Probe {
         kind: Kind,
     }
-    let text = fs::read_to_string(state_path(dir)).ok()?;
-    serde_json::from_str::<Probe>(&text)
-        .ok()
-        .map(|probe| probe.kind)
+    let path = state_path(dir);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let probe: Probe =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some(probe.kind))
 }
 
 pub fn is_campaign(dir: &Path) -> bool {
-    kind_of(dir) == Some(Kind::Campaign)
+    matches!(kind_of(dir), Ok(Some(Kind::Campaign)))
 }
 
 pub fn is_unit(dir: &Path) -> bool {
-    kind_of(dir) == Some(Kind::Unit)
+    matches!(kind_of(dir), Ok(Some(Kind::Unit)))
+}
+
+fn discover_root(start: &Path, strict: bool) -> Result<Option<PathBuf>> {
+    let start = absolute(start);
+    for dir in start.ancestors() {
+        match kind_of(dir) {
+            Ok(Some(Kind::Campaign)) => return Ok(Some(dir.to_path_buf())),
+            Err(error) if strict => return Err(error),
+            _ => {}
+        }
+    }
+    Ok(None)
 }
 
 pub fn find_root(start: &Path) -> Option<PathBuf> {
-    let start = absolute(start);
-    start
-        .ancestors()
-        .find(|dir| is_campaign(dir))
-        .map(Path::to_path_buf)
+    discover_root(start, false).ok().flatten()
 }
+
+#[derive(Debug)]
+pub(crate) struct NoCampaign(PathBuf);
+
+impl std::fmt::Display for NoCampaign {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no campaign folder at or above {}; run `cm init`",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for NoCampaign {}
 
 pub fn absolute(path: &Path) -> PathBuf {
     let joined = if path.is_absolute() {
@@ -72,12 +100,12 @@ pub fn root_or_cwd(root: Option<&Path>) -> Result<PathBuf> {
         Some(root) => root.to_path_buf(),
         None => std::env::current_dir()?,
     };
-    match find_root(&start) {
-        Some(found) => Ok(found),
-        None => bail!(
-            "no campaign folder at or above {}; run `cm init`",
-            start.display()
-        ),
+    match discover_root(&start, true)? {
+        Some(found) => {
+            load_campaign(&found)?;
+            Ok(found)
+        }
+        None => Err(NoCampaign(start).into()),
     }
 }
 
