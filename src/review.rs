@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::host::{Host, stamp};
@@ -535,6 +535,33 @@ impl WaitOutcome {
         self.outcome.field("wait_status", label);
         (self.outcome, std::process::ExitCode::from(exit))
     }
+}
+
+pub(crate) fn wait_root(root: Option<&Path>) -> Result<Option<PathBuf>> {
+    #[derive(Deserialize)]
+    struct Probe {
+        kind: crate::state::Kind,
+    }
+    let start = match root {
+        Some(root) if root.is_absolute() => root.to_path_buf(),
+        Some(root) => std::env::current_dir()?.join(root),
+        None => std::env::current_dir()?,
+    };
+    let start = crate::store::absolute(&start);
+    for dir in start.ancestors() {
+        let path = crate::store::state_path(dir);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+            Ok(_) => {}
+        }
+        let probe: Probe = read_json(&path)?;
+        if probe.kind == crate::state::Kind::Campaign {
+            crate::store::load_campaign(dir)?;
+            return Ok(Some(dir.to_path_buf()));
+        }
+    }
+    Ok(None)
 }
 
 /// Wait for a recorded round without preventing the recording process from taking the lock.

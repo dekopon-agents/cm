@@ -1014,14 +1014,17 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                 }),
             ..
         } => {
-            let waited = match root() {
-                Ok(root) => {
+            let waited = match crate::review::wait_root(cli.root.as_deref()) {
+                Ok(Some(root)) => {
                     crate::review::wait(&root, target, head, reviewer, part.as_deref(), *deadline)
                         .unwrap_or_else(crate::review::WaitOutcome::unreadable)
                 }
-                Err(error) => {
-                    crate::review::WaitOutcome::refused(".cm", "no-campaign", format!("{error:#}"))
-                }
+                Ok(None) => crate::review::WaitOutcome::refused(
+                    ".cm",
+                    "no-campaign",
+                    "no campaign folder at or above the starting directory; run `cm init`",
+                ),
+                Err(error) => crate::review::WaitOutcome::unreadable(error),
             };
             return Ok(waited.finish());
         }
