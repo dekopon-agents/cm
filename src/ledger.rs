@@ -696,6 +696,7 @@ pub enum MacState {
     Open,
     Held,
     Running,
+    Partial,
     Done,
     Withdrawn,
 }
@@ -706,6 +707,7 @@ impl MacState {
             MacState::Open => "open",
             MacState::Held => "held",
             MacState::Running => "running",
+            MacState::Partial => "partial",
             MacState::Done => "done",
             MacState::Withdrawn => "withdrawn",
         }
@@ -713,7 +715,7 @@ impl MacState {
 
     pub fn open(self) -> bool {
         match self {
-            MacState::Open | MacState::Held | MacState::Running => true,
+            MacState::Open | MacState::Held | MacState::Running | MacState::Partial => true,
             MacState::Done | MacState::Withdrawn => false,
         }
     }
@@ -756,6 +758,7 @@ fn bold(text: &str) -> Option<(usize, usize)> {
 fn mac_status(span: &str) -> Option<MacState> {
     let word = span.split(|c: char| !c.is_ascii_alphabetic()).next()?;
     match word {
+        "PARTIAL" => Some(MacState::Partial),
         "DONE" => Some(MacState::Done),
         "WITHDRAWN" => Some(MacState::Withdrawn),
         "HELD" => Some(MacState::Held),
@@ -764,6 +767,35 @@ fn mac_status(span: &str) -> Option<MacState> {
         "Receipt" => Some(MacState::Open),
         _ => None,
     }
+}
+
+// A partial receipt is part of the status, not part of the original instructions.
+fn partial_end(text: &str, close: usize) -> usize {
+    let Some(receipt) = text[close..].strip_prefix(" (") else {
+        return close;
+    };
+    let mut escaped = false;
+    let mut depth = 1;
+    for (offset, ch) in receipt.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = close + 2 + offset + 1;
+                    return end + usize::from(text[end..].starts_with('.'));
+                }
+            }
+            '\n' | '\r' => break,
+            _ => {}
+        }
+    }
+    close
 }
 
 pub fn mac_lane_items(text: &str) -> Result<Vec<MacItem>, Vec<Violation>> {
@@ -793,6 +825,9 @@ pub fn mac_lane_items(text: &str) -> Result<Vec<MacItem>, Vec<Violation>> {
                 .filter(|(open, _)| *open == 0)
                 .and_then(|(_, close)| Some((mac_status(&item[2..close - 2])?, close)));
             let (state, rest) = match status {
+                Some((MacState::Partial, close)) => {
+                    (MacState::Partial, &item[partial_end(item, close)..])
+                }
                 Some((state, close)) => (state, &item[close..]),
                 None => (MacState::Open, item),
             };
@@ -811,8 +846,14 @@ pub fn mac_lane_items(text: &str) -> Result<Vec<MacItem>, Vec<Violation>> {
                     .trim_end_matches(['.', ':'])
                     .to_owned(),
                 head,
-                status_end: status
-                    .map(|(_, close)| head + close + usize::from(item[close..].starts_with(' '))),
+                status_end: status.map(|(state, close)| {
+                    let close = if state == MacState::Partial {
+                        partial_end(item, close)
+                    } else {
+                        close
+                    };
+                    head + close + usize::from(item[close..].starts_with(' '))
+                }),
             }
         })
         .collect())
@@ -936,6 +977,25 @@ pub fn mac_lane_add(host: &dyn Host, root: &Path, title: &str, body: &str) -> Re
 }
 
 pub fn mac_lane_done(host: &dyn Host, root: &Path, number: u32, receipt: &str) -> Result<Outcome> {
+    mac_lane_stamp(host, root, number, receipt, MacState::Done)
+}
+
+pub(crate) fn mac_lane_partial(
+    host: &dyn Host,
+    root: &Path,
+    number: u32,
+    receipt: &str,
+) -> Result<Outcome> {
+    mac_lane_stamp(host, root, number, receipt, MacState::Partial)
+}
+
+fn mac_lane_stamp(
+    host: &dyn Host,
+    root: &Path,
+    number: u32,
+    receipt: &str,
+    state: MacState,
+) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
     one_line("--receipt", receipt, &mut violations, MAC_LANE_FILE);
     let path = root.join(MAC_LANE_FILE);
@@ -979,7 +1039,16 @@ pub fn mac_lane_done(host: &dyn Host, root: &Path, number: u32, receipt: &str) -
         return Ok(Outcome::refused(violations));
     };
     let date = host.now().strftime("%Y-%m-%d").to_string();
-    let status = format!("**DONE {date}** ({}). ", receipt.trim());
+    let receipt = if state == MacState::Partial {
+        receipt
+            .trim()
+            .replace('\\', "\\\\")
+            .replace('(', "\\(")
+            .replace(')', "\\)")
+    } else {
+        receipt.trim().to_owned()
+    };
+    let status = format!("**{} {date}** ({receipt}). ", state.name().to_uppercase());
     let mut out = text[..item.head].to_owned();
     if out.ends_with('.') {
         out.push(' ');
@@ -1003,7 +1072,7 @@ pub fn mac_lane_done(host: &dyn Host, root: &Path, number: u32, receipt: &str) -
     let journal = journal_line(
         root,
         &at,
-        &format!("mac-lane done {label}"),
+        &format!("mac-lane {} {label}", state.name()),
         &format!("- {MAC_LANE_FILE}: `{number}. {}`\n", status.trim_end()),
     )?;
     let mut outcome = Outcome::default();

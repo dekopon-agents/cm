@@ -554,6 +554,12 @@ enum QueueAct {
 
 #[derive(Subcommand)]
 enum MacLaneAct {
+    /// Stamp an open item PARTIAL, keeping its instructions and leaving it open.
+    Partial {
+        number: u32,
+        #[arg(long)]
+        receipt: String,
+    },
     /// Append `N. **<title>** <body>`, numbering on from the highest item.
     Add {
         title: String,
@@ -561,13 +567,13 @@ enum MacLaneAct {
         #[arg(long, value_name = "FILE")]
         body_file: Option<PathBuf>,
     },
-    /// Stamp item N `**DONE <date>** (<receipt>).`, replacing a leading HELD, RUNNING or Receipt span.
+    /// Stamp item N `**DONE <date>** (<receipt>).`, replacing a leading PARTIAL, HELD, RUNNING or Receipt span.
     Done {
         number: u32,
         #[arg(long)]
         receipt: String,
     },
-    /// List the open items: number, title and state (open, held or running).
+    /// List the open items: number, title and state (open, held, running or partial).
     List,
 }
 
@@ -949,6 +955,9 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 .transpose()?;
             crate::ledger::mac_lane_add(host, &root()?, title, body.as_deref().unwrap_or_default())
         }
+        Commands::MacLane {
+            act: MacLaneAct::Partial { number, receipt },
+        } => crate::ledger::mac_lane_partial(host, &root()?, *number, receipt),
         Commands::MacLane {
             act: MacLaneAct::Done { number, receipt },
         } => crate::ledger::mac_lane_done(host, &root()?, *number, receipt),
