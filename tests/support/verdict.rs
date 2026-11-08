@@ -146,5 +146,3 @@ pub fn owner_read(root: &std::path::Path) -> std::process::Output {
 
 pub const INVALID_QUEUE: &str = "# Owner queue\n\n## 1. Missing fields\n";
 pub const LEGACY_QUEUE: &str = "# Owner queue\n\n## Choose a setting\n\nContext: A decision.\nProceed?\nRecommendation: Yes.\nAnswer:\n";
-
-pub const MALFORMED_CAMPAIGN_STATES: [&str; 2] = ["not JSON", r#"{"kind":"campaign"}"#];

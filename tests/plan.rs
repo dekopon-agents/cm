@@ -4559,7 +4559,9 @@ fn reviewer_wait_timers_include_parts_filter_scope_and_only_warn_in_lint() {
     assert_eq!(waits[1]["part"], serde_json::Value::Null);
     assert_eq!(waits[1]["reason"], "EVIDENCE-BLOCKED");
     assert_eq!(waits[2]["part"], "core");
-    assert_eq!(waits[1]["head"], "a".repeat(40));
+    assert!(waits[1]["pr"].is_null());
+    assert!(waits[1]["head"].is_null());
+    assert_eq!(waits[2]["head"], "a".repeat(40));
     assert_eq!(waits[3]["reason"], "EVIDENCE-BLOCKED");
     let filtered = plan::next_at(
         &c.root,
