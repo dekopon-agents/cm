@@ -2919,3 +2919,40 @@ fn image_publication_passes_the_pull_token_on_stdin() {
         ["image:ghcr.io/acme/widget@sha256:synthetic-digest"]
     );
 }
+
+#[path = "support/formula.rs"]
+mod formula_fixture;
+
+#[test]
+fn unsupported_formula_arguments_journal_unknown_and_leave_the_release_merged() {
+    use publication_fixture as p;
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = p::campaign(&host, Phase::Merged, &p::ARTIFACTS);
+    let before = p::unit(&c);
+    for (key, value) in [
+        (
+            "url",
+            "https://github.com/o/widget/releases/download/widget-1.4.0/widget.tar.gz",
+        ),
+        ("version", "1.4.0"),
+    ] {
+        for (name, argument) in formula_fixture::unsupported_arguments(value) {
+            let call = format!("{key}({argument})");
+            let declaration = if key == "url" {
+                format!("{call}\nsha256 \"{}\"\n", "b".repeat(64))
+            } else {
+                call
+            };
+            let body = p::formula(p::TAG).replace("\nend\n", &format!("\n{declaration}\nend\n"));
+            let mut forge = p::present();
+            forge
+                .formulas
+                .insert(("o/homebrew-tap".into(), "widget".into()), body);
+            let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+            assert_eq!(rules(&out), ["sync-unknown"], "{key}: {name}");
+            assert!(out.fields.contains_key("journal"));
+            assert_eq!(out.fields["moves"], serde_json::json!([]));
+            assert_eq!(p::unit(&c), before);
+        }
+    }
+}

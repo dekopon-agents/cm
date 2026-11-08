@@ -673,16 +673,17 @@ pub fn parse_formula(
 ) -> Result<Read, ForgeError> {
     fn argument<'a>(line: &'a str, key: &str) -> Option<&'a str> {
         let rest = line.strip_prefix(key)?;
-        (rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || "(\"'".contains(c)))
-            .then_some(rest.trim_start())
+        (!rest.starts_with(|c: char| c.is_alphanumeric() || c == '_')).then_some(rest.trim_start())
     }
-    fn quoted<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    fn literal<'a>(line: &'a str, key: &str) -> Option<&'a str> {
         let rest = argument(line, key)?;
         let parenthesized = rest.starts_with('(');
         let rest = rest.strip_prefix('(').unwrap_or(rest).trim_start();
-        let quote = rest.chars().next().filter(|c| matches!(c, '\'' | '"'))?;
-        let (value, tail) = rest.strip_prefix(quote)?.split_once(quote)?;
-        if value.contains("#{") {
+        let (value, tail) = rest.strip_prefix('"')?.split_once('"')?;
+        if !value
+            .chars()
+            .all(|c| !c.is_control() && !matches!(c, '\\' | '#'))
+        {
             return None;
         }
         let tail = if parenthesized {
@@ -704,43 +705,47 @@ pub fn parse_formula(
         .collect();
     let prefix = format!("https://github.com/{repo}/releases/download/");
     let mut urls = 0;
+    let mut stale = None;
     for (index, line) in lines.iter().enumerate() {
         if argument(line, "url").is_some() {
             urls += 1;
-            let url = quoted(line, "url").ok_or(ForgeError::Json)?;
+            let url = literal(line, "url").ok_or(ForgeError::UnsupportedFormula)?;
             let (named, asset) = url
                 .strip_prefix(&prefix)
                 .and_then(|rest| rest.rsplit_once('/'))
-                .ok_or(ForgeError::Json)?;
+                .ok_or(ForgeError::UnsupportedFormula)?;
             if named != tag.as_str() {
-                return Ok(Read::Stale(named.to_owned()));
+                stale.get_or_insert(named);
             }
             if asset.is_empty() {
-                return Err(ForgeError::Json);
+                return Err(ForgeError::UnsupportedFormula);
             }
             let checksum = lines
                 .get(index + 1)
-                .and_then(|line| quoted(line, "sha256"))
-                .ok_or(ForgeError::Json)?;
+                .and_then(|line| literal(line, "sha256"))
+                .ok_or(ForgeError::UnsupportedFormula)?;
             if checksum.len() != 64
                 || !checksum
                     .bytes()
                     .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
             {
-                return Err(ForgeError::Json);
+                return Err(ForgeError::UnsupportedFormula);
             }
         }
         if argument(line, "version").is_some() {
-            let named = quoted(line, "version").ok_or(ForgeError::Json)?;
+            let named = literal(line, "version").ok_or(ForgeError::UnsupportedFormula)?;
             if named != version.to_string() {
-                return Ok(Read::Stale(named.to_owned()));
+                stale.get_or_insert(named);
             }
         }
     }
     if urls == 0 || sha.is_empty() {
-        return Err(ForgeError::Json);
+        return Err(ForgeError::UnsupportedFormula);
     }
-    Ok(Read::Present(sha.to_owned()))
+    Ok(match stale {
+        Some(named) => Read::Stale(named.to_owned()),
+        None => Read::Present(sha.to_owned()),
+    })
 }
 
 fn image_read(status: u16, headers: &str) -> Result<Read, ForgeError> {
@@ -978,7 +983,6 @@ impl Forge for Gh {
         }
         let formula: Formula = serde_json::from_str(body).map_err(|_| ForgeError::Json)?;
         parse_formula(&formula.content, &formula.sha, repo, tag, version)
-            .map_err(|_| ForgeError::UnsupportedFormula)
     }
 
     fn image_manifest(&self, image: &ImageRef, tag: &str) -> Result<Read, ForgeError> {
