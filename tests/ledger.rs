@@ -1695,3 +1695,79 @@ fn mac_lane_done_on_empty_headings_keeps_them_parseable_and_prints_the_number() 
         );
     }
 }
+
+#[path = "support/mac_partial.rs"]
+mod partial_fixture;
+
+#[test]
+fn partial_stays_open_and_done_replaces_the_entire_receipt() {
+    let fixture = campaign_fixture::campaign(&Fake);
+    let root = &fixture.root;
+    let path = root.join("MAC-LANE.md");
+    fs::write(
+        &path,
+        format!("# Mac lane queue\n\n1. {}", partial_fixture::INSTRUCTIONS),
+    )
+    .unwrap();
+    let run = |action: &str, receipt: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("-C")
+            .arg(root)
+            .args(["--json", "mac-lane", action, "1", "--receipt", receipt])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    };
+    run("partial", "first ) receipt (with details)");
+    assert!(mac_lane(root).ends_with(partial_fixture::INSTRUCTIONS));
+    let listed = ledger::mac_lane_list(root).unwrap();
+    assert_eq!(listed.fields["items"][0]["state"], "partial");
+    assert_eq!(listed.fields["items"][0]["title"], "Check the setting");
+    assert_eq!(
+        rules(&commands::close(&Fake, root).unwrap()),
+        vec!["closed-mac-lane"]
+    );
+    run("partial", "second receipt");
+    assert!(mac_lane(root).ends_with(partial_fixture::INSTRUCTIONS));
+    run("done", "complete");
+    assert_eq!(
+        mac_lane(root),
+        format!(
+            "# Mac lane queue\n\n1. **DONE {}** (complete). {}",
+            cm::host::System.now().strftime("%Y-%m-%d"),
+            partial_fixture::INSTRUCTIONS
+        )
+    );
+    assert_eq!(
+        ledger::mac_lane_list(root).unwrap().fields["items"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn mac_lane_receipt_line_breaks_refuse_without_changing_lane_or_journal() {
+    let fixture = campaign_fixture::campaign(&Fake);
+    let path = fixture.root.join("MAC-LANE.md");
+    fs::write(
+        &path,
+        format!("# Mac lane queue\n\n1. {}", partial_fixture::INSTRUCTIONS),
+    )
+    .unwrap();
+    let lane = fs::read(&path).unwrap();
+    let journal = fs::read(fixture.root.join("JOURNAL.md")).unwrap();
+    for action in ["partial", "done"] {
+        for receipt in partial_fixture::INVALID_RECEIPTS {
+            let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+                .arg("-C")
+                .arg(&fixture.root)
+                .args(["--json", "mac-lane", action, "1", "--receipt", receipt])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1), "{action}: {output:?}");
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(json["violations"][0]["rule"], "ledger-field");
+            assert_eq!(fs::read(&path).unwrap(), lane);
+            assert_eq!(fs::read(fixture.root.join("JOURNAL.md")).unwrap(), journal);
+        }
+    }
+}
