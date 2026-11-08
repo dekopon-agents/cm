@@ -867,6 +867,9 @@ pub fn lint_at(start: &Path, now: jiff::Timestamp) -> Result<Outcome> {
     for dir in &units {
         violations.extend(lint_unit(&root, dir, &mut seen));
     }
+    for item in crate::plan::stale_bases(&root, &seen.units) {
+        seen.warnings.push(crate::plan::stale_base_line(&item));
+    }
     for wait in crate::plan::review_waits(&seen.units, now, None, None) {
         seen.warnings.push(format!(
             "reviewer-blocked: {}",

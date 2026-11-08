@@ -118,6 +118,7 @@ impl Forge for FakeForge {
     }
 
     fn checks(&self, _repo: &GithubRepo, sha: &CommitSha) -> Result<Vec<CheckState>, ForgeError> {
+        self.assert_unlocked();
         if let Some(part) = self.parts.values().find(|part| part.head == sha.as_str()) {
             return part.checks(_repo, sha);
         }
@@ -3547,4 +3548,60 @@ fn review_wait_validation_exits_two_and_state_decode_failures_exit_four() {
     assert_eq!(output.status.code(), Some(4));
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["wait_status"], "unreadable");
+}
+
+#[test]
+fn sync_surfaces_a_moved_base_since_ci_and_refreshes_only_at_a_tested_new_head() {
+    let host = at("2026-10-25T00:00Z");
+    let c = campaign(&host, true);
+    let head = c.head();
+    let mut forge = FakeForge::open(&head, &[("test", "success")]);
+    forge.campaign = Some(c.root.clone());
+    forge.base = Some("b".repeat(40));
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    assert_eq!(
+        plan::next_at(&c.root, None, None, host.now())
+            .unwrap()
+            .fields["stale_base"],
+        serde_json::json!([])
+    );
+    forge.base = Some("c".repeat(40));
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    let next = plan::next_at(&c.root, None, None, host.now()).unwrap();
+    assert!(next.ok());
+    assert_eq!(next.fields["stale_base"][0]["ci_head"], head);
+    assert_eq!(next.fields["stale_base"][0]["ci_base"], "b".repeat(40));
+    assert_eq!(next.fields["stale_base"][0]["base"], "c".repeat(40));
+    let linted = cm::lint::lint_at(&c.root, host.now()).unwrap();
+    assert!(linted.ok(), "{:?}", linted.violations);
+    assert!(
+        linted.fields["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line.as_str().unwrap().starts_with("stale-base "))
+    );
+    let before: serde_json::Value = store::read_json(&plan::pulls_path(&c.root)).unwrap();
+    forge.down = true;
+    assert!(!sync(&host, &forge, &c.root).unwrap().ok());
+    let after: serde_json::Value = store::read_json(&plan::pulls_path(&c.root)).unwrap();
+    assert_eq!(before, after);
+    forge.down = false;
+    forge.head = "d".repeat(40);
+    forge.checks = vec![("test", "in_progress")];
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    assert_eq!(
+        plan::next_at(&c.root, None, None, host.now())
+            .unwrap()
+            .fields["stale_base"][0]["ci_head"],
+        head
+    );
+    forge.checks = vec![("test", "success")];
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    assert_eq!(
+        plan::next_at(&c.root, None, None, host.now())
+            .unwrap()
+            .fields["stale_base"],
+        serde_json::json!([])
+    );
 }

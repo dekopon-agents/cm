@@ -428,6 +428,12 @@ pub fn stall_line(stall: &Stall, limit: f64) -> String {
 /// What `cm sync` last saw of an open PR, in `.cm/pulls.json`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Observed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_base: Option<String>,
     pub target: String,
     pub at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -477,6 +483,42 @@ pub fn dirty_line(url: &str, observed: &Observed) -> String {
     format!(
         "dirty {}: {url} has merge conflicts (mergeable_state dirty, seen {})",
         observed.target, observed.at
+    )
+}
+
+pub(crate) fn stale_bases(root: &Path, units: &Units) -> Vec<Value> {
+    let Ok(seen) = store::read_json::<BTreeMap<String, Observed>>(&pulls_path(root)) else {
+        return Vec::new();
+    };
+    seen.into_iter()
+        .filter_map(|(url, observed)| {
+            let track = track(units, &observed.target)?;
+            if track.state != Phase::PrOpen || track.evidence.pr.as_deref() != Some(url.as_str()) {
+                return None;
+            }
+            let base = observed.base.as_ref()?;
+            let ci_base = observed.ci_base.as_ref()?;
+            let ci_head = observed.ci_head.as_ref()?;
+            if base == ci_base {
+                return None;
+            }
+            Some(
+                json!({ "target": observed.target, "pr": url, "head": observed.head,
+            "base": base, "ci_head": ci_head, "ci_base": ci_base, "observed_at": observed.at,
+            "command": "cm sync" }),
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn stale_base_line(item: &Value) -> String {
+    format!(
+        "stale-base {}: base moved from {} to {} since CI head {} (seen {})",
+        item["target"].as_str().unwrap(),
+        item["ci_base"].as_str().unwrap(),
+        item["base"].as_str().unwrap(),
+        item["ci_head"].as_str().unwrap(),
+        item["observed_at"].as_str().unwrap()
     )
 }
 
@@ -620,6 +662,24 @@ pub fn next_at(
     let mut outcome = Outcome::default();
     let mut number = 1;
     outcome.field("paused", paused);
+    let stale_bases: Vec<_> = stale_bases(root, &units)
+        .into_iter()
+        .filter(|item| {
+            let full = item["target"].as_str().unwrap().split('#').next().unwrap();
+            target.is_none_or(|target| {
+                full == format!(
+                    "{}/{}",
+                    target.unit,
+                    target.step.as_deref().unwrap_or_default()
+                )
+            }) && lane
+                .is_none_or(|lane| step(&units, full).is_some_and(|step| step.lane == Some(lane)))
+        })
+        .collect();
+    for item in &stale_bases {
+        outcome.line(next_item(&mut number, &stale_base_line(item), "cm sync"));
+    }
+    outcome.field("stale_base", stale_bases);
     let review_waits = review_waits(&units, now, target, lane);
     for wait in &review_waits {
         outcome.line(next_item(
