@@ -51,9 +51,9 @@ error.
 | Command | Contract |
 |---|---|
 | `cm init [DIR]` | Writes `RESUME.md`, `JOURNAL.md`, `LIMITS.toml`, `OWNER-QUEUE.md` and `.cm/state.json` from templates embedded in the binary. Never overwrites: in an existing folder it writes only what is missing and adopts each existing file as the baseline once it lints clean. `cm init <NN-name>/<unit>` inside a campaign writes the unit's `.cm/state.json` and its rendered `STATE.md`. |
-| `cm init <NN-name>/<unit>/<step> --lane L [--after A]… [--study \| --kind rollout] [--github OWNER/NAME] [--tag PATTERN] [--kickoff-file F]` | Declares a step `drafted` in lane `pi`, `codex`, `claude-cloud`, `fable`, `owner` or `coordinator` (a step the coordinator session runs itself), creating the unit if needed. `--study` marks a step that ships no PR: like an `owner`-lane step it finishes with `cm advance <step> done --evidence <path>` (see [Finishing](#finishing)). `--kind rollout` declares a rollout step that moves directly from `merged` to `deployed` with a merge SHA and an Argo sync evidence file; it is mutually exclusive with `--study` and cannot declare a release. Each `--after` is one gate, including `pin:<step>@<sha>` for a recorded head (see [Order](#order)); every step or release it names must already be declared, so the order has no cycles. `--kickoff-file F` writes `kickoff.md` from a non-empty file of at most 1 MiB (`-` reads stdin), never replacing an existing one, and journals one line. `--github` and `--tag` declare a release step's repository and tag (see [Releases](#releases)). A relative folder resolves against `-C` when it is given. A declaration is changed only by `cm amend`: a different one is `step-declared`, and the same one again repairs what an interrupted declaration left half written (the step folder, a missing kickoff when `--kickoff-file` is given, a missing or stale `STATE.md`) without replaying the journal, or else is a no-op. |
+| `cm init <NN-name>/<unit>/<step> --lane L [--after A]… [--study \| --kind rollout] [--github OWNER/NAME] [--tag PATTERN] [--artifact SPEC] [--kickoff-file F]` | Declares a step `drafted` in lane `pi`, `codex`, `claude-cloud`, `fable`, `owner` or `coordinator` (a step the coordinator session runs itself), creating the unit if needed. `--study` marks a step that ships no PR: like an `owner`-lane step it finishes with `cm advance <step> done --evidence <path>` (see [Finishing](#finishing)). `--kind rollout` declares a rollout step that moves directly from `merged` to `deployed` with a merge SHA and an Argo sync evidence file; it is mutually exclusive with `--study` and cannot declare a release. Each `--after` is one gate, including `pin:<step>@<sha>` for a recorded head (see [Order](#order)); every step or release it names must already be declared, so the order has no cycles. `--kickoff-file F` writes `kickoff.md` from a non-empty file of at most 1 MiB (`-` reads stdin), never replacing an existing one, and journals one line. `--github` and `--tag` declare a release step's repository and tag (see [Releases](#releases)). A relative folder resolves against `-C` when it is given. A declaration is changed only by `cm amend`: a different one is `step-declared`, and the same one again repairs what an interrupted declaration left half written (the step folder, a missing kickoff when `--kickoff-file` is given, a missing or stale `STATE.md`) without replaying the journal, or else is a no-op. |
 | `cm next [<NN-name>/<unit>/<step>] [--lane L]` | Numbers every item with its next cm command (`command` on each JSON item), shared with CARD.md’s Next, Waiting and Blocked sections; named inputs appear as quoted placeholders (see [Order](#order)). Lists the declared `drafted` steps whose every `--after` is met and whose folder has `kickoff.md` (`steps`), the rest with what each waits on (`waiting`), and the merged release steps that wait for their tag (`tags`). It also flags (`stalled`) each `codex`-lane step at `launched` with no PR whose attempt was claimed more than `codex_stall_hours` ago (LIMITS.toml, default 2; the launch stamp for a step launched without an attempt), and (`dirty`) each `pr-open` step whose PR the last `cm sync` saw with `mergeable_state: dirty`; neither is a violation. Nothing is next while `LIMITS.toml` is paused. `tags` is in version order. Given a step, it refuses (exit 1) unless that step is next, naming every unmet gate, and lists a refused step under `waiting`, never `steps`. |
-| `cm sync` | Reads GitHub with read-only `gh api` calls, each killed after 60 seconds, without holding `.cm/lock`; then it takes the lock, reloads the state and applies the moves that still hold. It moves steps along: `pr-open` → `merged` when the PR merged (the merge commit and GitHub's optional `merged_at` are the evidence; `since` remains the sync time), a release step `merged` → `released` when its declared tag exists in its repository and contains the prep merge, any other non-rollout step `merged` → `released` by the first release of its repository whose tag contains its merge, and `released` → `deployed` once a `deployed` release of the same line contains its merge. One journal entry lists the moves and new notifications; a sync with neither journals nothing. It refreshes the marked status span in `RESUME.md` from state (step counts, newest released and deployed version per release line, and epoch status), preserving all owner prose and silently leaving files without markers alone. It rewrites `CARD.md`, whose first line is `Last run: <stamp>`, and `.cm/pulls.json` with what it saw of each open PR (head, `mergeable_state`; a PR GitHub did not answer for keeps its last observation and stamp while its step rests at `pr-open` on it), and reports `stalled` and `dirty` as `cm next` does. A `codex`-lane step whose PR merged moves to `merged` only when its merge gate holds at the PR's head; otherwise it stays `pr-open` and each unmet condition is a `merge-gate` violation. A PR closed unmerged (`pr-closed`) or an observation `gh` could not make (`sync-unknown`) exits 1 after the rest is applied. |
+| `cm sync` | Reads GitHub and tap formulas with read-only `gh api` calls, and declared crates and images with read-only `curl` requests, each killed after 60 seconds, without holding `.cm/lock`; then it takes the lock, reloads the state and applies the moves that still hold. It moves steps along: `pr-open` → `merged` when the PR merged (the merge commit and GitHub's optional `merged_at` are the evidence; `since` remains the sync time), a release step `merged` → `released` when its declared tag exists in its repository and contains the prep merge and every declared artifact is published at the release version (see [Releases](#releases)), any other non-rollout step `merged` → `released` by the first release of its repository whose tag contains its merge, and `released` → `deployed` once a `deployed` release of the same line contains its merge. One journal entry lists the moves, new notifications and unreadable publication observations; a sync with none journals nothing. Unreadable PR and tag observations alone add no journal entry. It refreshes the marked status span in `RESUME.md` from state (step counts, newest released and deployed version per release line, and epoch status), preserving all owner prose and silently leaving files without markers alone. It rewrites `CARD.md`, whose first line is `Last run: <stamp>`, and `.cm/pulls.json` with what it saw of each open PR (head, `mergeable_state`; a PR GitHub did not answer for keeps its last observation and stamp while its step rests at `pr-open` on it), and reports `stalled` and `dirty` as `cm next` does. A `codex`-lane step whose PR merged moves to `merged` only when its merge gate holds at the PR's head; otherwise it stays `pr-open` and each unmet condition is a `merge-gate` violation. A PR closed unmerged (`pr-closed`) or an observation `gh` or `curl` could not make (`sync-unknown`) exits 1 after the rest is applied. |
 | `cm epoch planning\|working\|closed [--skill-revision R] [--plan-revision S]` | Moves `EPOCH.md`'s front matter one status along `OPEN → PLANNING → WORKING → CLOSED`, stamps `planning_started_at`, `working_started_at` or `closed_at` with the date, sets the pins it is given, journals the move, and refreshes RESUME.md’s generated status span. It refuses a null pin: PLANNING needs `skill_revision`, WORKING and CLOSED also `approved_plan_revision`. `closed` follows `cm close`. |
 | `cm idea admit <id>` | Admits an idea to this epoch, appends its id to `EPOCH.md`'s `ideas:` list in admission order, and journals the action. Repeating it completes interrupted writes without duplicating entries. |
 | `cm idea move <id> <maturity>` | Moves an admitted idea forward through `captured → exploring → designed`; skipping a maturity is allowed. |
@@ -62,7 +62,7 @@ error.
 | `cm launch <NN-name>/<unit>/<step> [--worktree PATH] [--coordinator LABEL] [--cap-min N]` | Runs the launch checks and reports every failure: `LIMITS.toml` not paused; a declared step's every `--after` met (`after-unmet`); for the local `pi` lane and undeclared steps, free disk on `disk_volume` minus `kache_headroom_gib` over `min_free_disk_gib`, live heavy builds (top-level `cargo` processes) under `max_heavy_builds` and the worktree, which they require; the step folder has `kickoff.md`; every path its packet names exists. A drafted step, a step blocked before its PR opened, or a launched step whose last attempt has ended can launch; relaunch picks the newest `resume*.md` when present and increments `launches`. The `--after` check runs on every launch, including relaunches. Then it marks the step (and a drafted unit) launched, journals the launch and, for a local step, prints the command; every other lane (`owner` and `coordinator` among them) prints only the step and its prompt and records its attempt (see [Attempts](#attempts)). It spawns nothing. When `--coordinator` is omitted, the label defaults to trimmed `CLAUDE_CODE_REMOTE_SESSION_ID` with a leading `cse_` mapped to `session_`, else `—` when unset or whitespace-only; an explicit label wins. Launch refuses an empty or multi-line label, explicit or inherited. A step whose last attempt has not ended does not launch again (`attempt-open`). |
 | `cm attempt <NN-name>/<unit>/<step> [--claim TOKEN] [claim [--coordinator L] --expect G \| begin KIND \| record KIND ID \| restart --lane L [--evidence PATH] \| end complete\|partial\|unknown [--evidence PATH]]` | Shows a remote attempt and what to do next from committed state alone, or extends it; each change is journaled. See [Attempts](#attempts). |
 | `cm unblock <NN-name>/<unit>[/<step>] [--evidence PATH]` | Releases a `blocked:<reason>` track to the state it was blocked from. Omit `--evidence` only for a step whose `blocked:until:<condition>` holds; the condition is journaled. Other blocks require a campaign evidence file, as for `done`. A step that rests at `drafted` or `launched` still waits on every `--after`: `cm next` and `cm launch` check them again, and the move lists what is still unmet. |
-| `cm amend <NN-name>/<unit>/<step> [--study] [--lane L] [--after A]… [--drop-after A]… [--part NAME]… [--kickoff-file F] [--github OWNER/NAME] [--tag PATTERN]` | Changes a declared step that rests at `drafted` or `launched`: marks it a study, moves its lane, or removes gates with `--drop-after` before adding gates with `--after` (each declared, never closing a cycle: `after-cycle`). Removing a gate it lacks is `after-absent`. `--kickoff-file F` replaces `kickoff.md` from a non-empty file of at most 1 MiB (`-` reads stdin) and journals one line; it refuses a step past launched. `--github` and `--tag` change a release step's repository and tag pattern through `pr-open` and `merged`, refusing once released; its prep PR must be in that repository. `--part` declares required parts (see [Parts](#parts)); given alone it also amends a step that has moved on, short of final. Journals the change; a change that changes nothing is `amend-empty`. |
+| `cm amend <NN-name>/<unit>/<step> [--study] [--lane L] [--after A]… [--drop-after A]… [--part NAME]… [--kickoff-file F] [--github OWNER/NAME] [--tag PATTERN] [--artifact SPEC] [--drop-artifact SPEC]` | Changes a declared step that rests at `drafted` or `launched`: marks it a study, moves its lane, or removes gates with `--drop-after` before adding gates with `--after` (each declared, never closing a cycle: `after-cycle`). Removing a gate it lacks is `after-absent`. `--kickoff-file F` replaces `kickoff.md` from a non-empty file of at most 1 MiB (`-` reads stdin) and journals one line; it refuses a step past launched. `--github` and `--tag` change a release step's repository and tag pattern through `pr-open` and `merged`, refusing once released; its prep PR must be in that repository. `--part` declares required parts (see [Parts](#parts)); given alone it also amends a step that has moved on, short of final. Journals the change; a change that changes nothing is `amend-empty`. |
 | `cm advance <NN-name>/<unit>[/<step>] <state> [--sha S] [--pr URL] [--tag T] [--digest D] [--evidence PATH] [--by STEP[,STEP…]] [--repo PATH] [--head SHA] [--ci-verified PATH] [--override PATH] [--part NAME]` | Moves one state along `drafted → launched → pr-open → merged → released → deployed → done`, or to `blocked:<reason>`; an `owner`-lane or study step, or a non-release `coordinator`-lane step without a recorded PR, SHA or declared parts, moves to `done` from `drafted` or `launched` with `--evidence` (see [Finishing](#finishing)). `superseded --evidence PATH [--by STEP[,STEP…]]` retires a step replaced by other work from any state short of final, recording its declared successors in state and the journal and showing them in `STATE.md` and `CARD.md`; it meets no gate, so its consumers are amended. A release step moves to `released --tag T --sha S` from `drafted` or `launched` when the tag was cut without a prep PR (tag-only); T must contain S. Other releases require T to contain the recorded merge SHA (`tag-lineage`). A step declared with `--kind rollout` moves `merged → deployed --sha S --evidence PATH` without a release or digest; PATH names the Argo sync revision (see [Finishing](#finishing)). Refuses any other skipped state and a state without its evidence, journals the move and re-renders `STATE.md`. A `codex`-lane step moves to `merged` only through its merge gate (see [Merge gate](#merge-gate)). An already `merged` release step accepts `merged --sha S` again when S descends from its recorded merge, updating only its evidence SHA and journaling both SHAs; otherwise it refuses (`merge-lineage`). `--part NAME` moves one part of a multipart step (see [Parts](#parts)). A step with an unresolved watch does not move to `deployed` or `done` (`watch-open`, see [Watches](#watches)), and `done --evidence` refuses a stale pinned file (`evidence-stale`). |
 | `cm known-red <step> --commit SHA --check NAME --reason T --owner WHO --until A` | Records a known-red exception for the step's merge gate (see [Known-red exceptions](#known-red-exceptions)) and journals it. |
 | `cm watch <step> add --signal span:Q\|log:Q\|metric:Q --deadline T`, `cm watch <step> resolve ID --evidence PATH`, `cm watch <step> withdraw ID --reason TEXT`, `cm watch <step> amend ID --signal SIGNAL` | Records a pending live read that holds the step below `deployed`, closes it with evidence or a withdrawal reason, or corrects its signal (see [Watches](#watches)). |
@@ -187,7 +187,7 @@ Campaign `.cm/state.json`:
 
 ```json
 {
-  "schema": 5,
+  "schema": 6,
   "kind": "campaign",
   "initialized": "2026-10-08T07:04Z",
   "written": ["RESUME.md", "JOURNAL.md", "LIMITS.toml", "OWNER-QUEUE.md"],
@@ -203,28 +203,31 @@ ledger (see [Review verdicts](#review-verdicts)) and `.cm/pulls.json` the open P
 `journal.baseline_lines` is where cm's stamped region starts; an adopted journal keeps its old
 headings.
 
-Unit `.cm/state.json`:
+Unit `.cm/state.json` (a release unit):
 
 ```json
 {
-  "schema": 5,
+  "schema": 6,
   "kind": "unit",
-  "unit": "01-first/alpha",
+  "unit": "00-release/widget",
   "state": "launched",
   "since": "2026-10-08T07:04Z",
   "steps": {
-    "BUILD": {
+    "1.4.0": {
       "state": "merged",
       "since": "2026-10-08T08:10Z",
-      "evidence": { "sha": "<40 hex>", "pr": "https://github.com/o/r/pull/7", "merged_at": "2026-10-08T07:50:42Z" },
+      "evidence": { "sha": "<40 hex>", "pr": "https://github.com/acme/widget/pull/7", "merged_at": "2026-10-08T07:50:42Z" },
       "worktree": "/abs/path",
       "launches": 1,
       "lane": "pi",
-      "after": ["01-first/alpha/PLAN", "tag:dekopon@0.49.0"]
+      "github": "acme/widget",
+      "tag": "v1.4.0",
+      "after": ["01-first/alpha/PLAN", "tag:widget@1.3.0"],
+      "artifacts": ["crate:acme-sdk"]
     }
   },
   "history": [
-    { "at": "2026-10-08T07:04Z", "target": "01-first/alpha/BUILD", "from": "drafted", "to": "launched" }
+    { "at": "2026-10-08T07:04Z", "target": "00-release/widget/1.4.0", "from": "drafted", "to": "launched" }
   ]
 }
 ```
@@ -371,6 +374,11 @@ be declared; a short name resolves in the retiring step's unit, and a full
 successors are recorded once, in the order given. `--by` is optional for retirements without a
 named successor, and is a usage error with any state other than `superseded`. `--evidence`
 remains required. Superseding meets no gate; amend consumers to name the replacement work.
+
+cm 0.12 raises SCHEMA from 5 to 6 for release `artifacts` and `evidence.published`.
+Both lists default to empty and are omitted when empty. Older state remains readable;
+cm 0.11 refuses schema 6 so it cannot erase publication declarations on a rewrite.
+Upgrade every reader before writing shared state with cm 0.12.
 
 cm 0.10 raises SCHEMA from 4 to 5 for persisted pin dependency gates and `superseded_by`
 successor references, and optional merge times. It writes every unit state, and a new campaign
@@ -629,7 +637,7 @@ its own tags; one repository can hold several (`runner` tagged `v<version>` and 
 `guest-v<version>` in `xrl/vm-runner`). Each declared version must be above every release already
 declared for that line.
 
-`cm init 00-release/<line>/<version> --lane L [--github OWNER/NAME] [--tag PATTERN]` records the
+`cm init 00-release/<line>/<version> --lane L [--github OWNER/NAME] [--tag PATTERN] [--artifact SPEC]` records the
 release's repository and its one tag: `PATTERN` holds `{version}` once. With neither flag,
 it inherits the repository and tag pattern from the newest declared release of that line in the
 same unit, replacing that release's version in its tag with `{version}`. Without an earlier release,
@@ -652,6 +660,44 @@ moves from `drafted` or `launched` with `released --tag T --sha S`; T must conta
 These checks use `--repo` or the step's worktree, resolving the commit and tag with Git and
 checking ancestry. Without a checkout, cm uses GitHub's tag comparison in the recorded PR's
 repository or the release's declared `--github` repository; an unread comparison refuses the move.
+Release steps can declare repeatable `--artifact crate:acme-sdk`, `--artifact tap:widget`,
+and `--artifact image:ghcr.io/acme/widget` flags, stored in declared order. Duplicate or malformed
+specifications refuse as `artifact`; a non-release step refuses them as `artifact-step`.
+Crate names contain 1–64 ASCII letters, digits, `_` or `-`. A tap is a formula name or
+`owner/repo/formula`; a bare formula uses the release repository owner's `homebrew-tap`.
+Images must be on ghcr.io and carry neither a tag nor a digest.
+
+After tag containment succeeds, `cm sync` reads every declared artifact. A crate must have the
+exact version and be unyanked. Every tap `url` must name the release repository's download at
+the declared tag, followed by a lowercase 64-hex `sha256`; any explicit `version` must match.
+The tap is read on its default branch. Quoted and parenthesized `url` and `version` calls
+are checked alike. Each argument must be exactly one double-quoted literal with no
+backslash, `#`, or control character, followed only by line end or its closing parenthesis;
+URL calls may also use `using: :curl` inside that call. The literal characters are read as-is.
+Expressions, escapes, interpolation, percent literals, single quotes, and heredocs are
+unsupported and read as unknown wherever they occur. Ruby is never evaluated.
+Every URL must be a release download from that repository; unrelated
+`livecheck`, `head` or `resource` URLs and unsupported Ruby expressions read as unknown.
+This check expects a generated release formula rather than arbitrary Homebrew Ruby.
+The checksum is not compared with a release asset.
+An image must have a manifest at `v<version>`, regardless of the git tag pattern. Crates and
+images use read-only `curl` requests; the tap uses `gh api`. Each request has a 60-second limit.
+
+Only when every artifact is present does the release move, atomically recording `tag` and
+`evidence.published`: crate name and version, resolved tap formula and blob SHA, or image and
+digest. Missing, yanked or stale artifacts raise `release-unpublished` and leave the step
+merged for the next sync. Unreadable responses, timeouts and rate limits journal `unknown`
+and raise `sync-unknown`; they leave the step in place. Such a release supplies no shipped
+release to other steps. With no declared artifacts, the existing tag behavior is unchanged.
+
+Hand advance to `released`, including a tag-only release or a resume, makes the same reads.
+It refuses missing artifacts as `release-unpublished`, and unreadable ones as `publication-unread`,
+changing no state. There is no publication override. Add declarations with
+`cm amend <release step> --artifact SPEC`, or remove them with `--drop-artifact SPEC`;
+these changes are journaled and refused once released. `cm lint` warns
+`release-artifacts-undeclared` for drafted or launched release steps with no declarations;
+this warning is never a gate.
+
 The tick's smoke receipt is
 `cm advance 00-release/<line>/<version> deployed --digest …`; the next sync carries `deployed` to
 every step other than a rollout that a deployed release of that line contains, so a fix-forward release deploys what the one

@@ -13,7 +13,7 @@ use crate::journal;
 use crate::outcome::{Outcome, Violation};
 use crate::plan::{self, Units};
 use crate::render;
-use crate::state::{Evidence, Lane, Move, Phase, Release, Step, Track, Work};
+use crate::state::{Evidence, Lane, Move, Phase, Release, Step, Track, Version, Work};
 use crate::store::{self, lock, parse_target, write_atomic};
 
 pub const CARD: &str = "CARD.md";
@@ -33,6 +33,8 @@ struct Reads {
     tags: BTreeMap<(GithubRepo, TagName), Read<bool>>,
     contains: BTreeMap<(GithubRepo, TagName, CommitSha), Read<bool>>,
     checks: BTreeMap<(GithubRepo, CommitSha), Read<Vec<CheckState>>>,
+    publications:
+        BTreeMap<(Vec<String>, GithubRepo, TagName, Version), Read<crate::forge::Publication>>,
     completed_checks: BTreeMap<(GithubRepo, CommitSha, Vec<String>), Read<Vec<CheckState>>>,
 }
 
@@ -589,15 +591,52 @@ impl<'a> Run<'a> {
                 None | Some(Ok(false)) => {}
                 Some(Ok(true)) => match self.contains(&repo, &tag, &sha) {
                     None => {}
-                    Some(Ok(true)) => self.advance(
-                        &target,
-                        None,
-                        Phase::Released,
-                        Evidence {
-                            tag: Some(tag.to_string()),
-                            ..Evidence::default()
-                        },
-                    ),
+                    Some(Ok(true)) => {
+                        let key = (
+                            step.artifacts.iter().map(ToString::to_string).collect(),
+                            repo.clone(),
+                            tag.clone(),
+                            release.version,
+                        );
+                        let Some(Ok(read)) =
+                            cached(&mut self.reads.publications, key, self.forge, |forge| {
+                                Ok(crate::forge::publication(
+                                    Some(forge),
+                                    &step.artifacts,
+                                    Some(&repo),
+                                    &release.version,
+                                    &tag,
+                                ))
+                            })
+                        else {
+                            continue;
+                        };
+                        let present = read.missing.is_empty() && read.unknown.is_empty();
+                        for message in read.missing {
+                            self.violations.push(Violation::new(
+                                &target,
+                                "release-unpublished",
+                                message,
+                            ));
+                        }
+                        for message in read.unknown {
+                            self.notes
+                                .push((String::new(), format!("- unknown {target}: {message}")));
+                            self.unknown(&target, message);
+                        }
+                        if present {
+                            self.advance(
+                                &target,
+                                None,
+                                Phase::Released,
+                                Evidence {
+                                    tag: Some(tag.to_string()),
+                                    published: read.published,
+                                    ..Evidence::default()
+                                },
+                            );
+                        }
+                    }
                     Some(Ok(false)) => self.violations.push(Violation::new(
                         &target,
                         "release-tag",

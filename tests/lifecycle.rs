@@ -429,7 +429,7 @@ fn github_merge_time_appears_in_state_and_close_accounting() {
         .unwrap();
         assert!(moved.ok(), "{:?}", moved.violations);
         let unit = store::load_unit(&c.root.join("01-first/alpha")).unwrap();
-        assert_eq!(unit.schema, 5);
+        assert_eq!(unit.schema, cm::state::SCHEMA);
         let track = &unit.steps["BUILD"].track;
         assert_eq!(track.evidence.merged_at.as_deref(), merged_at);
         assert_eq!(track.since, cm::host::stamp(later.now()));
@@ -2597,4 +2597,362 @@ fn multipart_rollouts_check_each_receipt_after_deployment() {
         "{:?}",
         missing.violations
     );
+}
+
+#[allow(dead_code)]
+#[path = "support/publication.rs"]
+mod publication_fixture;
+
+#[test]
+fn release_sync_records_every_publication_in_one_move() {
+    use publication_fixture as p;
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = p::campaign(&host, Phase::Merged, &p::ARTIFACTS);
+    let mut forge = p::present();
+    forge.root = Some(c.root.clone());
+    let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    let step = p::step(&c);
+    assert_eq!(step.track.state, Phase::Released);
+    let expected = vec![
+        "crate:acme-sdk@1.4.0",
+        "tap:o/homebrew-tap/widget@blob-sha",
+        "image:ghcr.io/acme/widget@sha256:digest",
+    ];
+    assert_eq!(step.track.evidence.published, expected);
+    assert_eq!(out.fields["moves"].as_array().unwrap().len(), 1);
+    assert_eq!(out.fields["moves"][0]["evidence"]["tag"], p::TAG);
+    assert_eq!(
+        out.fields["moves"][0]["evidence"]["published"],
+        serde_json::json!(expected)
+    );
+    assert_eq!(
+        *forge.artifact_queries.borrow(),
+        [
+            "crate:acme-sdk",
+            "tap:o/homebrew-tap/widget",
+            "image:ghcr.io/acme/widget"
+        ]
+    );
+}
+
+#[test]
+fn missing_yanked_or_stale_publications_stay_merged_and_are_retried() {
+    use cm::forge::Read;
+    use publication_fixture as p;
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    for fault in 0..6 {
+        let c = p::campaign(&host, Phase::Merged, &p::ARTIFACTS);
+        let mut forge = p::present();
+        match fault {
+            0..=2 => {
+                forge.crates.insert(
+                    ("acme-sdk".into(), "1.4.0".into()),
+                    match fault {
+                        0 => Read::Missing,
+                        1 => Read::Yanked,
+                        _ => Read::Stale("1.3.0".into()),
+                    },
+                );
+            }
+            3 => {
+                forge.formulas.clear();
+            }
+            4 => {
+                forge.formulas.insert(
+                    ("o/homebrew-tap".into(), "widget".into()),
+                    p::formula("widget-1.3.0"),
+                );
+            }
+            _ => {
+                forge.images.clear();
+            }
+        }
+        let before = p::step(&c);
+        let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+        assert_eq!(rules(&out), ["release-unpublished"]);
+        assert_eq!(p::step(&c), before);
+        assert_eq!(out.fields["moves"], serde_json::json!([]));
+        let forge = p::present();
+        let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+        assert!(out.ok(), "{:?}", out.violations);
+        assert_eq!(p::step(&c).track.state, Phase::Released);
+    }
+}
+
+#[test]
+fn unread_publication_journals_unknown_without_partial_evidence() {
+    use publication_fixture as p;
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = p::campaign(&host, Phase::Merged, &p::ARTIFACTS);
+    let before = p::unit(&c);
+    let mut forge = p::present();
+    forge.broken.insert("image:ghcr.io/acme/widget".into());
+    let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(rules(&out), ["sync-unknown"]);
+    assert_eq!(p::unit(&c), before);
+    assert!(out.fields.contains_key("journal"));
+    assert_eq!(out.fields["moves"], serde_json::json!([]));
+}
+
+#[test]
+fn tag_containment_is_checked_before_publication() {
+    use publication_fixture as p;
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = p::campaign(&host, Phase::Merged, &p::ARTIFACTS);
+    let mut forge = p::present();
+    forge
+        .tags
+        .insert(("o/widget".into(), p::TAG.into()), Default::default());
+    let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(rules(&out), ["release-tag"]);
+    assert!(forge.artifact_queries.borrow().is_empty());
+}
+
+#[test]
+fn undeclared_artifacts_warn_early_and_keep_the_existing_release_behavior() {
+    use publication_fixture as p;
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = p::campaign(&host, Phase::Drafted, &[]);
+    let out = lint(&c.root).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    assert!(out.fields["warnings"].as_array().unwrap().contains(&serde_json::json!(format!("release-artifacts-undeclared: {} declares no artifacts; cm amend {} --artifact <spec>", p::STEP, p::STEP))));
+    let c = p::campaign(&host, Phase::Merged, &[]);
+    let forge = p::present();
+    let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    assert_eq!(p::step(&c).track.state, Phase::Released);
+    assert!(forge.artifact_queries.borrow().is_empty());
+    assert!(p::step(&c).track.evidence.published.is_empty());
+}
+
+#[test]
+fn artifact_flags_refuse_malformed_specs_duplicates_and_non_release_steps() {
+    use publication_fixture as p;
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = campaign(&host);
+    let before = c.files();
+    for specs in [
+        vec!["other:widget"],
+        vec!["crate:"],
+        vec!["crate:has.dot"],
+        vec!["crate:has/slash"],
+        vec!["tap:owner/formula"],
+        vec!["tap:owner//widget"],
+        vec!["image:docker.io/o/widget"],
+        vec!["image:ghcr.io/o/widget:v1"],
+        vec!["image:ghcr.io/o/widget@sha256:abc"],
+        vec!["crate:widget", "crate:widget"],
+    ] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cm"));
+        cmd.arg("-C")
+            .arg(&c.root)
+            .args(["--json", "init", p::STEP, "--lane", "codex"]);
+        for spec in specs {
+            cmd.args(["--artifact", spec]);
+        }
+        let output = cmd.output().unwrap();
+        assert!(!output.status.success());
+        let out: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(out["violations"][0]["rule"], "artifact");
+        assert_eq!(c.files(), before);
+    }
+    let out = commands::declare(
+        &host,
+        &c.root.join("01-first/alpha/BUILD"),
+        &commands::Declaration {
+            lane: Some(Lane::Codex),
+            artifacts: vec!["crate:widget".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(rules(&out), ["artifact-step"]);
+    assert_eq!(c.files(), before);
+}
+
+#[test]
+fn artifacts_persist_in_order_and_can_only_be_removed_by_amend_before_released() {
+    use publication_fixture as p;
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = p::campaign(&host, Phase::Merged, &p::ARTIFACTS);
+    let stored: serde_json::Value =
+        store::read_json(&store::state_path(&c.root.join("00-release/widget"))).unwrap();
+    assert_eq!(stored["schema"], cm::state::SCHEMA);
+    assert_eq!(
+        stored["steps"]["1.4.0"]["artifacts"],
+        serde_json::json!(p::ARTIFACTS)
+    );
+    let amendment = commands::Amendment {
+        drop_artifacts: vec!["tap:widget".into()],
+        artifacts: vec!["tap:acme/custom-tap/widget".into()],
+        ..Default::default()
+    };
+    let out = commands::amend(&host, &c.root, &target(p::STEP), &amendment).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    assert_eq!(
+        out.fields["changes"],
+        serde_json::json!([
+            "- artifact: - tap:widget",
+            "- artifact: + tap:acme/custom-tap/widget"
+        ])
+    );
+    assert!(out.fields.contains_key("journal"));
+    let mut forge = p::present();
+    forge.formulas.insert(
+        ("acme/custom-tap".into(), "widget".into()),
+        p::formula(p::TAG),
+    );
+    assert!(cm::sync::sync(&host, &forge, &c.root).unwrap().ok());
+    let before = c.files();
+    let refused = commands::amend(
+        &host,
+        &c.root,
+        &target(p::STEP),
+        &commands::Amendment {
+            drop_artifacts: vec!["crate:acme-sdk".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(rules(&refused), ["amend-state"]);
+    assert_eq!(c.files(), before);
+}
+
+#[test]
+fn an_unpublished_release_ships_no_other_merged_steps() {
+    use publication_fixture as p;
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = p::campaign(&host, Phase::Merged, &p::ARTIFACTS);
+    c.publication_consumer(&host);
+    let mut forge = p::present();
+    forge.images.clear();
+    let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(rules(&out), ["release-unpublished"]);
+    let code = || {
+        store::load_unit(&c.root.join("01-build/widget"))
+            .unwrap()
+            .steps
+            .remove("BUILD")
+            .unwrap()
+            .track
+            .state
+    };
+    assert_eq!(code(), Phase::Merged);
+    assert_eq!(out.fields["moves"], serde_json::json!([]));
+    let out = cm::sync::sync(&host, &p::present(), &c.root).unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    assert_eq!(code(), Phase::Released);
+}
+
+#[test]
+fn publication_cache_never_satisfies_another_version_at_the_same_tag() {
+    use publication_fixture as p;
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let (c, forge) = p::colliding_versions(&host);
+    let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(rules(&out), ["release-unpublished"]);
+    assert_eq!(out.violations[0].path, "00-release/widget/4.0.0");
+    let unit = p::unit(&c);
+    assert_eq!(unit.steps["1.4.0"].track.state, Phase::Released);
+    assert_eq!(
+        unit.steps["1.4.0"].track.evidence.published,
+        ["crate:acme-sdk@1.4.0"]
+    );
+    assert_eq!(unit.steps["4.0.0"].track.state, Phase::Merged);
+    assert!(unit.steps["4.0.0"].track.evidence.published.is_empty());
+    assert_eq!(forge.artifact_queries.borrow().len(), 2);
+}
+
+#[test]
+fn unread_pr_or_tag_without_artifacts_does_not_journal() {
+    use publication_fixture as p;
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    for phase in [Phase::PrOpen, Phase::Merged] {
+        let c = p::campaign(&host, phase.clone(), &[]);
+        let mut forge = p::present();
+        forge.broken.insert(
+            if phase == Phase::PrOpen {
+                "https://github.com/o/widget/pull/7"
+            } else {
+                p::TAG
+            }
+            .into(),
+        );
+        let before = fs::read(c.root.join("JOURNAL.md")).unwrap();
+        let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+        assert_eq!(rules(&out), ["sync-unknown"]);
+        assert!(!out.fields.contains_key("journal"));
+        assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), before);
+        assert_eq!(p::step(&c).track.state, phase);
+    }
+}
+
+#[test]
+fn image_publication_passes_the_pull_token_on_stdin() {
+    use publication_fixture as p;
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = p::campaign(&host, Phase::Merged, &["image:ghcr.io/acme/widget"]);
+    let processes = lifecycle_fixture::image_read_processes();
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args(["--json", "advance", p::STEP, "released", "--tag", p::TAG])
+        .env("PATH", processes.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let args = fs::read_to_string(processes.fixture().join("manifest-args")).unwrap();
+    let args: Vec<_> = args.split_terminator('\0').collect();
+    assert!(args.windows(2).any(|pair| pair == ["--header", "@-"]));
+    assert!(args.iter().all(|arg| !arg.contains("synthetic-pull-token")));
+    assert_eq!(
+        fs::read_to_string(processes.fixture().join("manifest-headers")).unwrap(),
+        "Authorization: Bearer synthetic-pull-token\n"
+    );
+    assert_eq!(
+        p::step(&c).track.evidence.published,
+        ["image:ghcr.io/acme/widget@sha256:synthetic-digest"]
+    );
+}
+
+#[path = "support/formula.rs"]
+mod formula_fixture;
+
+#[test]
+fn unsupported_formula_arguments_journal_unknown_and_leave_the_release_merged() {
+    use publication_fixture as p;
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = p::campaign(&host, Phase::Merged, &p::ARTIFACTS);
+    let before = p::unit(&c);
+    for (key, value) in [
+        (
+            "url",
+            "https://github.com/o/widget/releases/download/widget-1.4.0/widget.tar.gz",
+        ),
+        ("version", "1.4.0"),
+    ] {
+        for (name, argument) in formula_fixture::unsupported_arguments(value) {
+            let call = format!("{key}({argument})");
+            let declaration = if key == "url" {
+                format!("{call}\nsha256 \"{}\"\n", "b".repeat(64))
+            } else {
+                call
+            };
+            let body = p::formula(p::TAG).replace("\nend\n", &format!("\n{declaration}\nend\n"));
+            let mut forge = p::present();
+            forge
+                .formulas
+                .insert(("o/homebrew-tap".into(), "widget".into()), body);
+            let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+            assert_eq!(rules(&out), ["sync-unknown"], "{key}: {name}");
+            assert!(out.fields.contains_key("journal"));
+            assert_eq!(out.fields["moves"], serde_json::json!([]));
+            assert_eq!(p::unit(&c), before);
+        }
+    }
 }

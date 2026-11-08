@@ -85,6 +85,7 @@ fn declare_work(
         lane: Some(lane),
         after: after.iter().map(|text| (*text).to_owned()).collect(),
         ships: Ships::default(),
+        artifacts: Vec::new(),
         parts: Vec::new(),
         work,
         kickoff: None,
@@ -751,7 +752,7 @@ fn pin_gate_follows_the_recorded_head_and_round_trips() {
 
     let path = store::state_path(&c.root.join("01-a/u"));
     let stored: serde_json::Value = store::read_json(&path).unwrap();
-    assert_eq!(stored["schema"], 5);
+    assert_eq!(stored["schema"], cm::state::SCHEMA);
     let not_recorded = next_one(&c, dependent);
     assert_eq!(
         not_recorded.fields["waiting"][0]["waits_on"],

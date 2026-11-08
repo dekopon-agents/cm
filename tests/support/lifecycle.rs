@@ -186,3 +186,48 @@ impl Campaign {
         commands::write_unit(&dir, &unit).unwrap();
     }
 }
+
+impl Campaign {
+    pub fn publication_consumer(&self, host: &dyn Host) {
+        self.merged_step(
+            host,
+            "01-build/widget/BUILD",
+            Lane::Pi,
+            Path::new(""),
+            super::publication_fixture::SHA,
+        );
+        let dir = self.root.join("01-build/widget");
+        let mut unit = store::load_unit(&dir).unwrap();
+        unit.steps.get_mut("BUILD").unwrap().track.evidence.pr =
+            Some("https://github.com/o/widget/pull/8".into());
+        commands::write_unit(&dir, &unit).unwrap();
+    }
+}
+
+pub fn image_read_processes() -> super::support::FakeGh {
+    let gh = super::support::FakeGh::new(
+        r#"
+case "$0" in
+  */curl)
+    case "$*" in
+      *ghcr.io/token*) printf '%s\n200' '{"token":"synthetic-pull-token"}' ;;
+      *)
+        printf '%s\0' "$@" >"$FAKE_GH/manifest-args"
+        cat >"$FAKE_GH/manifest-headers"
+        printf 'HTTP/2 200\r\nDocker-Content-Digest: sha256:synthetic-digest\r\n\r\n\n200'
+        ;;
+    esac
+    ;;
+  *)
+    case "$2" in
+      */git/matching-refs/*) printf '%s' '[{"ref":"refs/tags/widget-1.4.0"}]' ;;
+      */compare/*) printf '%s' '{"status":"ahead"}' ;;
+      *) exit 1 ;;
+    esac
+    ;;
+esac
+"#,
+    );
+    std::fs::copy(gh.program(), gh.fixture().join("bin/curl")).unwrap();
+    gh
+}

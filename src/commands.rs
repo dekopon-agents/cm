@@ -14,9 +14,9 @@ use crate::outcome::{Outcome, Violation};
 use crate::plan::{self, Units};
 use crate::render;
 use crate::state::{
-    After, Attempt, CampaignState, DEFAULT_TAG, Evidence, FLAGS, Finish, Flag, JournalMark, Kind,
-    Lane, Move, Phase, RELEASES, Release, SCHEMA, Step, Track, UnitState, Waived, Work,
-    evidence_for,
+    After, Artifact, Attempt, CampaignState, DEFAULT_TAG, Evidence, FLAGS, Finish, Flag,
+    JournalMark, Kind, Lane, Move, Phase, RELEASES, Release, SCHEMA, Step, Track, UnitState,
+    Waived, Work, evidence_for,
 };
 use crate::store::{
     self, JOURNAL, Target, UNIT_STATE, absolute, create_new, find_root, lock, parse_target,
@@ -59,6 +59,7 @@ pub struct Ships {
 
 #[derive(Debug, Clone, Default)]
 pub struct Declaration {
+    pub artifacts: Vec<String>,
     pub parts: Vec<String>,
     pub lane: Option<Lane>,
     pub after: Vec<String>,
@@ -69,7 +70,8 @@ pub struct Declaration {
 
 impl Declaration {
     fn given(&self) -> bool {
-        self.lane.is_some()
+        !self.artifacts.is_empty()
+            || self.lane.is_some()
             || !self.parts.is_empty()
             || !self.after.is_empty()
             || self.ships.given()
@@ -114,6 +116,29 @@ impl Ships {
             None => self.clone(),
         }
     }
+}
+
+fn parse_artifacts(full: &str, specs: &[String], violations: &mut Vec<Violation>) -> Vec<Artifact> {
+    if !specs.is_empty() && Release::of_target(full).is_none() {
+        violations.push(Violation::new(
+            full,
+            "artifact-step",
+            "--artifact and --drop-artifact require a release step",
+        ));
+    }
+    let mut artifacts = Vec::new();
+    for spec in specs {
+        match spec.parse::<Artifact>() {
+            Ok(artifact) if artifacts.contains(&artifact) => violations.push(Violation::new(
+                full,
+                "artifact",
+                format!("duplicate artifact `{spec}`"),
+            )),
+            Ok(artifact) => artifacts.push(artifact),
+            Err(message) => violations.push(Violation::new(full, "artifact", message)),
+        }
+    }
+    artifacts
 }
 
 fn check_kickoff(full: &str, text: Option<&str>) -> Option<Violation> {
@@ -371,18 +396,24 @@ fn record_release(
     root: &Path,
     unit: &mut UnitState,
     step_name: &str,
-    ships: &Ships,
+    declaration: &Declaration,
+    artifacts: &[Artifact],
     tag: &TagName,
-    kickoff: Option<&str>,
 ) -> Result<Outcome> {
+    let kickoff = declaration.kickoff.as_deref();
+    let ships = &declaration.ships;
     let at = stamp(host.now());
     let full = format!("{}/{step_name}", unit.unit);
     if let Some(step) = unit.steps.get_mut(step_name) {
+        step.artifacts = artifacts.to_vec();
         step.tag = Some(tag.clone());
         step.github.clone_from(&ships.github);
     }
     write_unit(&root.join(&unit.unit), unit)?;
     let mut body = format!("- tag: {tag}\n");
+    for artifact in artifacts {
+        body.push_str(&format!("- artifact: {artifact}\n"));
+    }
     let kickoff_path = root.join(&full).join("kickoff.md");
     fs::create_dir_all(root.join(&full))?;
     let written = if let Some(kickoff) = kickoff {
@@ -468,6 +499,7 @@ fn init_step(
     let mut violations = journal::check(root, &campaign);
     violations.extend(closed(root, &campaign));
     violations.extend(check_kickoff(&full, declaration.kickoff.as_deref()));
+    let artifacts = parse_artifacts(&full, &declaration.artifacts, &mut violations);
     let units: Units = plan::load_units(root)?;
     let mut parsed = Vec::new();
     for text in &declaration.after {
@@ -539,6 +571,7 @@ fn init_step(
         if step.lane == Some(lane)
             && step.after == parsed
             && step.github == ships.github
+            && step.artifacts == artifacts
             && step.work == work
             && (declaration.parts.is_empty() || step.parts.keys().eq(requested_parts))
             && same_tag
@@ -556,6 +589,12 @@ fn init_step(
         }
         if let (Some(mut unit), Some(tag)) = (existing.clone(), &tag)
             && declaration.parts.is_empty()
+            && step.artifacts.is_empty()
+            && (artifacts.is_empty()
+                || !matches!(
+                    step.track.resting(),
+                    Phase::Released | Phase::Deployed | Phase::Done | Phase::Superseded
+                ))
             && step.tag.is_none()
             && step.github.is_none()
             && step.lane == Some(lane)
@@ -568,9 +607,12 @@ fn init_step(
                 root,
                 &mut unit,
                 step_name,
-                &ships,
+                &Declaration {
+                    ships: ships.clone(),
+                    ..declaration.clone()
+                },
+                &artifacts,
                 tag,
-                declaration.kickoff.as_deref(),
             );
         }
         violations.push(Violation::new(
@@ -589,6 +631,7 @@ fn init_step(
     let at = stamp(host.now());
     let mut new_step = Step {
         lane: Some(lane),
+        artifacts: artifacts.clone(),
         after: parsed.clone(),
         github: ships.github.clone(),
         tag: tag.clone(),
@@ -635,6 +678,9 @@ fn init_step(
             shown.join(", ")
         }
     );
+    for artifact in &artifacts {
+        body.push_str(&format!("- artifact: {artifact}\n"));
+    }
     if let Some(tag) = &tag {
         body.push_str(&format!("- tag: {tag}\n"));
     }
@@ -665,6 +711,13 @@ fn init_step(
     if work == Work::Rollout {
         outcome.field("kind", "rollout");
     }
+    outcome.field(
+        "artifacts",
+        artifacts
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+    );
     outcome.field("after", shown);
     outcome.field("tag", tag.as_ref().map(ToString::to_string));
     if declaration.kickoff.is_some() {
@@ -1640,6 +1693,68 @@ pub fn advance_gated(
             }?;
             Some(read_tag(&full, gate.forge, github, tag, sha.clone()))
         });
+    let publication_read = if *to == Phase::Released {
+        store::load_unit(&root.join(&target.unit))
+            .ok()
+            .and_then(|unit| {
+                let release = Release::of_target(&step_full)?;
+                let step = unit.steps.get(target.step.as_deref()?)?;
+                if step.artifacts.is_empty() {
+                    return None;
+                }
+                let tag = step.release_tag(&release);
+                let track = &step.track;
+                let resuming = matches!(track.state, Phase::Blocked(_)) && track.resting() == to;
+                let tag_only = matches!(track.resting(), Phase::Drafted | Phase::Launched);
+                let sha = if tag_only {
+                    given.sha.as_deref()
+                } else {
+                    track.evidence.sha.as_deref()
+                };
+                let repos = evidence_repos(repo, &unit, target);
+                let contains = resuming
+                    || tag_read
+                        .as_ref()
+                        .is_some_and(|read| read.contains == Ok(true))
+                    || sha.is_some_and(|sha| {
+                        repos.iter().any(|repo| {
+                            let Some(sha) = git_commit(repo, sha) else {
+                                return false;
+                            };
+                            let Some(tag) = git_commit(repo, &format!("refs/tags/{tag}")) else {
+                                return false;
+                            };
+                            crate::verdict::is_ancestor(repo, &sha, &tag) == Some(true)
+                        })
+                    });
+                if !contains
+                    || given
+                        .tag
+                        .as_deref()
+                        .is_some_and(|given| given != tag.as_str())
+                {
+                    return None;
+                }
+                let github = track
+                    .evidence
+                    .pr
+                    .as_deref()
+                    .and_then(GithubRepo::of_pr)
+                    .or_else(|| step.github.clone());
+                Some((
+                    step.clone(),
+                    crate::forge::publication(
+                        gate.forge,
+                        &step.artifacts,
+                        github.as_ref(),
+                        &release.version,
+                        &tag,
+                    ),
+                ))
+            })
+    } else {
+        None
+    };
     let _lock = lock(root)?;
     let campaign = store::load_campaign(root)?;
     let mut violations = journal::check(root, &campaign);
@@ -1825,6 +1940,7 @@ pub fn advance_gated(
     }
     let repos = evidence_repos(repo, &unit, target);
     let mut evidence = given.clone();
+    evidence.published.clear();
     evidence.file = None;
     evidence.merged_at = read
         .as_ref()
@@ -2097,6 +2213,43 @@ pub fn advance_gated(
                 "tag-lineage",
                 "released needs a recorded merge SHA to check tag containment",
             ));
+        }
+    }
+    if *to == Phase::Released
+        && violations.is_empty()
+        && let Some(step) = declared.as_ref().filter(|step| !step.artifacts.is_empty())
+    {
+        match publication_read {
+            Some((before, read)) if before == *step => {
+                if !read.unknown.is_empty() {
+                    violations.push(Violation::new(
+                        &full,
+                        "publication-unread",
+                        format!(
+                            "retry; publication could not be read: {}",
+                            read.unknown.join("; ")
+                        ),
+                    ));
+                } else if !read.missing.is_empty() {
+                    violations.extend(
+                        read.missing
+                            .into_iter()
+                            .map(|message| Violation::new(&full, "release-unpublished", message)),
+                    );
+                } else {
+                    evidence.published = read.published;
+                }
+            }
+            Some(_) => violations.push(Violation::new(
+                &full,
+                "publication-unread",
+                "publication declaration or evidence changed while reading; retry",
+            )),
+            None => violations.push(Violation::new(
+                &full,
+                "publication-unread",
+                "publication was not read before taking the lock; verify tag containment and retry",
+            )),
         }
     }
     let gated = *to == Phase::Merged
@@ -2454,6 +2607,8 @@ pub fn unblock(
 
 #[derive(Debug, Clone, Default)]
 pub struct Amendment {
+    pub artifacts: Vec<String>,
+    pub drop_artifacts: Vec<String>,
     pub study: bool,
     pub lane: Option<Lane>,
     pub after: Vec<String>,
@@ -2591,10 +2746,14 @@ pub fn amend(
         || !amendment.after.is_empty()
         || !amendment.drop_after.is_empty()
         || amendment.kickoff.is_some();
-    let only_parts = !declaration_change && !amendment.ships.given() && !amendment.parts.is_empty();
+    let artifact_change = !amendment.artifacts.is_empty() || !amendment.drop_artifacts.is_empty();
+    let only_parts = !artifact_change
+        && !declaration_change
+        && !amendment.ships.given()
+        && !amendment.parts.is_empty();
     let late_release = !declaration_change
         && amendment.parts.is_empty()
-        && amendment.ships.given()
+        && (amendment.ships.given() || artifact_change)
         && Release::of_target(&full).is_some()
         && matches!(step.track.resting(), Phase::PrOpen | Phase::Merged);
     let early = match step.track.resting() {
@@ -2612,13 +2771,40 @@ pub fn amend(
             &full,
             "amend-state",
             format!(
-                "{full} is {}; declaration changes require drafted or launched; release --github/--tag also allow pr-open or merged; --part alone amends any step short of done",
+                "{full} is {}; declaration changes require drafted or launched; release --github/--tag/--artifact/--drop-artifact also allow pr-open or merged; --part alone amends any step short of done",
                 step.track.state
             ),
         ));
     }
     let mut changes = Vec::new();
     let mut next = step.clone();
+    let adds = parse_artifacts(&full, &amendment.artifacts, &mut violations);
+    let drops = parse_artifacts(&full, &amendment.drop_artifacts, &mut violations);
+    for artifact in drops {
+        if next.artifacts.contains(&artifact) {
+            next.artifacts.retain(|entry| entry != &artifact);
+            changes.push(format!("- artifact: - {artifact}"));
+        } else {
+            violations.push(Violation::new(
+                &full,
+                "artifact",
+                format!("{full} does not declare `{artifact}`"),
+            ));
+        }
+    }
+    for artifact in adds {
+        if next.artifacts.contains(&artifact) {
+            violations.push(Violation::new(
+                &full,
+                "artifact",
+                format!("duplicate artifact `{artifact}`"),
+            ));
+        } else {
+            changes.push(format!("- artifact: + {artifact}"));
+            next.artifacts.push(artifact);
+        }
+    }
+
     violations.extend(check_kickoff(&full, amendment.kickoff.as_deref()));
     if amendment.kickoff.is_some() {
         if !root.join(&full).is_dir() {

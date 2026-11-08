@@ -1,10 +1,17 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use cm::forge::{CheckState, CommitSha, Forge, ForgeError, GithubRepo, Pull, TagName};
+use cm::forge::{
+    CheckState, CommitSha, Forge, ForgeError, GithubRepo, ImageRef, Pull, Read, TagName,
+};
 
 #[derive(Default)]
 pub struct FakeForge {
+    pub root: Option<std::path::PathBuf>,
+    pub crates: BTreeMap<(String, String), Read>,
+    pub formulas: BTreeMap<(String, String), String>,
+    pub images: BTreeMap<(String, String), Read>,
+    pub artifact_queries: RefCell<Vec<String>>,
     pub pulls: BTreeMap<String, Pull>,
     pub tags: BTreeMap<(String, String), BTreeSet<String>>,
     pub broken: BTreeSet<String>,
@@ -12,7 +19,69 @@ pub struct FakeForge {
     pub containment_queries: RefCell<Vec<(String, String, String)>>,
 }
 
+impl FakeForge {
+    fn artifact_query(&self, key: &str) {
+        if let Some(root) = &self.root {
+            let lock = std::fs::OpenOptions::new()
+                .write(true)
+                .open(root.join(cm::store::CM_DIR).join(cm::store::LOCK))
+                .unwrap();
+            assert!(
+                rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                    .is_ok(),
+                "publication read held the campaign lock"
+            );
+        }
+        self.artifact_queries.borrow_mut().push(key.to_owned());
+    }
+}
+
 impl Forge for FakeForge {
+    fn crate_version(&self, name: &str, version: &cm::state::Version) -> Result<Read, ForgeError> {
+        let key = format!("crate:{name}");
+        self.artifact_query(&key);
+        if self.broken.contains(&key) {
+            return Err(ForgeError::Exit(Some(1)));
+        }
+        Ok(self
+            .crates
+            .get(&(name.into(), version.to_string()))
+            .cloned()
+            .unwrap_or(Read::Missing))
+    }
+
+    fn tap_formula(
+        &self,
+        tap: &GithubRepo,
+        formula: &str,
+        repo: &GithubRepo,
+        tag: &TagName,
+        version: &cm::state::Version,
+    ) -> Result<Read, ForgeError> {
+        let key = format!("tap:{tap}/{formula}");
+        self.artifact_query(&key);
+        if self.broken.contains(&key) {
+            return Err(ForgeError::Exit(Some(1)));
+        }
+        match self.formulas.get(&(tap.to_string(), formula.into())) {
+            Some(body) => cm::forge::parse_formula(body, "blob-sha", repo, tag, version),
+            None => Ok(Read::Missing),
+        }
+    }
+
+    fn image_manifest(&self, image: &ImageRef, tag: &str) -> Result<Read, ForgeError> {
+        let key = format!("image:{image}");
+        self.artifact_query(&key);
+        if self.broken.contains(&key) {
+            return Err(ForgeError::Exit(Some(1)));
+        }
+        Ok(self
+            .images
+            .get(&(image.to_string(), tag.into()))
+            .cloned()
+            .unwrap_or(Read::Missing))
+    }
+
     fn pull(&self, url: &str) -> Result<Pull, ForgeError> {
         *self.calls.borrow_mut() += 1;
         if self.broken.contains(url) {

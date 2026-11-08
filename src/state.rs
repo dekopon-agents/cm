@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::evidence::CampaignFile;
 use crate::forge::{GithubRepo, TagName};
 
-pub const SCHEMA: u32 = 5;
+pub const SCHEMA: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -124,6 +124,8 @@ pub struct Evidence {
     pub merged_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub published: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,6 +151,9 @@ impl Evidence {
                 mine.clone_from(theirs);
             }
         }
+        if !other.published.is_empty() {
+            self.published.clone_from(&other.published);
+        }
         if other.file.is_some() {
             self.file.clone_from(&other.file);
         }
@@ -167,6 +172,11 @@ impl Evidence {
         ]
         .into_iter()
         .filter_map(|(name, value)| value.as_ref().map(|value| format!("{name} {value}")))
+        .chain(
+            self.published
+                .iter()
+                .map(|read| format!("published {read}")),
+        )
         .chain(self.file.as_ref().map(|file| format!("file {file}")))
         .chain(
             (!self.superseded_by.is_empty())
@@ -689,6 +699,64 @@ impl From<After> for String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum Artifact {
+    Crate(String),
+    Tap(String),
+    Image(crate::forge::ImageRef),
+}
+
+impl std::str::FromStr for Artifact {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text.split_once(':') {
+            Some(("crate", name))
+                if (1..=64).contains(&name.len())
+                    && name
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c)) =>
+            {
+                Ok(Self::Crate(name.to_owned()))
+            }
+            Some(("tap", name))
+                if matches!(name.split('/').count(), 1 | 3)
+                    && name.split('/').all(crate::store::is_name) =>
+            {
+                Ok(Self::Tap(name.to_owned()))
+            }
+            Some(("image", name)) => name.parse().map(Self::Image),
+            _ => Err(format!(
+                "`{text}` is not crate:<name>, tap:<formula> or tap:<owner>/<repo>/<formula>, or image:ghcr.io/<owner>/<image> without a tag or digest"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for Artifact {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Crate(name) => write!(f, "crate:{name}"),
+            Self::Tap(name) => write!(f, "tap:{name}"),
+            Self::Image(name) => write!(f, "image:{name}"),
+        }
+    }
+}
+
+impl TryFrom<String> for Artifact {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<Artifact> for String {
+    fn from(value: Artifact) -> Self {
+        value.to_string()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
     #[serde(flatten)]
     pub track: Track,
@@ -704,6 +772,8 @@ pub struct Step {
     pub github: Option<GithubRepo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<TagName>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<Artifact>,
     #[serde(default, skip_serializing_if = "Work::is_code")]
     pub work: Work,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1040,6 +1110,7 @@ impl Step {
             after: Vec::new(),
             github: None,
             tag: None,
+            artifacts: Vec::new(),
             work: Work::Code,
             attempt: None,
             attempt_history: Vec::new(),

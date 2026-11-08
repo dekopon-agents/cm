@@ -73,6 +73,9 @@ enum Commands {
         /// A release step's tag pattern, holding `{version}` once; cm records the one tag it names. With neither release flag, inherits the newest declared release; otherwise defaults to `v{version}`.
         #[arg(long, value_name = "PATTERN")]
         tag: Option<String>,
+        /// A published crate, tap formula or ghcr.io image, without a version. Repeat for each.
+        #[arg(long, value_name = "SPEC")]
+        artifact: Vec<String>,
         /// Write kickoff.md from a non-empty file of at most 1 MiB, or `-` for stdin. Never overwrites an existing kickoff.
         #[arg(long, value_name = "F")]
         kickoff_file: Option<PathBuf>,
@@ -142,7 +145,7 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         evidence: Option<PathBuf>,
     },
-    /// Change a drafted or launched step's declaration. Release --github/--tag also allow pr-open or merged. --part alone also amends a step that moved on.
+    /// Change a drafted or launched step's declaration. Release --github/--tag/--artifact/--drop-artifact also allow pr-open or merged. --part alone also amends a step that moved on.
     Amend {
         /// <NN-name>/<unit>/<step>
         #[arg(value_parser = step_target)]
@@ -159,6 +162,9 @@ enum Commands {
         /// A gate to remove, as `cm init --after` takes it. Repeat for each.
         #[arg(long, value_name = "AFTER")]
         drop_after: Vec<String>,
+        /// Remove a declared artifact before the release reaches released.
+        #[arg(long, value_name = "SPEC")]
+        drop_artifact: Vec<String>,
         /// A required part (one PR) of a multipart step; the step moves to a state only once every part has. On a step past launched, the first new part takes the step's state and evidence and the step rests at launched. Repeat for each.
         #[arg(long, value_name = "NAME")]
         part: Vec<String>,
@@ -171,6 +177,9 @@ enum Commands {
         /// A release step's new tag pattern, holding `{version}` once.
         #[arg(long, value_name = "PATTERN")]
         tag: Option<String>,
+        /// A published crate, tap formula or ghcr.io image, without a version. Repeat for each.
+        #[arg(long, value_name = "SPEC")]
+        artifact: Vec<String>,
     },
     /// Show, claim or extend a remote launch's attempt record; every external action is recorded before the next.
     Attempt {
@@ -665,9 +674,11 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             after,
             github,
             tag,
+            artifact,
             kickoff_file,
         } => {
             let declaration = commands::Declaration {
+                artifacts: artifact.clone(),
                 parts: part.clone(),
                 lane: *lane,
                 after: after.clone(),
@@ -738,6 +749,8 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
             lane,
             after,
             drop_after,
+            drop_artifact,
+            artifact,
             part,
             kickoff_file,
             github,
@@ -751,6 +764,8 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<Outcome> {
                 lane: *lane,
                 after: after.clone(),
                 drop_after: drop_after.clone(),
+                artifacts: artifact.clone(),
+                drop_artifacts: drop_artifact.clone(),
                 parts: part.clone(),
                 kickoff: kickoff_file
                     .as_deref()
