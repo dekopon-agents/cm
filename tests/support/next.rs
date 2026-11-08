@@ -26,6 +26,9 @@ impl Campaign {
             &std::collections::BTreeMap::from([(
                 "https://github.com/o/r/pull/1",
                 Observed {
+                    base: None,
+                    ci_head: None,
+                    ci_base: None,
                     target: target.into(),
                     at: "2026-10-17T08:00Z".into(),
                     head: sha.map(str::to_owned),
@@ -181,6 +184,9 @@ impl Campaign {
             &std::collections::BTreeMap::from([(
                 "https://github.com/o/r/pull/1",
                 Observed {
+                    base: None,
+                    ci_head: None,
+                    ci_base: None,
                     target: "01-a/u/DIRTY".into(),
                     at: "2026-10-17T08:00Z".into(),
                     head: Some("a".repeat(40)),

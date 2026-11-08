@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::evidence::CampaignFile;
 use crate::forge::{GithubRepo, TagName};
 
-pub const SCHEMA: u32 = 6;
+pub const SCHEMA: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]

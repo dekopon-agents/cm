@@ -69,6 +69,7 @@ struct Run<'a> {
     moves: Vec<Moved>,
     violations: Vec<Violation>,
     open: BTreeMap<String, plan::Observed>,
+    seen: BTreeMap<String, plan::Observed>,
     now: jiff::Timestamp,
     heads: BTreeMap<String, String>,
     notes: Vec<(String, String)>,
@@ -114,6 +115,7 @@ impl<'a> Run<'a> {
             moves: Vec::new(),
             violations: Vec::new(),
             open: BTreeMap::new(),
+            seen: store::read_json(&plan::pulls_path(root)).unwrap_or_default(),
             now,
             heads: BTreeMap::new(),
             notes: Vec::new(),
@@ -142,9 +144,7 @@ impl<'a> Run<'a> {
     }
 
     fn remember_heads(&mut self) {
-        let seen =
-            store::read_json::<BTreeMap<String, plan::Observed>>(&plan::pulls_path(self.root))
-                .unwrap_or_default();
+        let seen = &self.seen;
         for (unit_name, unit) in &mut self.units {
             for (name, step) in &mut unit.steps {
                 let target = format!("{unit_name}/{name}");
@@ -544,11 +544,27 @@ impl<'a> Run<'a> {
                     state: PullState::Open,
                     head,
                     mergeable_state,
+                    base,
                     ..
                 }) => {
+                    let previous = self.seen.get(&url).filter(|seen| seen.target == target);
+                    let mut ci_head = previous.as_ref().and_then(|seen| seen.ci_head.clone());
+                    let mut ci_base = previous.as_ref().and_then(|seen| seen.ci_base.clone());
+                    if let (Some(head), Some(base), Some(repo)) = (&head, &base, GithubRepo::of_pr(&url))
+                        && ci_head.as_deref() != Some(head.as_str())
+                        && let Some(Ok(checks)) = self.checks(&repo, head)
+                        && !checks.is_empty()
+                        && checks.iter().all(|check| ["success", "neutral", "skipped", "failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale", "error"].iter().any(|state| check.state == *state))
+                    {
+                        ci_head = Some(head.to_string());
+                        ci_base = Some(base.to_string());
+                    }
                     self.open.insert(
                         url.clone(),
                         plan::Observed {
+                            base: base.map(|base| base.to_string()),
+                            ci_head,
+                            ci_base,
                             target: target.clone(),
                             at: self.at.clone(),
                             head: head.map(|head| head.to_string()),
@@ -895,20 +911,19 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
         write_unit(&root.join(name), &run.units[name])?;
     }
     let mut open = std::mem::take(&mut run.open);
-    if let Ok(seen) = store::read_json::<BTreeMap<String, plan::Observed>>(&plan::pulls_path(root))
-    {
-        // A PR GitHub could not answer for keeps what the last sync saw, stamp and all, while
-        // its step still rests at pr-open on it.
-        for (url, observed) in seen {
-            let failed = !matches!(run.reads.pulls.get(&url), Some(Ok(_)));
-            let current = plan::track(&run.units, &observed.target).is_some_and(|track| {
-                track.state == Phase::PrOpen && track.evidence.pr.as_deref() == Some(url.as_str())
-            });
-            if failed && current {
-                open.entry(url).or_insert(observed);
-            }
+    // Keep the previous observation when GitHub could not read a still-open PR.
+    for (url, observed) in std::mem::take(&mut run.seen) {
+        let failed = !matches!(run.reads.pulls.get(&url), Some(Ok(_)));
+        let current = plan::track(&run.units, &observed.target).is_some_and(|track| {
+            track.state == Phase::PrOpen && track.evidence.pr.as_deref() == Some(url.as_str())
+        });
+        if failed && current {
+            open.entry(url).or_insert(observed);
         }
     }
+    let mut campaign = store::load_campaign(root)?;
+    campaign.schema = crate::state::SCHEMA;
+    store::write_json(&store::state_path(root), &campaign)?;
     store::write_json(&plan::pulls_path(root), &open)?;
     let mut outcome = Outcome::refused(std::mem::take(&mut run.violations));
     let marker_path = root.join(store::CM_DIR).join("unblock-notified.json");
