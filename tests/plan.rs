@@ -4553,12 +4553,14 @@ fn reviewer_wait_timers_include_parts_filter_scope_and_only_warn_in_lint() {
     let next = plan::next_at(&c.root, None, None, host.now()).unwrap();
     assert!(next.ok(), "{:?}", next.violations);
     let waits = next.fields["review_waits"].as_array().unwrap();
-    assert_eq!(waits.len(), 3);
+    assert_eq!(waits.len(), 4);
     assert_eq!(waits[0]["waited_seconds"], 0);
     assert_eq!(waits[1]["waited_seconds"], 7200);
-    assert_eq!(waits[1]["part"], "core");
+    assert_eq!(waits[1]["part"], serde_json::Value::Null);
+    assert_eq!(waits[1]["reason"], "EVIDENCE-BLOCKED");
+    assert_eq!(waits[2]["part"], "core");
     assert_eq!(waits[1]["head"], "a".repeat(40));
-    assert_eq!(waits[2]["reason"], "EVIDENCE-BLOCKED");
+    assert_eq!(waits[3]["reason"], "EVIDENCE-BLOCKED");
     let filtered = plan::next_at(
         &c.root,
         Some(&parse_target("01-a/u/REVIEW", true).unwrap()),
@@ -4566,7 +4568,7 @@ fn reviewer_wait_timers_include_parts_filter_scope_and_only_warn_in_lint() {
         host.now(),
     )
     .unwrap();
-    assert_eq!(filtered.fields["review_waits"].as_array().unwrap().len(), 2);
+    assert_eq!(filtered.fields["review_waits"].as_array().unwrap().len(), 3);
     let linted = cm::lint::lint_at(&c.root, host.now()).unwrap();
     assert!(linted.ok(), "{:?}", linted.violations);
     assert_eq!(
@@ -4576,6 +4578,6 @@ fn reviewer_wait_timers_include_parts_filter_scope_and_only_warn_in_lint() {
             .iter()
             .filter(|warning| warning.as_str().unwrap().starts_with("reviewer-blocked:"))
             .count(),
-        3
+        4
     );
 }

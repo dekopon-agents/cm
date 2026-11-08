@@ -497,14 +497,8 @@ pub(crate) fn review_waits(
             {
                 continue;
             }
-            let tracks: Vec<_> = if step.parts.is_empty() {
-                vec![(None, &step.track)]
-            } else {
-                step.parts
-                    .iter()
-                    .map(|(part, track)| (Some(part), track))
-                    .collect()
-            };
+            let tracks = std::iter::once((None, &step.track))
+                .chain(step.parts.iter().map(|(part, track)| (Some(part), track)));
             for (part, track) in tracks {
                 let Phase::Blocked(reason) = &track.state else {
                     continue;
