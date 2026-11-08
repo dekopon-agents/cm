@@ -4544,3 +4544,86 @@ fn sync_completes_and_writes_card_with_an_invalid_mac_lane() {
         assert_eq!(rules(&linted), vec![rule], "{:?}", linted.violations);
     }
 }
+
+#[test]
+fn reviewer_wait_timers_include_parts_filter_scope_and_only_warn_in_lint() {
+    let host = at("2026-10-17T10:00Z");
+    let c = campaign(&host);
+    c.review_blocks(&host);
+    let next = plan::next_at(&c.root, None, None, host.now()).unwrap();
+    assert!(next.ok(), "{:?}", next.violations);
+    let waits = next.fields["review_waits"].as_array().unwrap();
+    assert_eq!(waits.len(), 4);
+    assert_eq!(waits[0]["waited_seconds"], 0);
+    assert_eq!(waits[1]["waited_seconds"], 7200);
+    assert_eq!(waits[1]["part"], serde_json::Value::Null);
+    assert_eq!(waits[1]["reason"], "EVIDENCE-BLOCKED");
+    assert_eq!(waits[2]["part"], "core");
+    assert!(waits[1]["pr"].is_null());
+    assert!(waits[1]["head"].is_null());
+    assert_eq!(waits[2]["head"], "a".repeat(40));
+    assert_eq!(waits[3]["reason"], "EVIDENCE-BLOCKED");
+    let filtered = plan::next_at(
+        &c.root,
+        Some(&parse_target("01-a/u/REVIEW", true).unwrap()),
+        Some(Lane::Codex),
+        host.now(),
+    )
+    .unwrap();
+    assert_eq!(filtered.fields["review_waits"].as_array().unwrap().len(), 3);
+    let linted = cm::lint::lint_at(&c.root, host.now()).unwrap();
+    assert!(linted.ok(), "{:?}", linted.violations);
+    assert_eq!(
+        linted.fields["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|warning| warning.as_str().unwrap().starts_with("reviewer-blocked:"))
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn adding_parts_to_a_blocked_step_preserves_the_review_wait_start() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    c.next_actions(&host);
+    let target = parse_target("01-a/u/DIRTY", true).unwrap();
+    let blocked = commands::advance(
+        &host,
+        &c.root,
+        &target,
+        &Phase::Blocked("REVIEW_BLOCKED".into()),
+        &Evidence::default(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(blocked.ok(), "{:?}", blocked.violations);
+    let later = at("2026-10-17T08:01:12Z");
+    let before = plan::next_at(&c.root, None, None, later.now()).unwrap();
+    assert_eq!(before.fields["review_waits"][0]["waited_seconds"], 72);
+    let amended = commands::amend(
+        &at("2026-10-17T08:01:00Z"),
+        &c.root,
+        &target,
+        &commands::Amendment {
+            parts: vec!["one".into(), "two".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(amended.ok(), "{:?}", amended.violations);
+    let after = plan::next_at(&c.root, None, None, later.now()).unwrap();
+    assert_eq!(after.fields["review_waits"][0]["waited_seconds"], 72);
+    assert_eq!(
+        after.fields["review_waits"][0]["since"],
+        before.fields["review_waits"][0]["since"]
+    );
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    assert_eq!(
+        unit.steps["DIRTY"].track.blocked_from,
+        Some(Phase::Launched)
+    );
+}

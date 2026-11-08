@@ -867,6 +867,12 @@ pub fn lint_at(start: &Path, now: jiff::Timestamp) -> Result<Outcome> {
     for dir in &units {
         violations.extend(lint_unit(&root, dir, &mut seen));
     }
+    for wait in crate::plan::review_waits(&seen.units, now, None, None) {
+        seen.warnings.push(format!(
+            "reviewer-blocked: {}",
+            crate::plan::review_wait_line(&wait)
+        ));
+    }
     let packets = seen.packets;
     let mut outcome = Outcome::refused(violations);
     outcome.field("root", root.to_string_lossy().into_owned());

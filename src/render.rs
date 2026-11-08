@@ -534,6 +534,19 @@ pub fn card(
     section(&mut out, "Waiting", &waiting, "Nothing waits.");
     section(&mut out, "In flight", &flight, "Nothing is in flight.");
     section(&mut out, "Blocked", &blocked, "Nothing is blocked.");
+    let waits: Vec<_> = crate::plan::review_waits(units, now, None, None)
+        .iter()
+        .map(|wait| {
+            next_item(
+                &mut number,
+                &crate::plan::review_wait_line(wait),
+                wait["command"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    if !waits.is_empty() {
+        section(&mut out, "Review waits", &waits, "");
+    }
     if !superseded.is_empty() {
         section(&mut out, "Superseded", &superseded, "");
     }
