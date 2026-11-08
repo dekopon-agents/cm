@@ -3337,6 +3337,7 @@ fn standing_registration_tries_each_parts_pr_without_changing_commit_selection()
     assert!(!known_red(&host, &c, &green, "", "red by design", "build").ok());
 }
 
+#[allow(dead_code)]
 #[path = "support/publication.rs"]
 mod publication_fixture;
 

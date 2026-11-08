@@ -2240,10 +2240,15 @@ pub fn advance_gated(
                     evidence.published = read.published;
                 }
             }
-            _ => violations.push(Violation::new(
+            Some(_) => violations.push(Violation::new(
                 &full,
                 "publication-unread",
                 "publication declaration or evidence changed while reading; retry",
+            )),
+            None => violations.push(Violation::new(
+                &full,
+                "publication-unread",
+                "publication was not read before taking the lock; verify tag containment and retry",
             )),
         }
     }

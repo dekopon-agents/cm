@@ -2844,3 +2844,78 @@ fn an_unpublished_release_ships_no_other_merged_steps() {
     assert!(out.ok(), "{:?}", out.violations);
     assert_eq!(code(), Phase::Released);
 }
+
+#[test]
+fn publication_cache_never_satisfies_another_version_at_the_same_tag() {
+    use publication_fixture as p;
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let (c, forge) = p::colliding_versions(&host);
+    let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(rules(&out), ["release-unpublished"]);
+    assert_eq!(out.violations[0].path, "00-release/widget/4.0.0");
+    let unit = p::unit(&c);
+    assert_eq!(unit.steps["1.4.0"].track.state, Phase::Released);
+    assert_eq!(
+        unit.steps["1.4.0"].track.evidence.published,
+        ["crate:acme-sdk@1.4.0"]
+    );
+    assert_eq!(unit.steps["4.0.0"].track.state, Phase::Merged);
+    assert!(unit.steps["4.0.0"].track.evidence.published.is_empty());
+    assert_eq!(forge.artifact_queries.borrow().len(), 2);
+}
+
+#[test]
+fn unread_pr_or_tag_without_artifacts_does_not_journal() {
+    use publication_fixture as p;
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    for phase in [Phase::PrOpen, Phase::Merged] {
+        let c = p::campaign(&host, phase.clone(), &[]);
+        let mut forge = p::present();
+        forge.broken.insert(
+            if phase == Phase::PrOpen {
+                "https://github.com/o/widget/pull/7"
+            } else {
+                p::TAG
+            }
+            .into(),
+        );
+        let before = fs::read(c.root.join("JOURNAL.md")).unwrap();
+        let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+        assert_eq!(rules(&out), ["sync-unknown"]);
+        assert!(!out.fields.contains_key("journal"));
+        assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), before);
+        assert_eq!(p::step(&c).track.state, phase);
+    }
+}
+
+#[test]
+fn image_publication_passes_the_pull_token_on_stdin() {
+    use publication_fixture as p;
+    let host = Fake::at("2026-10-08T07:00:00Z");
+    let c = p::campaign(&host, Phase::Merged, &["image:ghcr.io/acme/widget"]);
+    let processes = lifecycle_fixture::image_read_processes();
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args(["--json", "advance", p::STEP, "released", "--tag", p::TAG])
+        .env("PATH", processes.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let args = fs::read_to_string(processes.fixture().join("manifest-args")).unwrap();
+    let args: Vec<_> = args.split_terminator('\0').collect();
+    assert!(args.windows(2).any(|pair| pair == ["--header", "@-"]));
+    assert!(args.iter().all(|arg| !arg.contains("synthetic-pull-token")));
+    assert_eq!(
+        fs::read_to_string(processes.fixture().join("manifest-headers")).unwrap(),
+        "Authorization: Bearer synthetic-pull-token\n"
+    );
+    assert_eq!(
+        p::step(&c).track.evidence.published,
+        ["image:ghcr.io/acme/widget@sha256:synthetic-digest"]
+    );
+}

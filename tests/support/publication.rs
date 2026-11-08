@@ -114,3 +114,53 @@ pub fn advance(
     )
     .unwrap()
 }
+
+pub const SHARED_TAG: &str = "v1.4.0.0";
+
+pub fn colliding_versions(host: &dyn Host) -> (Campaign, FakeForge) {
+    let c = campaign(host, Phase::Merged, &["crate:acme-sdk"]);
+    let amended = commands::amend(
+        host,
+        &c.root,
+        &parse_target(STEP, true).unwrap(),
+        &commands::Amendment {
+            ships: Ships {
+                tag: Some("v{version}.0".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(amended.ok(), "{:?}", amended.violations);
+    let out = commands::declare(
+        host,
+        &c.root.join("00-release/widget/4.0.0"),
+        &Declaration {
+            lane: Some(Lane::Codex),
+            artifacts: vec!["crate:acme-sdk".into()],
+            ships: Ships {
+                github: Some("o/widget".parse().unwrap()),
+                tag: Some("v1.{version}".into()),
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(out.ok(), "{:?}", out.violations);
+    c.kickoff("00-release/widget/4.0.0", "Publish the next version.\n");
+    let mut state = unit(&c);
+    let evidence = state.steps["1.4.0"].track.evidence.clone();
+    state
+        .steps
+        .get_mut("4.0.0")
+        .unwrap()
+        .track
+        .apply(Phase::Merged, &stamp(host.now()), &evidence);
+    commands::write_unit(&c.root.join("00-release/widget"), &state).unwrap();
+    let mut forge = present();
+    forge
+        .tags
+        .insert(("o/widget".into(), SHARED_TAG.into()), [SHA.into()].into());
+    (c, forge)
+}

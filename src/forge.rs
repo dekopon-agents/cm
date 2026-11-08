@@ -1,5 +1,5 @@
 use std::fmt;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -14,26 +14,36 @@ pub enum ForgeError {
     Timeout(Duration),
     Json,
     Http(u16),
+    Curl(Box<ForgeError>),
     Url,
+}
+
+impl ForgeError {
+    fn fmt_program(&self, program: &str, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ForgeError::Curl(error) => error.fmt_program("curl", f),
+            ForgeError::Http(status) => {
+                write!(f, "{program} HTTP {status}; retry the publication read")
+            }
+            ForgeError::Spawn => write!(f, "could not execute {program}; check installation"),
+            ForgeError::Exit(Some(code)) => {
+                write!(f, "{program} exited {code}; check access with {program}")
+            }
+            ForgeError::Exit(None) => write!(f, "{program} exited by signal"),
+            ForgeError::Timeout(after) => write!(
+                f,
+                "{program} did not answer within {}s; killed it",
+                after.as_secs()
+            ),
+            ForgeError::Json => write!(f, "{program} returned JSON cm cannot read"),
+            ForgeError::Url => f.write_str("not a https://github.com/<owner>/<repo>/pull/<n> URL"),
+        }
+    }
 }
 
 impl fmt::Display for ForgeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ForgeError::Http(status) => write!(f, "HTTP {status}; retry the publication read"),
-            ForgeError::Spawn => f.write_str("could not execute forge reader; check installation"),
-            ForgeError::Exit(Some(code)) => write!(f, "forge reader exited {code}; check access"),
-            ForgeError::Exit(None) => f.write_str("forge reader exited by signal"),
-            ForgeError::Timeout(after) => {
-                write!(
-                    f,
-                    "forge reader did not answer within {}s; killed it",
-                    after.as_secs()
-                )
-            }
-            ForgeError::Json => f.write_str("forge reader returned data cm cannot read"),
-            ForgeError::Url => f.write_str("not a https://github.com/<owner>/<repo>/pull/<n> URL"),
-        }
+        self.fmt_program("gh", f)
     }
 }
 
@@ -516,17 +526,22 @@ impl Gh {
     }
 
     fn json<T: DeserializeOwned>(&self, args: &[&str]) -> Result<T, ForgeError> {
-        let output = run(&self.program, args, self.timeout)?;
+        let output = run(&self.program, args, self.timeout, None)?;
         if !output.status.success() {
             return Err(ForgeError::Exit(output.status.code()));
         }
         serde_json::from_slice(&output.stdout).map_err(|_| ForgeError::Json)
     }
 
-    fn http(&self, args: &[&str]) -> Result<(u16, String), ForgeError> {
+    fn http(&self, args: &[&str], input: Option<&[u8]>) -> Result<(u16, String), ForgeError> {
         let mut request = vec!["-sS", "--max-time", "60", "--write-out", "\n%{http_code}"];
         request.extend_from_slice(args);
-        let output = run(Path::new("curl"), &request, self.timeout.min(GH_TIMEOUT))?;
+        let output = run(
+            Path::new("curl"),
+            &request,
+            self.timeout.min(GH_TIMEOUT),
+            input,
+        )?;
         if !output.status.success() {
             return Err(ForgeError::Exit(output.status.code()));
         }
@@ -539,11 +554,20 @@ impl Gh {
     }
 }
 
-fn run(program: &Path, args: &[&str], timeout: Duration) -> Result<Output, ForgeError> {
+fn run(
+    program: &Path,
+    args: &[&str],
+    timeout: Duration,
+    input: Option<&[u8]>,
+) -> Result<Output, ForgeError> {
     let mut child = Command::new(program)
         .args(args)
         .env("GH_PROMPT_DISABLED", "1")
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -554,6 +578,13 @@ fn run(program: &Path, args: &[&str], timeout: Duration) -> Result<Output, Forge
         stdout.read_to_end(&mut bytes).map(|_| bytes)
     });
     let deadline = Instant::now() + timeout;
+    let writer = if let Some(input) = input {
+        let mut stdin = child.stdin.take().ok_or(ForgeError::Spawn)?;
+        let bytes = input.to_vec();
+        Some(std::thread::spawn(move || stdin.write_all(&bytes)))
+    } else {
+        None
+    };
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -569,6 +600,12 @@ fn run(program: &Path, args: &[&str], timeout: Duration) -> Result<Output, Forge
         .join()
         .map_err(|_| ForgeError::Json)?
         .map_err(|_| ForgeError::Json)?;
+    if let Some(writer) = writer {
+        let sent = writer.join().map_err(|_| ForgeError::Spawn)?;
+        if status.success() {
+            sent.map_err(|_| ForgeError::Spawn)?;
+        }
+    }
     Ok(Output {
         status,
         stdout,
@@ -612,7 +649,6 @@ fn crate_read(
     Ok(Read::Present(response.version.checksum))
 }
 
-/// Parse every formula URL and its following checksum, shared with the fake Forge.
 pub fn parse_formula(
     body: &str,
     sha: &str,
@@ -620,11 +656,17 @@ pub fn parse_formula(
     tag: &TagName,
     version: &crate::state::Version,
 ) -> Result<Read, ForgeError> {
+    fn argument<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        let rest = line.strip_prefix(key)?;
+        (rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || "(\"'".contains(c)))
+            .then_some(rest.trim_start())
+    }
     fn quoted<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-        line.strip_prefix(key)?
-            .trim_start()
-            .strip_prefix('"')?
-            .split_once('"')
+        let rest = argument(line, key)?;
+        let rest = rest.strip_prefix('(').unwrap_or(rest).trim_start();
+        let quote = rest.chars().next().filter(|c| matches!(c, '\'' | '"'))?;
+        rest.strip_prefix(quote)?
+            .split_once(quote)
             .map(|(value, _)| value)
     }
     let lines: Vec<_> = body
@@ -635,10 +677,7 @@ pub fn parse_formula(
     let prefix = format!("https://github.com/{repo}/releases/download/");
     let mut urls = 0;
     for (index, line) in lines.iter().enumerate() {
-        if line
-            .strip_prefix("url")
-            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
-        {
+        if argument(line, "url").is_some() {
             urls += 1;
             let url = quoted(line, "url").ok_or(ForgeError::Json)?;
             let (named, asset) = url
@@ -663,10 +702,7 @@ pub fn parse_formula(
                 return Err(ForgeError::Json);
             }
         }
-        if line
-            .strip_prefix("version")
-            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
-        {
+        if argument(line, "version").is_some() {
             let named = quoted(line, "version").ok_or(ForgeError::Json)?;
             if named != version.to_string() {
                 return Ok(Read::Stale(named.to_owned()));
@@ -849,16 +885,22 @@ impl Forge for Gh {
         name: &str,
         version: &crate::state::Version,
     ) -> Result<Read, ForgeError> {
-        let (status, body) = self.http(&[
-            "--header",
-            concat!(
-                "User-Agent: cm/",
-                env!("CARGO_PKG_VERSION"),
-                " (+https://github.com/dekopon-agents/cm)"
-            ),
-            &format!("https://crates.io/api/v1/crates/{name}/{version}"),
-        ])?;
-        crate_read(status, &body, version)
+        (|| {
+            let (status, body) = self.http(
+                &[
+                    "--header",
+                    concat!(
+                        "User-Agent: cm/",
+                        env!("CARGO_PKG_VERSION"),
+                        " (+https://github.com/dekopon-agents/cm)"
+                    ),
+                    &format!("https://crates.io/api/v1/crates/{name}/{version}"),
+                ],
+                None,
+            )?;
+            crate_read(status, &body, version)
+        })()
+        .map_err(|error| ForgeError::Curl(Box::new(error)))
     }
 
     fn tap_formula(
@@ -879,6 +921,7 @@ impl Forge for Gh {
                 "{sha, content: (.content | @base64d)}",
             ],
             self.timeout.min(GH_TIMEOUT),
+            None,
         )?;
         let text = String::from_utf8(output.stdout).map_err(|_| ForgeError::Json)?;
         let (headers, body) = text
@@ -910,10 +953,11 @@ impl Forge for Gh {
     }
 
     fn image_manifest(&self, image: &ImageRef, tag: &str) -> Result<Read, ForgeError> {
+        (|| {
         let (status, body) = self.http(&[&format!(
             "https://ghcr.io/token?scope=repository:{}:pull",
             image.path()
-        )])?;
+        )], None)?;
         if status != 200 {
             return Err(ForgeError::Http(status));
         }
@@ -926,11 +970,12 @@ impl Forge for Gh {
             return Err(ForgeError::Json);
         }
         let (status, headers) = self.http(&[
-            "--head", "--header", &format!("Authorization: Bearer {}", token.token),
+            "--head", "--header", "@-",
             "--header", "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json",
             &format!("https://ghcr.io/v2/{}/manifests/{tag}", image.path()),
-        ])?;
+        ], Some(format!("Authorization: Bearer {}\n", token.token).as_bytes()))?;
         image_read(status, &headers)
+        })().map_err(|error| ForgeError::Curl(Box::new(error)))
     }
 
     fn tag_exists(&self, repo: &GithubRepo, tag: &TagName) -> Result<bool, ForgeError> {

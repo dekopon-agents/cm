@@ -53,10 +53,7 @@ fn formula_reads_check_every_url_checksum_and_explicit_version() {
     let repo = "acme/widget".parse().unwrap();
     let tag = "widget-1.4.0".parse().unwrap();
     let version = "1.4.0".parse().unwrap();
-    let good = format!(
-        "  url \"https://github.com/acme/widget/releases/download/widget-1.4.0/widget.tar.gz\"\n  sha256 \"{}\"\n",
-        "a".repeat(64)
-    );
+    let good = release_formula();
     let read = |body: &str| parse_formula(body, "blob-sha", &repo, &tag, &version);
     assert_eq!(read(&good), Ok(Read::Present("blob-sha".into())));
     assert_eq!(
@@ -84,5 +81,51 @@ fn formula_reads_check_every_url_checksum_and_explicit_version() {
         good.lines().next().unwrap().into(),
     ] {
         assert_eq!(read(&bad), Err(ForgeError::Json), "{bad}");
+    }
+}
+
+fn release_formula() -> String {
+    format!(
+        "  url \"https://github.com/acme/widget/releases/download/widget-1.4.0/widget.tar.gz\"\n  sha256 \"{}\"\n",
+        "a".repeat(64)
+    )
+}
+
+#[test]
+fn formula_calls_check_parenthesized_and_single_quoted_urls_and_versions() {
+    let repo = "acme/widget".parse().unwrap();
+    let tag = "widget-1.4.0".parse().unwrap();
+    let version = "1.4.0".parse().unwrap();
+    let good = release_formula();
+    let read = |body: &str| parse_formula(body, "blob-sha", &repo, &tag, &version);
+    for (open, close) in [
+        (" \"", "\""),
+        ("(\"", "\")"),
+        (" ( \"", "\" )"),
+        ("('", "')"),
+        (" '", "'"),
+        ("\"", "\""),
+    ] {
+        let explicit = format!("version{open}1.3.0{close}\n{good}");
+        assert_eq!(
+            read(&explicit),
+            Ok(Read::Stale("1.3.0".into())),
+            "{explicit}"
+        );
+        let current = explicit.replace("1.3.0", "1.4.0");
+        assert_eq!(
+            read(&current),
+            Ok(Read::Present("blob-sha".into())),
+            "{current}"
+        );
+        let stale = format!(
+            "{good}url{open}https://github.com/acme/widget/releases/download/widget-1.3.0/widget.tar.gz{close}\nsha256 \"{}\"\n",
+            "a".repeat(64)
+        );
+        assert_eq!(
+            read(&stale),
+            Ok(Read::Stale("widget-1.3.0".into())),
+            "{stale}"
+        );
     }
 }
