@@ -675,7 +675,9 @@ are checked alike. Each argument must be exactly one double-quoted literal with 
 backslash, `#`, or control character, followed only by line end or its closing parenthesis;
 URL calls may also use `using: :curl` inside that call. The literal characters are read as-is.
 Expressions, escapes, interpolation, percent literals, single quotes, and heredocs are
-unsupported and read as unknown wherever they occur. Ruby is never evaluated.
+unsupported and read as unknown in the `url`, `version` and `sha256` arguments. Only lines
+that start with `url`, `sha256` or `version` are read; a call elsewhere on a line, or code
+that turns those lines into data, is not detected. Ruby is never evaluated.
 Every URL must be a release download from that repository; unrelated
 `livecheck`, `head` or `resource` URLs and unsupported Ruby expressions read as unknown.
 This check expects a generated release formula rather than arbitrary Homebrew Ruby.
