@@ -3439,3 +3439,266 @@ fn unsupported_tap_content_has_a_formula_error() {
         );
     }
 }
+
+#[test]
+fn review_wait_observes_a_concurrent_record_and_distinguishes_deadline_and_unreadable() {
+    let host = at("2026-10-25T00:00Z");
+    let c = campaign(&host, true);
+    let head = c.head();
+    let report = c.report("wait", &head, &[], "ACCEPT");
+    let spawn = |reviewer: &str, deadline: &str| {
+        Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("-C")
+            .arg(&c.root)
+            .args([
+                "--json",
+                "review",
+                "wait",
+                STEP,
+                "--head",
+                &head,
+                "--reviewer",
+                reviewer,
+                "--deadline",
+                deadline,
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let deadline = (jiff::Timestamp::now() + jiff::SignedDuration::from_secs(10)).to_string();
+    let mut child = spawn("astra", &deadline);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(child.try_wait().unwrap().is_none());
+    assert!(
+        verdict::record(&host, &c.root, &target(), &report, Some("astra"), None)
+            .unwrap()
+            .ok()
+    );
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["wait_status"], "recorded");
+    assert_eq!(json["review"]["reviewer"], "astra");
+    let output = spawn("other", &jiff::Timestamp::now().to_string())
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["wait_status"], "deadline");
+    c.write(".cm/verdicts.json", "broken JSON");
+    let output = spawn("astra", &deadline).wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(4));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["wait_status"], "unreadable");
+}
+
+#[test]
+fn review_wait_validation_exits_two_and_state_decode_failures_exit_four() {
+    let host = at("2026-10-25T00:00Z");
+    let c = campaign(&host, true);
+    let head = c.head();
+    let deadline = jiff::Timestamp::now().to_string();
+    let run = |step: &str, head: &str, reviewer: &str, part: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cm"));
+        command.arg("-C").arg(&c.root).args([
+            "--json",
+            "review",
+            "wait",
+            step,
+            "--head",
+            head,
+            "--reviewer",
+            reviewer,
+            "--deadline",
+            &deadline,
+        ]);
+        if let Some(part) = part {
+            command.args(["--part", part]);
+        }
+        command.output().unwrap()
+    };
+    assert_eq!(
+        run(STEP, review_fixture::INVALID_WAIT_HEAD, "astra", None)
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(
+        run(STEP, &head, review_fixture::INVALID_WAIT_REVIEWER, None)
+            .status
+            .code(),
+        Some(2)
+    );
+    for step in review_fixture::UNKNOWN_WAIT_STEPS {
+        let output = run(step, &head, "astra", None);
+        assert_eq!(output.status.code(), Some(2));
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["wait_status"], "refused");
+        assert_eq!(json["violations"][0]["rule"], "step-unknown");
+    }
+    let output = run(STEP, &head, "astra", Some("missing"));
+    assert_eq!(output.status.code(), Some(2));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["wait_status"], "refused");
+    assert_eq!(json["violations"][0]["rule"], "part-unknown");
+    c.write("01-a/u/.cm/state.json", "not JSON");
+    let output = run(STEP, &head, "astra", None);
+    assert_eq!(output.status.code(), Some(4));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["wait_status"], "unreadable");
+}
+
+#[test]
+fn review_wait_follows_a_pr_opened_while_waiting() {
+    let host = at("2026-10-25T00:00Z");
+    let c = campaign(&host, false);
+    let head = c.head();
+    let report = c.report("wait-for-pr", &head, &[], "ACCEPT");
+    let deadline = (jiff::Timestamp::now() + jiff::SignedDuration::from_secs(10)).to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args([
+            "--json",
+            "review",
+            "wait",
+            STEP,
+            "--head",
+            &head,
+            "--reviewer",
+            "astra",
+            "--deadline",
+            &deadline,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(child.try_wait().unwrap().is_none());
+    let opened = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args([
+            "--json", "advance", STEP, "pr-open", "--pr", PR, "--sha", &head, "--repo",
+        ])
+        .arg(&c.repo)
+        .output()
+        .unwrap();
+    assert!(opened.status.success(), "{opened:?}");
+    let recorded = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&c.root)
+        .args(["--json", "review", "record", STEP])
+        .arg(&report)
+        .args(["--reviewer", "astra"])
+        .output()
+        .unwrap();
+    assert!(recorded.status.success(), "{recorded:?}");
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["wait_status"], "recorded");
+    assert_eq!(json["review"]["pr"], PR);
+    assert_eq!(json["review"]["head"], head);
+}
+
+#[test]
+fn review_wait_distinguishes_bad_campaign_state_from_a_missing_campaign() {
+    let host = at("2026-10-25T00:00Z");
+    for kind in 0..4 {
+        let c = campaign(&host, true);
+        let head = c.head();
+        let path = store::state_path(&c.root);
+        match kind {
+            0 | 1 => fs::write(&path, review_fixture::MALFORMED_CAMPAIGN_STATES[kind]).unwrap(),
+            2 => {
+                fs::remove_file(&path).unwrap();
+                fs::create_dir(&path).unwrap();
+            }
+            _ => fs::remove_file(&path).unwrap(),
+        }
+        for start in [&c.root, &c.root.join("01-a/u")] {
+            let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+                .arg("-C")
+                .arg(start)
+                .args([
+                    "--json",
+                    "review",
+                    "wait",
+                    STEP,
+                    "--head",
+                    &head,
+                    "--reviewer",
+                    "astra",
+                    "--deadline",
+                    &jiff::Timestamp::now().to_string(),
+                ])
+                .output()
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if kind == 3 {
+                assert_eq!(output.status.code(), Some(2), "{output:?}");
+                assert_eq!(json["wait_status"], "refused");
+                assert_eq!(json["violations"][0]["rule"], "no-campaign");
+            } else {
+                assert_eq!(output.status.code(), Some(4), "{output:?}");
+                assert_eq!(json["wait_status"], "unreadable");
+                assert_eq!(json["violations"][0]["rule"], "review-wait-unreadable");
+            }
+        }
+    }
+}
+
+#[test]
+fn review_wait_does_not_match_an_outer_round_through_a_malformed_inner_campaign() {
+    let host = at("2026-10-25T00:00Z");
+    let outer = campaign(&host, true);
+    let head = outer.head();
+    let report = outer.report("outer-round", &head, &[], "ACCEPT");
+    assert!(
+        verdict::record(&host, &outer.root, &target(), &report, Some("astra"), None)
+            .unwrap()
+            .ok()
+    );
+    let run = |start: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("-C")
+            .arg(start)
+            .args([
+                "--json",
+                "review",
+                "wait",
+                STEP,
+                "--head",
+                &head,
+                "--reviewer",
+                "astra",
+                "--deadline",
+                &jiff::Timestamp::now().to_string(),
+            ])
+            .output()
+            .unwrap()
+    };
+    assert_eq!(run(&outer.root).status.code(), Some(0));
+    for kind in 0..3 {
+        let inner = campaign(&host, true);
+        let nested = outer.root.join(format!("inner-{kind}"));
+        fs::rename(&inner.root, &nested).unwrap();
+        let path = store::state_path(&nested);
+        match kind {
+            0 | 1 => fs::write(&path, review_fixture::MALFORMED_CAMPAIGN_STATES[kind]).unwrap(),
+            _ => {
+                fs::remove_file(&path).unwrap();
+                fs::create_dir(&path).unwrap();
+            }
+        }
+        for start in [&nested, &nested.join("01-a/u")] {
+            let output = run(start);
+            assert_eq!(output.status.code(), Some(4), "{output:?}");
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(json["wait_status"], "unreadable");
+            assert_eq!(json["violations"][0]["rule"], "review-wait-unreadable");
+        }
+    }
+}

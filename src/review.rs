@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::host::{Host, stamp};
@@ -489,4 +489,179 @@ pub fn review(host: &dyn Host, root: &Path, target: &Target, args: &ReviewArgs) 
     outcome.field("number", number);
     outcome.field("journal", journal);
     Ok(outcome)
+}
+
+#[derive(Clone, Copy)]
+enum WaitStatus {
+    Recorded,
+    Deadline,
+    Refused,
+    Unreadable,
+}
+
+pub(crate) struct WaitOutcome {
+    status: WaitStatus,
+    outcome: Outcome,
+}
+
+impl WaitOutcome {
+    pub(crate) fn refused(path: &str, rule: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: WaitStatus::Refused,
+            outcome: Outcome::refused(vec![Violation::new(path, rule, message)]),
+        }
+    }
+
+    pub(crate) fn unreadable(error: anyhow::Error) -> Self {
+        let mut outcome = Outcome::refused(vec![Violation::new(
+            ".cm",
+            "review-wait-unreadable",
+            format!("{error:#}"),
+        )]);
+        outcome.field("error", format!("{error:#}"));
+        Self {
+            status: WaitStatus::Unreadable,
+            outcome,
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> (Outcome, std::process::ExitCode) {
+        let (label, exit) = match self.status {
+            WaitStatus::Recorded => ("recorded", 0u8),
+            WaitStatus::Deadline => ("deadline", 3),
+            WaitStatus::Refused => ("refused", 2),
+            WaitStatus::Unreadable => ("unreadable", 4),
+        };
+        self.outcome.field("wait_status", label);
+        (self.outcome, std::process::ExitCode::from(exit))
+    }
+}
+
+pub(crate) fn wait_root(root: Option<&Path>) -> Result<Option<PathBuf>> {
+    #[derive(Deserialize)]
+    struct Probe {
+        kind: crate::state::Kind,
+    }
+    let start = match root {
+        Some(root) if root.is_absolute() => root.to_path_buf(),
+        Some(root) => std::env::current_dir()?.join(root),
+        None => std::env::current_dir()?,
+    };
+    let start = crate::store::absolute(&start);
+    for dir in start.ancestors() {
+        let path = crate::store::state_path(dir);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+            Ok(_) => {}
+        }
+        let probe: Probe = read_json(&path)?;
+        if probe.kind == crate::state::Kind::Campaign {
+            crate::store::load_campaign(dir)?;
+            return Ok(Some(dir.to_path_buf()));
+        }
+    }
+    Ok(None)
+}
+
+/// Wait for a recorded round without preventing the recording process from taking the lock.
+pub(crate) fn wait(
+    root: &Path,
+    target: &Target,
+    head: &str,
+    reviewer: &str,
+    part: Option<&str>,
+    deadline: jiff::Timestamp,
+) -> Result<WaitOutcome> {
+    let full = format!(
+        "{}/{}",
+        target.unit,
+        target.step.as_deref().unwrap_or_default()
+    );
+    let now = jiff::Timestamp::now();
+    let remaining = (deadline.as_nanosecond() - now.as_nanosecond()).max(0);
+    let budget = std::time::Duration::from_nanos(remaining.min(u64::MAX as i128) as u64);
+    let started = std::time::Instant::now();
+    loop {
+        match fs::metadata(crate::store::state_path(&root.join(&target.unit))) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(WaitOutcome::refused(
+                    &full,
+                    "step-unknown",
+                    "the step is not declared",
+                ));
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        let unit = crate::store::load_unit(&root.join(&target.unit))?;
+        let Some(step) = unit.steps.get(target.step.as_deref().unwrap_or_default()) else {
+            return Ok(WaitOutcome::refused(
+                &full,
+                "step-unknown",
+                "the step is not declared",
+            ));
+        };
+        let track = match part {
+            Some(part) => match step.parts.get(part) {
+                Some(track) => track,
+                None => {
+                    return Ok(WaitOutcome::refused(
+                        &full,
+                        "part-unknown",
+                        format!("unknown part {part}"),
+                    ));
+                }
+            },
+            None if step.parts.is_empty() => &step.track,
+            None => {
+                return Ok(WaitOutcome::refused(
+                    &full,
+                    "review-part",
+                    "select the reviewed part with --part NAME",
+                ));
+            }
+        };
+        let pr = &track.evidence.pr;
+        let path = root
+            .join(crate::store::CM_DIR)
+            .join(crate::verdict::VERDICTS);
+        let ledger: crate::verdict::Verdicts = match fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(recorded) = ledger.reviews.iter().find(|round| {
+            round.step == full
+                && &round.pr == pr
+                && round.part.as_deref() == part
+                && round.reviewer.as_deref() == Some(reviewer)
+                && crate::state::same_commit(&round.head, head)
+        }) {
+            let mut outcome = Outcome::default();
+            outcome.field("review", serde_json::to_value(recorded)?);
+            outcome.line(format!(
+                "recorded R{}: {full} by {reviewer} at {}",
+                recorded.number, recorded.head
+            ));
+            return Ok(WaitOutcome {
+                status: WaitStatus::Recorded,
+                outcome,
+            });
+        }
+        let Some(left) = budget
+            .checked_sub(started.elapsed())
+            .filter(|left| !left.is_zero())
+        else {
+            let mut outcome = Outcome::default();
+            outcome.line(format!(
+                "deadline: no recorded round for {full} by {reviewer} at {head}"
+            ));
+            return Ok(WaitOutcome {
+                status: WaitStatus::Deadline,
+                outcome,
+            });
+        };
+        std::thread::sleep(left.min(std::time::Duration::from_secs(1)));
+    }
 }
