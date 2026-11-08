@@ -3413,3 +3413,29 @@ fn a_forge_without_publication_support_refuses_the_hand_release_as_unread() {
     assert_eq!(rules(&out), ["publication-unread"]);
     assert_eq!(c.files(), before);
 }
+
+#[test]
+fn unsupported_tap_content_has_a_formula_error() {
+    use publication_fixture as p;
+    for body in [
+        p::formula(p::TAG).replace(r#"version "1.4.0""#, r#"version("1.4.0".sub("4", "3"))"#),
+        p::formula(p::TAG).replace(p::TAG, "v#{version}"),
+    ] {
+        let response = p::formula_response(&body);
+        let gh = Gh {
+            program: response.program(),
+            timeout: Duration::from_secs(10),
+        };
+        let result = gh.tap_formula(
+            &"o/homebrew-tap".parse().unwrap(),
+            "widget",
+            &"o/widget".parse().unwrap(),
+            &p::TAG.parse().unwrap(),
+            &"1.4.0".parse().unwrap(),
+        );
+        assert!(
+            matches!(result, Err(ForgeError::UnsupportedFormula)),
+            "{result:?}"
+        );
+    }
+}

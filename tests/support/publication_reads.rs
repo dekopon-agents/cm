@@ -42,7 +42,10 @@ fn image_reads_require_the_digest_and_classify_only_manifest_404_as_missing() {
         Ok(Read::Present("sha256:digest".into()))
     );
     assert_eq!(image_read(404, ""), Ok(Read::Missing));
-    assert_eq!(image_read(200, "Content-Length: 0"), Err(ForgeError::Json));
+    assert!(matches!(
+        image_read(200, "Content-Length: 0"),
+        Err(ForgeError::ManifestDigest)
+    ));
     for status in [401, 403, 429, 500, 503] {
         assert_eq!(image_read(status, ""), Err(ForgeError::Http(status)));
     }
@@ -62,6 +65,14 @@ fn formula_reads_check_every_url_checksum_and_explicit_version() {
     );
     assert_eq!(
         read(&good.replace("widget.tar.gz\"", "widget.tar.gz\", using: :curl")),
+        Ok(Read::Present("blob-sha".into()))
+    );
+    assert_eq!(
+        read(
+            &good
+                .replace("url \"", "url(\"")
+                .replace("widget.tar.gz\"", "widget.tar.gz\", using: :curl)")
+        ),
         Ok(Read::Present("blob-sha".into()))
     );
     let stale = good.replace("widget-1.4.0", "widget-1.3.0");
@@ -126,6 +137,75 @@ fn formula_calls_check_parenthesized_and_single_quoted_urls_and_versions() {
             read(&stale),
             Ok(Read::Stale("widget-1.3.0".into())),
             "{stale}"
+        );
+        let current_url = stale.replace("widget-1.3.0", "widget-1.4.0");
+        assert_eq!(
+            read(&current_url),
+            Ok(Read::Present("blob-sha".into())),
+            "{current_url}"
+        );
+    }
+}
+
+#[test]
+fn formula_version_expressions_are_unreadable() {
+    let repo = "acme/widget".parse().unwrap();
+    let tag = "widget-1.4.0".parse().unwrap();
+    let version = "1.4.0".parse().unwrap();
+    let good = release_formula();
+    for call in [
+        r#"version("1.4.0".sub("4", "3"))"#,
+        r#"version("1.4.0").sub("4", "3")"#,
+        r#"version "1.4.0" + suffix"#,
+    ] {
+        let body = format!("{call}\n{good}");
+        assert_eq!(
+            parse_formula(&body, "blob-sha", &repo, &tag, &version),
+            Err(ForgeError::Json),
+            "{call}"
+        );
+    }
+}
+
+#[test]
+fn formula_url_expressions_are_unreadable() {
+    let repo = "acme/widget".parse().unwrap();
+    let tag = "widget-1.4.0".parse().unwrap();
+    let version = "1.4.0".parse().unwrap();
+    let good = release_formula();
+    for body in [
+        good.replace("widget.tar.gz\"", r#"widget.tar.gz".sub("1.4.0", "1.3.0")"#),
+        good.replace("url \"", "url(\"").replace(
+            "widget.tar.gz\"",
+            r#"widget.tar.gz".sub("1.4.0", "1.3.0"))"#,
+        ),
+        good.replace(
+            "widget.tar.gz\"",
+            r#"widget.tar.gz", using: :curl.sub("curl", "git")"#,
+        ),
+    ] {
+        assert_eq!(
+            parse_formula(&body, "blob-sha", &repo, &tag, &version),
+            Err(ForgeError::Json),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn formula_interpolation_is_unreadable() {
+    let repo = "acme/widget".parse().unwrap();
+    let tag = "widget-1.4.0".parse().unwrap();
+    let version = "1.4.0".parse().unwrap();
+    let good = release_formula();
+    for body in [
+        good.replace("widget-1.4.0", "v#{version}"),
+        format!("version \"#{{version}}\"\n{good}"),
+    ] {
+        assert_eq!(
+            parse_formula(&body, "blob-sha", &repo, &tag, &version),
+            Err(ForgeError::Json),
+            "{body}"
         );
     }
 }

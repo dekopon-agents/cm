@@ -13,6 +13,8 @@ pub enum ForgeError {
     Exit(Option<i32>),
     Timeout(Duration),
     Json,
+    UnsupportedFormula,
+    ManifestDigest,
     Http(u16),
     Curl(Box<ForgeError>),
     Url,
@@ -36,6 +38,12 @@ impl ForgeError {
                 after.as_secs()
             ),
             ForgeError::Json => write!(f, "{program} returned JSON cm cannot read"),
+            ForgeError::UnsupportedFormula => {
+                f.write_str("tap formula uses unsupported or invalid publication content")
+            }
+            ForgeError::ManifestDigest => {
+                f.write_str("image manifest response is missing docker-content-digest")
+            }
             ForgeError::Url => f.write_str("not a https://github.com/<owner>/<repo>/pull/<n> URL"),
         }
     }
@@ -388,6 +396,13 @@ pub trait Forge {
 
 pub const GH_TIMEOUT: Duration = Duration::from_secs(60);
 
+const IMAGE_ACCEPT_HEADER: &str = concat!(
+    "Accept: application/vnd.oci.image.index.v1+json, ",
+    "application/vnd.docker.distribution.manifest.list.v2+json, ",
+    "application/vnd.oci.image.manifest.v1+json, ",
+    "application/vnd.docker.distribution.manifest.v2+json",
+);
+
 pub struct Gh {
     pub program: PathBuf,
     pub timeout: Duration,
@@ -663,11 +678,24 @@ pub fn parse_formula(
     }
     fn quoted<'a>(line: &'a str, key: &str) -> Option<&'a str> {
         let rest = argument(line, key)?;
+        let parenthesized = rest.starts_with('(');
         let rest = rest.strip_prefix('(').unwrap_or(rest).trim_start();
         let quote = rest.chars().next().filter(|c| matches!(c, '\'' | '"'))?;
-        rest.strip_prefix(quote)?
-            .split_once(quote)
-            .map(|(value, _)| value)
+        let (value, tail) = rest.strip_prefix(quote)?.split_once(quote)?;
+        if value.contains("#{") {
+            return None;
+        }
+        let tail = if parenthesized {
+            tail.trim().strip_suffix(')')?.trim()
+        } else {
+            tail.trim()
+        };
+        let download_option = key == "url"
+            && tail
+                .strip_prefix(',')
+                .and_then(|tail| tail.trim_start().strip_prefix("using:"))
+                .is_some_and(|value| value.trim() == ":curl");
+        (tail.is_empty() || download_option).then_some(value)
     }
     let lines: Vec<_> = body
         .lines()
@@ -725,7 +753,7 @@ fn image_read(status: u16, headers: &str) -> Result<Read, ForgeError> {
                 key.eq_ignore_ascii_case("docker-content-digest") && !value.trim().is_empty()
             })
             .map(|(_, value)| Read::Present(value.trim().to_owned()))
-            .ok_or(ForgeError::Json),
+            .ok_or(ForgeError::ManifestDigest),
         _ => Err(ForgeError::Http(status)),
     }
 }
@@ -950,32 +978,43 @@ impl Forge for Gh {
         }
         let formula: Formula = serde_json::from_str(body).map_err(|_| ForgeError::Json)?;
         parse_formula(&formula.content, &formula.sha, repo, tag, version)
+            .map_err(|_| ForgeError::UnsupportedFormula)
     }
 
     fn image_manifest(&self, image: &ImageRef, tag: &str) -> Result<Read, ForgeError> {
         (|| {
-        let (status, body) = self.http(&[&format!(
-            "https://ghcr.io/token?scope=repository:{}:pull",
-            image.path()
-        )], None)?;
-        if status != 200 {
-            return Err(ForgeError::Http(status));
-        }
-        #[derive(Deserialize)]
-        struct Token {
-            token: String,
-        }
-        let token: Token = serde_json::from_str(&body).map_err(|_| ForgeError::Json)?;
-        if token.token.is_empty() || token.token.contains(['\r', '\n']) {
-            return Err(ForgeError::Json);
-        }
-        let (status, headers) = self.http(&[
-            "--head", "--header", "@-",
-            "--header", "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json",
-            &format!("https://ghcr.io/v2/{}/manifests/{tag}", image.path()),
-        ], Some(format!("Authorization: Bearer {}\n", token.token).as_bytes()))?;
-        image_read(status, &headers)
-        })().map_err(|error| ForgeError::Curl(Box::new(error)))
+            let (status, body) = self.http(
+                &[&format!(
+                    "https://ghcr.io/token?scope=repository:{}:pull",
+                    image.path()
+                )],
+                None,
+            )?;
+            if status != 200 {
+                return Err(ForgeError::Http(status));
+            }
+            #[derive(Deserialize)]
+            struct Token {
+                token: String,
+            }
+            let token: Token = serde_json::from_str(&body).map_err(|_| ForgeError::Json)?;
+            if token.token.is_empty() || token.token.contains(['\r', '\n']) {
+                return Err(ForgeError::Json);
+            }
+            let (status, headers) = self.http(
+                &[
+                    "--head",
+                    "--header",
+                    "@-",
+                    "--header",
+                    IMAGE_ACCEPT_HEADER,
+                    &format!("https://ghcr.io/v2/{}/manifests/{tag}", image.path()),
+                ],
+                Some(format!("Authorization: Bearer {}\n", token.token).as_bytes()),
+            )?;
+            image_read(status, &headers)
+        })()
+        .map_err(|error| ForgeError::Curl(Box::new(error)))
     }
 
     fn tag_exists(&self, repo: &GithubRepo, tag: &TagName) -> Result<bool, ForgeError> {

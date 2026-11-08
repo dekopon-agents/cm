@@ -64,7 +64,8 @@ impl Forge for FakeForge {
             return Err(ForgeError::Exit(Some(1)));
         }
         match self.formulas.get(&(tap.to_string(), formula.into())) {
-            Some(body) => cm::forge::parse_formula(body, "blob-sha", repo, tag, version),
+            Some(body) => cm::forge::parse_formula(body, "blob-sha", repo, tag, version)
+                .map_err(|_| ForgeError::UnsupportedFormula),
             None => Ok(Read::Missing),
         }
     }

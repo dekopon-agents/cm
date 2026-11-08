@@ -671,7 +671,9 @@ After tag containment succeeds, `cm sync` reads every declared artifact. A crate
 exact version and be unyanked. Every tap `url` must name the release repository's download at
 the declared tag, followed by a lowercase 64-hex `sha256`; any explicit `version` must match.
 The tap is read on its default branch. Quoted and parenthesized `url` and `version` calls
-are checked alike. Every URL must be a release download from that repository; unrelated
+are checked alike. Arguments must be complete string literals; URL calls may also use
+`using: :curl`. Method calls, concatenation and `#{…}` interpolation read as unknown.
+Every URL must be a release download from that repository; unrelated
 `livecheck`, `head` or `resource` URLs and unsupported Ruby expressions read as unknown.
 This check expects a generated release formula rather than arbitrary Homebrew Ruby.
 The checksum is not compared with a release asset.

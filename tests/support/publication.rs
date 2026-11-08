@@ -164,3 +164,20 @@ pub fn colliding_versions(host: &dyn Host) -> (Campaign, FakeForge) {
         .insert(("o/widget".into(), SHARED_TAG.into()), [SHA.into()].into());
     (c, forge)
 }
+
+pub fn formula_response(body: &str) -> super::support::FakeGh {
+    let gh = super::support::FakeGh::new(
+        r#"printf 'HTTP/2.0 200 OK\r\n\r\n'
+cat "$FAKE_GH/formula-response.json"
+"#,
+    );
+    std::fs::write(
+        gh.fixture().join("formula-response.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "sha": "blob-sha", "content": body,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    gh
+}
