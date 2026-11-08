@@ -550,8 +550,13 @@ pub(crate) fn review_waits(
                 }
                 let elapsed =
                     instant(&track.since).map(|since| now.duration_since(since).as_secs().max(0));
+                let (pr, head) = if part.is_none() && !step.parts.is_empty() {
+                    (None, None)
+                } else {
+                    (track.evidence.pr.as_deref(), track.evidence.sha.as_deref())
+                };
                 waits.push(json!({
-                    "target": full, "part": part, "pr": track.evidence.pr, "head": track.evidence.sha,
+                    "target": full, "part": part, "pr": pr, "head": head,
                     "reason": reason, "since": track.since, "waited_seconds": elapsed,
                     "command": format!("cm next {}", shell_word(&full)),
                 }));
@@ -570,12 +575,15 @@ pub(crate) fn review_wait_line(wait: &Value) -> String {
         .as_i64()
         .map(|seconds| format!("{seconds}s"))
         .unwrap_or_else(|| "unknown duration".into());
+    let head = wait["head"]
+        .as_str()
+        .map(|head| format!(" (head {head})"))
+        .unwrap_or_default();
     format!(
-        "reviewer blocked {}{part}: {}, waited {elapsed} since {} (head {})",
+        "reviewer blocked {}{part}: {}, waited {elapsed} since {}{head}",
         wait["target"].as_str().unwrap(),
         wait["reason"].as_str().unwrap(),
         wait["since"].as_str().unwrap(),
-        wait["head"].as_str().unwrap_or("unknown")
     )
 }
 
