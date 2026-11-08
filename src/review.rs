@@ -551,51 +551,51 @@ pub(crate) fn wait(
         target.unit,
         target.step.as_deref().unwrap_or_default()
     );
-    match fs::metadata(crate::store::state_path(&root.join(&target.unit))) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(WaitOutcome::refused(
-                &full,
-                "step-unknown",
-                "the step is not declared",
-            ));
-        }
-        Err(error) => return Err(error.into()),
-        Ok(_) => {}
-    }
-    let unit = crate::store::load_unit(&root.join(&target.unit))?;
-    let Some(step) = unit.steps.get(target.step.as_deref().unwrap_or_default()) else {
-        return Ok(WaitOutcome::refused(
-            &full,
-            "step-unknown",
-            "the step is not declared",
-        ));
-    };
-    let track = match part {
-        Some(part) => match step.parts.get(part) {
-            Some(track) => track,
-            None => {
-                return Ok(WaitOutcome::refused(
-                    &full,
-                    "part-unknown",
-                    format!("unknown part {part}"),
-                ));
-            }
-        },
-        None if step.parts.is_empty() => &step.track,
-        None => {
-            return Ok(WaitOutcome::refused(
-                &full,
-                "review-part",
-                "select the reviewed part with --part NAME",
-            ));
-        }
-    };
-    let pr = &track.evidence.pr;
     let now = jiff::Timestamp::now();
     let remaining = (deadline.as_nanosecond() - now.as_nanosecond()).max(0);
     let budget = std::time::Duration::from_nanos(remaining.min(u64::MAX as i128) as u64);
     let started = std::time::Instant::now();
     loop {
+        match fs::metadata(crate::store::state_path(&root.join(&target.unit))) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(WaitOutcome::refused(
+                    &full,
+                    "step-unknown",
+                    "the step is not declared",
+                ));
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        let unit = crate::store::load_unit(&root.join(&target.unit))?;
+        let Some(step) = unit.steps.get(target.step.as_deref().unwrap_or_default()) else {
+            return Ok(WaitOutcome::refused(
+                &full,
+                "step-unknown",
+                "the step is not declared",
+            ));
+        };
+        let track = match part {
+            Some(part) => match step.parts.get(part) {
+                Some(track) => track,
+                None => {
+                    return Ok(WaitOutcome::refused(
+                        &full,
+                        "part-unknown",
+                        format!("unknown part {part}"),
+                    ));
+                }
+            },
+            None if step.parts.is_empty() => &step.track,
+            None => {
+                return Ok(WaitOutcome::refused(
+                    &full,
+                    "review-part",
+                    "select the reviewed part with --part NAME",
+                ));
+            }
+        };
+        let pr = &track.evidence.pr;
         let path = root
             .join(crate::store::CM_DIR)
             .join(crate::verdict::VERDICTS);
