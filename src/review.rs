@@ -490,3 +490,81 @@ pub fn review(host: &dyn Host, root: &Path, target: &Target, args: &ReviewArgs) 
     outcome.field("journal", journal);
     Ok(outcome)
 }
+
+/// Wait for a recorded round without preventing the recording process from taking the lock.
+pub(crate) fn wait(
+    root: &Path,
+    target: &Target,
+    head: &str,
+    reviewer: &str,
+    part: Option<&str>,
+    deadline: jiff::Timestamp,
+) -> Result<Outcome> {
+    let full = format!(
+        "{}/{}",
+        target.unit,
+        target.step.as_deref().unwrap_or_default()
+    );
+    let unit = crate::store::load_unit(&root.join(&target.unit))?;
+    let step = unit
+        .steps
+        .get(target.step.as_deref().unwrap_or_default())
+        .ok_or_else(|| anyhow::anyhow!("the step {full} is not declared"))?;
+    let track = match part {
+        Some(part) => step
+            .parts
+            .get(part)
+            .ok_or_else(|| anyhow::anyhow!("unknown part {part}"))?,
+        None if step.parts.is_empty() => &step.track,
+        None => anyhow::bail!("select the reviewed part with --part NAME"),
+    };
+    anyhow::ensure!(
+        (7..=40).contains(&head.len()) && head.bytes().all(|b| b.is_ascii_hexdigit()),
+        "--head must be a commit SHA"
+    );
+    anyhow::ensure!(crate::store::is_name(reviewer), "--reviewer must be a name");
+    let pr = &track.evidence.pr;
+    let now = jiff::Timestamp::now();
+    let remaining = (deadline.as_nanosecond() - now.as_nanosecond()).max(0);
+    let budget = std::time::Duration::from_nanos(remaining.min(u64::MAX as i128) as u64);
+    let started = std::time::Instant::now();
+    loop {
+        // Only NotFound means empty. In particular, a directory or broken JSON is unreadable.
+        let path = root
+            .join(crate::store::CM_DIR)
+            .join(crate::verdict::VERDICTS);
+        let ledger: crate::verdict::Verdicts = match fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(recorded) = ledger.reviews.iter().find(|round| {
+            round.step == full
+                && &round.pr == pr
+                && round.part.as_deref() == part
+                && round.reviewer.as_deref() == Some(reviewer)
+                && crate::state::same_commit(&round.head, head)
+        }) {
+            let mut outcome = Outcome::default();
+            outcome.field("wait_status", "recorded");
+            outcome.field("review", serde_json::to_value(recorded)?);
+            outcome.line(format!(
+                "recorded R{}: {full} by {reviewer} at {}",
+                recorded.number, recorded.head
+            ));
+            return Ok(outcome);
+        }
+        let Some(left) = budget
+            .checked_sub(started.elapsed())
+            .filter(|left| !left.is_zero())
+        else {
+            let mut outcome = Outcome::default();
+            outcome.field("wait_status", "deadline");
+            outcome.line(format!(
+                "deadline: no recorded round for {full} by {reviewer} at {head}"
+            ));
+            return Ok(outcome);
+        };
+        std::thread::sleep(left.min(std::time::Duration::from_secs(1)));
+    }
+}

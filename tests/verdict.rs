@@ -3439,3 +3439,56 @@ fn unsupported_tap_content_has_a_formula_error() {
         );
     }
 }
+
+#[test]
+fn review_wait_observes_a_concurrent_record_and_distinguishes_deadline_and_unreadable() {
+    let host = at("2026-10-25T00:00Z");
+    let c = campaign(&host, true);
+    let head = c.head();
+    let report = c.report("wait", &head, &[], "ACCEPT");
+    let spawn = |reviewer: &str, deadline: &str| {
+        Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("-C")
+            .arg(&c.root)
+            .args([
+                "--json",
+                "review",
+                "wait",
+                STEP,
+                "--head",
+                &head,
+                "--reviewer",
+                reviewer,
+                "--deadline",
+                deadline,
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let deadline = (jiff::Timestamp::now() + jiff::SignedDuration::from_secs(10)).to_string();
+    let child = spawn("astra", &deadline);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        verdict::record(&host, &c.root, &target(), &report, Some("astra"), None)
+            .unwrap()
+            .ok()
+    );
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["wait_status"], "recorded");
+    assert_eq!(json["review"]["reviewer"], "astra");
+    // A matching head under another reviewer is not the named round.
+    let output = spawn("other", &jiff::Timestamp::now().to_string())
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["wait_status"], "deadline");
+    c.write(".cm/verdicts.json", "broken JSON");
+    let output = spawn("astra", &deadline).wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(4));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["wait_status"], "unreadable");
+}
