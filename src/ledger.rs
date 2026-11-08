@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -305,10 +306,15 @@ pub(crate) fn unread_owner_queue(root: &Path) -> Result<Vec<String>> {
         return Ok(Vec::new());
     }
     let campaign = store::load_campaign(root)?;
-    let read = campaign.owner_queue_read.as_ref();
+    let read: HashSet<&str> = campaign
+        .owner_queue_read
+        .as_ref()
+        .into_iter()
+        .flat_map(|read| read.items.iter().map(String::as_str))
+        .collect();
     Ok(queue_items(&text)
         .into_iter()
-        .filter(|heading| read.is_none_or(|read| !read.items.contains(heading)))
+        .filter(|heading| !read.contains(heading.as_str()))
         .collect())
 }
 
