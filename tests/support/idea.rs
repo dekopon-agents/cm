@@ -10,23 +10,6 @@ use super::campaign_fixture::{Campaign, campaign};
 const MANIFEST: &str = "---\nepoch: epoch-alpha\nstatus: PLANNING\nideas_dir: ../ideas\n---\n\n# Epoch\n\nKeep this body exactly.  \n";
 const BODY: &str = "\n# An idea\n\n## Proposal\n\nKeep `inline code`, spaces  and Unicode: λ.  \n\n## Epoch history\n\n- 2026-01-01: captured by hand.  \n  A continuation line.\n  - A nested bullet.\n\n## Details\n\nKeep the final section too.\n";
 
-#[allow(dead_code)]
-pub fn epoch_manifest_with_outcome(c: &Campaign) -> &'static str {
-    const EPOCH_STATUS: &str = "---\nepoch: d\nstatus: OPEN\nplanning_started_at: null\nworking_started_at: null\nclosed_at: null\nskill_revision: a461b854\napproved_plan_revision: null\nideas_dir: ../ideas\nideas: [IDEA-0001]\n---\n\n# D\n";
-    fs::create_dir_all(c.idea_dir()).unwrap();
-    c.add_idea("IDEA-0001");
-    c.edit_idea(
-        "IDEA-0001",
-        "maturity: captured",
-        "maturity: captured\ncurrent_epoch: d",
-    );
-    c.history(
-        "IDEA-0001",
-        "- 2026-01-02: outcome in `d`: landed; tool-x #12.",
-    );
-    EPOCH_STATUS
-}
-
 pub fn ideas() -> Campaign {
     let c = campaign(&cm::host::System);
     fs::create_dir_all(c.idea_dir()).unwrap();

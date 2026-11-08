@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -828,9 +828,18 @@ pub fn lint_at(start: &Path, now: jiff::Timestamp) -> Result<Outcome> {
     violations.extend(root_files(&root, state.as_ref()));
     let units = unit_dirs(&root);
     violations.extend(crate::ledger::lint_feedback(&root));
+    let key = |violation: &Violation| {
+        (
+            violation.path.clone(),
+            violation.line,
+            violation.rule,
+            violation.message.clone(),
+        )
+    };
+    let mut reported: HashSet<_> = violations.iter().map(key).collect();
     for violation in crate::idea::lint(&root) {
         // Sealed accounting may already have reported the same malformed idea.
-        if !violations.contains(&violation) {
+        if reported.insert(key(&violation)) {
             violations.push(violation);
         }
     }

@@ -494,12 +494,11 @@ pub(crate) fn lint(root: &Path) -> Vec<Violation> {
     out
 }
 
-/// Account only for admitted ids, using their outcomes in this epoch's history.
 pub(crate) fn accounting(root: &Path, rule: &'static str, out: &mut Vec<Violation>) -> String {
     let Some(text) = read_manifest(root, out) else {
         return String::new();
     };
-    if field(&text, "ideas").is_none() {
+    if field(&text, "ideas_dir").is_none() || field(&text, "ideas").is_none() {
         return String::new();
     }
     let Some(manifest) = manifest(root, text, true, out) else {

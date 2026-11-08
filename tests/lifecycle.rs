@@ -1068,7 +1068,6 @@ fn close_requires_an_outcome_for_every_admitted_idea() {
         closed.fields["closed"].as_str()
     );
 
-    // A sealed campaign reports the same gaps if the outcomes disappear.
     for (id, text) in ["IDEA-9003", "IDEA-9001"].into_iter().zip(open_ideas) {
         c.write_idea(id, &text);
     }
@@ -1189,6 +1188,38 @@ fn close_looks_up_the_outcome_for_this_epoch_in_history() {
             )
         )
     );
+}
+
+#[test]
+fn close_with_unconfigured_ideas_keeps_lint_clean_and_the_existing_journal_shape() {
+    let c = idea_fixture::ideas();
+    c.edit_epoch("ideas_dir: ../ideas\n", "ideas: [IDEA-9003, IDEA-9001]\n");
+    assert_clean(&c.root);
+    let before = c.journal_text();
+    let closed = commands::close(&cm::host::System, &c.root).unwrap();
+    assert!(closed.ok(), "{:?}", closed.violations);
+    assert_eq!(
+        c.journal_text(),
+        format!(
+            "{before}\n{}",
+            cm::journal::entry(
+                closed.fields["closed"].as_str().unwrap(),
+                "cm close",
+                Some(
+                    "- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n"
+                ),
+            )
+        )
+    );
+    let resume_path = c.root.join("RESUME.md");
+    let resume = fs::read_to_string(&resume_path).unwrap();
+    let end = resume.find("\n\n# Resume").unwrap();
+    fs::write(
+        resume_path,
+        format!("> Closed; the successor governs.{}", &resume[end..]),
+    )
+    .unwrap();
+    assert_clean(&c.root);
 }
 
 #[test]
