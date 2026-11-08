@@ -2686,8 +2686,8 @@ fn add_parts(
             step.track.blocked_from = Some(to);
         } else {
             step.track.state = to;
+            step.track.since = at.to_owned();
         }
-        step.track.since = at.to_owned();
         step.track.evidence = Evidence::default();
     }
 }

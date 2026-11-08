@@ -216,6 +216,7 @@ impl Campaign {
 }
 
 impl Campaign {
+    // Blocked part tracks are synthetic: the CLI records blocked transitions on the step.
     pub fn review_blocks(&self, host: &dyn Host) {
         for (name, lane) in [("REVIEW", Lane::Codex), ("LOCAL", Lane::Pi)] {
             assert!(

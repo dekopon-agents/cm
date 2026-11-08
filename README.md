@@ -468,6 +468,13 @@ Those findings block; every other finding is a follow-up (`cm followups`). `.cm/
 holds each review (`R<n>`: step, reviewer, PR, optional part, head, verdict, the report's own verdict line,
 the report copy) and each finding with its resolution or closure.
 
+Blocked-reviewer waits are recorded at step scope with
+`cm advance <step> blocked:REVIEW_BLOCKED` or `blocked:EVIDENCE-BLOCKED`.
+A blocked transition with `--part` is refused as `part-state`. The reader can
+surface blocked part tracks already present in state; its part-reader test uses
+synthetic state and does not demonstrate a CLI path for recording a part wait.
+Adding parts to a blocked step preserves the original block start.
+
 ### Rounds
 
 Each distinct reviewed head of the current PR with a computed FIX REQUIRED verdict is one fix
