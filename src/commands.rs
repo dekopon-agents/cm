@@ -219,6 +219,7 @@ fn init_campaign(host: &dyn Host, dir: &Path) -> Result<Outcome> {
             adopted: Vec::new(),
             journal: None,
             closed: None,
+            owner_queue_read: None,
         }
     };
     let mut written = Vec::new();
@@ -912,6 +913,9 @@ pub fn launch_remote(
     let campaign = store::load_campaign(root)?;
     let mut violations = journal::check(root, &campaign);
     violations.extend(closed(root, &campaign));
+    if Release::of_target(&full).is_some() {
+        violations.extend(crate::ledger::owner_queue_refusal(root, &full)?);
+    }
     let coordinator = remote.coordinator.as_deref().unwrap_or("—");
     violations.extend(crate::attempt::check_coordinator(&full, coordinator));
     let units = plan::load_units(root)?;
@@ -1759,6 +1763,9 @@ pub fn advance_gated(
     let campaign = store::load_campaign(root)?;
     let mut violations = journal::check(root, &campaign);
     violations.extend(closed(root, &campaign));
+    if *to == Phase::Merged || Release::of_target(&step_full).is_some() {
+        violations.extend(crate::ledger::owner_queue_refusal(root, &full)?);
+    }
     let unit_dir = root.join(&target.unit);
     if !store::is_unit(&unit_dir) {
         violations.push(Violation::new(

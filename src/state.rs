@@ -393,6 +393,16 @@ pub struct CampaignState {
     pub journal: Option<JournalMark>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) owner_queue_read: Option<OwnerQueueRead>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OwnerQueueRead {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub at: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1190,6 +1200,8 @@ impl Step {
             || self.track.blocked_from.is_some()
             || self.track.check(&reach, self.finish(release)).is_err()
             || (reach == Phase::Deployed && self.unresolved_watches(root).next().is_some())
+            || (reach == Phase::Merged
+                && crate::ledger::unread_owner_queue(root).is_ok_and(|items| !items.is_empty()))
         {
             return None;
         }

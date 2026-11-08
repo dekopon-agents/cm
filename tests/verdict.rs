@@ -3641,6 +3641,301 @@ fn sync_surfaces_a_moved_base_since_ci_and_refreshes_only_at_a_tested_new_head()
 }
 
 #[test]
+fn owner_queue_banner_persists_until_explicit_journaled_read_and_reappears_for_new_items() {
+    let host = at("2026-10-25T00:00Z");
+    let c = campaign(&host, true);
+    let forge = FakeForge::open(&c.head(), &[("test", "success")]);
+    review_fixture::new_owner_item(&host, &c.root, "Choose a setting");
+    let next = plan::next_at(&c.root, None, None, host.now()).unwrap();
+    assert_eq!(
+        next.lines[0],
+        "NEW OWNER-QUEUE since last read: 1. Choose a setting"
+    );
+    let synced = sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(
+        synced.fields["owner_queue_unread"],
+        serde_json::json!(["1. Choose a setting"])
+    );
+    assert!(
+        commands::journal(&host, &c.root, "inspect queue", None)
+            .unwrap()
+            .ok()
+    );
+    let state: serde_json::Value = store::read_json(&store::state_path(&c.root)).unwrap();
+    assert!(state["owner_queue_read"].is_null());
+    let output = review_fixture::owner_read(&c.root);
+    assert!(output.status.success(), "{output:?}");
+    let read: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        read["acknowledged"],
+        serde_json::json!(["1. Choose a setting"])
+    );
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    let headings = cm::markdown::headings(&journal);
+    assert_eq!(
+        format!("## {}", headings.last().unwrap().text),
+        read["journal"]
+    );
+    assert_eq!(
+        plan::next_at(&c.root, None, None, host.now())
+            .unwrap()
+            .fields["owner_queue_unread"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        sync(&host, &forge, &c.root).unwrap().fields["owner_queue_unread"],
+        serde_json::json!([])
+    );
+    review_fixture::new_owner_item(&host, &c.root, "Second decision");
+    assert_eq!(
+        plan::next_at(&c.root, None, None, host.now())
+            .unwrap()
+            .fields["owner_queue_unread"],
+        serde_json::json!(["2. Second decision"])
+    );
+}
+
+#[test]
+fn unread_owner_queue_refuses_merge_even_with_override_then_allows_it_after_read() {
+    let host = at("2026-10-25T00:00Z");
+    let c = campaign(&host, true);
+    let head = c.head();
+    let report = c.report("astra-review-owner", &head, &[], "ACCEPT");
+    c.receipt("astra-review-owner", &head, "gpt-6-astra", "xhigh");
+    assert!(
+        verdict::record(&host, &c.root, &target(), &report, Some("astra"), None)
+            .unwrap()
+            .ok()
+    );
+    let forge = FakeForge::open(&head, &[("test", "success")]);
+    let waiver = c.write("override.md", "Independent gate evidence.\n");
+    let advance = || {
+        commands::advance_gated(
+            &host,
+            &c.root,
+            &target(),
+            commands::Advance {
+                to: &Phase::Merged,
+                given: &Evidence {
+                    sha: Some(head.clone()),
+                    ..Default::default()
+                },
+                file: None,
+                repo: Some(&c.repo),
+                part: None,
+                by: &[],
+            },
+            &MergeGate {
+                forge: Some(&forge),
+                waiver: Some(waiver.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    review_fixture::new_owner_item(&host, &c.root, "Choose a setting");
+    assert_eq!(rules(&advance()), vec!["owner-queue-unread"]);
+    assert_eq!(c.state(), Phase::PrOpen);
+    assert!(review_fixture::owner_read(&c.root).status.success());
+    assert!(advance().ok());
+    assert_eq!(c.state(), Phase::Merged);
+}
+
+#[test]
+fn sync_refuses_an_unread_owner_merge_then_moves_it_after_read() {
+    let host = at("2026-10-25T00:00Z");
+    let c = campaign(&host, true);
+    let head = c.head();
+    let report = c.report("astra-review-owner", &head, &[], "ACCEPT");
+    c.receipt("astra-review-owner", &head, "gpt-6-astra", "xhigh");
+    assert!(
+        verdict::record(&host, &c.root, &target(), &report, Some("astra"), None)
+            .unwrap()
+            .ok()
+    );
+    let mut forge = FakeForge::open(&head, &[("test", "success")]);
+    forge.state = PullState::Merged;
+    review_fixture::new_owner_item(&host, &c.root, "Choose a setting");
+    let refused = sync(&host, &forge, &c.root).unwrap();
+    assert_eq!(rules(&refused), vec!["owner-queue-unread"]);
+    assert_eq!(refused.fields["moves"], serde_json::json!([]));
+    assert_eq!(c.state(), Phase::PrOpen);
+    assert!(review_fixture::owner_read(&c.root).status.success());
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    assert_eq!(c.state(), Phase::Merged);
+}
+
+#[test]
+fn owner_queue_read_failure_does_not_acknowledge_and_legacy_headings_are_readable() {
+    let host = at("2026-10-25T00:00Z");
+    let c = campaign(&host, true);
+    c.write("OWNER-QUEUE.md", review_fixture::LEGACY_QUEUE);
+    let next = plan::next_at(&c.root, None, None, host.now()).unwrap();
+    assert_eq!(
+        next.fields["owner_queue_unread"],
+        serde_json::json!(["Choose a setting"])
+    );
+    fs::create_dir(c.root.join(".JOURNAL.md.cm-tmp")).unwrap();
+    assert_eq!(review_fixture::owner_read(&c.root).status.code(), Some(1));
+    let state: serde_json::Value = store::read_json(&store::state_path(&c.root)).unwrap();
+    assert!(state["owner_queue_read"].is_null());
+    fs::remove_dir(c.root.join(".JOURNAL.md.cm-tmp")).unwrap();
+    assert!(review_fixture::owner_read(&c.root).status.success());
+    c.write(
+        "OWNER-QUEUE.md",
+        &review_fixture::LEGACY_QUEUE.replace("Context: A decision.", "Context: Revised decision."),
+    );
+    assert_eq!(
+        plan::next_at(&c.root, None, None, host.now())
+            .unwrap()
+            .fields["owner_queue_unread"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn invalid_missing_and_unreadable_queues_do_not_invent_new_merge_refusals() {
+    for kind in ["missing", "invalid", "unreadable"] {
+        let host = at("2026-10-25T00:00Z");
+        let c = campaign(&host, true);
+        let dir = c.root.join("01-a/u");
+        let mut unit = store::load_unit(&dir).unwrap();
+        unit.steps.get_mut("S1").unwrap().lane = Some(Lane::ClaudeCloud);
+        commands::write_unit(&dir, &unit).unwrap();
+        let path = c.root.join("OWNER-QUEUE.md");
+        match kind {
+            "missing" => fs::remove_file(path).unwrap(),
+            "invalid" => {
+                c.write("OWNER-QUEUE.md", review_fixture::INVALID_QUEUE);
+            }
+            _ => {
+                fs::remove_file(&path).unwrap();
+                fs::create_dir(path).unwrap();
+            }
+        }
+        assert_eq!(
+            plan::next_at(&c.root, None, None, host.now())
+                .unwrap()
+                .fields["owner_queue_unread"],
+            serde_json::json!([])
+        );
+        let moved = commands::advance(
+            &host,
+            &c.root,
+            &target(),
+            &Phase::Merged,
+            &Evidence {
+                sha: Some(c.head()),
+                ..Default::default()
+            },
+            None,
+            Some(&c.repo),
+        )
+        .unwrap();
+        assert!(moved.ok(), "{kind}: {:?}", moved.violations);
+    }
+}
+
+#[test]
+fn unread_owner_items_refuse_release_launch_hand_release_and_sync_until_read() {
+    use publication_fixture as p;
+    let host = at("2026-10-25T00:00Z");
+    for phase in [Phase::Drafted, Phase::Merged] {
+        let c = p::campaign(&host, phase.clone(), &[]);
+        let forge = p::present();
+        review_fixture::new_owner_item(&host, &c.root, "Choose a setting");
+        assert_eq!(
+            rules(&p::advance(
+                &host,
+                &c,
+                &forge,
+                phase == Phase::Drafted,
+                false
+            )),
+            vec!["owner-queue-unread"]
+        );
+        if phase == Phase::Drafted {
+            let launch = commands::launch_remote(
+                &host,
+                &c.root,
+                &parse_target(p::STEP, true).unwrap(),
+                None,
+                &Remote::default(),
+            )
+            .unwrap();
+            assert_eq!(rules(&launch), vec!["owner-queue-unread"]);
+        } else {
+            assert_eq!(
+                rules(&sync(&host, &forge, &c.root).unwrap()),
+                vec!["owner-queue-unread"]
+            );
+        }
+        assert!(review_fixture::owner_read(&c.root).status.success());
+        if phase == Phase::Merged {
+            assert!(sync(&host, &forge, &c.root).unwrap().ok());
+        } else {
+            let launch = commands::launch_remote(
+                &host,
+                &c.root,
+                &parse_target(p::STEP, true).unwrap(),
+                None,
+                &Remote::default(),
+            )
+            .unwrap();
+            assert!(launch.ok(), "{:?}", launch.violations);
+            assert!(p::advance(&host, &c, &forge, true, false).ok());
+        }
+        assert_eq!(p::step(&c).track.state, Phase::Released);
+    }
+}
+
+#[test]
+fn unread_owner_items_hold_parts_and_automatic_parent_merge_rollups() {
+    let host = at("2026-10-25T00:00Z");
+    let c = review_fixture::multipart_campaign(&host);
+    review_fixture::new_owner_item(&host, &c.root, "Choose a setting");
+    let moved = commands::advance_gated(
+        &host,
+        &c.root,
+        &target(),
+        commands::Advance {
+            to: &Phase::Merged,
+            given: &Evidence {
+                sha: Some(c.head()),
+                ..Default::default()
+            },
+            file: None,
+            repo: Some(&c.repo),
+            part: Some("one"),
+            by: &[],
+        },
+        &MergeGate::default(),
+    )
+    .unwrap();
+    assert_eq!(rules(&moved), vec!["owner-queue-unread"]);
+    let dir = c.root.join("01-a/u");
+    let mut unit = store::load_unit(&dir).unwrap();
+    let step = unit.steps.get_mut("S1").unwrap();
+    for part in step.parts.values_mut() {
+        part.state = Phase::Merged;
+    }
+    assert!(
+        step.roll_up_all(false, "2026-10-25T00:00Z", &Evidence::default(), &c.root)
+            .is_empty()
+    );
+    commands::write_unit(&dir, &unit).unwrap();
+    let forge = FakeForge::open(&c.head(), &[]);
+    assert_eq!(
+        rules(&sync(&host, &forge, &c.root).unwrap()),
+        vec!["owner-queue-unread"]
+    );
+    assert_eq!(c.state(), Phase::PrOpen);
+    assert!(review_fixture::owner_read(&c.root).status.success());
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    assert_eq!(c.state(), Phase::Merged);
+}
+
+#[test]
 fn review_wait_follows_a_pr_opened_while_waiting() {
     let host = at("2026-10-25T00:00Z");
     let c = campaign(&host, false);

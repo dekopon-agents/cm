@@ -120,5 +120,31 @@ pub fn block_multipart_parent(c: &super::Campaign, host: &super::Fake) {
 pub const INVALID_WAIT_HEAD: &str = "not-a-sha";
 pub const INVALID_WAIT_REVIEWER: &str = "bad/name";
 pub const UNKNOWN_WAIT_STEPS: [&str; 2] = ["01-a/u/MISSING", "02-missing/unit/MISSING"];
+pub fn new_owner_item(host: &super::Fake, root: &std::path::Path, title: &str) {
+    let added = cm::ledger::owner_queue_add(
+        host,
+        root,
+        &cm::ledger::QueueItem {
+            title,
+            context: "Choose the setting before shipping.",
+            question: "Proceed?",
+            recommendation: "Use the smaller change.",
+        },
+    )
+    .unwrap();
+    assert!(added.ok(), "{:?}", added.violations);
+}
+
+pub fn owner_read(root: &std::path::Path) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(root)
+        .args(["--json", "owner-queue", "read"])
+        .output()
+        .unwrap()
+}
+
+pub const INVALID_QUEUE: &str = "# Owner queue\n\n## 1. Missing fields\n";
+pub const LEGACY_QUEUE: &str = "# Owner queue\n\n## Choose a setting\n\nContext: A decision.\nProceed?\nRecommendation: Yes.\nAnswer:\n";
 
 pub const MALFORMED_CAMPAIGN_STATES: [&str; 2] = ["not JSON", r#"{"kind":"campaign"}"#];

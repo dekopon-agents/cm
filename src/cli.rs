@@ -533,6 +533,8 @@ enum FollowupAct {
 
 #[derive(Subcommand)]
 enum QueueAct {
+    /// Read the valid queue and journal an explicit acknowledgement of its current items.
+    Read,
     /// Append `## N. <title>` with its Context, question, Recommendation and an empty Answer.
     Add {
         title: String,
@@ -938,6 +940,9 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             };
             crate::ledger::feedback(host, &root()?, &entry)
         }
+        Commands::OwnerQueue {
+            act: QueueAct::Read,
+        } => crate::ledger::owner_queue_read(host, &root()?),
         Commands::OwnerQueue {
             act:
                 QueueAct::Add {

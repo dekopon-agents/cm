@@ -668,6 +668,7 @@ pub fn next_at(
     let units = load_units(root)?;
     let all = candidates(root, &units);
     let mut outcome = Outcome::default();
+    crate::ledger::owner_queue_banner(root, &mut outcome)?;
     let mut number = 1;
     outcome.field("paused", paused);
     let stale_bases: Vec<_> = stale_bases(root, &units)
