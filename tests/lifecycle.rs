@@ -17,6 +17,9 @@ mod support;
 
 #[path = "support/campaign.rs"]
 mod campaign_fixture;
+#[allow(dead_code)]
+#[path = "support/idea.rs"]
+mod idea_fixture;
 #[path = "support/kickoff.rs"]
 mod kickoff_fixture;
 #[path = "support/lifecycle.rs"]
@@ -991,6 +994,258 @@ fn hand_edit_messages_name_the_reset() {
             .ok()
     );
     assert_clean(&c.root);
+}
+
+#[test]
+fn close_requires_an_outcome_for_every_admitted_idea() {
+    let c = idea_fixture::ideas();
+    for id in ["IDEA-9003", "IDEA-9001"] {
+        c.add_idea(id);
+        assert_eq!(c.cm(&["idea", "admit", id])["ok"], true);
+    }
+    let open_ideas = [c.read_idea("IDEA-9003"), c.read_idea("IDEA-9001")];
+    let before = c.idea_snapshot();
+    let refused = commands::close(&cm::host::System, &c.root).unwrap();
+    assert_eq!(
+        rules(&refused),
+        ["idea-outcome-missing", "idea-outcome-missing"]
+    );
+    for (violation, id) in refused.violations.iter().zip(["IDEA-9003", "IDEA-9001"]) {
+        assert_eq!(violation.path, "EPOCH.md");
+        assert!(violation.message.contains(id), "{violation}");
+        assert!(violation.message.contains(&format!("cm idea outcome {id}")));
+    }
+    assert_eq!(c.idea_snapshot(), before);
+    let refused_gaps = refused.violations;
+    assert_eq!(c.cm(&["lint"])["ok"], true);
+
+    assert_eq!(
+        c.cm(&[
+            "idea",
+            "outcome",
+            "IDEA-9003",
+            "partial",
+            "--to",
+            "epoch-beta",
+            "--note",
+            "one part landed"
+        ])["ok"],
+        true
+    );
+    let refused = commands::close(&cm::host::System, &c.root).unwrap();
+    assert_eq!(rules(&refused), ["idea-outcome-missing"]);
+    assert!(refused.violations[0].message.contains("IDEA-9001"));
+    assert_eq!(
+        c.cm(&[
+            "idea",
+            "outcome",
+            "IDEA-9001",
+            "deferred",
+            "--to",
+            "unassigned"
+        ])["ok"],
+        true
+    );
+
+    let before = c.journal_text();
+    let closed = commands::close(&cm::host::System, &c.root).unwrap();
+    assert!(closed.ok(), "{:?}", closed.violations);
+    assert_eq!(
+        c.journal_text(),
+        format!(
+            "{before}\n{}",
+            cm::journal::entry(
+                closed.fields["closed"].as_str().unwrap(),
+                "cm close",
+                Some(
+                    "- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n- idea: IDEA-9003 partial to epoch-beta\n- idea: IDEA-9001 deferred to unassigned\n"
+                ),
+            )
+        )
+    );
+    assert_eq!(
+        store::load_campaign(&c.root).unwrap().closed.as_deref(),
+        closed.fields["closed"].as_str()
+    );
+
+    for (id, text) in ["IDEA-9003", "IDEA-9001"].into_iter().zip(open_ideas) {
+        c.write_idea(id, &text);
+    }
+    let linted = lint(&c.root).unwrap();
+    let gaps: Vec<_> = linted
+        .violations
+        .iter()
+        .filter(|v| v.rule == "closed-ideas")
+        .collect();
+    assert_eq!(gaps.len(), 2, "{:?}", linted.violations);
+    for (gap, original) in gaps.iter().zip(refused_gaps) {
+        assert_eq!(gap.path, original.path);
+        assert_eq!(gap.message, original.message);
+    }
+    c.duplicate_idea("IDEA-9003");
+    let linted = lint(&c.root).unwrap();
+    assert_eq!(
+        linted
+            .violations
+            .iter()
+            .filter(|v| v.rule == "idea-duplicate-id")
+            .count(),
+        2
+    );
+    assert_eq!(
+        linted
+            .violations
+            .iter()
+            .filter(|v| v.rule == "closed-ideas")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn close_journals_every_outcome_word_and_target() {
+    let c = idea_fixture::ideas();
+    for id in [
+        "IDEA-9005",
+        "IDEA-9004",
+        "IDEA-9003",
+        "IDEA-9002",
+        "IDEA-9001",
+    ] {
+        c.add_idea(id);
+        assert_eq!(c.cm(&["idea", "admit", id])["ok"], true);
+    }
+    for args in [
+        vec!["IDEA-9005", "landed", "--note", "tool-x #12"],
+        vec!["IDEA-9004", "cancelled", "--note", "no longer needed"],
+        vec!["IDEA-9003", "superseded", "--by", "IDEA-9005"],
+        vec![
+            "IDEA-9002",
+            "partial",
+            "--to",
+            "unassigned",
+            "--note",
+            "one part landed",
+        ],
+        vec!["IDEA-9001", "deferred", "--to", "epoch-beta"],
+    ] {
+        let mut command = vec!["idea", "outcome"];
+        command.extend(args);
+        assert_eq!(c.cm(&command)["ok"], true);
+    }
+    let before = c.journal_text();
+    let closed = commands::close(&cm::host::System, &c.root).unwrap();
+    assert!(closed.ok(), "{:?}", closed.violations);
+    let entry = cm::journal::entry(
+        closed.fields["closed"].as_str().unwrap(),
+        "cm close",
+        Some(
+            "- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n- idea: IDEA-9005 landed\n- idea: IDEA-9004 cancelled\n- idea: IDEA-9003 superseded by IDEA-9005\n- idea: IDEA-9002 partial to unassigned\n- idea: IDEA-9001 deferred to epoch-beta\n",
+        ),
+    );
+    assert_eq!(c.journal_text(), format!("{before}\n{entry}"));
+}
+
+#[test]
+fn close_looks_up_the_outcome_for_this_epoch_in_history() {
+    let c = idea_fixture::ideas();
+    c.add_idea("IDEA-9001");
+    assert_eq!(c.cm(&["idea", "admit", "IDEA-9001"])["ok"], true);
+    c.history(
+        "IDEA-9001",
+        "- 2026-01-02T09:30:00-05:00: outcome in `epoch-beta`: landed; tool-x #12.",
+    );
+    let refused = commands::close(&cm::host::System, &c.root).unwrap();
+    assert_eq!(rules(&refused), ["idea-outcome-missing"]);
+    assert_eq!(
+        c.cm(&[
+            "idea",
+            "outcome",
+            "IDEA-9001",
+            "deferred",
+            "--to",
+            "epoch-gamma"
+        ])["ok"],
+        true
+    );
+    c.history(
+        "IDEA-9001",
+        "- 2026-01-03T09:30:00-05:00: outcome in `epoch-beta`: deferred to unassigned.",
+    );
+    let before = c.journal_text();
+    let closed = commands::close(&cm::host::System, &c.root).unwrap();
+    assert!(closed.ok(), "{:?}", closed.violations);
+    assert_eq!(
+        c.journal_text(),
+        format!(
+            "{before}\n{}",
+            cm::journal::entry(
+                closed.fields["closed"].as_str().unwrap(),
+                "cm close",
+                Some(
+                    "- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n- idea: IDEA-9001 deferred to epoch-gamma\n"
+                ),
+            )
+        )
+    );
+}
+
+#[test]
+fn close_with_unconfigured_ideas_keeps_lint_clean_and_the_existing_journal_shape() {
+    let c = idea_fixture::ideas();
+    c.edit_epoch("ideas_dir: ../ideas\n", "ideas: [IDEA-9003, IDEA-9001]\n");
+    assert_clean(&c.root);
+    let before = c.journal_text();
+    let closed = commands::close(&cm::host::System, &c.root).unwrap();
+    assert!(closed.ok(), "{:?}", closed.violations);
+    assert_eq!(
+        c.journal_text(),
+        format!(
+            "{before}\n{}",
+            cm::journal::entry(
+                closed.fields["closed"].as_str().unwrap(),
+                "cm close",
+                Some(
+                    "- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n"
+                ),
+            )
+        )
+    );
+    let resume_path = c.root.join("RESUME.md");
+    let resume = fs::read_to_string(&resume_path).unwrap();
+    let end = resume.find("\n\n# Resume").unwrap();
+    fs::write(
+        resume_path,
+        format!("> Closed; the successor governs.{}", &resume[end..]),
+    )
+    .unwrap();
+    assert_clean(&c.root);
+}
+
+#[test]
+fn close_without_an_ideas_key_keeps_the_existing_journal_shape() {
+    for ideas_dir in [false, true] {
+        let c = idea_fixture::ideas();
+        if !ideas_dir {
+            c.edit_epoch("ideas_dir: ../ideas\n", "");
+        }
+        let before = c.journal_text();
+        let closed = commands::close(&cm::host::System, &c.root).unwrap();
+        assert!(closed.ok(), "{:?}", closed.violations);
+        assert_eq!(
+            c.journal_text(),
+            format!(
+                "{before}\n{}",
+                cm::journal::entry(
+                    closed.fields["closed"].as_str().unwrap(),
+                    "cm close",
+                    Some(
+                        "- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n"
+                    ),
+                )
+            )
+        );
+    }
 }
 
 #[test]
