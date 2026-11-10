@@ -48,6 +48,14 @@ fn init_then_lint_is_clean_and_two_hand_edits_are_both_listed() {
         .collect();
     assert!(paths.contains(&"JOURNAL.md"), "{report}");
     assert!(paths.contains(&"01-first/alpha/STATE.md"), "{report}");
+
+    let state_before = fs::read(root.join(".cm/state.json")).unwrap();
+    let journal_before = fs::read(root.join("JOURNAL.md")).unwrap();
+    let refused = cm(root, &["close", "--json"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert_eq!(json(&refused)["violations"], report["violations"]);
+    assert_eq!(fs::read(root.join(".cm/state.json")).unwrap(), state_before);
+    assert_eq!(fs::read(root.join("JOURNAL.md")).unwrap(), journal_before);
 }
 
 #[test]

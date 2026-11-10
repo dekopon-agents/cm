@@ -1488,16 +1488,16 @@ fn unreadable_owner_queue_blocks_banner_lint_and_close() {
         io::ErrorKind::InvalidData
     );
     assert!(cm::templates::Banner::of(root, false).is_err());
+    let linted = lint(root).unwrap();
     assert!(
-        lint(root)
-            .unwrap()
+        linted
             .violations
             .iter()
             .any(|v| v.rule == "queue-unreadable" && v.path == "OWNER-QUEUE.md")
     );
     assert_eq!(
-        rules(&commands::close(&Fake, root).unwrap()),
-        vec!["queue-unreadable"]
+        commands::close(&Fake, root).unwrap().violations,
+        linted.violations
     );
     assert_eq!(fs::read(root.join(".cm/state.json")).unwrap(), state);
     assert_eq!(fs::read(root.join("JOURNAL.md")).unwrap(), journal);

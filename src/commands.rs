@@ -731,8 +731,14 @@ fn init_step(
 pub fn close(host: &dyn Host, root: &Path) -> Result<Outcome> {
     let _lock = lock(root)?;
     let mut campaign = store::load_campaign(root)?;
+    if let Some(violation) = closed(root, &campaign) {
+        return Ok(Outcome::refused(vec![violation]));
+    }
+    let linted = lint::lint_at(root, host.now())?;
+    if !linted.ok() {
+        return Ok(linted);
+    }
     let mut violations = journal::check(root, &campaign);
-    violations.extend(closed(root, &campaign));
     let mut body = String::from(
         "- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n",
     );

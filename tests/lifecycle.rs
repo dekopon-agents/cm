@@ -1026,7 +1026,7 @@ fn close_requires_an_outcome_for_every_admitted_idea() {
             "IDEA-9003",
             "partial",
             "--to",
-            "epoch-beta",
+            "unassigned",
             "--note",
             "one part landed"
         ])["ok"],
@@ -1058,7 +1058,7 @@ fn close_requires_an_outcome_for_every_admitted_idea() {
                 closed.fields["closed"].as_str().unwrap(),
                 "cm close",
                 Some(
-                    "- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n- idea: IDEA-9003 partial to epoch-beta\n- idea: IDEA-9001 deferred to unassigned\n"
+                    "- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n- idea: IDEA-9003 partial to unassigned\n- idea: IDEA-9001 deferred to unassigned\n"
                 ),
             )
         )
@@ -1127,7 +1127,7 @@ fn close_journals_every_outcome_word_and_target() {
             "--note",
             "one part landed",
         ],
-        vec!["IDEA-9001", "deferred", "--to", "epoch-beta"],
+        vec!["IDEA-9001", "deferred", "--to", "unassigned"],
     ] {
         let mut command = vec!["idea", "outcome"];
         command.extend(args);
@@ -1140,7 +1140,7 @@ fn close_journals_every_outcome_word_and_target() {
         closed.fields["closed"].as_str().unwrap(),
         "cm close",
         Some(
-            "- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n- idea: IDEA-9005 landed\n- idea: IDEA-9004 cancelled\n- idea: IDEA-9003 superseded by IDEA-9005\n- idea: IDEA-9002 partial to unassigned\n- idea: IDEA-9001 deferred to epoch-beta\n",
+            "- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n- idea: IDEA-9005 landed\n- idea: IDEA-9004 cancelled\n- idea: IDEA-9003 superseded by IDEA-9005\n- idea: IDEA-9002 partial to unassigned\n- idea: IDEA-9001 deferred to unassigned\n",
         ),
     );
     assert_eq!(c.journal_text(), format!("{before}\n{entry}"));
@@ -1164,7 +1164,7 @@ fn close_looks_up_the_outcome_for_this_epoch_in_history() {
             "IDEA-9001",
             "deferred",
             "--to",
-            "epoch-gamma"
+            "unassigned"
         ])["ok"],
         true
     );
@@ -1183,7 +1183,7 @@ fn close_looks_up_the_outcome_for_this_epoch_in_history() {
                 closed.fields["closed"].as_str().unwrap(),
                 "cm close",
                 Some(
-                    "- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n- idea: IDEA-9001 deferred to epoch-gamma\n"
+                    "- sealed: unit init, launch and advance refuse from here; the journal stays open for follow-up observations\n- idea: IDEA-9001 deferred to unassigned\n"
                 ),
             )
         )
@@ -1249,6 +1249,33 @@ fn close_without_an_ideas_key_keeps_the_existing_journal_shape() {
 }
 
 #[test]
+fn close_allows_lint_warnings() {
+    let host = Fake::at("2026-10-15T18:00:00Z");
+    let c = campaign(&host);
+    c.sized_file("evidence/large.txt", (1 << 20) + 1, true);
+    let report = lint(&c.root).unwrap();
+    assert!(report.ok(), "{report:?}");
+    assert!(!report.fields["warnings"].as_array().unwrap().is_empty());
+    let closed = commands::close(&host, &c.root).unwrap();
+    assert!(closed.ok(), "{closed:?}");
+}
+
+#[test]
+fn second_close_reports_campaign_closed_before_stale_resume_lint() {
+    let host = Fake::at("2026-10-15T18:00:00Z");
+    let c = campaign(&host);
+    let closed = commands::close(&host, &c.root).unwrap();
+    assert!(closed.ok(), "{closed:?}");
+    assert_eq!(rules(&lint(&c.root).unwrap()), ["resume-loop"]);
+    let before = c.files();
+    assert_eq!(
+        rules(&commands::close(&host, &c.root).unwrap()),
+        ["campaign-closed"]
+    );
+    assert_eq!(c.files(), before);
+}
+
+#[test]
 fn close_seals_the_campaign() {
     let host = Fake::at("2026-10-15T18:00:00Z");
     let c = campaign(&host);
@@ -1271,6 +1298,21 @@ fn close_seals_the_campaign() {
     )
     .unwrap();
 
+    let ready_resume = fs::read_to_string(c.root.join("RESUME.md")).unwrap();
+    let start = ready_resume.find("> ```").unwrap();
+    let end = ready_resume.find("\n\n# Resume").unwrap();
+    fs::write(
+        c.root.join("RESUME.md"),
+        format!(
+            "{}> {}{}",
+            &ready_resume[..start],
+            cm::templates::LOOP_WITHHELD,
+            &ready_resume[end..]
+        ),
+    )
+    .unwrap();
+    assert_clean(&c.root);
+
     let refused = commands::close(&host, &c.root).unwrap();
     assert_eq!(
         rules(&refused),
@@ -1281,6 +1323,7 @@ fn close_seals_the_campaign() {
     assert!(store::load_campaign(&c.root).unwrap().closed.is_none());
 
     fs::write(c.root.join("OWNER-QUEUE.md"), "# Owner queue\n").unwrap();
+    fs::write(c.root.join("RESUME.md"), ready_resume).unwrap();
     assert!(advance(&host, &c, step, "blocked:superseded", Evidence::default()).ok());
     assert!(
         advance(

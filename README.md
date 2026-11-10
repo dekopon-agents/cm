@@ -57,7 +57,7 @@ error. `review wait` additionally uses 3 for its deadline and 4 for unreadable c
 | `cm epoch planning\|working\|closed [--skill-revision R] [--plan-revision S]` | Moves `EPOCH.md`'s front matter one status along `OPEN → PLANNING → WORKING → CLOSED`, stamps `planning_started_at`, `working_started_at` or `closed_at` with the date, sets the pins it is given, journals the move, and refreshes RESUME.md’s generated status span. It refuses a null pin: PLANNING needs `skill_revision`, WORKING and CLOSED also `approved_plan_revision`. `closed` follows `cm close`. |
 | `cm idea admit <id>` | Admits an idea to this epoch, appends its id to `EPOCH.md`'s `ideas:` list in admission order, and journals the action. Repeating it completes interrupted writes without duplicating entries. |
 | `cm idea move <id> <maturity>` | Moves an admitted idea forward through `captured → exploring → designed`; skipping a maturity is allowed. |
-| `cm idea outcome <id> <word> [--to EPOCH] [--by ID] [--note TEXT]` | Records one outcome per idea per epoch: `landed`, `partial`, `deferred`, `superseded` or `cancelled`, and journals the action. |
+| `cm idea outcome <id> <word> [--to unassigned] [--by ID] [--note TEXT]` | Records one outcome per idea per epoch: `landed`, `partial`, `deferred`, `superseded` or `cancelled`, and journals the action. Partial/deferred remainders become unassigned. |
 | `cm journal "<title>" [--body-file F]` | Appends `## YYYY-MM-DDTHH:MMZ — <title>` and the body (`-` reads stdin). The only way `JOURNAL.md` grows. A body may not hold a `#` or `##` heading. |
 | `cm launch <NN-name>/<unit>/<step> [--worktree PATH] [--coordinator LABEL] [--cap-min N]` | Runs the launch checks and reports every failure: `LIMITS.toml` not paused; a declared step's every `--after` met (`after-unmet`); for the local `pi` lane and undeclared steps, free disk on `disk_volume` minus `kache_headroom_gib` over `min_free_disk_gib`, live heavy builds (top-level `cargo` processes) under `max_heavy_builds` and the worktree, which they require; the step folder has `kickoff.md`; every path its packet names exists. A drafted step, a step blocked before its PR opened, or a launched step whose last attempt has ended can launch; relaunch picks the newest `resume*.md` when present and increments `launches`. The `--after` check runs on every launch, including relaunches. A release step also refuses with `owner-queue-unread` while valid new queue items await `cm owner-queue read`. Then it marks the step (and a drafted unit) launched, journals the launch and, for a local step, prints the command; every other lane (`owner` and `coordinator` among them) prints only the step and its prompt and records its attempt (see [Attempts](#attempts)). It spawns nothing. When `--coordinator` is omitted, the label defaults to trimmed `CLAUDE_CODE_REMOTE_SESSION_ID` with a leading `cse_` mapped to `session_`, else `—` when unset or whitespace-only; an explicit label wins. Launch refuses an empty or multi-line label, explicit or inherited. A step whose last attempt has not ended does not launch again (`attempt-open`). |
 | `cm attempt <NN-name>/<unit>/<step> [--claim TOKEN] [claim [--coordinator L] --expect G \| begin KIND \| record KIND ID \| restart --lane L [--evidence PATH] \| end complete\|partial\|unknown [--evidence PATH]]` | Shows a remote attempt and what to do next from committed state alone, or extends it; each change is journaled. See [Attempts](#attempts). |
@@ -66,7 +66,7 @@ error. `review wait` additionally uses 3 for its deadline and 4 for unreadable c
 | `cm advance <NN-name>/<unit>[/<step>] <state> [--sha S] [--pr URL] [--tag T] [--digest D] [--evidence PATH] [--by STEP[,STEP…]] [--repo PATH] [--head SHA] [--ci-verified PATH] [--override PATH] [--part NAME]` | Refuses merged moves in every lane/part and all release-step lifecycle moves with `owner-queue-unread` until explicit `owner-queue read`; no override. Moves one state along `drafted → launched → pr-open → merged → released → deployed → done`, or to `blocked:<reason>`; an `owner`-lane or study step, or a non-release `coordinator`-lane step without a recorded PR, SHA or declared parts, moves to `done` from `drafted` or `launched` with `--evidence` (see [Finishing](#finishing)). `superseded --evidence PATH [--by STEP[,STEP…]]` retires a step replaced by other work from any state short of final, recording its declared successors in state and the journal and showing them in `STATE.md` and `CARD.md`; it meets no gate, so its consumers are amended. A release step moves to `released --tag T --sha S` from `drafted` or `launched` when the tag was cut without a prep PR (tag-only); T must contain S. Other releases require T to contain the recorded merge SHA (`tag-lineage`). A step declared with `--kind rollout` moves `merged → deployed --sha S --evidence PATH` without a release or digest; PATH names the Argo sync revision (see [Finishing](#finishing)). Refuses any other skipped state and a state without its evidence, journals the move and re-renders `STATE.md`. A `codex`-lane step moves to `merged` only through its merge gate (see [Merge gate](#merge-gate)). An already `merged` release step accepts `merged --sha S` again when S descends from its recorded merge, updating only its evidence SHA and journaling both SHAs; otherwise it refuses (`merge-lineage`). `--part NAME` moves one part of a multipart step (see [Parts](#parts)). A step with an unresolved watch does not move to `deployed` or `done` (`watch-open`, see [Watches](#watches)), and `done --evidence` refuses a stale pinned file (`evidence-stale`). |
 | `cm known-red <step> --commit SHA --check NAME --reason T --owner WHO --until A` | Records a known-red exception for the step's merge gate (see [Known-red exceptions](#known-red-exceptions)) and journals it. |
 | `cm watch <step> add --signal span:Q\|log:Q\|metric:Q --deadline T`, `cm watch <step> resolve ID --evidence PATH`, `cm watch <step> withdraw ID --reason TEXT`, `cm watch <step> amend ID --signal SIGNAL` | Records a pending live read that holds the step below `deployed`, closes it with evidence or a withdrawal reason, or corrects its signal (see [Watches](#watches)). |
-| `cm close` | Seals the campaign. Refuses, listing every gap, while `OWNER-QUEUE.md` or `MAC-LANE.md` has an open item, `MAC-LANE.md` has a numbering gap or repeat (`mac-lane-number`), any unit or step is short of `done` or `blocked:<reason>`, or an id in `EPOCH.md`’s `ideas:` list has no outcome for this epoch (`idea-outcome-missing`, one gap per id). Then it stamps `closed` in `.cm/state.json`, journals the close with one `- idea: <id> <word>[ to <target>\| by <id>]` line per admitted idea in list order, and refreshes RESUME.md’s generated status span to show closed. From there unit `cm init`, `cm launch`, `cm advance` and a second `cm close` refuse with `campaign-closed`; `cm journal` stays open for follow-up observations. |
+| `cm close` | For an open campaign, requires a clean `cm lint` first (warnings do not block), then seals the campaign. Refuses, listing every gap, while `OWNER-QUEUE.md` or `MAC-LANE.md` has an open item, `MAC-LANE.md` has a numbering gap or repeat (`mac-lane-number`), any unit or step is short of `done` or `blocked:<reason>`, or an id in `EPOCH.md`’s `ideas:` list has no outcome for this epoch (`idea-outcome-missing`, one gap per id). Then it stamps `closed` in `.cm/state.json`, journals the close with one `- idea: <id> <word>[ to <target>\| by <id>]` line per admitted idea in list order, and refreshes RESUME.md’s generated status span to show closed. From there unit `cm init`, `cm launch`, `cm advance` and a second `cm close` refuse with `campaign-closed`; `cm journal` stays open for follow-up observations. |
 | `cm feedback "<title>" --urgency urgent\|queued --body-file F` | Appends `### FB-<sequence>-NNN · <urgency> · <title>` and the body to `FEEDBACK.md`, numbering on from the highest id of the letter in `EPOCH.md`'s `sequence:`, and journals a line naming it; an empty body is `feedback-empty`. `--follow-up <id> --disposition proposed\|accepted\|applied\|deferred\|rejected` appends `### <id> follow-up · <disposition>: <title>` to an existing id. Hand-written entries (dated `##` sections, `FB-` sub-entries) still parse. Log feedback whenever a file would otherwise be appended by hand. |
 | `cm owner-queue read` | Prints the valid queue and journals an explicit acknowledgement of its current level-2 headings in optional campaign `owner_queue_read` state. Only this command acknowledges. A new heading since the last read is unread; body-only edits are not new. Initially all valid open headings are unread, including unnumbered headings. Missing, unreadable or queue-lint-failing files create no new items or new unread refusal; an invalid explicit read does not acknowledge. |
 | `cm owner-queue add "<title>" --context T --question T --recommendation T` | Appends `## N. <title>` (numbering on from the highest item in the queue or any journaled owner-queue add, answer or strike; numbers are never reused), its `Context:` line, the question, a `Recommendation:` line and an empty `Answer:` to `OWNER-QUEUE.md`; refuses an empty field or a RESUME.md with no `>` banner (`resume-banner`), sets RESUME.md's banner to `OWNER-QUEUE not drained: /loop withheld` and journals the item. A leading `Recommendation:` in `--recommendation` (any case) is stripped once. `cm owner-queue answer N --body-file F` journals a non-empty answer and removes item N; `cm owner-queue strike N --reason T` removes it and journals the reason; `cm owner-queue edit N --body-file F` replaces its body, keeping the heading and requiring the item fields. `-` reads either body from stdin. Unknown numbers are refused; other items keep their numbers. When a removal drains the queue, the withheld banner line is removed and the session is told to print the resuming `/loop`. |
@@ -93,7 +93,9 @@ ideas_dir: ../ideas
 ideas: [IDEA-9003, IDEA-9001]
 ```
 
-Each idea file is named `<id>.md` or `<id>-<slug>.md`. Its front matter includes
+Each idea file is named `<id>.md` or `<id>-<slug>.md`, with an id of the form
+`<letters>-<digits>` (for example `IDEA-9001`). Files in the ideas folder not
+named `<letters>-<digits>[-slug].md` are ignored. Its front matter includes
 `id: IDEA-9001` and `maturity: captured` (or `exploring` or `designed`). Admission
 sets `current_epoch: epoch-alpha`. A `## Epoch history` section must already exist, with every Markdown fence closed.
 cm changes only the `current_epoch` and `maturity` front-matter lines and appends
@@ -102,13 +104,14 @@ history entries; other keys, sections and existing history entries keep their by
 ```sh
 cm idea admit IDEA-9001
 cm idea move IDEA-9001 exploring
-cm idea outcome IDEA-9001 partial --to epoch-beta --note 'tool-x #12 shipped'
+cm idea outcome IDEA-9001 partial --to unassigned --note 'tool-x #12 shipped'
 ```
 
 Admission refuses a closed campaign or CLOSED epoch, an idea still open in another
 epoch, or an idea whose last outcome is terminal. Movement and outcomes require
-`current_epoch` to name this epoch. Maturity moves forward only. An outcome keeps
-`current_epoch` and the `ideas:` membership unchanged, including after deferral.
+`current_epoch` to name this epoch. Maturity moves forward only. A partial or
+deferred outcome sets `current_epoch: null`; terminal outcomes leave that field
+unchanged. All outcomes preserve the epoch's `ideas:` admission list.
 
 | Outcome | Required flags | Terminal |
 |---|---|---|
@@ -118,7 +121,9 @@ epoch, or an idea whose last outcome is terminal. Movement and outcomes require
 | `superseded` | `--by` naming an existing idea | yes |
 | `cancelled` | `--note` with the reason | yes |
 
-`--to` accepts an epoch name or `unassigned`; `--note` is one non-empty line.
+`--to` accepts only `unassigned`. A later epoch takes the remainder by running
+its own `cm idea admit`; an outcome cannot admit it to another epoch.
+`--note` is one non-empty line.
 Only the flags listed for each outcome are accepted. cm writes date-only history
 lines, for example ``- 2026-01-02: admitted to `epoch-alpha` (PLANNING).`` and
 ``- 2026-01-09: outcome in `epoch-alpha`: deferred to unassigned.`` Only cm's exact
@@ -134,8 +139,12 @@ When `ideas_dir` is set, `cm lint` checks duplicate ids (`idea-duplicate-id`, on
 violation per file), filenames (`idea-filename`), required front matter
 (`idea-front-matter`), maturity (`idea-maturity`) and epoch membership
 (`idea-epoch-list`). An open idea naming this epoch must appear in `ideas:`, and
-every listed id must resolve to a file naming this epoch. Commands also refuse
-ambiguous ids with `idea-duplicate-id`.
+every listed id must resolve to a file that either names this epoch as
+`current_epoch` or records an outcome for this epoch in `## Epoch history`.
+This is one rule for OPEN, PLANNING, WORKING and CLOSED epochs: recorded
+remainders may be unassigned or admitted later, but unexplained reassignments
+still fail. Existing outcome history naming an epoch as its target remains
+readable. Commands also refuse ambiguous ids with `idea-duplicate-id`.
 
 ## The folder
 
@@ -335,6 +344,11 @@ while its condition is unmet; that command lists the unblock action once it hold
 blocks offer `cm unblock`.
 
 ### Finishing
+
+An already sealed campaign refuses `cm close` with `campaign-closed` before lint.
+Otherwise, `cm close` runs the same checks as `cm lint` on the campaign folder and
+refuses with the full violation list if lint fails. Warnings do not block close.
+It does not seal state or append its close journal entry on a lint refusal.
 
 Before `cm close`, record an outcome with `cm idea outcome <id> <word>` for every id
 in `EPOCH.md`'s `ideas:` list. Close lists every missing outcome as `idea-outcome-missing`;
