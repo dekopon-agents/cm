@@ -1261,6 +1261,21 @@ fn close_allows_lint_warnings() {
 }
 
 #[test]
+fn second_close_reports_campaign_closed_before_stale_resume_lint() {
+    let host = Fake::at("2026-10-15T18:00:00Z");
+    let c = campaign(&host);
+    let closed = commands::close(&host, &c.root).unwrap();
+    assert!(closed.ok(), "{closed:?}");
+    assert_eq!(rules(&lint(&c.root).unwrap()), ["resume-loop"]);
+    let before = c.files();
+    assert_eq!(
+        rules(&commands::close(&host, &c.root).unwrap()),
+        ["campaign-closed"]
+    );
+    assert_eq!(c.files(), before);
+}
+
+#[test]
 fn close_seals_the_campaign() {
     let host = Fake::at("2026-10-15T18:00:00Z");
     let c = campaign(&host);
