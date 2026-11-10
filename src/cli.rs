@@ -107,7 +107,7 @@ enum Commands {
         #[command(subcommand)]
         act: IdeaAct,
     },
-    /// Seal the campaign. Refuses while OWNER-QUEUE.md has an open item or any unit or step is short of done or blocked; afterwards unit init, launch and advance refuse and RESUME.md's banner holds no `/loop`.
+    /// Seal the campaign after a clean `cm lint` (warnings do not block). Refuses while OWNER-QUEUE.md has an open item or any unit or step is short of done or blocked; afterwards unit init, launch and advance refuse and RESUME.md's banner holds no `/loop`.
     Close,
     /// Append a stamped entry to JOURNAL.md.
     Journal {
@@ -387,12 +387,12 @@ enum IdeaAct {
     Admit { id: String },
     /// Move maturity forward: captured, exploring or designed; skipping is allowed.
     Move { id: String, maturity: Maturity },
-    /// Record one outcome for this idea in this epoch.
+    /// Record one outcome for this idea in this epoch; partial/deferred remainders become unassigned.
     Outcome {
         id: String,
         word: Word,
-        /// A later epoch or unassigned; required for partial and deferred.
-        #[arg(long)]
+        /// Use unassigned for partial/deferred; a later epoch admits the idea with `cm idea admit`.
+        #[arg(long, value_name = "unassigned")]
         to: Option<String>,
         /// An existing idea id; required for superseded.
         #[arg(long)]

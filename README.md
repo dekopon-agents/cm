@@ -57,7 +57,7 @@ error. `review wait` additionally uses 3 for its deadline and 4 for unreadable c
 | `cm epoch planning\|working\|closed [--skill-revision R] [--plan-revision S]` | Moves `EPOCH.md`'s front matter one status along `OPEN → PLANNING → WORKING → CLOSED`, stamps `planning_started_at`, `working_started_at` or `closed_at` with the date, sets the pins it is given, journals the move, and refreshes RESUME.md’s generated status span. It refuses a null pin: PLANNING needs `skill_revision`, WORKING and CLOSED also `approved_plan_revision`. `closed` follows `cm close`. |
 | `cm idea admit <id>` | Admits an idea to this epoch, appends its id to `EPOCH.md`'s `ideas:` list in admission order, and journals the action. Repeating it completes interrupted writes without duplicating entries. |
 | `cm idea move <id> <maturity>` | Moves an admitted idea forward through `captured → exploring → designed`; skipping a maturity is allowed. |
-| `cm idea outcome <id> <word> [--to EPOCH] [--by ID] [--note TEXT]` | Records one outcome per idea per epoch: `landed`, `partial`, `deferred`, `superseded` or `cancelled`, and journals the action. |
+| `cm idea outcome <id> <word> [--to unassigned] [--by ID] [--note TEXT]` | Records one outcome per idea per epoch: `landed`, `partial`, `deferred`, `superseded` or `cancelled`, and journals the action. Partial/deferred remainders become unassigned. |
 | `cm journal "<title>" [--body-file F]` | Appends `## YYYY-MM-DDTHH:MMZ — <title>` and the body (`-` reads stdin). The only way `JOURNAL.md` grows. A body may not hold a `#` or `##` heading. |
 | `cm launch <NN-name>/<unit>/<step> [--worktree PATH] [--coordinator LABEL] [--cap-min N]` | Runs the launch checks and reports every failure: `LIMITS.toml` not paused; a declared step's every `--after` met (`after-unmet`); for the local `pi` lane and undeclared steps, free disk on `disk_volume` minus `kache_headroom_gib` over `min_free_disk_gib`, live heavy builds (top-level `cargo` processes) under `max_heavy_builds` and the worktree, which they require; the step folder has `kickoff.md`; every path its packet names exists. A drafted step, a step blocked before its PR opened, or a launched step whose last attempt has ended can launch; relaunch picks the newest `resume*.md` when present and increments `launches`. The `--after` check runs on every launch, including relaunches. A release step also refuses with `owner-queue-unread` while valid new queue items await `cm owner-queue read`. Then it marks the step (and a drafted unit) launched, journals the launch and, for a local step, prints the command; every other lane (`owner` and `coordinator` among them) prints only the step and its prompt and records its attempt (see [Attempts](#attempts)). It spawns nothing. When `--coordinator` is omitted, the label defaults to trimmed `CLAUDE_CODE_REMOTE_SESSION_ID` with a leading `cse_` mapped to `session_`, else `—` when unset or whitespace-only; an explicit label wins. Launch refuses an empty or multi-line label, explicit or inherited. A step whose last attempt has not ended does not launch again (`attempt-open`). |
 | `cm attempt <NN-name>/<unit>/<step> [--claim TOKEN] [claim [--coordinator L] --expect G \| begin KIND \| record KIND ID \| restart --lane L [--evidence PATH] \| end complete\|partial\|unknown [--evidence PATH]]` | Shows a remote attempt and what to do next from committed state alone, or extends it; each change is journaled. See [Attempts](#attempts). |
@@ -93,7 +93,9 @@ ideas_dir: ../ideas
 ideas: [IDEA-9003, IDEA-9001]
 ```
 
-Each idea file is named `<id>.md` or `<id>-<slug>.md`. Its front matter includes
+Each idea file is named `<id>.md` or `<id>-<slug>.md`, with an id of the form
+`<letters>-<digits>` (for example `IDEA-9001`). Other files such as the ideas
+index `README.md` are not loaded as idea records. Its front matter includes
 `id: IDEA-9001` and `maturity: captured` (or `exploring` or `designed`). Admission
 sets `current_epoch: epoch-alpha`. A `## Epoch history` section must already exist, with every Markdown fence closed.
 cm changes only the `current_epoch` and `maturity` front-matter lines and appends
@@ -102,13 +104,14 @@ history entries; other keys, sections and existing history entries keep their by
 ```sh
 cm idea admit IDEA-9001
 cm idea move IDEA-9001 exploring
-cm idea outcome IDEA-9001 partial --to epoch-beta --note 'tool-x #12 shipped'
+cm idea outcome IDEA-9001 partial --to unassigned --note 'tool-x #12 shipped'
 ```
 
 Admission refuses a closed campaign or CLOSED epoch, an idea still open in another
 epoch, or an idea whose last outcome is terminal. Movement and outcomes require
-`current_epoch` to name this epoch. Maturity moves forward only. An outcome keeps
-`current_epoch` and the `ideas:` membership unchanged, including after deferral.
+`current_epoch` to name this epoch. Maturity moves forward only. A partial or
+deferred outcome sets `current_epoch: null`; terminal outcomes leave that field
+unchanged. All outcomes preserve the epoch's `ideas:` admission list.
 
 | Outcome | Required flags | Terminal |
 |---|---|---|
@@ -118,7 +121,9 @@ epoch, or an idea whose last outcome is terminal. Movement and outcomes require
 | `superseded` | `--by` naming an existing idea | yes |
 | `cancelled` | `--note` with the reason | yes |
 
-`--to` accepts an epoch name or `unassigned`; `--note` is one non-empty line.
+`--to` accepts only `unassigned`. A later epoch takes the remainder by running
+its own `cm idea admit`; an outcome cannot admit it to another epoch.
+`--note` is one non-empty line.
 Only the flags listed for each outcome are accepted. cm writes date-only history
 lines, for example ``- 2026-01-02: admitted to `epoch-alpha` (PLANNING).`` and
 ``- 2026-01-09: outcome in `epoch-alpha`: deferred to unassigned.`` Only cm's exact
@@ -134,8 +139,11 @@ When `ideas_dir` is set, `cm lint` checks duplicate ids (`idea-duplicate-id`, on
 violation per file), filenames (`idea-filename`), required front matter
 (`idea-front-matter`), maturity (`idea-maturity`) and epoch membership
 (`idea-epoch-list`). An open idea naming this epoch must appear in `ideas:`, and
-every listed id must resolve to a file naming this epoch. Commands also refuse
-ambiguous ids with `idea-duplicate-id`.
+every listed id in an OPEN, PLANNING or WORKING epoch must resolve to a file
+naming this epoch. A CLOSED epoch instead requires an outcome in its own history
+for every listed id, regardless of where the idea is assigned now. Existing
+outcome history naming an epoch as its target remains readable. Commands also
+refuse ambiguous ids with `idea-duplicate-id`.
 
 ## The folder
 
@@ -335,6 +343,10 @@ while its condition is unmet; that command lists the unblock action once it hold
 blocks offer `cm unblock`.
 
 ### Finishing
+
+`cm close` first runs the same checks as `cm lint` on the campaign folder and
+refuses with the full violation list if lint fails. Warnings do not block close.
+It does not seal state or append its close journal entry on a lint refusal.
 
 Before `cm close`, record an outcome with `cm idea outcome <id> <word>` for every id
 in `EPOCH.md`'s `ideas:` list. Close lists every missing outcome as `idea-outcome-missing`;

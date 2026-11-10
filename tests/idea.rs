@@ -142,7 +142,7 @@ fn move_changes_only_maturity_and_appends_one_history_line() {
 }
 
 #[test]
-fn all_five_outcomes_preserve_membership_and_idea_bodies() {
+fn all_five_outcomes_preserve_history_and_unassign_only_remainders() {
     for (word, flags, details) in [
         (
             "landed",
@@ -151,8 +151,8 @@ fn all_five_outcomes_preserve_membership_and_idea_bodies() {
         ),
         (
             "partial",
-            vec!["--to", "epoch-beta", "--note", "tool-x #12"],
-            "partial, remainder to `epoch-beta`; tool-x #12",
+            vec!["--to", "unassigned", "--note", "tool-x #12"],
+            "partial, remainder to unassigned; tool-x #12",
         ),
         (
             "deferred",
@@ -183,10 +183,15 @@ fn all_five_outcomes_preserve_membership_and_idea_bodies() {
         let result = ok(c.cm(&args));
         assert_eq!(result["outcome"], word);
         assert_eq!(result["action"], "outcome");
+        let expected = if matches!(word, "partial" | "deferred") {
+            before.replace("current_epoch: epoch-alpha", "current_epoch: null")
+        } else {
+            before
+        };
         assert_eq!(
             c.read_idea("IDEA-9001"),
             append_expected(
-                &before,
+                &expected,
                 &format!("- {}: outcome in `epoch-alpha`: {details}.", date(&result))
             )
         );
@@ -217,7 +222,7 @@ fn nonterminal_outcomes_allow_admission_in_a_later_epoch() {
         let c = ideas();
         c.add_idea("IDEA-9001");
         ok(c.cm(&["idea", "admit", "IDEA-9001"]));
-        let mut args = vec!["idea", "outcome", "IDEA-9001", word, "--to", "epoch-beta"];
+        let mut args = vec!["idea", "outcome", "IDEA-9001", word, "--to", "unassigned"];
         if word == "partial" {
             args.extend(["--note", "one part landed"]);
         }
@@ -226,7 +231,7 @@ fn nonterminal_outcomes_allow_admission_in_a_later_epoch() {
         c.edit_epoch("ideas: [IDEA-9001]\n", "");
         let before = c.read_idea("IDEA-9001");
         let result = ok(c.cm(&["idea", "admit", "IDEA-9001"]));
-        let expected = before.replace("current_epoch: epoch-alpha", "current_epoch: epoch-beta");
+        let expected = before.replace("current_epoch: null", "current_epoch: epoch-beta");
         assert_eq!(
             c.read_idea("IDEA-9001"),
             append_expected(
@@ -412,7 +417,7 @@ fn invalid_outcome_flags_and_multiline_notes_refuse_without_writes() {
     for flags in [
         vec!["landed"],
         vec!["partial", "--note", "part"],
-        vec!["partial", "--to", "epoch-beta"],
+        vec!["partial", "--to", "unassigned"],
         vec!["deferred"],
         vec!["superseded"],
         vec!["cancelled"],
@@ -530,6 +535,129 @@ fn no_ideas_dir_leaves_existing_campaign_lint_unchanged() {
     c.duplicate_idea("IDEA-9001");
     c.edit_epoch("ideas_dir: ../ideas\n", "");
     ok(c.cm(&["lint"]));
+}
+
+#[test]
+fn idea_loader_skips_readme_and_other_non_idea_files() {
+    let c = ideas();
+    c.add_idea("IDEA-9001");
+    c.add_idea("TASK-42");
+    for name in ["README.md", "index.md", "notes.txt"] {
+        std::fs::write(c.idea_dir().join(name), "An index, not an idea record.\n").unwrap();
+    }
+    ok(c.cm(&["lint"]));
+    ok(c.cm(&["idea", "admit", "IDEA-9001"]));
+    ok(c.cm(&["idea", "admit", "TASK-42"]));
+    ok(c.cm(&["lint"]));
+}
+
+#[test]
+fn remainder_outcomes_refuse_routing_to_an_epoch_without_writing() {
+    for word in ["partial", "deferred"] {
+        let c = ideas();
+        c.add_idea("IDEA-9001");
+        ok(c.cm(&["idea", "admit", "IDEA-9001"]));
+        let mut args = vec!["idea", "outcome", "IDEA-9001", word, "--to", "epoch-beta"];
+        if word == "partial" {
+            args.extend(["--note", "one part landed"]);
+        }
+        let before = c.idea_snapshot();
+        let refused = c.cm(&args);
+        assert_eq!(rules(&refused), ["idea-outcome-flags"]);
+        let message = refused["violations"][0]["message"].as_str().unwrap();
+        assert!(message.contains("unassigned") && message.contains("cm idea admit"));
+        assert_eq!(c.idea_snapshot(), before);
+    }
+}
+
+#[test]
+fn closed_epoch_keeps_remainders_after_unassignment_and_later_admission() {
+    for word in ["partial", "deferred"] {
+        let c = ideas();
+        c.add_idea("IDEA-9001");
+        ok(c.cm(&["idea", "admit", "IDEA-9001"]));
+        let mut args = vec!["idea", "outcome", "IDEA-9001", word, "--to", "unassigned"];
+        if word == "partial" {
+            args.extend(["--note", "one part landed"]);
+        }
+        ok(c.cm(&args));
+        assert!(c.read_idea("IDEA-9001").contains("current_epoch: null"));
+        c.edit_epoch("status: PLANNING", "status: CLOSED");
+        ok(c.cm(&["lint"]));
+
+        let later = c.root.parent().unwrap().join("later");
+        assert!(cm::commands::init(&cm::host::System, &later).unwrap().ok());
+        std::fs::write(
+            later.join("EPOCH.md"),
+            "---\nepoch: epoch-beta\nstatus: OPEN\nideas_dir: ../ideas\n---\n\n# Epoch\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("-C")
+            .arg(&later)
+            .args(["idea", "admit", "IDEA-9001"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            c.read_idea("IDEA-9001")
+                .contains("current_epoch: epoch-beta")
+        );
+        ok(c.cm(&["lint"]));
+    }
+}
+
+#[test]
+fn closed_epoch_needs_its_own_outcome_not_a_current_pointer_or_foreign_outcome() {
+    for entry in [
+        "",
+        "- 2026-01-02: outcome in `epoch-beta`: deferred to unassigned.",
+    ] {
+        let c = ideas();
+        c.add_idea("IDEA-9001");
+        ok(c.cm(&["idea", "admit", "IDEA-9001"]));
+        if !entry.is_empty() {
+            c.history("IDEA-9001", entry);
+        }
+        c.edit_epoch("status: PLANNING", "status: CLOSED");
+        assert_eq!(rules(&c.cm(&["lint"])), ["idea-epoch-list"]);
+    }
+}
+
+#[test]
+fn closed_epoch_accepts_legacy_remainder_targets_without_rewriting_history() {
+    let c = ideas();
+    c.add_idea("IDEA-9001");
+    ok(c.cm(&["idea", "admit", "IDEA-9001"]));
+    c.history("IDEA-9001", "- 2026-01-02: outcome in `epoch-alpha`: partial, remainder to `epoch-beta`; one part landed.");
+    c.edit_idea(
+        "IDEA-9001",
+        "current_epoch: epoch-alpha",
+        "current_epoch: null",
+    );
+    c.edit_epoch("status: PLANNING", "status: CLOSED");
+    let before = c.idea_snapshot();
+    ok(c.cm(&["lint"]));
+    assert_eq!(c.idea_snapshot(), before);
+}
+
+#[test]
+fn active_epoch_still_requires_listed_ideas_to_name_it() {
+    for status in ["OPEN", "PLANNING", "WORKING"] {
+        let c = ideas();
+        c.add_idea("IDEA-9001");
+        ok(c.cm(&["idea", "admit", "IDEA-9001"]));
+        ok(c.cm(&[
+            "idea",
+            "outcome",
+            "IDEA-9001",
+            "deferred",
+            "--to",
+            "unassigned",
+        ]));
+        c.edit_epoch("status: PLANNING", &format!("status: {status}"));
+        assert_eq!(rules(&c.cm(&["lint"])), ["idea-epoch-list"]);
+    }
 }
 
 #[test]

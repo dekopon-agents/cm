@@ -197,6 +197,21 @@ struct Idea {
     current: Option<String>,
 }
 
+fn idea_file(path: &Path) -> bool {
+    if path.extension().is_none_or(|ext| ext != "md") {
+        return false;
+    }
+    let Some((prefix, suffix)) = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.split_once('-'))
+    else {
+        return false;
+    };
+    let number = suffix.split('-').next().unwrap_or_default();
+    id_valid(&format!("{prefix}-{number}"))
+}
+
 fn read_ideas(root: &Path, dir: &Path, out: &mut Vec<Violation>) -> Vec<Idea> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -214,7 +229,7 @@ fn read_ideas(root: &Path, dir: &Path, out: &mut Vec<Violation>) -> Vec<Idea> {
         match entry {
             Ok(entry) => {
                 let path = entry.path();
-                if path.is_file() && path.extension().is_some_and(|ext| ext == "md") {
+                if path.is_file() && idea_file(&path) {
                     paths.push(path);
                 }
             }
@@ -477,18 +492,25 @@ pub(crate) fn lint(root: &Path) -> Vec<Violation> {
             .iter()
             .filter(|idea| idea.id.as_deref() == Some(id))
             .collect();
-        if found.is_empty()
-            || found
-                .iter()
-                .any(|idea| idea.current.as_deref() != Some(&manifest.name))
-        {
-            out.push(Violation::new(
-                EPOCH,
-                "idea-epoch-list",
+        let belongs = |idea: &&Idea| {
+            if manifest.status == Status::Closed {
+                idea.outcomes()
+                    .iter()
+                    .any(|(name, _)| *name == manifest.name)
+            } else {
+                idea.current.as_deref() == Some(&manifest.name)
+            }
+        };
+        if found.is_empty() || !found.iter().all(belongs) {
+            let message = if manifest.status == Status::Closed {
                 format!(
-                    "{id} has no file or names another current_epoch; run `cm idea admit {id}`"
-                ),
-            ));
+                    "{id} has no file or no recorded outcome in `{}`",
+                    manifest.name
+                )
+            } else {
+                format!("{id} has no file or names another current_epoch; run `cm idea admit {id}`")
+            };
+            out.push(Violation::new(EPOCH, "idea-epoch-list", message));
         }
     }
     out
@@ -617,6 +639,10 @@ pub(crate) fn run(host: &dyn Host, root: &Path, id: &str, action: Action<'_>) ->
     result.field("id", id);
     result.field("epoch", manifest.name.clone());
     result.field("at", at.clone());
+    let recorded_here = idea
+        .outcomes()
+        .iter()
+        .any(|(name, _)| *name == manifest.name);
     let (act, record, body) = match action {
         Action::Admit => {
             violations.extend(crate::commands::closed(root, &campaign));
@@ -693,11 +719,7 @@ pub(crate) fn run(host: &dyn Host, root: &Path, id: &str, action: Action<'_>) ->
             )
         }
         Action::Outcome { word, to, by, note } => {
-            if idea
-                .outcomes()
-                .iter()
-                .any(|(name, _)| *name == manifest.name)
-            {
+            if recorded_here {
                 violations.push(Violation::new(
                     &path,
                     "idea-outcome-twice",
@@ -711,13 +733,14 @@ pub(crate) fn run(host: &dyn Host, root: &Path, id: &str, action: Action<'_>) ->
             {
                 violations.push(Violation::new(&path, "idea-outcome-flags", "landed/cancelled need only --note; partial needs --to and --note; deferred needs only --to; superseded needs only --by"));
             }
-            if let Some(target) = to
-                && !epoch_valid(target)
+            if needs_to
+                && let Some(target) = to
+                && target != "unassigned"
             {
                 violations.push(Violation::new(
                     &path,
                     "idea-outcome-flags",
-                    "--to names an epoch or unassigned",
+                    "--to must be unassigned; a later epoch admits the idea itself with `cm idea admit`",
                 ));
             }
             if let Some(note) = note
@@ -740,15 +763,11 @@ pub(crate) fn run(host: &dyn Host, root: &Path, id: &str, action: Action<'_>) ->
                     resolve(root, &ideas, by, &mut violations);
                 }
             }
-            let target = to
-                .map(|target| {
-                    if target == "unassigned" {
-                        target.to_owned()
-                    } else {
-                        format!("`{target}`")
-                    }
-                })
-                .unwrap_or_default();
+            if needs_to && violations.is_empty() {
+                next = epoch::set_text(&next, "current_epoch", "null")
+                    .expect("validated front matter");
+            }
+            let target = to.unwrap_or_default();
             let details = match word {
                 Word::Landed => format!("landed; {}", note.unwrap_or_default()),
                 Word::Partial => format!(
@@ -774,7 +793,10 @@ pub(crate) fn run(host: &dyn Host, root: &Path, id: &str, action: Action<'_>) ->
             )
         }
     };
-    if act != "admit" && idea.current.as_deref() != Some(&manifest.name) {
+    if act != "admit"
+        && idea.current.as_deref() != Some(&manifest.name)
+        && !(act == "outcome" && recorded_here)
+    {
         violations.push(Violation::new(
             &path,
             "idea-not-here",

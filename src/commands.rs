@@ -730,6 +730,10 @@ fn init_step(
 
 pub fn close(host: &dyn Host, root: &Path) -> Result<Outcome> {
     let _lock = lock(root)?;
+    let linted = lint::lint_at(root, host.now())?;
+    if !linted.ok() {
+        return Ok(linted);
+    }
     let mut campaign = store::load_campaign(root)?;
     let mut violations = journal::check(root, &campaign);
     violations.extend(closed(root, &campaign));
