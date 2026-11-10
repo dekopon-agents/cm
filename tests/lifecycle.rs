@@ -1283,6 +1283,21 @@ fn close_seals_the_campaign() {
     )
     .unwrap();
 
+    let ready_resume = fs::read_to_string(c.root.join("RESUME.md")).unwrap();
+    let start = ready_resume.find("> ```").unwrap();
+    let end = ready_resume.find("\n\n# Resume").unwrap();
+    fs::write(
+        c.root.join("RESUME.md"),
+        format!(
+            "{}> {}{}",
+            &ready_resume[..start],
+            cm::templates::LOOP_WITHHELD,
+            &ready_resume[end..]
+        ),
+    )
+    .unwrap();
+    assert_clean(&c.root);
+
     let refused = commands::close(&host, &c.root).unwrap();
     assert_eq!(
         rules(&refused),
@@ -1293,6 +1308,7 @@ fn close_seals_the_campaign() {
     assert!(store::load_campaign(&c.root).unwrap().closed.is_none());
 
     fs::write(c.root.join("OWNER-QUEUE.md"), "# Owner queue\n").unwrap();
+    fs::write(c.root.join("RESUME.md"), ready_resume).unwrap();
     assert!(advance(&host, &c, step, "blocked:superseded", Evidence::default()).ok());
     assert!(
         advance(

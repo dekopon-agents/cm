@@ -493,23 +493,17 @@ pub(crate) fn lint(root: &Path) -> Vec<Violation> {
             .filter(|idea| idea.id.as_deref() == Some(id))
             .collect();
         let belongs = |idea: &&Idea| {
-            if manifest.status == Status::Closed {
-                idea.outcomes()
+            idea.current.as_deref() == Some(&manifest.name)
+                || idea
+                    .outcomes()
                     .iter()
                     .any(|(name, _)| *name == manifest.name)
-            } else {
-                idea.current.as_deref() == Some(&manifest.name)
-            }
         };
         if found.is_empty() || !found.iter().all(belongs) {
-            let message = if manifest.status == Status::Closed {
-                format!(
-                    "{id} has no file or no recorded outcome in `{}`",
-                    manifest.name
-                )
-            } else {
-                format!("{id} has no file or names another current_epoch; run `cm idea admit {id}`")
-            };
+            let message = format!(
+                "{id} has no file, or neither names this current_epoch nor records an outcome in `{}`; run `cm idea admit {id}` for a new admission",
+                manifest.name
+            );
             out.push(Violation::new(EPOCH, "idea-epoch-list", message));
         }
     }

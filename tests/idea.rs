@@ -608,19 +608,35 @@ fn closed_epoch_keeps_remainders_after_unassignment_and_later_admission() {
 }
 
 #[test]
-fn closed_epoch_needs_its_own_outcome_not_a_current_pointer_or_foreign_outcome() {
-    for entry in [
-        "",
-        "- 2026-01-02: outcome in `epoch-beta`: deferred to unassigned.",
-    ] {
+fn current_epoch_satisfies_list_membership_at_every_epoch_status() {
+    for status in ["OPEN", "PLANNING", "WORKING", "CLOSED"] {
         let c = ideas();
         c.add_idea("IDEA-9001");
         ok(c.cm(&["idea", "admit", "IDEA-9001"]));
-        if !entry.is_empty() {
-            c.history("IDEA-9001", entry);
+        c.edit_epoch("status: PLANNING", &format!("status: {status}"));
+        ok(c.cm(&["lint"]));
+    }
+}
+
+#[test]
+fn foreign_outcomes_do_not_explain_reassignment_at_any_epoch_status() {
+    for status in ["OPEN", "PLANNING", "WORKING", "CLOSED"] {
+        for current in ["null", "epoch-beta"] {
+            let c = ideas();
+            c.add_idea("IDEA-9001");
+            ok(c.cm(&["idea", "admit", "IDEA-9001"]));
+            c.history(
+                "IDEA-9001",
+                "- 2026-01-02: outcome in `epoch-beta`: deferred to unassigned.",
+            );
+            c.edit_idea(
+                "IDEA-9001",
+                "current_epoch: epoch-alpha",
+                &format!("current_epoch: {current}"),
+            );
+            c.edit_epoch("status: PLANNING", &format!("status: {status}"));
+            assert_eq!(rules(&c.cm(&["lint"])), ["idea-epoch-list"]);
         }
-        c.edit_epoch("status: PLANNING", "status: CLOSED");
-        assert_eq!(rules(&c.cm(&["lint"])), ["idea-epoch-list"]);
     }
 }
 
@@ -642,8 +658,8 @@ fn closed_epoch_accepts_legacy_remainder_targets_without_rewriting_history() {
 }
 
 #[test]
-fn active_epoch_still_requires_listed_ideas_to_name_it() {
-    for status in ["OPEN", "PLANNING", "WORKING"] {
+fn recorded_outcomes_satisfy_list_membership_at_every_epoch_status() {
+    for status in ["OPEN", "PLANNING", "WORKING", "CLOSED"] {
         let c = ideas();
         c.add_idea("IDEA-9001");
         ok(c.cm(&["idea", "admit", "IDEA-9001"]));
@@ -656,7 +672,7 @@ fn active_epoch_still_requires_listed_ideas_to_name_it() {
             "unassigned",
         ]));
         c.edit_epoch("status: PLANNING", &format!("status: {status}"));
-        assert_eq!(rules(&c.cm(&["lint"])), ["idea-epoch-list"]);
+        ok(c.cm(&["lint"]));
     }
 }
 
