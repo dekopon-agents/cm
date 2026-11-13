@@ -87,6 +87,41 @@ fn anchor(heading: &str) -> String {
         .collect()
 }
 
+fn links(line: &str) -> impl Iterator<Item = &str> {
+    line.match_indices("](").filter_map(|(at, _)| {
+        let rest = &line[at + 2..];
+        rest.find(')').map(|end| &rest[..end])
+    })
+}
+
+/// A link into `history/` or a pass's `designs/<pass>/notes/`, where full reviews live.
+fn review_link(target: &str) -> bool {
+    let path = target.split('#').next().unwrap_or_default();
+    let parts: Vec<&str> = path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    matches!(
+        parts.as_slice(),
+        ["history", _] | [.., "ideas", "history", _] | [.., "designs", _, "notes", _]
+    )
+}
+
+/// A review section already in its minimal form: at most two lines under the heading, naming the
+/// verdict and linking the full review. It never moves.
+fn stub(section: &str) -> bool {
+    let body: Vec<&str> = section
+        .lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    body.len() <= 2
+        && body
+            .iter()
+            .any(|line| line.to_lowercase().contains("verdict"))
+        && body.iter().any(|line| links(line).any(review_link))
+}
+
 struct Move {
     from: usize,
     to: usize,
@@ -111,7 +146,7 @@ fn plan(text: &str, min_bytes: usize) -> Vec<Move> {
             let (from, to) = (pair[0], pair[1]);
             let heading = line_at(text, from);
             let (kind, date) = review_heading(heading)?;
-            if text[from..to].contains("Moved to [history/") {
+            if text[from..to].contains("Moved to [history/") || stub(&text[from..to]) {
                 return None;
             }
             rulings
@@ -229,6 +264,22 @@ mod tests {
             anchor("## Astra review — 2026-11-13 (gpt-6-astra)"),
             "astra-review--2026-11-13-gpt-6-astra"
         );
+    }
+
+    #[test]
+    fn stubs_never_move() {
+        let pad = "x".repeat(100);
+        let text = format!(
+            "# R\n\n{pad}\n\n## Astra review — 2026-11-13 (gpt-6-astra high)\n\nFull review: [IDEA-0022.md](../designs/astra-review-20261113-design/notes/IDEA-0022.md). Verdict: **FIX REQUIRED** — sound pilot.\n\n## Regrets sweep — 2026-11-13 (Fable)\n\nVerdict: PASS.\nNotes: [IDEA-0022](../../store/ideas/history/IDEA-0022.md#x)\n\n## Owner rulings — 2026-11-13: the Astra review and regrets sweep\n\nRuled.\n"
+        );
+        assert!(plan(&text, 10).is_empty());
+        let full = text.replace(
+            "sound pilot.",
+            "sound pilot.\n\n| Severity | Finding |\n| major | one |",
+        );
+        assert_eq!(plan(&full, 10).len(), 1);
+        assert!(!review_link("../designs/x/REPORT.md"));
+        assert!(review_link("history/IDEA-0022.md#rubric-review"));
     }
 
     #[test]

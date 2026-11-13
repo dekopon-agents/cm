@@ -424,3 +424,32 @@ fn split_history_moves_ruled_reviews_once() {
         after
     );
 }
+
+#[test]
+fn split_history_leaves_a_review_stub_in_place_after_a_ruling() {
+    let temp = tempfile::tempdir().unwrap();
+    let ideas = temp.path().join("ideas");
+    fs::create_dir_all(&ideas).unwrap();
+    let record = format!(
+        "---\nid: IDEA-0022\nmaturity: exploring\n---\n\n# Fleet\n\n{}\n\n## Astra review — 2026-11-13 (gpt-6-astra high)\n\nFull review: [IDEA-0022.md](../designs/astra-review-20261113-design/notes/IDEA-0022.md). Verdict: **FIX REQUIRED** — the small QA pilot is sound.\n\n## Owner rulings — 2026-11-13: the Astra review\n\nRuled.\n\n## Epoch history\n\n- 2026-11-13: ruled.\n",
+        "Design text. ".repeat(40)
+    );
+    fs::write(ideas.join("IDEA-0022-fleet.md"), &record).unwrap();
+    let args = [
+        "idea",
+        "split-history",
+        "--ideas",
+        "ideas",
+        "--min-bytes",
+        "100",
+        "--apply",
+    ];
+    let output = cm(temp.path(), &args);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(text(&output), "");
+    assert_eq!(
+        fs::read_to_string(ideas.join("IDEA-0022-fleet.md")).unwrap(),
+        record
+    );
+    assert!(!ideas.join("history").exists());
+}

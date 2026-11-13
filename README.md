@@ -198,7 +198,9 @@ catches `DISABLE_NONESSENTIAL_TRAFFIC` written for `CLAUDE_CODE_DISABLE_NONESSEN
 `## Regrets sweep — <date>` section when its record is at least `--min-bytes` and an
 `## Owner rulings …` heading names that kind of review and is undated or dated on or after it.
 The heading stays as a stub with a link to the history file and the review's verdict line;
-the text is appended verbatim to `history/<id>.md`. A stub never moves again.
+the text is appended verbatim to `history/<id>.md`. A stub never moves: a section with at most two
+lines under its heading that names the verdict and links the full review into `history/` or a pass's
+`designs/<pass>/notes/` is already in its minimal form.
 
 ## The folder
 
