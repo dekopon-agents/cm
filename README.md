@@ -58,6 +58,10 @@ error. `review wait` additionally uses 3 for its deadline and 4 for unreadable c
 | `cm idea admit <id>` | Admits an idea to this epoch, appends its id to `EPOCH.md`'s `ideas:` list in admission order, and journals the action. Repeating it completes interrupted writes without duplicating entries. |
 | `cm idea move <id> <maturity>` | Moves an admitted idea forward through `captured → exploring → designed`; skipping a maturity is allowed. |
 | `cm idea outcome <id> <word> [--to unassigned] [--by ID] [--note TEXT]` | Records one outcome per idea per epoch: `landed`, `partial`, `deferred`, `superseded` or `cancelled`, and journals the action. Partial/deferred remainders become unassigned. |
+| `cm idea facts --pin ALIAS=DIR@SHA… [--out F] [--ideas DIR] <id>…` | Writes a review pass's `FACTS.md`: verifies every pin with `git cat-file -e` (any missing one is `pin-missing` and nothing is written), then lists each record's file citations resolved at the pins, `ok` or `STALE`, with the enclosing heading or item. See [Review tools](#review-tools). |
+| `cm idea idents --base REV [--ideas DIR] <id>…` | Checks the backticked identifiers, env vars and `IDEA-NNNN:line` refs a record gained since `REV` against the records it links: `exact`, `MISMATCH` (only inside a longer token) or `absent`, and prints each ref's target line. |
+| `cm idea split-history [--apply] [--min-bytes N] [--date D] [--ideas DIR] [<id>…]` | Moves ruled-on review sections of records over N bytes (default 20,000) to `history/<id>.md`, leaving heading stubs; prints what would move unless `--apply`. Idempotent. |
+| `cm read [--pins F] [--pin ALIAS=DIR@SHA]… <spec>…` | Prints files at pinned commits, never the working tree, every line numbered: whole up to 8 KB, an outline beyond that unless the spec names a range or heading, about 64 KB per call with every cut named. See [Review tools](#review-tools). |
 | `cm journal "<title>" [--body-file F]` | Appends `## YYYY-MM-DDTHH:MMZ — <title>` and the body (`-` reads stdin). The only way `JOURNAL.md` grows. A body may not hold a `#` or `##` heading. |
 | `cm launch <NN-name>/<unit>/<step> [--worktree PATH] [--coordinator LABEL] [--cap-min N]` | Runs the launch checks and reports every failure: `LIMITS.toml` not paused; a declared step's every `--after` met (`after-unmet`); for the local `pi` lane and undeclared steps, free disk on `disk_volume` minus `kache_headroom_gib` over `min_free_disk_gib`, live heavy builds (top-level `cargo` processes) under `max_heavy_builds` and the worktree, which they require; the step folder has `kickoff.md`; every path its packet names exists. A drafted step, a step blocked before its PR opened, or a launched step whose last attempt has ended can launch; relaunch picks the newest `resume*.md` when present and increments `launches`. The `--after` check runs on every launch, including relaunches. A release step also refuses with `owner-queue-unread` while valid new queue items await `cm owner-queue read`. Then it marks the step (and a drafted unit) launched, journals the launch and, for a local step, prints the command; every other lane (`owner` and `coordinator` among them) prints only the step and its prompt and records its attempt (see [Attempts](#attempts)). It spawns nothing. When `--coordinator` is omitted, the label defaults to trimmed `CLAUDE_CODE_REMOTE_SESSION_ID` with a leading `cse_` mapped to `session_`, else `—` when unset or whitespace-only; an explicit label wins. Launch refuses an empty or multi-line label, explicit or inherited. A step whose last attempt has not ended does not launch again (`attempt-open`). |
 | `cm attempt <NN-name>/<unit>/<step> [--claim TOKEN] [claim [--coordinator L] --expect G \| begin KIND \| record KIND ID \| restart --lane L [--evidence PATH] \| end complete\|partial\|unknown [--evidence PATH]]` | Shows a remote attempt and what to do next from committed state alone, or extends it; each change is journaled. See [Attempts](#attempts). |
@@ -145,6 +149,56 @@ This is one rule for OPEN, PLANNING, WORKING and CLOSED epochs: recorded
 remainders may be unassigned or admitted later, but unexplained reassignments
 still fail. Existing outcome history naming an epoch as its target remains
 readable. Commands also refuse ambiguous ids with `idea-duplicate-id`.
+
+## Review tools
+
+Four commands serve a review pass over idea records. None of them needs a campaign:
+`--ideas DIR` names the ideas folder, and without it the campaign's `ideas_dir` is used.
+
+```sh
+cm idea facts --pin core=~/code/dekopon/dekopon@4eb92d29f8 --pin ct=~/code/dekopon/campaign-trail@e0dc3dc5d \
+  --ideas store/ideas --out store/designs/<pass>-design/FACTS.md IDEA-0151 IDEA-0138
+cm read --pins store/designs/<pass>-design/FACTS.md core:crates/dekopon-gatewayd/src/gateway.rs:360-445 ct:AGENTS.md:#Regrets
+cm idea idents --ideas store/ideas --base <session-start-sha> IDEA-0151
+cm idea split-history --ideas store/ideas --apply
+```
+
+`cm read` takes many specs per call. A spec is `<alias>:<path>`, `<dir>@<sha>:<path>` or
+`<sha>:<path>` (the current directory's repository), optionally followed by `:N`, `:A-B`, `:A-`
+or `:#Heading` (Markdown only: exact, then prefix, then substring, case-insensitive; an ambiguous
+heading is refused with the candidates). It reads `git show <sha>:<path>`. A file of 8 KB or
+less prints whole; a bigger one without a range prints a numbered outline and its byte size:
+Markdown headings, item definitions for code (`fn`, `struct`, `enum`, `impl`, `trait`, `mod`,
+`class`, `def`, `func` and the like), table headers for TOML, top-level keys for YAML, and every
+Nth line otherwise. A directory lists its entries. Output stops at about 64 KB per call; the
+rest of a spec and any later spec are named in `[cut: …]` lines and a closing
+`Cut by the 64 KB cap:` line. Aliases come from `--pins F`, the `| Alias | Repository | Commit |`
+table under a `Pins` heading that `cm idea facts` writes, and from `--pin`. With pins, every spec
+must resolve to one of them: an explicit `<dir>@<sha>` that is not pinned is `read-spec`.
+Other refusals are `read-missing` (no such path at the pin), `read-range` and `read-heading`;
+each is listed and the remaining specs still print.
+
+`cm idea facts` extracts citations from each record: `path`, `path:N`, `path:A-B` and
+`path:A,B` (en dashes accepted), in backticks or plain text, where the path has a `/` or a known
+source extension. URLs and Markdown link text and targets are not citations. A path resolves
+exactly at a pin's root first, then as a `/path` suffix, then loosely (the last component equal,
+the others ending with the cited ones, so `model/src/wire.rs` finds
+`crates/dekopon-model/src/wire.rs`, marked `loose match`). Several matches are listed as
+ambiguous. A citation is `STALE` when no pin has the path or a cited line is past its end. Line
+citations name the enclosing heading or item from `cm read`'s outliner. No model is involved.
+
+`cm idea idents` reads `git diff <base> -- <record>` in the ideas folder's repository (so
+uncommitted edits count) and takes the added lines. It searches the files the record links:
+Markdown links that resolve to a file and bare record ids in the ideas folder. The record's own
+notes and history (files named for its id outside the ideas folder) are not sources. A token
+inside a longer identifier is a `MISMATCH`, naming the longer token and its line: the check that
+catches `DISABLE_NONESSENTIAL_TRAFFIC` written for `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`.
+
+`cm idea split-history` moves a `## Rubric review — <date>`, `## Astra review — <date>` or
+`## Regrets sweep — <date>` section when its record is at least `--min-bytes` and an
+`## Owner rulings …` heading names that kind of review and is undated or dated on or after it.
+The heading stays as a stub with a link to the history file and the review's verdict line;
+the text is appended verbatim to `history/<id>.md`. A stub never moves again.
 
 ## The folder
 

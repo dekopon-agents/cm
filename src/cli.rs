@@ -102,7 +102,19 @@ enum Commands {
         #[arg(long, value_name = "SHA")]
         plan_revision: Option<String>,
     },
-    /// Admit an idea, move its maturity forward, or record its outcome.
+    /// Print files at pinned commits, never the working tree: whole up to 8 KB, else an outline unless given a range or heading; every line numbered; about 64 KB per call.
+    Read {
+        /// A pins table (`## Pins`, as `cm idea facts` writes) that resolves `<alias>:` specs; with pins, every spec must be pinned.
+        #[arg(long, value_name = "FILE")]
+        pins: Option<PathBuf>,
+        /// One pin, ALIAS=DIR@SHA. Repeat for each.
+        #[arg(long, value_name = "ALIAS=DIR@SHA")]
+        pin: Vec<crate::source::Pin>,
+        /// <alias>:<path>, <dir>@<sha>:<path> or <sha>:<path>, each optionally :N, :A-B, :A- or :#Heading.
+        #[arg(required = true, value_name = "SPEC")]
+        specs: Vec<String>,
+    },
+    /// Admit an idea, move its maturity forward, or record its outcome; build review packets.
     Idea {
         #[command(subcommand)]
         act: IdeaAct,
@@ -401,6 +413,48 @@ enum IdeaAct {
         #[arg(long)]
         note: Option<String>,
     },
+    /// Write a review pass's FACTS.md: verify every pin, then resolve each record's file citations at the pins (ok or STALE, with the enclosing heading or item).
+    Facts {
+        /// ALIAS=DIR@SHA, a repository at a commit. Repeat for each.
+        #[arg(long, required = true, value_name = "ALIAS=DIR@SHA")]
+        pin: Vec<crate::source::Pin>,
+        /// Write the packet here; prints it when omitted.
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+        /// The ideas folder; defaults to the campaign's `ideas_dir`.
+        #[arg(long, value_name = "DIR")]
+        ideas: Option<PathBuf>,
+        /// Record ids, one section each.
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
+    /// Check identifiers, env vars and `IDEA-NNNN:line` refs added since a base against the records each record links.
+    Idents {
+        /// The revision the session started from.
+        #[arg(long, value_name = "REV")]
+        base: String,
+        /// The ideas folder; defaults to the campaign's `ideas_dir`.
+        #[arg(long, value_name = "DIR")]
+        ideas: Option<PathBuf>,
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
+    /// Move ruled-on review sections of large records to `history/<id>.md`, leaving heading stubs. Prints what would move unless --apply.
+    SplitHistory {
+        #[arg(long)]
+        apply: bool,
+        /// Only records of at least this many bytes.
+        #[arg(long, value_name = "N", default_value_t = crate::history::MIN_BYTES)]
+        min_bytes: usize,
+        /// The date the stubs name; defaults to today (UTC).
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        date: Option<String>,
+        /// The ideas folder; defaults to the campaign's `ideas_dir`.
+        #[arg(long, value_name = "DIR")]
+        ideas: Option<PathBuf>,
+        /// Record id prefixes; all records when omitted.
+        ids: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -612,6 +666,13 @@ fn any_target(text: &str) -> Result<Target, String> {
     parse_target(text, false)
 }
 
+fn ideas_folder(cli: &Cli, given: &Option<PathBuf>) -> Result<PathBuf> {
+    match given {
+        Some(dir) => Ok(dir.clone()),
+        None => idea::ideas_dir(&store::root_or_cwd(cli.root.as_deref())?),
+    }
+}
+
 fn under_root(cli: &Cli, path: &Path) -> PathBuf {
     match &cli.root {
         Some(root) if path.is_relative() => root.join(path),
@@ -675,28 +736,62 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             coordinator,
             *record,
         ),
-        Commands::Idea { act } => {
-            let (id, action) = match act {
-                IdeaAct::Admit { id } => (id, idea::Action::Admit),
-                IdeaAct::Move { id, maturity } => (id, idea::Action::Move(*maturity)),
-                IdeaAct::Outcome {
-                    id,
-                    word,
-                    to,
-                    by,
-                    note,
-                } => (
-                    id,
-                    idea::Action::Outcome {
-                        word: *word,
-                        to: to.as_deref(),
-                        by: by.as_deref(),
-                        note: note.as_deref(),
-                    },
-                ),
-            };
-            idea::run(host, &root()?, id, action)
-        }
+        Commands::Read { pins, pin, specs } => Ok(crate::source::read(
+            specs,
+            &crate::source::load_pins(pins.as_deref(), pin)?,
+        )),
+        Commands::Idea { act } => match act {
+            IdeaAct::Admit { id } => idea::run(host, &root()?, id, idea::Action::Admit),
+            IdeaAct::Move { id, maturity } => {
+                idea::run(host, &root()?, id, idea::Action::Move(*maturity))
+            }
+            IdeaAct::Outcome {
+                id,
+                word,
+                to,
+                by,
+                note,
+            } => idea::run(
+                host,
+                &root()?,
+                id,
+                idea::Action::Outcome {
+                    word: *word,
+                    to: to.as_deref(),
+                    by: by.as_deref(),
+                    note: note.as_deref(),
+                },
+            ),
+            IdeaAct::Facts {
+                pin,
+                out,
+                ideas,
+                ids,
+            } => crate::facts::facts(&crate::facts::FactsArgs {
+                pins: pin,
+                ideas: &ideas_folder(cli, ideas)?,
+                ids,
+                out: out.as_deref(),
+            }),
+            IdeaAct::Idents { base, ideas, ids } => {
+                crate::facts::idents(&ideas_folder(cli, ideas)?, base, ids)
+            }
+            IdeaAct::SplitHistory {
+                apply,
+                min_bytes,
+                date,
+                ideas,
+                ids,
+            } => crate::history::split(&crate::history::SplitArgs {
+                ideas: &ideas_folder(cli, ideas)?,
+                ids,
+                apply: *apply,
+                min_bytes: *min_bytes,
+                date: &date
+                    .clone()
+                    .unwrap_or_else(|| host.now().strftime("%Y-%m-%d").to_string()),
+            }),
+        },
         Commands::Close => commands::close(host, &root()?),
         Commands::Init {
             part,
@@ -1136,6 +1231,7 @@ fn name(command: &Commands) -> &'static str {
         Commands::Next { .. } => "next",
         Commands::Sync => "sync",
         Commands::Epoch { .. } => "epoch",
+        Commands::Read { .. } => "read",
         Commands::Idea { .. } => "idea",
         Commands::Journal { .. } => "journal",
         Commands::Launch { .. } => "launch",

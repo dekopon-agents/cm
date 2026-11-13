@@ -212,6 +212,41 @@ fn idea_file(path: &Path) -> bool {
     id_valid(&format!("{prefix}-{number}"))
 }
 
+/// The id an idea file's name carries: `IDEA-0138-slug.md` is `IDEA-0138`.
+pub(crate) fn record_id(path: &Path) -> Option<String> {
+    if !idea_file(path) {
+        return None;
+    }
+    let name = path.file_stem()?.to_str()?;
+    let (prefix, suffix) = name.split_once('-')?;
+    Some(format!("{prefix}-{}", suffix.split('-').next()?))
+}
+
+/// The record file for an id in an ideas folder: `<id>.md`, else the first `<id>-*.md`.
+pub(crate) fn record(dir: &Path, id: &str) -> Option<PathBuf> {
+    let exact = dir.join(format!("{id}.md"));
+    if exact.is_file() {
+        return Some(exact);
+    }
+    let mut found: Vec<PathBuf> = fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_file() && record_id(path).as_deref() == Some(id))
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
+/// The campaign's `ideas_dir`, for idea tools given no `--ideas`.
+pub(crate) fn ideas_dir(root: &Path) -> Result<PathBuf> {
+    let text = fs::read_to_string(root.join(EPOCH))
+        .map_err(|error| anyhow::anyhow!("reading {}: {error}", root.join(EPOCH).display()))?;
+    let dir = field(&text, "ideas_dir")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("EPOCH.md sets no ideas_dir; pass --ideas DIR"))?;
+    Ok(root.join(dir))
+}
+
 fn read_ideas(root: &Path, dir: &Path, out: &mut Vec<Violation>) -> Vec<Idea> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
