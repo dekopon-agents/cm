@@ -386,6 +386,22 @@ enum Commands {
         #[command(subcommand)]
         act: Option<FollowupAct>,
     },
+    /// One coordinator cycle: reconcile the effect ledger, take in events and timers, gate verdicts, plan merges, releases and pins, dispatch ready steps, and print the decision packet. Reads `[authority]` only at --approved.
+    Tick {
+        /// The runner entry's approved revision, a full 40-hex SHA; `[authority]` is read there.
+        #[arg(long, value_name = "SHA", value_parser = commit_sha)]
+        approved: String,
+        /// Print `{effects, packet?}` for the runner to apply (11-D3) instead of the outcome.
+        #[arg(long)]
+        effects: bool,
+    },
+    /// The runner's receipts for effects `cm tick --effects` printed.
+    Effects {
+        #[command(subcommand)]
+        act: EffectsAct,
+    },
+    /// Print the unit and step graph the dashboard reads.
+    Export,
     /// Report every violation in the campaign folder; exit 1 when there is any.
     Lint {
         /// A folder inside the campaign; defaults to --root or the current directory.
@@ -522,7 +538,12 @@ enum AttemptAct {
     /// Record that an external action (thread, turn, session, cancel, …) is about to start.
     Begin { kind: String },
     /// Record the id the begun action returned.
-    Record { kind: String, id: String },
+    Record {
+        kind: String,
+        id: String,
+        #[command(flatten)]
+        echo: Box<crate::tick::agents::Echo>,
+    },
     /// End the attempt: complete, partial (with --evidence) or unknown.
     End {
         outcome: crate::state::AttemptOutcome,
@@ -561,6 +582,8 @@ enum ReviewAct {
         /// The declared part reviewed by this report.
         #[arg(long, value_name = "NAME")]
         part: Option<String>,
+        #[command(flatten)]
+        echo: Box<crate::tick::agents::Echo>,
     },
     /// Record what resolved a blocking finding: a commit, or a ruling file in the campaign.
     Resolve {
@@ -572,6 +595,12 @@ enum ReviewAct {
         #[arg(long, value_name = "COMMIT|RULING-FILE")]
         by: String,
     },
+}
+
+#[derive(Subcommand)]
+enum EffectsAct {
+    /// Record one batch of receipts (a JSON array on stdin, at most 20 KiB) into the effect ledger and push it.
+    Record,
 }
 
 #[derive(Subcommand)]
@@ -664,6 +693,16 @@ fn step_target(text: &str) -> Result<Target, String> {
 
 fn any_target(text: &str) -> Result<Target, String> {
     parse_target(text, false)
+}
+
+/// The echoed values on `cm attempt record`, when any is given.
+fn act_echo(act: &Option<AttemptAct>) -> Option<&crate::tick::agents::Echo> {
+    match act {
+        Some(AttemptAct::Record { echo, .. }) if **echo != crate::tick::agents::Echo::default() => {
+            Some(echo)
+        }
+        _ => None,
+    }
 }
 
 fn ideas_folder(cli: &Cli, given: &Option<PathBuf>) -> Result<PathBuf> {
@@ -907,6 +946,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
         ),
         Commands::Attempt { target, claim, act } => {
             use crate::attempt::Act;
+            let echo = act_echo(act);
             let act = match act {
                 None => Act::Status,
                 Some(AttemptAct::Claim {
@@ -922,7 +962,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                     file: evidence.as_deref().map(|file| under_root(cli, file)),
                 },
                 Some(AttemptAct::Begin { kind }) => Act::Begin { kind: kind.clone() },
-                Some(AttemptAct::Record { kind, id }) => Act::Record {
+                Some(AttemptAct::Record { kind, id, .. }) => Act::Record {
                     kind: kind.clone(),
                     id: id.clone(),
                 },
@@ -931,7 +971,13 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                     file: evidence.as_deref().map(|file| under_root(cli, file)),
                 },
             };
-            crate::attempt::attempt(host, &root()?, target, claim.as_deref(), &act)
+            let recorded = crate::attempt::attempt(host, &root()?, target, claim.as_deref(), &act);
+            match echo {
+                Some(echo) => recorded.and_then(|outcome| {
+                    crate::tick::agents::echoed(host, &root()?, target, outcome, echo)
+                }),
+                None => recorded,
+            }
         }
         Commands::Advance {
             target,
@@ -1135,16 +1181,26 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                     report,
                     reviewer,
                     part,
+                    echo,
                 }),
             ..
-        } => crate::verdict::record(
-            host,
-            &root()?,
-            target,
-            &under_root(cli, report),
-            reviewer.as_deref(),
-            part.as_deref(),
-        ),
+        } => {
+            let recorded = crate::verdict::record(
+                host,
+                &root()?,
+                target,
+                &under_root(cli, report),
+                reviewer.as_deref(),
+                part.as_deref(),
+            );
+            if **echo == crate::tick::agents::Echo::default() {
+                recorded
+            } else {
+                recorded.and_then(|outcome| {
+                    crate::tick::agents::echoed(host, &root()?, target, outcome, echo)
+                })
+            }
+        }
         Commands::Review {
             act:
                 Some(ReviewAct::Resolve {
@@ -1206,6 +1262,22 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             act: Some(FollowupAct::Close { id, by }),
             ..
         } => crate::verdict::close_followup(host, &root()?, id, by),
+        Commands::Tick { approved, effects } => {
+            let args = crate::tick::TickArgs {
+                approved: approved.clone(),
+                effects: *effects,
+            };
+            return crate::tick::cli_tick(host, &root()?, &args);
+        }
+        Commands::Effects {
+            act: EffectsAct::Record,
+        } => crate::tick::record::record(
+            host,
+            &crate::tick::push::SystemGit::default(),
+            &root()?,
+            &mut std::io::stdin().lock(),
+        ),
+        Commands::Export => crate::tick::export::export(&root()?),
         Commands::Lint { dir } => {
             let start = match (dir, &cli.root) {
                 (Some(dir), _) => dir.clone(),
@@ -1249,6 +1321,9 @@ fn name(command: &Commands) -> &'static str {
         Commands::Ruling { .. } => "ruling",
         Commands::Brief { .. } => "brief",
         Commands::Followups { .. } => "followups",
+        Commands::Tick { .. } => "tick",
+        Commands::Effects { .. } => "effects",
+        Commands::Export => "export",
         Commands::Lint { .. } => "lint",
     }
 }
