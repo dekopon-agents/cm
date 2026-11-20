@@ -49,8 +49,9 @@ pub enum TickError {
     /// 11-D4: LIMITS.toml, `[authority]`, `[gates]` or `[review]` is missing or malformed there.
     #[error("no usable authority at {sha}: {detail}")]
     AuthorityMissing { sha: String, detail: String },
-    /// 11-D7: `git pull --no-rebase` conflicted in a checkout cm did not clone; the merge was
-    /// aborted and nothing was written (R03).
+    /// 11-D7: `git pull --no-rebase` conflicted and the merge was aborted: at `begin` in a checkout
+    /// cm did not clone, inside any `commit_and_push` (the local commit is kept), or on a
+    /// rebuild's own push (R03, F2).
     #[error("pull conflicted in {paths:?}; merge aborted")]
     PullConflict { paths: Vec<String> },
     /// R02: dirty paths no cm command writes would be overwritten by the pull.

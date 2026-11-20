@@ -48,3 +48,11 @@ fn a_fourth_counting_core_merge_is_refused_across_restarts_while_the_tally_holds
 fn a_counting_merge_reserves_its_tally_row_in_the_same_commit_as_its_intent() {
     todo!()
 }
+
+/// F1: a reservation lost with a killed tick is reserved again once, and a readmitted merge keeps
+/// its one row.
+#[test]
+#[ignore = "skeleton: tick/release-lan"]
+fn a_killed_reservation_is_reserved_again_once_and_a_readmitted_merge_keeps_its_one_row() {
+    todo!()
+}

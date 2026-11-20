@@ -2,8 +2,9 @@
 //!
 //! 0. With `--clone`, `push::ensure_checkout` (11-D7, G5). Then [`TickLock`](crate::tick::ledger::TickLock) without waiting;
 //!    held elsewhere: exit 0, no effects, no packet.
-//! 1. `push::begin`: the union check, recovery of dirty cm-owned files, the unpushed commit, then
-//!    `pull --no-rebase` (R02, R03).
+//! 1. `push::begin`: an aborted leftover merge, the union check, recovery by the pending mark
+//!    (a killed tick's decisions discarded, its recorded facts committed), the unpushed commit,
+//!    then `pull --no-rebase` (R02, R03, F1). Then the `decide` [`PendingMark`] is saved.
 //! 2. `authority::paused_live`, then `Approved::read` at `--approved` (11-D4). Unreadable: one
 //!    `authority-unavailable` item, and stage 3's retries and stages 6 to 8 plan nothing.
 //! 3. `ledger::reconcile` through `SystemObserver`; then the due timers (retry, collect, review
@@ -21,23 +22,27 @@
 //! 9. `wire::admit` the planned effects beside the packet; write their intent and `emitted` rows
 //!    under tick number `Cursor::tick + 1`; save the cursor (the loaded one, with this tick's
 //!    handled marks and requests, R04), timers and seen set; the first commit, pushed
-//!    (`push::commit_and_push`). Nothing external has happened yet.
+//!    (`push::commit_and_push`). Nothing external has happened yet. On a push error the tick
+//!    discards its decisions (`push::discard`) and stops (F2). Once pushed, the mark becomes
+//!    `record`.
 //! 10. `dispatch::launch_stage`; then with `--effects` the [`EffectsOut`] line is the output, and
 //!     without it `apply::apply_in_order` through `LocalApply` and `record::record_receipts`.
-//! 11. The second commit: binds, attempt ids, receipts. A failed push leaves it local, and the next
-//!     tick's stage 1 pushes it first.
+//! 11. The second commit: binds, attempt ids, receipts. Pushed, the mark is cleared. A failed push
+//!     leaves it local with the mark `record`, and the next tick's stage 1 pushes or rebuilds it.
 //!
 //! While `paused` is true, stage 3's retries and stages 6 to 8 plan nothing and stage 10 launches and applies
 //! nothing; reconcile, sync, intake and review collection still run. An error in stages 1 to 9
-//! leaves the pushed cursor, timers, seen set and ledger as they were, so the next tick redoes the
-//! work.
+//! discards everything the tick wrote (F1), and a kill there leaves it for the next `begin` to
+//! discard, so the pushed cursor, timers, seen set, ledger, state files and drop tally are as
+//! they were and the next tick redoes the work.
 //!
 //! S-tick-42, task: the tick itself. **Owner:** the `cm` process's main thread, which spawns no
 //! thread of its own beyond `forge::run`'s two pipe threads per child. **Bound:** one tick per
 //! clone at a time ([`TickLock`](crate::tick::ledger::TickLock)); each stage's bound is its module's (S-tick-06). **Queue:** none
 //! in memory; what waits is in the ledger, the timers or the cursor. **Shutdown:** a killed tick
-//! leaves at most an unpushed commit, dirty cm-owned files and a torn ledger line, which the next
-//! tick's stage 1 and the ledger's exclusive open handle.
+//! leaves at most its pending mark, an unpushed commit, dirty cm-owned files or marked paths, a
+//! merge in progress and a torn ledger line, which the next tick's stage 1 and the ledger's
+//! exclusive open handle.
 
 #![allow(unused_variables, reason = "skeleton: tick/core fills these bodies")]
 
@@ -58,7 +63,7 @@ use crate::tick::lan::LanReads;
 use crate::tick::ledger::{Draft, EffectLedger, IntentId};
 use crate::tick::merge::MergeReads;
 use crate::tick::packet::{DecisionPacket, Seen};
-use crate::tick::push::{Git, Pushed};
+use crate::tick::push::{Git, PendingMark, Pushed};
 use crate::tick::release::ReleaseReads;
 use crate::tick::timers::Timers;
 use crate::tick::wire::{EffectInput, EffectsOut};
@@ -141,9 +146,11 @@ pub struct Cycle<'a> {
     pub packet: DecisionPacket,
     /// The tick's own `.cm/tick/` files, relative to the checkout: committed with `--force`.
     pub forced: BTreeSet<PathBuf>,
-    /// Other paths the tick wrote outside the cm-owned set (an Astra out-dir): committed without
-    /// `--force` (S-tick-20).
+    /// Other paths the tick wrote outside the cm-owned set (the drop tally, an Astra out-dir):
+    /// committed without `--force` (S-tick-20).
     pub wrote: BTreeSet<PathBuf>,
+    /// Saved after stage 1; every `wrote` path is in it before its write (F1).
+    pub pending: PendingMark,
     pub counters: Counters,
 }
 
@@ -164,8 +171,10 @@ impl Cycle<'_> {
         todo!("tick/core")
     }
 
-    /// Records a path, absolute or relative to the campaign folder, for the next commit.
-    pub fn wrote(&mut self, path: &Path) {
+    /// Records a path, absolute or relative to the campaign folder, for the next commit. Call it
+    /// before writing the path: it adds the path to the pending mark and saves the mark, so a kill
+    /// after the write still names it (F1).
+    pub fn wrote(&mut self, path: &Path) -> crate::tick::Result<()> {
         todo!("tick/core")
     }
 }

@@ -39,3 +39,12 @@ fn tick_keeps_taking_in_and_dispatching_when_the_forge_fails_for_some_prs() {
 fn a_paused_tick_then_a_resumed_one_still_reviews_every_head_and_handles_every_comment() {
     todo!()
 }
+
+/// F1: a kill or an error at each of stages 2 to 9 (after the tally reservation, the launch
+/// writes, the intent rows and the cursor) leaves main as it was, and the next tick pushes one
+/// whole decision set.
+#[test]
+#[ignore = "skeleton: tick/core"]
+fn a_tick_killed_or_failing_before_its_first_push_leaves_main_as_it_was_and_the_next_redoes_it() {
+    todo!()
+}

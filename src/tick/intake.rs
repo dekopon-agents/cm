@@ -140,7 +140,8 @@ pub struct Cursor {
     pub rotation: usize,
     /// The number of the last tick that pushed its first commit. A tick runs as `tick + 1`;
     /// receipts and intents carry the number they were written under, which orders them where
-    /// minute stamps cannot (R11, S-tick-63).
+    /// minute stamps cannot (R11, S-tick-63). `run` takes the larger of this and the ledger's
+    /// highest row `cycle`, so a rebuild that resets this file never rewinds it.
     #[serde(default)]
     pub tick: u64,
     /// Receipt rows already turned into `effect-refused` items (R17).

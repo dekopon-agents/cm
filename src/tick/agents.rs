@@ -18,6 +18,14 @@
 //! the coordinator, before `tick/agent-ledger` lands), and until it lands `record.py` and cm must
 //! not write one epoch's file at the same time.
 //!
+//! **Folding (F3).** The lock is per clone, so a second line for one invocation can arrive by git:
+//! an owned checkout's rebuild re-appends the rows main lacked (`push::rebuild`), and a merge of
+//! two clones can keep both versions of a rewritten row. [`fold`] is the rule every reader and
+//! every cm rewrite applies. Lines with one `invocation` key fold field by field into the first
+//! one's place: an echoed value beats `"unknown"`, and between two echoed values the later line
+//! wins. Every other line is kept byte for byte. After the next cm write the file holds one row
+//! per invocation again, and no row for a launch that happened is lost.
+//!
 //! **Two callers.** The CLI calls these only when a `Requested` or `Echo` flag is given (the glue
 //! in `cli.rs`), so the existing commands behave as before. The tick records every launch it
 //! performs and every Astra receipt it collects through [`AgentRecorder`] (R15): `Deps::agents`
@@ -226,6 +234,11 @@ pub fn echoed(
     todo!("tick/agent-ledger")
 }
 
+/// The file's text with the lines of each invocation folded into one row (module doc, Folding).
+pub fn fold(text: &str) -> String {
+    todo!("tick/agent-ledger")
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -267,6 +280,12 @@ mod tests {
     #[test]
     #[ignore = "skeleton: tick/agent-ledger"]
     fn an_append_by_a_lock_holding_writer_during_a_cm_rewrite_is_kept() {
+        todo!()
+    }
+
+    #[test]
+    #[ignore = "skeleton: tick/agent-ledger"]
+    fn two_lines_for_one_invocation_fold_field_by_field_and_the_next_write_leaves_one() {
         todo!()
     }
 }

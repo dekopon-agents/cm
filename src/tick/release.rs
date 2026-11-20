@@ -177,7 +177,8 @@ impl DropTally {
     }
 }
 
-/// PR-aware admission for core merges; `Exempt` for every other repository.
+/// PR-aware admission for core merges; `Exempt` for every other repository. A PR whose row is
+/// already in the tally is admitted again without counting twice.
 pub fn drop_admits(
     root: &Path,
     authority: &Authority,
@@ -188,9 +189,11 @@ pub fn drop_admits(
     todo!("tick/release-lan")
 }
 
-/// Appends the counting PR's row to the drop's `RELEASE.md` and returns the path for
-/// `Cycle::wrote`, so the row reaches main in the same commit as the merge intent.
-pub fn reserve(root: &Path, tally: &DropTally, row: &TallyRow) -> crate::tick::Result<PathBuf> {
+/// Appends the counting PR's row to the drop's `RELEASE.md`, after naming the file through
+/// `Cycle::wrote` (F1): the row reaches main in the same commit as the merge intent, or a tick
+/// that dies first loses it with its other decisions. A PR that already holds a row (a readmitted
+/// merge) writes nothing. `merge::stage` calls it; `route` only reads.
+pub fn reserve(cycle: &mut Cycle, tally: &DropTally, row: &TallyRow) -> crate::tick::Result<()> {
     todo!("tick/release-lan")
 }
 
