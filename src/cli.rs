@@ -147,6 +147,8 @@ enum Commands {
         /// A remote launch: its cap in minutes, stored as an absolute deadline a replacement inherits.
         #[arg(long, value_name = "MINUTES")]
         cap_min: Option<u32>,
+        #[command(flatten)]
+        requested: Box<crate::tick::agents::Requested>,
     },
     /// Release a blocked unit or step to the state it was blocked from, with the evidence that cleared it.
     Unblock {
@@ -386,21 +388,21 @@ enum Commands {
         #[command(subcommand)]
         act: Option<FollowupAct>,
     },
-    /// One coordinator cycle: reconcile the effect ledger, take in events and timers, gate verdicts, plan merges, releases and pins, dispatch ready steps, and print the decision packet. Reads `[authority]` only at --approved.
+    /// One coordinator cycle: reconcile the effect ledger, take in events and timers, gate verdicts, plan merges, releases and pins, dispatch ready steps, and print the decision packet. Reads `[authority]`, `[gates]` and `[review]` only at --approved, and `paused` live.
     Tick {
-        /// The runner entry's approved revision, a full 40-hex SHA; `[authority]` is read there.
-        #[arg(long, value_name = "SHA", value_parser = commit_sha)]
+        /// The approved revision, a full 40-hex SHA: the runner entry's, or in the cloud interim the stamp the coordinator passes.
+        #[arg(long, value_name = "SHA", value_parser = full_sha)]
         approved: String,
-        /// Print `{effects, packet?}` for the runner to apply (11-D3) instead of the outcome.
+        /// Print one `{effects, packet?}` JSON line for the runner to apply (11-D3) instead of applying locally.
         #[arg(long)]
         effects: bool,
     },
-    /// The runner's receipts for effects `cm tick --effects` printed.
+    /// The effect ledger's two writers besides `cm tick`: the runner's receipts and rulings on parked intents.
     Effects {
         #[command(subcommand)]
         act: EffectsAct,
     },
-    /// Print the unit and step graph the dashboard reads.
+    /// The unit and step graph the dashboard reads, under `graph`.
     Export,
     /// Report every violation in the campaign folder; exit 1 when there is any.
     Lint {
@@ -549,6 +551,8 @@ enum AttemptAct {
         outcome: crate::state::AttemptOutcome,
         #[arg(long, value_name = "PATH")]
         evidence: Option<PathBuf>,
+        #[command(flatten)]
+        echo: Box<crate::tick::agents::Echo>,
     },
 }
 
@@ -599,8 +603,21 @@ enum ReviewAct {
 
 #[derive(Subcommand)]
 enum EffectsAct {
-    /// Record one batch of receipts (a JSON array on stdin, at most 20 KiB) into the effect ledger and push it.
+    /// Record one batch of receipts (a JSON array on stdin, at most 20 KiB) into the effect ledger, commit and push it.
     Record,
+    /// Rule on a parked intent: done (with --evidence), retry under the same id, or drop (with --reason); commit and push the row.
+    Resolve {
+        /// The intent id, `i-YYYYMMDDTHHMM-NNNN`.
+        intent: String,
+        #[arg(long = "as", value_parser = ["done", "retry", "drop"])]
+        ruling: String,
+        /// A campaign file showing the intent happened (done).
+        #[arg(long, value_name = "PATH", required_if_eq("ruling", "done"))]
+        evidence: Option<PathBuf>,
+        /// Why it is closed without being done (drop).
+        #[arg(long, required_if_eq("ruling", "drop"))]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -681,6 +698,15 @@ fn commit_sha(text: &str) -> Result<String, String> {
         .ok_or_else(|| "expected a commit SHA (7 to 40 hexadecimal digits)".into())
 }
 
+fn full_sha(text: &str) -> Result<String, String> {
+    (text.len() == 40
+        && text
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+    .then(|| text.to_owned())
+    .ok_or_else(|| "expected a full commit SHA (40 lower-case hexadecimal digits)".into())
+}
+
 fn reviewer_name(text: &str) -> Result<String, String> {
     crate::store::is_name(text)
         .then(|| text.to_owned())
@@ -695,10 +721,12 @@ fn any_target(text: &str) -> Result<Target, String> {
     parse_target(text, false)
 }
 
-/// The echoed values on `cm attempt record`, when any is given.
+/// The echoed values on `cm attempt record` or `cm attempt end`, when any is given.
 fn act_echo(act: &Option<AttemptAct>) -> Option<&crate::tick::agents::Echo> {
     match act {
-        Some(AttemptAct::Record { echo, .. }) if **echo != crate::tick::agents::Echo::default() => {
+        Some(AttemptAct::Record { echo, .. } | AttemptAct::End { echo, .. })
+            if **echo != crate::tick::agents::Echo::default() =>
+        {
             Some(echo)
         }
         _ => None,
@@ -895,17 +923,30 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             worktree,
             coordinator,
             cap_min,
-        } => commands::launch_remote(
-            host,
-            &root()?,
-            target,
-            worktree.as_deref(),
-            &commands::Remote {
-                no_parts: no_parts.clone(),
-                coordinator: coordinator_label(coordinator),
-                cap_min: *cap_min,
-            },
-        ),
+            requested,
+        } => {
+            let launched = commands::launch_remote(
+                host,
+                &root()?,
+                target,
+                worktree.as_deref(),
+                &commands::Remote {
+                    no_parts: no_parts.clone(),
+                    coordinator: coordinator_label(coordinator),
+                    cap_min: *cap_min,
+                },
+            );
+            // S-tick-02 glue: the agent row only when the launch states what it asked for.
+            match launched {
+                Ok(outcome)
+                    if outcome.ok() && **requested != crate::tick::agents::Requested::default() =>
+                {
+                    crate::tick::agents::record_launch(host, &root()?, target, requested)?;
+                    Ok(outcome)
+                }
+                other => other,
+            }
+        }
         Commands::Unblock { target, evidence } => {
             let file = evidence.as_ref().map(|path| under_root(cli, path));
             commands::unblock(host, &root()?, target, file.as_deref())
@@ -966,7 +1007,9 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                     kind: kind.clone(),
                     id: id.clone(),
                 },
-                Some(AttemptAct::End { outcome, evidence }) => Act::End {
+                Some(AttemptAct::End {
+                    outcome, evidence, ..
+                }) => Act::End {
                     outcome: *outcome,
                     file: evidence.as_deref().map(|file| under_root(cli, file)),
                 },
@@ -1264,7 +1307,8 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
         } => crate::verdict::close_followup(host, &root()?, id, by),
         Commands::Tick { approved, effects } => {
             let args = crate::tick::TickArgs {
-                approved: approved.clone(),
+                approved: crate::tick::ApprovedSha::parse(approved)
+                    .expect("clap checks a full 40-hex SHA"),
                 effects: *effects,
             };
             return crate::tick::cli_tick(host, &root()?, &args);
@@ -1277,6 +1321,36 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             &root()?,
             &mut std::io::stdin().lock(),
         ),
+        Commands::Effects {
+            act:
+                EffectsAct::Resolve {
+                    intent,
+                    ruling,
+                    evidence,
+                    reason,
+                },
+        } => {
+            use crate::tick::ledger::Ruling;
+            let ruling = match ruling.as_str() {
+                "done" => Ruling::Done {
+                    evidence: evidence
+                        .as_deref()
+                        .map(|file| under_root(cli, file).to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                },
+                "retry" => Ruling::Retry,
+                _ => Ruling::Drop {
+                    reason: reason.clone().unwrap_or_default(),
+                },
+            };
+            crate::tick::record::resolve(
+                host,
+                &crate::tick::push::SystemGit::default(),
+                &root()?,
+                &crate::tick::IntentId(intent.clone()),
+                ruling,
+            )
+        }
         Commands::Export => crate::tick::export::export(&root()?),
         Commands::Lint { dir } => {
             let start = match (dir, &cli.root) {
@@ -1338,6 +1412,17 @@ pub fn main() -> ExitCode {
             .error(
                 clap::error::ErrorKind::ArgumentConflict,
                 "--by applies only to superseded",
+            )
+            .exit();
+    }
+    if let Commands::Tick { effects: true, .. } = &cli.command
+        && cli.json
+    {
+        // S-tick-10: with --effects stdout is exactly one EffectsOut line.
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--json does not apply to `cm tick --effects`, which prints its own JSON line",
             )
             .exit();
     }

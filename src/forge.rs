@@ -514,7 +514,8 @@ impl Gh {
     /// Every item of a paginated list endpoint whose pages report `total_count`: page after page
     /// until the total is read. A page that cannot be read, or that ends the list short of its
     /// total, is an error, never a shorter list.
-    fn pages<P: DeserializeOwned, T>(
+    /// S-tick-04: crate-visible so the tick's read traits page the same way.
+    pub(crate) fn pages<P: DeserializeOwned, T>(
         &self,
         path: &str,
         split: impl Fn(P) -> (usize, Vec<T>),
@@ -540,7 +541,9 @@ impl Gh {
         Err(ForgeError::Json)
     }
 
-    fn json<T: DeserializeOwned>(&self, args: &[&str]) -> Result<T, ForgeError> {
+    /// S-tick-04: crate-visible so the tick's read traits (`tick::intake::GhPullReads` and the
+    /// rest) run `gh api` exactly as the forge does.
+    pub(crate) fn json<T: DeserializeOwned>(&self, args: &[&str]) -> Result<T, ForgeError> {
         let output = run(&self.program, args, self.timeout, None)?;
         if !output.status.success() {
             return Err(ForgeError::Exit(output.status.code()));
@@ -569,7 +572,9 @@ impl Gh {
     }
 }
 
-fn run(
+/// One child process with a deadline: killed on expiry. S-tick-04: crate-visible so every tick
+/// child (`git`, `astra-review.sh`) runs through it rather than a second runner.
+pub(crate) fn run(
     program: &Path,
     args: &[&str],
     timeout: Duration,

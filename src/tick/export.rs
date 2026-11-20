@@ -1,5 +1,6 @@
-//! `cm export --json` (`tick/agent-ledger`): the unit and step graph the dashboard reads, so
-//! UNITS.json retires.
+//! `cm export --json` (`tick/agent-ledger`): the unit and step graph cm holds, under the outcome's
+//! `graph` field, so the dashboard reads cm instead of UNITS.json for state and edges. Plan facts cm
+//! does not hold (title, wave, size, ideas) stay with the plan (SKELETON.md, Named gaps).
 
 #![allow(
     unused_variables,
@@ -17,16 +18,20 @@ use crate::outcome::Outcome;
 pub struct Node {
     /// `<NN-name>/<unit>` or `<NN-name>/<unit>/<step>`.
     pub id: String,
+    /// `unit` or `step`.
+    pub kind: String,
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Edge {
     pub from: String,
     pub to: String,
-    /// The `--after` form: `merged`, `pr-open`, `tag`, `deployed`.
+    /// The `--after` form: `merged`, `pr-open`, `tag` or `deployed`.
     pub kind: String,
 }
 

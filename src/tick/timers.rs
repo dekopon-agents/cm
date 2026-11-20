@@ -1,5 +1,6 @@
-//! Timers and retries (`tick/core`): due work that is not an event. Durable in
-//! `.cm/timers.json`, keyed so re-arming is idempotent.
+//! Timers and retries (`tick/core`): due work that is not an event. Durable in [`TIMERS_FILE`],
+//! keyed so arming is idempotent, saved into the tick's first commit (S-tick-41, stage 9), so a
+//! killed tick leaves the pushed file as it was.
 
 #![allow(unused_variables, reason = "skeleton: tick/core fills these bodies")]
 
@@ -10,26 +11,33 @@ use serde::{Deserialize, Serialize};
 
 use crate::tick::ledger::IntentId;
 
-pub const TIMERS_FILE: &str = ".cm/timers.json";
-/// Growth bound: armed timers; arming past it parks the arming unit.
+pub const TIMERS_FILE: &str = ".cm/tick/timers.json";
+/// Growth bound: armed timers. Arming past it is [`crate::tick::TickError::TimersFull`], which the
+/// arming stage turns into a parked intent and one packet item.
 pub const MAX_TIMERS: usize = 256;
-/// A retried intent parks after this many tries.
+/// A known-not-done intent is emitted at most this many times, then parked.
 pub const MAX_TRIES: u32 = 5;
+/// How often a parked intent comes back into the packet while nobody rules on it.
+pub const REMINDER_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// How long a review may run before the packet says it is late.
+pub const REVIEW_DEADLINE: Duration = Duration::from_secs(90 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum TimerKind {
-    /// Re-emit a known-not-done intent after backoff.
+    /// Emit a known-not-done intent again after [`backoff`].
     Retry { intent: IntentId },
-    /// A review launched with this nonce has not posted by the deadline.
-    ReviewDeadline { target: String, intent: IntentId },
-    /// A launched step has had no attempt activity for the LIMITS stall hours.
-    Stall { target: String },
+    /// Poll an Astra review with `astra-review.sh collect` (S-tick-38).
+    Collect { intent: IntentId },
+    /// A review launched with this intent's nonce has no verdict by the deadline.
+    ReviewDeadline { intent: IntentId },
+    /// A parked intent nobody has ruled on.
+    Reminder { intent: IntentId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Timer {
-    /// Unique; arming an existing key moves its due time.
+    /// Unique; arming an existing key moves its due time and keeps its tries.
     pub key: String,
     /// `cm` stamp.
     pub due: String,
@@ -44,10 +52,12 @@ pub struct Timers {
 }
 
 impl Timers {
+    /// Absent is empty.
     pub fn load(root: &Path) -> crate::tick::Result<Self> {
         todo!("tick/core")
     }
 
+    /// Written atomically; the caller adds the path to the tick's commit.
     pub fn save(&self, root: &Path) -> crate::tick::Result<()> {
         todo!("tick/core")
     }
@@ -61,13 +71,13 @@ impl Timers {
         todo!("tick/core")
     }
 
-    /// Removes and returns the timers due at `now` (a `cm` stamp), oldest first.
+    /// The timers due at `now` (a `cm` stamp), oldest first, removed from this copy only.
     pub fn take_due(&mut self, now: &str) -> Vec<Timer> {
         todo!("tick/core")
     }
 }
 
-/// Exponential, capped: the delay before try `tries + 1`.
+/// Exponential from one tick interval, capped at one hour: the delay before try `tries + 1`.
 pub fn backoff(tries: u32) -> Duration {
     todo!("tick/core")
 }
@@ -76,7 +86,7 @@ pub fn backoff(tries: u32) -> Duration {
 mod tests {
     #[test]
     #[ignore = "skeleton: tick/core"]
-    fn a_tick_aborted_after_take_due_leaves_the_timers_file_unchanged() {
+    fn a_tick_killed_after_take_due_leaves_the_pushed_timers_file_unchanged() {
         todo!()
     }
 
@@ -94,7 +104,7 @@ mod tests {
 
     #[test]
     #[ignore = "skeleton: tick/core"]
-    fn restart_fires_each_overdue_timer_once() {
+    fn a_restart_fires_each_overdue_timer_once() {
         todo!()
     }
 }
