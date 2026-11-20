@@ -1,10 +1,11 @@
-//! Who applies the effects a tick plans (S-tick-23, S-tick-24). One cycle, two appliers:
+//! Who applies the effects a tick plans (`tick/wire`; S-tick-23, S-tick-24). One cycle, two
+//! appliers:
 //!
 //! - **Runner** (`cm tick --effects`, the RPi): cm prints the effects and the runner applies them
 //!   as principal `rpi-coordinator` (11-D3 (2)); receipts come back by `cm effects record`.
 //! - **Local** (`cm tick` in the cloud interim, before any runner exists): cm applies what the
 //!   cloud session's own `gh` login can, through [`LocalApply`], in order, stopping at the first
-//!   refusal or error exactly as the runner does, and records the receipts with
+//!   refusal or failure exactly as the runner does, and records the receipts with
 //!   [`record_receipts`](crate::tick::record::record_receipts). What it cannot apply becomes a
 //!   decision-packet action for the coordinator, whose receipt comes back by
 //!   `cm effects record` like the runner's: the enqueue (GraphQL is 403 in the cloud, so the
@@ -14,7 +15,7 @@
 //! Either way the intent rows are pushed first and the ledger is the only record, so the interim
 //! and the RPi share one reconcile.
 
-#![allow(unused_variables, reason = "skeleton: tick/ledger fills these bodies")]
+#![allow(unused_variables, reason = "skeleton: tick/wire fills these bodies")]
 
 use crate::forge::Gh;
 use crate::tick::packet::PacketItem;
@@ -74,39 +75,44 @@ impl Apply for LocalApply<'_> {
 /// gate-merge's bracket: read the head over REST right before the call and enqueue only if it is
 /// the gated head.
 pub fn defer(effect: &Effect) -> PacketItem {
-    todo!("tick/ledger")
+    todo!("tick/wire")
 }
 
-/// The effects applied in order up to and including the first `refused` or `error` receipt.
+/// The effects applied in order up to and including the first `refused` or `failed` receipt or
+/// the first deferral.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AppliedRun {
     pub receipts: Vec<Receipt>,
     pub deferred: Vec<PacketItem>,
-    /// The index of the effect that stopped the run; the ones after it were not applied.
+    /// The index of the effect that stopped the run; the ones after it were not applied and wait
+    /// for the next tick.
     pub stopped_at: Option<usize>,
 }
 
-/// 11-D3 (2)'s order and stop rule, for the local applier.
+/// 11-D3 (2)'s order and stop rule, for the local applier. A deferral stops the run like a
+/// refusal (U08): a later effect may depend on the handed one, so it waits until the handoff's
+/// receipt is recorded.
 pub fn apply_in_order(apply: &dyn Apply, effects: &[Effect]) -> AppliedRun {
-    todo!("tick/ledger")
+    todo!("tick/wire")
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    #[ignore = "skeleton: tick/ledger"]
-    fn the_local_run_stops_at_the_first_refusal_and_leaves_later_intents_open() {
+    #[ignore = "skeleton: tick/wire"]
+    fn the_local_run_stops_at_the_first_refusal_failure_or_deferral_and_leaves_later_intents_open()
+    {
         todo!()
     }
 
     #[test]
-    #[ignore = "skeleton: tick/ledger"]
+    #[ignore = "skeleton: tick/wire"]
     fn a_tick_killed_mid_apply_reconciles_the_applied_effect_and_reemits_only_the_rest() {
         todo!()
     }
 
     #[test]
-    #[ignore = "skeleton: tick/ledger"]
+    #[ignore = "skeleton: tick/wire"]
     fn a_deferred_effect_stays_open_until_its_receipt_is_recorded() {
         todo!()
     }

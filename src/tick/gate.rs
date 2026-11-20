@@ -16,8 +16,19 @@
 //!
 //! `tick/gate-merge` also changes three existing files, and only it does: `src/verdict.rs` (parse
 //! the `nonce:` line into `Block::nonce`; `merge_gaps` takes the phase's [`ProofRule`]; the RULING
-//! text for the third FIX REQUIRED), `src/commands.rs` (`cm advance`'s gate passes that rule) and
-//! `src/sync.rs` (`gate_holds` applies it to every reviewed lane, not only codex).
+//! text for the third FIX REQUIRED), `src/commands.rs` (fills `advance_proved`) and `src/sync.rs`
+//! (fills `sync_proved`, whose `gate_holds` applies the rule to every reviewed lane).
+//!
+//! **The approved channel (R07).** `cm advance … --approved <sha>` and `cm sync --approved <sha>`
+//! (skeleton glue) read the phase's proof through [`approved_context`], the same `[review]` table
+//! the tick reads at its `--approved`, and call `commands::advance_proved` and `sync::sync_proved`.
+//! Without `--approved`, both keep today's gate: Astra receipt plus review record on codex steps,
+//! which is the bootstrap proof. The tick's own stage 4 calls `sync_proved` with its cycle's
+//! approved context.
+//!
+//! **Reading the ledger (R08).** Every proof reader here and in those two seams uses
+//! `EffectLedger::snapshot`, never the exclusive open: `cm advance` and `cm sync` hold no tick
+//! lock, and stage 4 runs inside a tick that already holds it.
 
 #![allow(
     unused_variables,
@@ -27,7 +38,7 @@
 use std::path::Path;
 
 use crate::store::Target;
-use crate::tick::authority::{ProofRule, ReviewTable};
+use crate::tick::authority::{Approved, ApprovedSha, ProofRule, ReviewTable};
 use crate::tick::intake::IssueComment;
 use crate::tick::ledger::{EffectLedger, Family, IntentId, Nonce, VerdictProof};
 use crate::verdict::Verdict;
@@ -162,7 +173,14 @@ pub fn fix_required_count(ledger: &EffectLedger, repo: &str, pr: u32, reviewer: 
     todo!("tick/gate-merge")
 }
 
-/// What the phase's proof still lacks at `head`, for `cm advance` and `cm sync`: the existing
+/// [`Approved`] for `cm advance --approved` and `cm sync --approved`: `Approved::read` through
+/// `SystemGit` at the checkout holding `root`.
+pub fn approved_context(root: &Path, sha: &ApprovedSha) -> crate::tick::Result<Approved> {
+    todo!("tick/gate-merge")
+}
+
+/// What the phase's proof still lacks at `head`, for `cm advance` and `cm sync`, reading the
+/// ledger only through `EffectLedger::snapshot`: the existing
 /// Astra-plus-record gaps for the bootstrap rule, the Astra half for `astra-receipt`, and a bound
 /// App comment verdict for `app-comment`. Empty when the proof holds.
 pub fn proof_gaps(
@@ -199,6 +217,12 @@ mod tests {
     #[test]
     #[ignore = "skeleton: tick/gate-merge"]
     fn a_restart_still_refuses_every_must_not_merge_comment() {
+        todo!()
+    }
+
+    #[test]
+    #[ignore = "skeleton: tick/gate-merge"]
+    fn a_proof_read_inside_a_locked_tick_uses_the_snapshot_and_writes_nothing() {
         todo!()
     }
 }

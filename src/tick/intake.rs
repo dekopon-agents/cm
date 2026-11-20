@@ -2,10 +2,20 @@
 //! read-only `gh api` GETs that 11-D10's route table already opens (`pulls/{number}`,
 //! `issues/{number}/comments`). The runner hands cm no event payload (11-D3 (1)), so intake polls.
 //!
-//! Watched PRs are the ones cm tracks: every step or part at `pr-open` with its PR URL. A step's
-//! first sight at `pr-open`, a moved head, and a `@dekopon review` comment each make a review owed;
-//! every other new issue comment is a verdict candidate for the gate. Recording `pr-open` stays
-//! where it is today (`cm advance`, or `cm sync` once a URL is known); intake reads no PR list.
+//! Watched PRs are the ones cm tracks: every step or part at `pr-open` with its PR URL. Intake
+//! reports what it read; it owns no obligation (R04). Review debt is level-triggered in
+//! `dispatch::reviews_owed`: every watched PR's current head with no review intent or verdict from
+//! the other family is owed, every tick, whatever was read before, so a paused tick, an authority
+//! outage or a full launch batch loses nothing. A `@dekopon review` comment is kept in
+//! `Cursor::requested` until a review intent names it (`IntentRow::requested_by`). Comments advance
+//! `PrCursor::last_comment` only when a stage marks them handled (`Cycle::handled`): the gate, once
+//! it has bound, refused or ignored each one. A watched PR whose lane has no reviewed family (a
+//! homelab pin PR) gets no comment reads (U04).
+//!
+//! Recording `pr-open` stays where it is today (`cm advance`, or `cm sync` once a URL is known);
+//! intake reads no PR list. On the RPi the proposed recorder is `11-rpi/coordinator-agent`, which
+//! records a writer lane's PR with `cm advance … pr-open` and pushes it before the next tick (G9,
+//! R26; SKELETON.md).
 //!
 //! S-tick-36, task. **Owner:** the tick's thread; each read is one `gh` child through
 //! `forge::run` with `forge::GH_TIMEOUT`. **Bound:** at most [`MAX_READS_PER_TICK`] reads and
@@ -118,23 +128,31 @@ pub struct PrCursor {
     pub last_comment: Option<u64>,
 }
 
-/// Per watched PR URL, what intake already took in; plus the tick bookkeeping that must move with
-/// it in one commit.
+/// Per watched PR URL, what the stages have handled; plus the tick bookkeeping that must move
+/// with it in the tick's first commit.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursor {
     pub prs: BTreeMap<String, PrCursor>,
+    /// PR URL to the newest `@dekopon review` comment no review intent names yet.
+    #[serde(default)]
+    pub requested: BTreeMap<String, u64>,
     /// Where the next tick's round-robin starts.
     pub rotation: usize,
-    /// `cm` stamp of the last tick that pushed its first commit: "one heartbeat ago" for the
-    /// readiness rule (S-tick-63).
-    pub last_tick: Option<String>,
+    /// The number of the last tick that pushed its first commit. A tick runs as `tick + 1`;
+    /// receipts and intents carry the number they were written under, which orders them where
+    /// minute stamps cannot (R11, S-tick-63).
+    #[serde(default)]
+    pub tick: u64,
+    /// Receipt rows already turned into `effect-refused` items (R17).
+    #[serde(default)]
+    pub receipts_done: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Intake {
     pub events: Vec<Event>,
-    /// The cursor to save in the tick's first commit.
-    pub next: Cursor,
+    /// Each read PR's current head and base: what `reviews_owed` and the gate compare against.
+    pub heads: BTreeMap<String, (String, String)>,
     /// Watched PRs left for the next tick by the read or event bound.
     pub deferred: usize,
     /// PR URL and why its read failed.
@@ -160,7 +178,9 @@ pub fn watched(units: &Units) -> Vec<Watched> {
 }
 
 /// Reads each watched PR (head and base through `Forge::pull`, comments through `reads`) since
-/// the cursor, within the bounds. Never fails: a read error is an `unread` entry.
+/// the cursor's handled marks, within the bounds. Never fails: a read error is an `unread` entry.
+/// The cursor saved at stage 9 is the loaded one with `Cycle::handled` marks applied, never what
+/// was merely read.
 pub fn intake(
     forge: &dyn Forge,
     reads: &dyn PullReads,
@@ -199,6 +219,12 @@ mod tests {
     #[test]
     #[ignore = "skeleton: tick/core"]
     fn a_failed_read_for_one_pr_is_unread_and_every_other_pr_is_still_taken_in() {
+        todo!()
+    }
+
+    #[test]
+    #[ignore = "skeleton: tick/core"]
+    fn a_paused_or_full_tick_keeps_review_debt_and_every_unhandled_comment() {
         todo!()
     }
 }

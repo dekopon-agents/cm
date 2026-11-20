@@ -15,19 +15,12 @@ fn a_restart_between_intent_and_effect_reconciles_or_parks_with_no_second_launch
 
 #[test]
 #[ignore = "skeleton: tick/ledger"]
-fn tick_effects_stdout_parses_as_the_runner_wire_shape_with_provider_field_names() {
-    todo!()
-}
-
-#[test]
-#[ignore = "skeleton: tick/ledger"]
-fn effects_record_takes_a_twenty_kib_batch_commits_and_pushes_it_and_records_oversize_outputs_by_hash()
- {
-    todo!()
-}
-
-#[test]
-#[ignore = "skeleton: tick/ledger"]
 fn effects_resolve_closes_a_parked_intent_and_retry_reemits_it_under_the_same_id() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: tick/ledger"]
+fn a_killed_tick_and_a_second_clone_recover_by_the_dirty_tree_and_union_rules() {
     todo!()
 }

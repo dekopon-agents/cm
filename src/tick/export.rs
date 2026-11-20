@@ -1,6 +1,8 @@
-//! `cm export --json` (`tick/agent-ledger`): the unit and step graph cm holds, under the outcome's
-//! `graph` field, so the dashboard reads cm instead of UNITS.json for state and edges. Plan facts cm
-//! does not hold (title, wave, size, ideas) stay with the plan (SKELETON.md, Named gaps).
+//! `cm export --json` (`tick/agent-ledger`; R20): the unit and step graph cm holds, under the
+//! outcome's `graph` field. cm holds state, lanes and `--after` edges, not plan facts (title, wave,
+//! size, ideas, depends_on, calls); those stay in UNITS.json, the plan-fact source, and are not
+//! copied into cm. Each node carries its UNITS.json id, so the dashboard joins the two. Retiring
+//! UNITS.json needs a plan-fact source the owner names (G8); this unit does not retire it.
 
 #![allow(
     unused_variables,
@@ -18,6 +20,10 @@ use crate::outcome::Outcome;
 pub struct Node {
     /// `<NN-name>/<unit>` or `<NN-name>/<unit>/<step>`.
     pub id: String,
+    /// The UNITS.json id a unit node maps to: the unit path with its `NN-` prefix dropped
+    /// (`07-tick/ledger` → `tick/ledger`); `None` for a step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
     /// `unit` or `step`.
     pub kind: String,
     pub state: String,
@@ -30,6 +36,8 @@ pub struct Node {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Edge {
     pub from: String,
+    /// A step id, or for a `tag` or `deployed` gate the release target `<line>@<version>`, which
+    /// may name a line no unit in this campaign declares.
     pub to: String,
     /// The `--after` form: `merged`, `pr-open`, `tag` or `deployed`.
     pub kind: String,

@@ -21,6 +21,12 @@ pub const MAX_TRIES: u32 = 5;
 pub const REMINDER_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// How long a review may run before the packet says it is late.
 pub const REVIEW_DEADLINE: Duration = Duration::from_secs(90 * 60);
+/// How long a handed packet action may stay undone before its intent is parked (R18).
+pub const ACTION_DEADLINE: Duration = Duration::from_secs(2 * 60 * 60);
+/// The first retry delay (U05): the RPi runner's 5-minute schedule (EXECUTION.md §Runner).
+pub const BACKOFF_BASE: Duration = Duration::from_secs(5 * 60);
+/// The longest retry delay.
+pub const BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -33,6 +39,9 @@ pub enum TimerKind {
     ReviewDeadline { intent: IntentId },
     /// A parked intent nobody has ruled on.
     Reminder { intent: IntentId },
+    /// A handed packet action: if its intent is still handed when this fires, reconcile parks it
+    /// and arms its reminder (R18).
+    ActionDeadline { intent: IntentId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,7 +86,7 @@ impl Timers {
     }
 }
 
-/// Exponential from one tick interval, capped at one hour: the delay before try `tries + 1`.
+/// [`BACKOFF_BASE`] doubled per try, capped at [`BACKOFF_MAX`]: the delay before try `tries + 1`.
 pub fn backoff(tries: u32) -> Duration {
     todo!("tick/core")
 }

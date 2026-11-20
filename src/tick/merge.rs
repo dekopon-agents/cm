@@ -2,14 +2,17 @@
 //!
 //! For each watched PR with a bound ACCEPT from the other family at its current head, the
 //! phase's proof whole, `[authority]` allowing the repository, the §Gates checks green at that head
-//! (`authority::checks_green`) and, on core dekopon, the drop admitting one more counting merge
-//! (`release::drop_admits`): a branch with a merge queue gets `gh.pull-request.enqueue` with
+//! (`authority::checks_green`) and, on core dekopon, a tally row reserved in the open drop's
+//! `RELEASE.md` before the intent is written (`release::reserve`, R09; the prep PR is exempt and
+//! held by its own rule): a branch with a merge queue gets `gh.pull-request.enqueue` with
 //! `expectedHeadSha` = that head, never REST; any other gets `gh.pull-request.merge` with it. In the
 //! cloud interim the enqueue is a packet action (`apply::defer`), bracketed by a REST head read
 //! right before the MCP call. After every merge or enqueue intent, [`confirm`] reads the merged PR
 //! over REST and binds merged only when its head is the gated head; otherwise the intent parks
-//! with a `head-moved-after-merge` item (revert PR, every pin held, journaled), and
-//! [`pins_held`] holds every pin until a ruling closes it. `gh pr` is never used.
+//! with a `head-moved-after-merge` item and [`pins_held`] holds every pin until a ruling closes it.
+//! The revert PR is a packet action in the interim, where the coordinator may open PRs; on the RPi
+//! no executor holds a PR-create, so it is a `missing-capability` item (G2, R23). The queue rule is
+//! read for the PR's own base branch (`MergeReads::base_ref`, R22). `gh pr` is never used.
 
 #![allow(
     unused_variables,
@@ -18,7 +21,7 @@
 
 use crate::forge::{Forge, ForgeError, Gh, GithubRepo};
 use crate::tick::gate::BoundVerdict;
-use crate::tick::ledger::{EffectLedger, IntentId, IntentRow, Observation};
+use crate::tick::ledger::{EffectLedger, IntentId, IntentRow, Observation, Readmit};
 use crate::tick::packet::PacketItem;
 use crate::tick::run::{Cycle, Deps, Planned};
 use crate::tick::wire::{Effect, Receipt};
@@ -31,6 +34,8 @@ pub enum BranchKind {
 
 /// The merge reads `Forge` does not have.
 pub trait MergeReads {
+    /// The PR's base branch name (`pulls/{number}` `base.ref`; 11-D10).
+    fn base_ref(&self, repo: &GithubRepo, number: u32) -> Result<String, ForgeError>;
     /// Whether `branch` requires a merge queue (`rules/branches/{branch}` holds a `merge_queue`
     /// rule; 11-D10).
     fn queued(&self, repo: &GithubRepo, branch: &str) -> Result<bool, ForgeError>;
@@ -41,6 +46,10 @@ pub struct GhMergeReads<'a> {
 }
 
 impl MergeReads for GhMergeReads<'_> {
+    fn base_ref(&self, repo: &GithubRepo, number: u32) -> Result<String, ForgeError> {
+        todo!("tick/gate-merge")
+    }
+
     fn queued(&self, repo: &GithubRepo, branch: &str) -> Result<bool, ForgeError> {
         todo!("tick/gate-merge")
     }
@@ -54,6 +63,10 @@ pub enum MergePlan {
     /// Checks pending, the other family's verdict missing, or the drop full: look again next tick.
     Wait {
         why: String,
+    },
+    /// No executor holds the capability on this path (G2's revert on the RPi).
+    Missing {
+        gap: &'static str,
     },
 }
 
@@ -94,6 +107,12 @@ pub fn apply_local(gh: &Gh, effect: &Effect) -> Receipt {
     todo!("tick/gate-merge")
 }
 
+/// R05: a merge or enqueue is emitted again only when a bound verdict, the proof and green checks
+/// still hold at the PR's current head, which is still the intent's head.
+pub fn readmit(cycle: &Cycle, row: &IntentRow) -> Readmit {
+    todo!("tick/gate-merge")
+}
+
 /// A parked merge mismatch holds every pin until a ruling closes it.
 pub fn pins_held(ledger: &EffectLedger) -> Option<IntentId> {
     todo!("tick/gate-merge")
@@ -128,6 +147,18 @@ mod tests {
     #[test]
     #[ignore = "skeleton: tick/gate-merge"]
     fn a_restart_after_a_mismatched_merge_keeps_every_pin_held_until_a_ruling() {
+        todo!()
+    }
+
+    #[test]
+    #[ignore = "skeleton: tick/gate-merge"]
+    fn the_queue_rule_is_read_for_the_prs_own_base_branch() {
+        todo!()
+    }
+
+    #[test]
+    #[ignore = "skeleton: tick/gate-merge"]
+    fn a_revert_on_the_rpi_is_a_missing_capability_item_never_a_packet_action() {
         todo!()
     }
 }

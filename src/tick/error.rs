@@ -49,9 +49,16 @@ pub enum TickError {
     /// 11-D4: LIMITS.toml, `[authority]`, `[gates]` or `[review]` is missing or malformed there.
     #[error("no usable authority at {sha}: {detail}")]
     AuthorityMissing { sha: String, detail: String },
-    /// 11-D7: `git pull --no-rebase` conflicted; the merge was aborted and nothing was written.
+    /// 11-D7: `git pull --no-rebase` conflicted in a checkout cm did not clone; the merge was
+    /// aborted and nothing was written (R03).
     #[error("pull conflicted in {paths:?}; merge aborted")]
     PullConflict { paths: Vec<String> },
+    /// R02: dirty paths no cm command writes would be overwritten by the pull.
+    #[error("pull blocked by dirty paths cm does not own: {paths:?}")]
+    PullBlocked { paths: Vec<String> },
+    /// R03: the ledger segment lacks campaign-trail's `merge=union` attribute.
+    #[error("{path}: merge attribute is not union")]
+    LedgerNotUnion { path: PathBuf },
     /// 11-D8: non-fast-forward rejects on every try.
     #[error("ledger push rejected {tries} times")]
     PushExhausted { tries: u8 },

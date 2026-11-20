@@ -916,6 +916,19 @@ pub(crate) fn render_resume(root: &Path, units: &Units, closed: bool) -> Result<
     Ok(())
 }
 
+/// S-tick-52 seam (R07): `cm sync --approved <sha>` and the tick's stage 4. `gate_holds` takes
+/// the phase's proof from the approved `[review]` table for every reviewed lane. `tick/gate-merge`
+/// fills it.
+#[allow(unused_variables, reason = "skeleton: tick/gate-merge fills this body")]
+pub fn sync_proved(
+    host: &dyn Host,
+    forge: &dyn Forge,
+    root: &Path,
+    approved: &crate::tick::Approved,
+) -> Result<Outcome> {
+    todo!("tick/gate-merge")
+}
+
 pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> {
     let found = guard(root)?;
     if !found.is_empty() {

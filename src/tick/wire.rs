@@ -1,34 +1,50 @@
-//! The 11-D3 wire contract with dekopon's RPi coordinator runner (`rpi/tick-runner`). These
-//! shapes are frozen by the skeleton: no unit renames a field or a capability (S-tick-10..13).
+//! The 11-D3 wire contract with dekopon's RPi coordinator runner (`rpi/tick-runner`), owned by
+//! `tick/wire` (C2 split, R21). The shapes are the runner skeleton's, dekopon#983 at `63e2ab53`:
+//! `runner.rs` `TickPlan` and `Effect`, both `deny_unknown_fields`, and `runner/receipt.rs`
+//! `Receipt`, `ReceiptOutcome` and `ReceiptOutput` (R01). No unit renames a field or a capability.
+//! `tests/fixtures/tick-wire/` holds one plan and one receipt batch that both sides parse; a change
+//! to it is a wire change in both repositories at once.
 //!
 //! The runner's two command lines, frozen:
-//! - Step (1): `cm tick --effects --approved <40-hex> -C <checkout>/store/epochs/<slug>`. Exit 0
-//!   means stdout is exactly one [`EffectsOut`] JSON line and every effect's intent row is
-//!   already pushed. A tick that started and then failed still exits 0, with no effects and a
-//!   `tick-aborted` packet item. A non-zero exit (bad arguments, no campaign folder) prints
-//!   nothing on stdout, and the runner applies nothing.
+//! - Step (1): `cm tick --effects --approved <40-hex> --clone <url> -C <checkout>/store/epochs/<slug>`.
+//!   `--clone` is 11-D7's hand-in: when `<checkout>` is absent (a new or reaped jail), cm clones
+//!   `<url>` there first; when present, cm uses it (G5, proposed disposition). Exit 0 means stdout
+//!   is exactly one [`EffectsOut`] JSON line and every effect's intent row is already pushed. A
+//!   tick that started and then failed still exits 0, with no effects and a `tick-aborted` packet
+//!   item. A non-zero exit (bad arguments, a failed clone) prints nothing on stdout, and the runner
+//!   applies nothing.
 //! - Step (3): `cm effects record -C <same>` reads one JSON array of [`Receipt`] on stdin, at most
 //!   [`BATCH_MAX_BYTES`], in effect order. Exit 0 means the batch is committed and pushed.
+//!
+//! The runner runs one cycle at a time per entry: it starts no compute while an earlier cycle of
+//! the same entry is applying or recording (R06; `rpi/tick-runner` owns this). cm's side of a
+//! cycle whose completion is unknown is the observer's conservative rule (S-tick-16): a
+//! non-idempotent effect with no receipt parks unless positive evidence binds it.
 //!
 //! The stdout bound holds by construction: [`admit`] sizes the effects and the packet before any
 //! intent row is written, and whatever does not fit waits for the next tick. cm never prints a
 //! line past [`TICK_STDOUT_MAX_BYTES`], so vm-runner's `truncated` mark cannot come from cm.
 //!
+//! One sizing rule (U07): an output of [`OUTPUT_INLINE_MAX_BYTES`] or more, or one that is not
+//! UTF-8, is [`Oversize`]: its length and SHA-256, never truncated. Whoever produced the output
+//! decides (the runner's `ReceiptOutput::of`, or [`ReceiptOutput::of`] here for the local
+//! applier); `cm effects record` checks it again. An inline output is the provider's output bytes
+//! as UTF-8 text, verbatim, never re-serialized; a stage that needs a field parses it as JSON.
+//!
 //! The inputs are the provider's own schemas, which deny unknown fields: provider-gh
 //! `reviews.rs` `MergeInput` and `workflows.rs` `Input` at `5b1616e`, and 11-D15, 11-D17 and
 //! 11-D18 for the verbs `11-rpi/gh-verbs` builds. The kubectl inputs are this skeleton's reading of
-//! 11-D20's four forms; `11-rpi/k8s-provider` confirms them (SKELETON.md, Choices).
+//! 11-D20's four forms; `11-rpi/k8s-provider` confirms them (SKELETON.md, G6).
 
-#![allow(unused_variables, reason = "skeleton: tick/ledger fills these bodies")]
+#![allow(unused_variables, reason = "skeleton: tick/wire fills these bodies")]
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::tick::ledger::IntentId;
-use crate::tick::packet::PacketKind;
 
-/// 11-D3: one receipt's serialized size; a larger output is recorded as [`Oversize`].
-pub const RECEIPT_MAX_BYTES: usize = 8 * 1024;
+/// 11-D3: one receipt fits the vm provider's budget; outputs reaching it are [`Oversize`].
+pub const OUTPUT_INLINE_MAX_BYTES: usize = 8 * 1024;
 /// 11-D3: one `cm effects record` stdin (provider-vm's 24,576-byte argv plus stdin budget).
 pub const BATCH_MAX_BYTES: usize = 20 * 1024;
 /// vm-runner's cap on step (1)'s stdout (README §Named sessions).
@@ -36,34 +52,20 @@ pub const TICK_STDOUT_MAX_BYTES: usize = 64 * 1024;
 /// Full-queue policy: effects one tick emits; the rest wait for the next tick, oldest first.
 pub const MAX_EFFECTS_PER_TICK: usize = 16;
 
-/// Step (1)'s stdout.
+/// Step (1)'s stdout: the runner's `TickPlan`, exactly these two fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EffectsOut {
     pub effects: Vec<Effect>,
+    /// 11-D3 (4): the packet's rendered text, which the runner posts verbatim as one message to
+    /// the coordinator conversation (`DecisionPacket::render`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub packet: Option<PacketOut>,
-}
-
-/// 11-D3 (4): what the runner delivers. It posts `text` verbatim as one message to the
-/// coordinator conversation and reads nothing else; `items` is for tests and the journal.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PacketOut {
-    /// Markdown, at most [`crate::tick::packet::PACKET_MAX_BYTES`].
-    pub text: String,
-    pub items: Vec<PacketLine>,
-    /// Items past the packet's bounds; they stay unseen and come back on a later tick.
-    pub omitted: usize,
-}
-
-/// One packet item as the wire carries it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PacketLine {
-    pub key: String,
-    pub kind: PacketKind,
+    pub packet: Option<String>,
 }
 
 /// One effect the runner applies, in order, as principal `rpi-coordinator`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Effect {
     pub intent: IntentId,
     pub capability: Capability,
@@ -211,35 +213,36 @@ pub struct DeploymentInput {
 #[serde(deny_unknown_fields)]
 pub struct ReadyzInput {}
 
-/// What the runner saw applying one effect. The runner stops at the first `refused` or `error`;
-/// the effects after it get no receipt and their intents stay open for the next reconcile.
+/// The runner's `ReceiptOutcome`. The runner stops at the first `refused` or `failed`; the
+/// effects after it get no receipt and their intents stay open for the next reconcile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EffectOutcome {
+#[serde(rename_all = "camelCase")]
+pub enum ReceiptOutcome {
     /// Closes the intent.
-    Applied,
-    /// Closes the intent with a packet item: Cedar or the provider said no, which is judgment.
+    Ok,
+    /// Closes the intent and puts one `effect-refused` packet item (S-tick-40, R17): Cedar or the
+    /// provider said no, which is judgment.
     Refused,
     /// Leaves the intent open: the write may or may not have happened, so reconcile decides.
-    Error,
+    Failed,
 }
 
-/// Step (3)'s stdin element.
+/// Step (3)'s stdin element: the runner's `Receipt`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Receipt {
     pub intent: IntentId,
     pub capability: Capability,
-    pub outcome: EffectOutcome,
+    pub outcome: ReceiptOutcome,
     pub output: ReceiptOutput,
 }
 
-/// Inline when the whole receipt serializes under [`RECEIPT_MAX_BYTES`], else only the output's
-/// size and hash: never truncated.
+/// The runner's `ReceiptOutput`: the output text inline, or only its size and hash.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ReceiptOutput {
+    Inline(String),
     Oversize(Oversize),
-    Inline(Value),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,35 +267,35 @@ pub struct Admitted {
 impl Capability {
     /// The wire id, `gh.pull-request.merge` and so on.
     pub fn id(self) -> &'static str {
-        todo!("tick/ledger")
+        todo!("tick/wire")
     }
 }
 
 impl EffectInput {
     pub fn capability(&self) -> Capability {
-        todo!("tick/ledger")
+        todo!("tick/wire")
     }
 }
 
 impl Effect {
     /// Serializes a typed input under its capability.
     pub fn new(intent: IntentId, input: &EffectInput) -> Self {
-        todo!("tick/ledger")
+        todo!("tick/wire")
     }
 }
 
 impl ReceiptOutput {
-    /// Inline when the receipt carrying it stays under [`RECEIPT_MAX_BYTES`], else [`Oversize`]
-    /// with the output's byte length and SHA-256.
-    pub fn bounded(output: Value) -> Self {
-        todo!("tick/ledger")
+    /// The one sizing rule: inline below [`OUTPUT_INLINE_MAX_BYTES`] when the bytes are UTF-8,
+    /// else [`Oversize`] with their length and SHA-256. The runner's `ReceiptOutput::of` twin.
+    pub fn of(output: &[u8]) -> Self {
+        todo!("tick/wire")
     }
 }
 
 impl EffectsOut {
     /// The one JSON line step (1) prints, newline included.
     pub fn to_line(&self) -> String {
-        todo!("tick/ledger")
+        todo!("tick/wire")
     }
 }
 
@@ -300,26 +303,32 @@ impl EffectsOut {
 /// beside a packet of `packet_bytes`, sizing each with the longest intent id. Runs before any
 /// intent row is written, so every printed effect has a row and no row lacks its effect.
 pub fn admit(proposed: &[EffectInput], packet_bytes: usize) -> Admitted {
-    todo!("tick/ledger")
+    todo!("tick/wire")
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    #[ignore = "skeleton: tick/ledger"]
+    #[ignore = "skeleton: tick/wire"]
+    fn the_shared_fixture_parses_as_the_runner_shapes_and_reserializes_byte_for_byte() {
+        todo!()
+    }
+
+    #[test]
+    #[ignore = "skeleton: tick/wire"]
     fn every_input_round_trips_through_the_provider_field_names() {
         todo!()
     }
 
     #[test]
-    #[ignore = "skeleton: tick/ledger"]
+    #[ignore = "skeleton: tick/wire"]
     fn admitted_effects_and_packet_never_print_past_sixty_four_kib_or_sixteen_effects() {
         todo!()
     }
 
     #[test]
-    #[ignore = "skeleton: tick/ledger"]
-    fn an_output_whose_receipt_reaches_eight_kib_is_recorded_oversize_with_its_hash() {
+    #[ignore = "skeleton: tick/wire"]
+    fn an_output_of_eight_kib_or_not_utf8_is_oversize_with_its_length_and_hash() {
         todo!()
     }
 }

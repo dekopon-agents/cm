@@ -1604,6 +1604,21 @@ pub struct Advance<'a> {
     pub by: &'a [String],
 }
 
+/// S-tick-52 seam (R07): `cm advance … --approved <sha>`. The gate takes the proof the approved
+/// `[review]` table names for the step's phase and writer instead of the bootstrap rule
+/// [`advance_gated`] applies. `tick/gate-merge` fills it.
+#[allow(unused_variables, reason = "skeleton: tick/gate-merge fills this body")]
+pub fn advance_proved(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    advance: Advance,
+    gate: &MergeGate,
+    approved: &crate::tick::Approved,
+) -> Result<Outcome> {
+    todo!("tick/gate-merge")
+}
+
 pub fn advance_gated(
     host: &dyn Host,
     root: &Path,

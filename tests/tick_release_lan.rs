@@ -42,3 +42,9 @@ fn a_missing_failed_or_stale_readiness_receipt_holds_the_pin() {
 fn a_fourth_counting_core_merge_is_refused_across_restarts_while_the_tally_holds_three() {
     todo!()
 }
+
+#[test]
+#[ignore = "skeleton: tick/release-lan"]
+fn a_counting_merge_reserves_its_tally_row_in_the_same_commit_as_its_intent() {
+    todo!()
+}

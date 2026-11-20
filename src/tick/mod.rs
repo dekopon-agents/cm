@@ -30,6 +30,7 @@ pub mod packet;
 pub mod push;
 pub mod record;
 pub mod release;
+pub mod resolve;
 pub mod run;
 pub mod timers;
 pub mod wire;

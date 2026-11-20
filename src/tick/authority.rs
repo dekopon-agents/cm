@@ -174,6 +174,16 @@ impl ReviewTable {
     }
 }
 
+/// Whether cuts dispatch for real or as dry runs (R10). Read at the approved SHA, so a tick cannot
+/// change it: `[authority] release_mode = "dry-run"`, absent meaning `real`. That key is not yet in
+/// EXECUTION.md's `[authority]`, and 11-D27 lets the probe epoch use only the stamp's keys: G10, an
+/// owner stop. Until it is ruled, a probe epoch's cuts have no approved dry-run source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseMode {
+    Real,
+    DryRun,
+}
+
 /// The three tables at one SHA.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Approved {
@@ -181,6 +191,7 @@ pub struct Approved {
     pub authority: Authority,
     pub gates: Gates,
     pub review: ReviewTable,
+    pub release_mode: ReleaseMode,
 }
 
 impl Approved {

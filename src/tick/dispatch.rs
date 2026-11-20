@@ -8,15 +8,22 @@
 //!   intent row reach main together.
 //! - [`launch_stage`], after the push: performs each launch by its [`LaunchRoute`], binds the
 //!   intent and records the attempt id (`cm attempt record`). A launch error parks that intent;
-//!   the next one still runs.
+//!   the next one still runs. Every launch and every collected Astra receipt is recorded through
+//!   `Deps::agents` (R15): the launch's requested model and effort under its invocation key, and
+//!   the receipt's effective values as its echo.
+//!
+//! Review debt is level-triggered (R04): [`reviews_owed`] reads current state each tick, not this
+//! tick's events, so nothing is lost when a tick is paused, has no authority or defers launches.
 //!
 //! Routes ([`route`]): a GPT review is `astra-review.sh start` until the phase is gpt-route
 //! (EXECUTION.md §Lanes); a Claude session (a Claude review, or a claude-cloud step) is a decision
 //! packet action for the coordinator's `create_session` when cm applies locally (the cloud
 //! interim, F1), and one MAC-LANE launcher item (`tools/cloud-env/browser/claude-session-new.sh`)
 //! when the runner applies (the RPi); never `claude --cloud`. A Codex step, a coordinator or
-//! fable step, and a gpt-route review request are packet actions: cm holds no capability for them
-//! (11-D19; SKELETON.md, Named gaps). Owner-lane steps are never dispatched.
+//! fable step are packet actions: cm holds no capability for them (11-D19). A gpt-route review
+//! request is a packet action in the interim, where the coordinator may comment; on the RPi it has
+//! no route (`None`): the PR waits with a `missing-capability` item, since no executor holds a
+//! comment write (G1, R23). Owner-lane steps are never dispatched.
 //!
 //! S-tick-38, task. **Owner:** the tick's thread; each `astra-review.sh` call is one child through
 //! `forge::run` with [`LAUNCH_TIMEOUT`]. **Bound:** [`MAX_LAUNCHES_PER_TICK`] launch intents per
@@ -36,8 +43,7 @@ use crate::plan::Units;
 use crate::state::Lane;
 use crate::tick::apply::Applier;
 use crate::tick::authority::Phase;
-use crate::tick::intake::Event;
-use crate::tick::ledger::{Bind, EffectLedger, Family, IntentId, IntentRow, Observation};
+use crate::tick::ledger::{Bind, EffectLedger, Family, IntentId, IntentRow, Observation, Readmit};
 use crate::tick::run::{Cycle, Deps};
 
 pub const MAX_LAUNCHES_PER_TICK: usize = 8;
@@ -63,7 +69,7 @@ pub enum Purpose {
     Review,
 }
 
-/// The route for one launch.
+/// The route for one launch; `None` when no authorized executor exists on this path (G1).
 pub fn route(
     purpose: Purpose,
     lane: Option<Lane>,
@@ -173,9 +179,16 @@ pub fn ready(root: &Path, units: &Units, ledger: &EffectLedger) -> Vec<Ready> {
     todo!("tick/core")
 }
 
-/// The reviews owed from this tick's events: one per watched PR head that has none in flight or
-/// bound, from the family that did not write the PR, with the model and effort its phase names.
-pub fn reviews_owed(cycle: &Cycle, events: &[Event]) -> Vec<ReviewWant> {
+/// The reviews owed now (R04): one per watched PR whose current head has no review intent (open,
+/// handed, bound or parked) and no bound verdict from the family that did not write it, plus one
+/// per `Cursor::requested` comment no intent names yet; with the model and effort the phase names.
+pub fn reviews_owed(cycle: &Cycle) -> Vec<ReviewWant> {
+    todo!("tick/core")
+}
+
+/// R05 for launches: a step launch is relaunched only while the step is still ready and not
+/// paused; a review launch only while its head is still the PR's current head.
+pub fn readmit(cycle: &Cycle, row: &IntentRow) -> Readmit {
     todo!("tick/core")
 }
 
@@ -232,6 +245,12 @@ mod tests {
     #[test]
     #[ignore = "skeleton: tick/core"]
     fn a_launch_error_parks_that_intent_and_the_next_launch_still_runs() {
+        todo!()
+    }
+
+    #[test]
+    #[ignore = "skeleton: tick/core"]
+    fn a_retry_is_readmitted_by_its_owner_under_current_authority_and_keeps_its_id() {
         todo!()
     }
 }

@@ -14,7 +14,6 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::tick::ledger::IntentId;
-use crate::tick::wire::PacketOut;
 
 pub const PACKET_MAX_ITEMS: usize = 20;
 /// Leaves room under the 64 KiB tick stdout for the effects.
@@ -54,6 +53,16 @@ pub enum PacketKind {
     OutOfAuthority,
     /// An effect the local applier cannot run, for the coordinator (S-tick-24).
     ApplyAction,
+    /// A receipt `refused`, local or the runner's, once per receipt row (R17).
+    EffectRefused,
+    /// A handed action past its deadline, now parked (R18).
+    ActionOverdue,
+    /// Work that needs a capability no executor holds on this path: G1's review-request comment
+    /// and G2's revert PR on the RPi (R23). The PR or step waits.
+    MissingCapability,
+    /// The pull conflicted in a checkout cm did not clone (R03), or a dirty path cm does not own
+    /// blocked it (R02).
+    PullConflict,
     /// A launch the coordinator performs (S-tick-37).
     LaunchAction,
 }
@@ -102,8 +111,8 @@ impl DecisionPacket {
         todo!("tick/core")
     }
 
-    /// `None` when empty.
-    pub fn to_wire(&self) -> Option<PacketOut> {
+    /// The wire's `packet`: [`Self::render`], or `None` when empty.
+    pub fn to_wire(&self) -> Option<String> {
         todo!("tick/core")
     }
 }
@@ -148,6 +157,18 @@ mod tests {
     #[test]
     #[ignore = "skeleton: tick/core"]
     fn a_restart_brings_a_parked_intent_back_only_through_its_reminder() {
+        todo!()
+    }
+
+    #[test]
+    #[ignore = "skeleton: tick/core"]
+    fn each_refused_receipt_local_or_runner_puts_one_effect_refused_item_once() {
+        todo!()
+    }
+
+    #[test]
+    #[ignore = "skeleton: tick/core"]
+    fn a_handed_action_past_its_deadline_parks_and_arms_its_reminder() {
         todo!()
     }
 }
