@@ -128,6 +128,10 @@ impl Finding {
 /// A parsed `cm-review` block and the verdict line after it, if the report has one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
+    /// S-tick-04: the `nonce:` line of a comment verdict (EXECUTION.md §Verdict grammar).
+    /// `tick/gate-merge` parses it; until then it is always `None`, and a report with the line is
+    /// still refused as an unknown line.
+    pub nonce: Option<String>,
     pub head: String,
     pub findings: Vec<Finding>,
     pub stated: Option<Verdict>,
@@ -483,6 +487,7 @@ pub fn parse_report(text: &str) -> Result<Block, Vec<BlockError>> {
     }
     match (head, errors.is_empty()) {
         (Some(head), true) => Ok(Block {
+            nonce: None,
             head,
             findings,
             stated,

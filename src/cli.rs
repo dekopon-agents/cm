@@ -90,7 +90,11 @@ enum Commands {
         lane: Option<Lane>,
     },
     /// Read PR state and release tags from GitHub (read-only `gh`), move steps pr-open → merged → released (→ deployed after their release's receipt), and render CARD.md.
-    Sync,
+    Sync {
+        /// Gate merges on the verdict proof `[review]` names at this approved revision (40 hex), not the bootstrap rule.
+        #[arg(long, value_name = "SHA", value_parser = full_sha)]
+        approved: Option<String>,
+    },
     /// Move EPOCH.md along OPEN → PLANNING → WORKING → CLOSED, stamping the date. Refuses a null pin.
     Epoch {
         /// planning, working or closed.
@@ -147,6 +151,8 @@ enum Commands {
         /// A remote launch: its cap in minutes, stored as an absolute deadline a replacement inherits.
         #[arg(long, value_name = "MINUTES")]
         cap_min: Option<u32>,
+        #[command(flatten)]
+        requested: Box<crate::tick::agents::Requested>,
     },
     /// Release a blocked unit or step to the state it was blocked from, with the evidence that cleared it.
     Unblock {
@@ -244,6 +250,9 @@ enum Commands {
         /// Move this part of a multipart step; the step follows once every part has.
         #[arg(long, value_name = "NAME")]
         part: Option<String>,
+        /// A merge gate takes the verdict proof `[review]` names at this approved revision (40 hex), not the bootstrap rule.
+        #[arg(long, value_name = "SHA", value_parser = full_sha)]
+        approved: Option<String>,
     },
     /// Record a known-red exception: the merge gate accepts this check failing at one commit or, with --standing, across PR heads until the closing condition holds. Refused for a check that is cancelled, timed out or unrun, or green at the PR's base.
     KnownRed {
@@ -386,6 +395,25 @@ enum Commands {
         #[command(subcommand)]
         act: Option<FollowupAct>,
     },
+    /// One coordinator cycle: reconcile the effect ledger, take in events and timers, gate verdicts, plan merges, releases and pins, dispatch ready steps, and print the decision packet. Reads `[authority]`, `[gates]` and `[review]` only at --approved, and `paused` live.
+    Tick {
+        /// The approved revision, a full 40-hex SHA: the runner entry's, or in the cloud interim the stamp the coordinator passes.
+        #[arg(long, value_name = "SHA", value_parser = full_sha)]
+        approved: String,
+        /// Print one `{effects, packet?}` JSON line for the runner to apply (11-D3) instead of applying locally.
+        #[arg(long)]
+        effects: bool,
+        /// Clone this repository into the checkout holding the campaign folder when that checkout is absent (11-D7).
+        #[arg(long, value_name = "URL")]
+        clone: Option<String>,
+    },
+    /// The effect ledger's two writers besides `cm tick`: the runner's receipts and rulings on parked intents.
+    Effects {
+        #[command(subcommand)]
+        act: EffectsAct,
+    },
+    /// The unit and step graph the dashboard reads, under `graph`.
+    Export,
     /// Report every violation in the campaign folder; exit 1 when there is any.
     Lint {
         /// A folder inside the campaign; defaults to --root or the current directory.
@@ -522,12 +550,19 @@ enum AttemptAct {
     /// Record that an external action (thread, turn, session, cancel, …) is about to start.
     Begin { kind: String },
     /// Record the id the begun action returned.
-    Record { kind: String, id: String },
+    Record {
+        kind: String,
+        id: String,
+        #[command(flatten)]
+        echo: Box<crate::tick::agents::Echo>,
+    },
     /// End the attempt: complete, partial (with --evidence) or unknown.
     End {
         outcome: crate::state::AttemptOutcome,
         #[arg(long, value_name = "PATH")]
         evidence: Option<PathBuf>,
+        #[command(flatten)]
+        echo: Box<crate::tick::agents::Echo>,
     },
 }
 
@@ -561,6 +596,8 @@ enum ReviewAct {
         /// The declared part reviewed by this report.
         #[arg(long, value_name = "NAME")]
         part: Option<String>,
+        #[command(flatten)]
+        echo: Box<crate::tick::agents::Echo>,
     },
     /// Record what resolved a blocking finding: a commit, or a ruling file in the campaign.
     Resolve {
@@ -571,6 +608,25 @@ enum ReviewAct {
         finding: String,
         #[arg(long, value_name = "COMMIT|RULING-FILE")]
         by: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum EffectsAct {
+    /// Record one batch of receipts (a JSON array on stdin, at most 20 KiB) into the effect ledger, commit and push it.
+    Record,
+    /// Rule on a parked intent: done (with --evidence), retry under the same id, or drop (with --reason); commit and push the row.
+    Resolve {
+        /// The intent id, `i-YYYYMMDDTHHMM-NNNN`.
+        intent: String,
+        #[arg(long = "as", value_parser = ["done", "retry", "drop"])]
+        ruling: String,
+        /// A campaign file showing the intent happened (done).
+        #[arg(long, value_name = "PATH", required_if_eq("ruling", "done"))]
+        evidence: Option<PathBuf>,
+        /// Why it is closed without being done (drop).
+        #[arg(long, required_if_eq("ruling", "drop"))]
+        reason: Option<String>,
     },
 }
 
@@ -652,6 +708,15 @@ fn commit_sha(text: &str) -> Result<String, String> {
         .ok_or_else(|| "expected a commit SHA (7 to 40 hexadecimal digits)".into())
 }
 
+fn full_sha(text: &str) -> Result<String, String> {
+    (text.len() == 40
+        && text
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+    .then(|| text.to_owned())
+    .ok_or_else(|| "expected a full commit SHA (40 lower-case hexadecimal digits)".into())
+}
+
 fn reviewer_name(text: &str) -> Result<String, String> {
     crate::store::is_name(text)
         .then(|| text.to_owned())
@@ -664,6 +729,18 @@ fn step_target(text: &str) -> Result<Target, String> {
 
 fn any_target(text: &str) -> Result<Target, String> {
     parse_target(text, false)
+}
+
+/// The echoed values on `cm attempt record` or `cm attempt end`, when any is given.
+fn act_echo(act: &Option<AttemptAct>) -> Option<&crate::tick::agents::Echo> {
+    match act {
+        Some(AttemptAct::Record { echo, .. } | AttemptAct::End { echo, .. })
+            if **echo != crate::tick::agents::Echo::default() =>
+        {
+            Some(echo)
+        }
+        _ => None,
+    }
 }
 
 fn ideas_folder(cli: &Cli, given: &Option<PathBuf>) -> Result<PathBuf> {
@@ -831,7 +908,18 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
         Commands::Next { target, lane } => {
             crate::plan::next_at(&root()?, target.as_ref(), *lane, host.now())
         }
-        Commands::Sync => crate::sync::sync(host, &crate::forge::Gh::default(), &root()?),
+        Commands::Sync { approved: None } => {
+            crate::sync::sync(host, &crate::forge::Gh::default(), &root()?)
+        }
+        Commands::Sync {
+            approved: Some(sha),
+        } => {
+            // S-tick-02 glue (R07): the approved channel for the phase proof.
+            let root = root()?;
+            let sha = crate::tick::ApprovedSha::parse(sha).expect("clap checks a full 40-hex SHA");
+            let approved = crate::tick::gate::approved_context(&root, &sha)?;
+            crate::sync::sync_proved(host, &crate::forge::Gh::default(), &root, &approved)
+        }
         Commands::Epoch {
             status,
             skill_revision,
@@ -856,17 +944,38 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             worktree,
             coordinator,
             cap_min,
-        } => commands::launch_remote(
-            host,
-            &root()?,
-            target,
-            worktree.as_deref(),
-            &commands::Remote {
-                no_parts: no_parts.clone(),
-                coordinator: coordinator_label(coordinator),
-                cap_min: *cap_min,
-            },
-        ),
+            requested,
+        } => {
+            let launched = commands::launch_remote(
+                host,
+                &root()?,
+                target,
+                worktree.as_deref(),
+                &commands::Remote {
+                    no_parts: no_parts.clone(),
+                    coordinator: coordinator_label(coordinator),
+                    cap_min: *cap_min,
+                },
+            );
+            // S-tick-02 glue: the agent row only when the launch states what it asked for.
+            match launched {
+                Ok(outcome)
+                    if outcome.ok() && **requested != crate::tick::agents::Requested::default() =>
+                {
+                    // U12: a failed agent row never hides the launch that already happened.
+                    let claim = outcome.lines.join("; ");
+                    crate::tick::agents::record_launch(host, &root()?, target, requested).map_err(
+                        |error| {
+                            anyhow::Error::new(error).context(format!(
+                                "launched ({claim}), but the agent row was not written"
+                            ))
+                        },
+                    )?;
+                    Ok(outcome)
+                }
+                other => other,
+            }
+        }
         Commands::Unblock { target, evidence } => {
             let file = evidence.as_ref().map(|path| under_root(cli, path));
             commands::unblock(host, &root()?, target, file.as_deref())
@@ -907,6 +1016,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
         ),
         Commands::Attempt { target, claim, act } => {
             use crate::attempt::Act;
+            let echo = act_echo(act);
             let act = match act {
                 None => Act::Status,
                 Some(AttemptAct::Claim {
@@ -922,16 +1032,24 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                     file: evidence.as_deref().map(|file| under_root(cli, file)),
                 },
                 Some(AttemptAct::Begin { kind }) => Act::Begin { kind: kind.clone() },
-                Some(AttemptAct::Record { kind, id }) => Act::Record {
+                Some(AttemptAct::Record { kind, id, .. }) => Act::Record {
                     kind: kind.clone(),
                     id: id.clone(),
                 },
-                Some(AttemptAct::End { outcome, evidence }) => Act::End {
+                Some(AttemptAct::End {
+                    outcome, evidence, ..
+                }) => Act::End {
                     outcome: *outcome,
                     file: evidence.as_deref().map(|file| under_root(cli, file)),
                 },
             };
-            crate::attempt::attempt(host, &root()?, target, claim.as_deref(), &act)
+            let recorded = crate::attempt::attempt(host, &root()?, target, claim.as_deref(), &act);
+            match echo {
+                Some(echo) => recorded.and_then(|outcome| {
+                    crate::tick::agents::echoed(host, &root()?, target, outcome, echo)
+                }),
+                None => recorded,
+            }
         }
         Commands::Advance {
             target,
@@ -947,6 +1065,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             ci_verified,
             waiver,
             part,
+            approved,
         } => {
             let evidence = Evidence {
                 sha: sha.clone(),
@@ -963,20 +1082,25 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                 ci_verified: ci_verified.as_deref().map(|file| under_root(cli, file)),
                 waiver: waiver.as_deref().map(|file| under_root(cli, file)),
             };
-            commands::advance_gated(
-                host,
-                &root()?,
-                target,
-                commands::Advance {
-                    to: state,
-                    given: &evidence,
-                    file: file.as_deref(),
-                    repo: repo.as_deref(),
-                    part: part.as_deref(),
-                    by,
-                },
-                &gate,
-            )
+            let root = root()?;
+            let advance = commands::Advance {
+                to: state,
+                given: &evidence,
+                file: file.as_deref(),
+                repo: repo.as_deref(),
+                part: part.as_deref(),
+                by,
+            };
+            match approved {
+                None => commands::advance_gated(host, &root, target, advance, &gate),
+                Some(sha) => {
+                    // S-tick-02 glue (R07): the approved channel for the phase proof.
+                    let sha = crate::tick::ApprovedSha::parse(sha)
+                        .expect("clap checks a full 40-hex SHA");
+                    let approved = crate::tick::gate::approved_context(&root, &sha)?;
+                    commands::advance_proved(host, &root, target, advance, &gate, &approved)
+                }
+            }
         }
         Commands::KnownRed {
             target,
@@ -1135,16 +1259,26 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                     report,
                     reviewer,
                     part,
+                    echo,
                 }),
             ..
-        } => crate::verdict::record(
-            host,
-            &root()?,
-            target,
-            &under_root(cli, report),
-            reviewer.as_deref(),
-            part.as_deref(),
-        ),
+        } => {
+            let recorded = crate::verdict::record(
+                host,
+                &root()?,
+                target,
+                &under_root(cli, report),
+                reviewer.as_deref(),
+                part.as_deref(),
+            );
+            if **echo == crate::tick::agents::Echo::default() {
+                recorded
+            } else {
+                recorded.and_then(|outcome| {
+                    crate::tick::agents::echoed(host, &root()?, target, outcome, echo)
+                })
+            }
+        }
         Commands::Review {
             act:
                 Some(ReviewAct::Resolve {
@@ -1206,6 +1340,63 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             act: Some(FollowupAct::Close { id, by }),
             ..
         } => crate::verdict::close_followup(host, &root()?, id, by),
+        Commands::Tick {
+            approved,
+            effects,
+            clone,
+        } => {
+            let args = crate::tick::TickArgs {
+                approved: crate::tick::ApprovedSha::parse(approved)
+                    .expect("clap checks a full 40-hex SHA"),
+                effects: *effects,
+                clone: clone.clone(),
+            };
+            // With --clone the campaign folder may not exist yet: cli_tick clones before any read.
+            let root = match (&cli.root, clone) {
+                (Some(dir), Some(_)) => dir.clone(),
+                _ => root()?,
+            };
+            return crate::tick::cli_tick(host, &root, &args);
+        }
+        Commands::Effects {
+            act: EffectsAct::Record,
+        } => crate::tick::record::record(
+            host,
+            &crate::tick::push::SystemGit::default(),
+            &root()?,
+            &mut std::io::stdin().lock(),
+        ),
+        Commands::Effects {
+            act:
+                EffectsAct::Resolve {
+                    intent,
+                    ruling,
+                    evidence,
+                    reason,
+                },
+        } => {
+            use crate::tick::ledger::Ruling;
+            let ruling = match ruling.as_str() {
+                "done" => Ruling::Done {
+                    evidence: evidence
+                        .as_deref()
+                        .map(|file| under_root(cli, file).to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                },
+                "retry" => Ruling::Retry,
+                _ => Ruling::Drop {
+                    reason: reason.clone().unwrap_or_default(),
+                },
+            };
+            crate::tick::resolve::resolve(
+                host,
+                &crate::tick::push::SystemGit::default(),
+                &root()?,
+                &crate::tick::IntentId(intent.clone()),
+                ruling,
+            )
+        }
+        Commands::Export => crate::tick::export::export(&root()?),
         Commands::Lint { dir } => {
             let start = match (dir, &cli.root) {
                 (Some(dir), _) => dir.clone(),
@@ -1229,7 +1420,7 @@ fn name(command: &Commands) -> &'static str {
         Commands::Close => "close",
         Commands::Init { .. } => "init",
         Commands::Next { .. } => "next",
-        Commands::Sync => "sync",
+        Commands::Sync { .. } => "sync",
         Commands::Epoch { .. } => "epoch",
         Commands::Read { .. } => "read",
         Commands::Idea { .. } => "idea",
@@ -1249,6 +1440,9 @@ fn name(command: &Commands) -> &'static str {
         Commands::Ruling { .. } => "ruling",
         Commands::Brief { .. } => "brief",
         Commands::Followups { .. } => "followups",
+        Commands::Tick { .. } => "tick",
+        Commands::Effects { .. } => "effects",
+        Commands::Export => "export",
         Commands::Lint { .. } => "lint",
     }
 }
@@ -1263,6 +1457,17 @@ pub fn main() -> ExitCode {
             .error(
                 clap::error::ErrorKind::ArgumentConflict,
                 "--by applies only to superseded",
+            )
+            .exit();
+    }
+    if let Commands::Tick { effects: true, .. } = &cli.command
+        && cli.json
+    {
+        // S-tick-10: with --effects stdout is exactly one EffectsOut line.
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--json does not apply to `cm tick --effects`, which prints its own JSON line",
             )
             .exit();
     }
