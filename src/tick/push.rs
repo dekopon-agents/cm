@@ -297,10 +297,14 @@ pub fn begin(git: &dyn Git, checkout: &Path, campaign: &Path) -> crate::tick::Re
     todo!("tick/ledger")
 }
 
-/// F1: a tick that died or failed before its first push. Moves the branch back to the mark's
-/// `base` and restores to `base` every dirty cm-owned path under `campaign` and every path the mark
-/// lists, and removes every untracked or ignored file under `.cm/tick/` (a new segment); then
-/// clears the mark. Nothing of that tick remains.
+/// F1: a tick that died or failed before its first push. Holding the campaign lock
+/// (`<epoch>/.cm/lock`, R16) throughout, it moves the branch back to the mark's `base`, restores to
+/// `base` every dirty cm-owned path under `campaign` except `AGENTS.jsonl` and every path the mark
+/// lists, removes every untracked or ignored file under `.cm/tick/` (a new segment), and clears the
+/// mark. `AGENTS.jsonl` is never restored: its rows and already-recorded echoes stay exactly as the
+/// last lock-holding writer left them, so an independent writer's row (a harvester's) is never
+/// deleted, and an echo of a run that happened (a collected Astra receipt) is kept. Nothing else
+/// of that tick remains.
 pub fn discard(
     git: &dyn Git,
     checkout: &Path,
