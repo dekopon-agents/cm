@@ -43,18 +43,19 @@
 //! `src/attempt.rs`). The intent row names that attempt, and reconcile reads the attempt's own
 //! plan (`attempt::plan`), so the two records never disagree about whether a launch happened.
 
-#![allow(unused_variables, reason = "skeleton: tick/ledger fills these bodies")]
-
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::host::Host;
 use crate::state::Lane;
 use crate::tick::dispatch::LaunchRoute;
 use crate::tick::run::{Cycle, Deps};
-use crate::tick::wire::{Capability, EffectInput, Receipt};
+use crate::tick::wire::{Capability, EffectInput, Receipt, ReceiptOutcome};
 
 /// Relative to the campaign (epoch) folder. Segments are `effects-0001.jsonl` and on. The
 /// top-level `.gitignore` of campaign-trail ignores `*.jsonl`, so the tick force-adds them
@@ -108,11 +109,18 @@ impl Family {
     /// The writer family of a step's lane: codex writes GPT, claude-cloud and fable write Claude;
     /// owner, coordinator and pi steps have no reviewed family.
     pub fn writer_of(lane: Lane) -> Option<Family> {
-        todo!("tick/ledger")
+        match lane {
+            Lane::Codex => Some(Family::Gpt),
+            Lane::ClaudeCloud | Lane::Fable => Some(Family::Claude),
+            Lane::Owner | Lane::Coordinator | Lane::Pi => None,
+        }
     }
 
     pub fn other(self) -> Family {
-        todo!("tick/ledger")
+        match self {
+            Family::Claude => Family::Gpt,
+            Family::Gpt => Family::Claude,
+        }
     }
 }
 
@@ -339,56 +347,82 @@ pub enum Recorded {
 
 /// The loaded ledger: every segment's rows in order.
 #[derive(Debug)]
-#[expect(dead_code, reason = "skeleton: tick/ledger reads these fields")]
 pub struct EffectLedger {
     dir: PathBuf,
     rows: Vec<LedgerRow>,
     /// `true` only for [`EffectLedger::open`]: the handle that may append.
     writable: bool,
+    /// How many rows were on disk when this handle loaded: rows past it are this handle's own,
+    /// which [`reconcile`] does not observe.
+    loaded: usize,
 }
 
 impl EffectLedger {
     /// The read-only view: every segment, a torn last line ignored in memory, nothing written.
     pub fn snapshot(root: &Path) -> crate::tick::Result<Self> {
-        todo!("tick/ledger")
+        let dir = root.join(LEDGER_DIR);
+        let rows = load(&dir, false)?;
+        Ok(EffectLedger {
+            dir,
+            loaded: rows.len(),
+            rows,
+            writable: false,
+        })
     }
 
     /// The exclusive handle: a torn last line is truncated; only this handle appends. Any other
     /// unreadable line is [`crate::tick::TickError::Row`].
     pub fn open(root: &Path, lock: &TickLock) -> crate::tick::Result<Self> {
-        todo!("tick/ledger")
+        let _ = lock;
+        let dir = root.join(LEDGER_DIR);
+        let rows = load(&dir, true)?;
+        Ok(EffectLedger {
+            dir,
+            loaded: rows.len(),
+            rows,
+            writable: true,
+        })
     }
 
     pub fn rows(&self) -> &[LedgerRow] {
-        todo!("tick/ledger")
+        &self.rows
     }
 
     /// The segment appends go to, relative to the campaign folder: the tick force-adds it.
     pub fn active_segment(&self) -> PathBuf {
-        todo!("tick/ledger")
+        Path::new(LEDGER_DIR).join(segment_name(active_number(&self.dir)))
     }
 
     pub fn state(&self, id: &IntentId) -> Option<IntentState> {
-        todo!("tick/ledger")
+        let intent = self.intent(id)?;
+        Some(
+            self.rows
+                .iter()
+                .filter(|row| subject(row) == Some(id))
+                .fold(IntentState::Open, |state, row| step(intent, state, row)),
+        )
     }
 
     /// Intents in [`IntentState::Open`] or [`IntentState::Handed`], oldest first.
     pub fn open_intents(&self) -> Vec<&IntentRow> {
-        todo!("tick/ledger")
+        self.intents_in(&[IntentState::Open, IntentState::Handed])
     }
 
     /// Intents in [`IntentState::Parked`], oldest first.
     pub fn parked(&self) -> Vec<&IntentRow> {
-        todo!("tick/ledger")
+        self.intents_in(&[IntentState::Parked])
     }
 
     pub fn intent(&self, id: &IntentId) -> Option<&IntentRow> {
-        todo!("tick/ledger")
+        self.intents().find(|row| row.id == *id)
     }
 
     /// The cycle of an intent's latest emission.
     pub fn last_emitted(&self, id: &IntentId) -> Option<u64> {
-        todo!("tick/ledger")
+        self.rows.iter().rev().find_map(|row| match row {
+            LedgerRow::Emitted { intent, cycle, .. } if intent == id => Some(*cycle),
+            _ => None,
+        })
     }
 
     /// Appends one intent row as one `write` of one whole line, then fsyncs. Refuses past
@@ -401,7 +435,79 @@ impl EffectLedger {
         cycle: u64,
         draft: Draft,
     ) -> crate::tick::Result<Intended> {
-        todo!("tick/ledger")
+        let live = self.intents_in(&[IntentState::Open, IntentState::Handed, IntentState::Parked]);
+        if let Some(same) = live.iter().find(|row| {
+            row.target == draft.target
+                && row.kind == draft.kind
+                && row.capability == draft.capability
+                && row.head == draft.head
+        }) {
+            return Ok(Intended::AlreadyOpen(same.id.clone()));
+        }
+        let full = crate::tick::TickError::LedgerFull {
+            open: live.len(),
+            max: MAX_OPEN_INTENTS,
+        };
+        if live.len() >= MAX_OPEN_INTENTS {
+            return Err(full);
+        }
+        let at = crate::host::stamp(host.now());
+        let minute: String = at.chars().filter(char::is_ascii_digit).collect();
+        let prefix = format!("i-{}T{}-", &minute[..8], &minute[8..]);
+        let next = self
+            .intents()
+            .filter_map(|row| row.id.0.strip_prefix(&prefix)?.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        // Ten thousand intents in one minute cannot come from bounded ticks; refuse rather than
+        // reuse an id.
+        if next > 9999 {
+            return Err(full);
+        }
+        let id = IntentId(format!("{prefix}{next:04}"));
+        // A review's nonce is derived from its id, so a review draft that carries none gets it
+        // here, on the row the launch's prompt is built from.
+        let minted = (draft.kind == IntentKind::ReviewLaunch && draft.nonce.is_none())
+            .then(|| self.mint_nonce(&id));
+        let Draft {
+            target,
+            kind,
+            capability,
+            input,
+            repo,
+            pr,
+            head,
+            nonce,
+            model,
+            effort,
+            family,
+            route,
+            attempt,
+            requested_by,
+            follows,
+        } = draft;
+        self.append(LedgerRow::Intent(IntentRow {
+            id: id.clone(),
+            at,
+            cycle,
+            target,
+            kind,
+            capability,
+            input,
+            repo,
+            pr,
+            head,
+            nonce: nonce.or(minted),
+            model,
+            effort,
+            family,
+            route,
+            attempt,
+            requested_by,
+            follows,
+        }))?;
+        Ok(Intended::New(id))
     }
 
     pub fn emitted(
@@ -410,11 +516,27 @@ impl EffectLedger {
         id: &IntentId,
         cycle: u64,
     ) -> crate::tick::Result<()> {
-        todo!("tick/ledger")
+        self.known(id)?;
+        self.append(LedgerRow::Emitted {
+            intent: id.clone(),
+            at: crate::host::stamp(host.now()),
+            cycle,
+        })
     }
 
     pub fn bind(&mut self, host: &dyn Host, id: &IntentId, bind: Bind) -> crate::tick::Result<()> {
-        todo!("tick/ledger")
+        self.known(id)?;
+        // Only a change of state is a row: a closed intent, or a handed one handed again, takes
+        // none, so an intent stays within its row budget.
+        let state = self.state(id).unwrap_or(IntentState::Open);
+        if closed(state) || (state == IntentState::Handed && matches!(bind, Bind::Action { .. })) {
+            return Ok(());
+        }
+        self.append(LedgerRow::Bound {
+            intent: id.clone(),
+            at: crate::host::stamp(host.now()),
+            bind,
+        })
     }
 
     pub fn park(
@@ -423,7 +545,19 @@ impl EffectLedger {
         id: &IntentId,
         reason: &str,
     ) -> crate::tick::Result<()> {
-        todo!("tick/ledger")
+        self.known(id)?;
+        // Only an open or handed intent parks; parking again writes nothing (row budget).
+        if !matches!(
+            self.state(id),
+            Some(IntentState::Open | IntentState::Handed)
+        ) {
+            return Ok(());
+        }
+        self.append(LedgerRow::Parked {
+            intent: id.clone(),
+            at: crate::host::stamp(host.now()),
+            reason: reason.to_owned(),
+        })
     }
 
     /// The fold's receipt rule: [`Recorded::Duplicate`] for the same receipt again;
@@ -436,7 +570,17 @@ impl EffectLedger {
         cycle: u64,
         receipt: Receipt,
     ) -> crate::tick::Result<Recorded> {
-        todo!("tick/ledger")
+        match self.check_receipt(&receipt)? {
+            Recorded::Duplicate => Ok(Recorded::Duplicate),
+            Recorded::New => {
+                self.append(LedgerRow::Receipt {
+                    at: crate::host::stamp(host.now()),
+                    cycle,
+                    receipt,
+                })?;
+                Ok(Recorded::New)
+            }
+        }
     }
 
     /// Refuses a ruling on an intent that is not parked, and a `retry` past
@@ -447,46 +591,431 @@ impl EffectLedger {
         id: &IntentId,
         ruling: Ruling,
     ) -> crate::tick::Result<()> {
-        todo!("tick/ledger")
+        if let Some(reason) = self.ruling_refusal(id, &ruling)? {
+            return Err(crate::tick::TickError::Io {
+                path: self.dir.join(segment_name(active_number(&self.dir))),
+                source: io::Error::other(reason),
+            });
+        }
+        self.append(LedgerRow::Ruled {
+            intent: id.clone(),
+            at: crate::host::stamp(host.now()),
+            ruling,
+        })
     }
 
     /// Appends a bound verdict. The gate has already refused a consumed nonce (S-tick-51).
     pub fn verdict(&mut self, host: &dyn Host, verdict: VerdictRow) -> crate::tick::Result<()> {
-        todo!("tick/ledger")
+        self.known(&verdict.intent)?;
+        self.append(LedgerRow::Verdict {
+            at: crate::host::stamp(host.now()),
+            verdict,
+        })
     }
 
     /// The nonce a review intent with this id carries: 32 hex digits of SHA-256 over the ledger's
     /// path inside the checkout and the id.
     pub fn mint_nonce(&self, id: &IntentId) -> Nonce {
-        todo!("tick/ledger")
+        let inside = self
+            .dir
+            .ancestors()
+            .find(|dir| dir.join(".git").exists())
+            .and_then(|top| self.dir.strip_prefix(top).ok())
+            .unwrap_or(&self.dir);
+        let path = inside
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let digest = Sha256::digest(format!("{path}\n{id}").as_bytes());
+        Nonce(
+            digest[..16]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        )
     }
 
     /// The review intent that carries `nonce`, if any: the verdict gate's lookup.
     pub fn by_nonce(&self, nonce: &Nonce) -> Option<&IntentRow> {
-        todo!("tick/ledger")
+        self.intents()
+            .find(|row| row.kind == IntentKind::ReviewLaunch && row.nonce.as_ref() == Some(nonce))
     }
 
     /// True once a Verdict row cites the intent that carries `nonce`: a second verdict with it is
     /// a replay.
     pub fn nonce_consumed(&self, nonce: &Nonce) -> bool {
-        todo!("tick/ledger")
+        let Some(intent) = self.by_nonce(nonce) else {
+            return false;
+        };
+        self.rows.iter().any(
+            |row| matches!(row, LedgerRow::Verdict { verdict, .. } if verdict.intent == intent.id),
+        )
     }
 
     /// The latest receipt for an intent.
     pub fn receipt(&self, id: &IntentId) -> Option<&Receipt> {
-        todo!("tick/ledger")
+        self.rows.iter().rev().find_map(|row| match row {
+            LedgerRow::Receipt { receipt, .. } if receipt.intent == *id => Some(receipt),
+            _ => None,
+        })
     }
 
     /// Receipt rows from position `from` on (counted over receipt rows only), with their cycle:
     /// the `effect-refused` items' source (R17).
     pub fn receipts_from(&self, from: usize) -> Vec<(u64, &Receipt)> {
-        todo!("tick/ledger")
+        self.rows
+            .iter()
+            .filter_map(|row| match row {
+                LedgerRow::Receipt { cycle, receipt, .. } => Some((*cycle, receipt)),
+                _ => None,
+            })
+            .skip(from)
+            .collect()
     }
 
     /// Bound verdicts for a PR at a head, oldest first.
     pub fn verdicts_at(&self, repo: &str, pr: u32, head: &str) -> Vec<&VerdictRow> {
-        todo!("tick/ledger")
+        self.rows
+            .iter()
+            .filter_map(|row| match row {
+                LedgerRow::Verdict { verdict, .. } if verdict.head == head => Some(verdict),
+                _ => None,
+            })
+            .filter(|verdict| {
+                self.intent(&verdict.intent)
+                    .is_some_and(|row| row.repo.as_deref() == Some(repo) && row.pr == Some(pr))
+            })
+            .collect()
     }
+
+    fn intents(&self) -> impl Iterator<Item = &IntentRow> {
+        self.rows.iter().filter_map(|row| match row {
+            LedgerRow::Intent(intent) => Some(intent),
+            _ => None,
+        })
+    }
+
+    fn intents_in(&self, states: &[IntentState]) -> Vec<&IntentRow> {
+        let mut folded: std::collections::BTreeMap<&IntentId, (&IntentRow, IntentState)> = self
+            .intents()
+            .map(|row| (&row.id, (row, IntentState::Open)))
+            .collect();
+        for row in &self.rows {
+            if let Some((intent, state)) = subject(row).and_then(|id| folded.get_mut(id)) {
+                *state = step(intent, *state, row);
+            }
+        }
+        self.intents()
+            .filter(|row| {
+                folded
+                    .get(&row.id)
+                    .is_some_and(|(_, state)| states.contains(state))
+            })
+            .collect()
+    }
+
+    /// Whether the intent's latest emission has neither a receipt nor a retry ruling after it.
+    fn unreceipted_emission(&self, id: &IntentId) -> bool {
+        let Some(at) = self
+            .rows
+            .iter()
+            .rposition(|row| matches!(row, LedgerRow::Emitted { intent, .. } if intent == id))
+        else {
+            return false;
+        };
+        !self.rows[at..].iter().any(|row| match row {
+            LedgerRow::Receipt { receipt, .. } => receipt.intent == *id,
+            LedgerRow::Ruled {
+                intent,
+                ruling: Ruling::Retry,
+                ..
+            } => intent == id,
+            _ => false,
+        })
+    }
+
+    fn known(&self, id: &IntentId) -> crate::tick::Result<&IntentRow> {
+        self.intent(id)
+            .ok_or_else(|| crate::tick::TickError::UnknownIntent(id.clone()))
+    }
+
+    /// The fold's receipt rule without writing: `New` when the receipt would be appended.
+    pub(crate) fn check_receipt(&self, receipt: &Receipt) -> crate::tick::Result<Recorded> {
+        let intent = self.known(&receipt.intent)?;
+        let conflict = || crate::tick::TickError::ReceiptConflict(receipt.intent.clone());
+        if intent.capability != Some(receipt.capability) {
+            return Err(conflict());
+        }
+        let latest = self.rows.iter().rposition(
+            |row| matches!(row, LedgerRow::Receipt { receipt: seen, .. } if seen.intent == receipt.intent),
+        );
+        let same = latest.filter(|at| {
+            matches!(&self.rows[*at], LedgerRow::Receipt { receipt: seen, .. } if seen == receipt)
+        });
+        // The same receipt again with no emission since it: the runner resent a batch.
+        let reemitted = |at: usize| {
+            self.rows[at..].iter().any(
+                |row| matches!(row, LedgerRow::Emitted { intent, .. } if *intent == receipt.intent),
+            )
+        };
+        if let Some(at) = same
+            && !reemitted(at)
+        {
+            return Ok(Recorded::Duplicate);
+        }
+        let state = self.state(&receipt.intent).unwrap_or(IntentState::Open);
+        if closed(state) {
+            return if same.is_some() {
+                Ok(Recorded::Duplicate)
+            } else {
+                Err(conflict())
+            };
+        }
+        Ok(Recorded::New)
+    }
+
+    /// Why a ruling would be refused, or `None` when it may be written.
+    pub(crate) fn ruling_refusal(
+        &self,
+        id: &IntentId,
+        ruling: &Ruling,
+    ) -> crate::tick::Result<Option<String>> {
+        self.known(id)?;
+        if self.state(id) != Some(IntentState::Parked) {
+            return Ok(Some(format!("intent {id} is not parked")));
+        }
+        let rulings = self
+            .rows
+            .iter()
+            .filter(|row| matches!(row, LedgerRow::Ruled { intent, .. } if intent == id))
+            .count();
+        if *ruling == Ruling::Retry && rulings >= MAX_RULINGS_PER_INTENT {
+            return Ok(Some(format!(
+                "intent {id} has had {rulings} rulings; only done or drop is accepted now"
+            )));
+        }
+        Ok(None)
+    }
+
+    /// One row as one `write` of one whole line, then fsync.
+    fn append(&mut self, row: LedgerRow) -> crate::tick::Result<()> {
+        if !self.writable {
+            return Err(crate::tick::TickError::Io {
+                path: self.dir.clone(),
+                source: io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "a ledger snapshot never writes",
+                ),
+            });
+        }
+        let line = serde_json::to_string(&row).map_err(|source| crate::tick::TickError::Row {
+            path: self.dir.clone(),
+            line: 0,
+            source,
+        })?;
+        write_line(&self.dir, &line)?;
+        self.rows.push(row);
+        Ok(())
+    }
+}
+
+/// `push::rebuild`'s re-append (F3): each line, unparsed, goes to the active segment as one
+/// `write` and fsync, rolling segments as [`EffectLedger`]'s own appends do. Returns the
+/// segments it wrote, relative to the campaign folder.
+pub(crate) fn append_lines(root: &Path, lines: &[String]) -> crate::tick::Result<Vec<PathBuf>> {
+    let dir = root.join(LEDGER_DIR);
+    let mut touched: Vec<PathBuf> = Vec::new();
+    for line in lines {
+        let name = write_line(&dir, line)?;
+        let rel = Path::new(LEDGER_DIR).join(name);
+        if !touched.contains(&rel) {
+            touched.push(rel);
+        }
+    }
+    Ok(touched)
+}
+
+/// Appends `line` and a newline to the active segment in one `write`, then fsyncs; the segment's
+/// file name.
+fn write_line(dir: &Path, line: &str) -> crate::tick::Result<String> {
+    let name = segment_name(active_number(dir));
+    let path = dir.join(&name);
+    let io = |source| crate::tick::TickError::Io {
+        path: path.clone(),
+        source,
+    };
+    fs::create_dir_all(dir).map_err(io)?;
+    let existing = fs::metadata(&path).map(|meta| meta.len()).ok();
+    let mut bytes = Vec::with_capacity(line.len() + 2);
+    // A segment that does not end in a newline gets one first, so the row stays whole.
+    if existing.is_some_and(|len| len > 0) {
+        let mut last = [0u8; 1];
+        let file = File::open(&path).map_err(io)?;
+        std::os::unix::fs::FileExt::read_at(&file, &mut last, existing.unwrap_or(1) - 1)
+            .map_err(io)?;
+        if last[0] != b'\n' {
+            bytes.push(b'\n');
+        }
+    }
+    bytes.extend_from_slice(line.as_bytes());
+    bytes.push(b'\n');
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(io)?;
+    let written = file.write(&bytes).map_err(io)?;
+    if written != bytes.len() {
+        return Err(io(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "short write of a ledger row",
+        )));
+    }
+    file.sync_all().map_err(io)?;
+    if existing.is_none() {
+        File::open(dir).and_then(|dir| dir.sync_all()).map_err(io)?;
+    }
+    Ok(name)
+}
+
+/// The intent a row names.
+fn subject(row: &LedgerRow) -> Option<&IntentId> {
+    match row {
+        LedgerRow::Intent(intent) => Some(&intent.id),
+        LedgerRow::Emitted { intent, .. }
+        | LedgerRow::Bound { intent, .. }
+        | LedgerRow::Parked { intent, .. }
+        | LedgerRow::Ruled { intent, .. } => Some(intent),
+        LedgerRow::Receipt { receipt, .. } => Some(&receipt.intent),
+        LedgerRow::Verdict { verdict, .. } => Some(&verdict.intent),
+    }
+}
+
+/// The fold (module doc, Fold): `intent`'s state after `row`, a row that names it.
+fn step(intent: &IntentRow, state: IntentState, row: &LedgerRow) -> IntentState {
+    match row {
+        LedgerRow::Bound { bind, .. } if !closed(state) => {
+            if matches!(bind, Bind::Action { .. }) {
+                IntentState::Handed
+            } else {
+                IntentState::Bound
+            }
+        }
+        LedgerRow::Parked { .. } if !closed(state) => IntentState::Parked,
+        LedgerRow::Receipt { receipt, .. }
+            if !closed(state) && Some(receipt.capability) == intent.capability =>
+        {
+            match receipt.outcome {
+                ReceiptOutcome::Ok | ReceiptOutcome::Refused => IntentState::Received,
+                ReceiptOutcome::Failed => IntentState::Open,
+            }
+        }
+        LedgerRow::Ruled { ruling, .. } if !closed(state) => match ruling {
+            Ruling::Retry if state == IntentState::Parked => IntentState::Open,
+            Ruling::Retry => state,
+            Ruling::Done { .. } | Ruling::Drop { .. } => IntentState::Closed,
+        },
+        LedgerRow::Verdict { .. } => IntentState::Closed,
+        _ => state,
+    }
+}
+
+/// `Bound`, `Received` and `Closed` take no further receipt, bind, park or ruling.
+fn closed(state: IntentState) -> bool {
+    matches!(
+        state,
+        IntentState::Bound | IntentState::Received | IntentState::Closed
+    )
+}
+
+fn segment_name(number: u32) -> String {
+    format!("{SEGMENT_PREFIX}{number:04}.jsonl")
+}
+
+/// The segments in `dir`, by number.
+fn segments(dir: &Path) -> crate::tick::Result<Vec<(u32, PathBuf)>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(crate::tick::TickError::Io {
+                path: dir.to_owned(),
+                source,
+            });
+        }
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| crate::tick::TickError::Io {
+            path: dir.to_owned(),
+            source,
+        })?;
+        let name = entry.file_name();
+        let Some(number) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(SEGMENT_PREFIX))
+            .and_then(|rest| rest.strip_suffix(".jsonl"))
+            .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|digits| digits.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        found.push((number, entry.path()));
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// The highest segment while it is under [`SEGMENT_MAX_BYTES`], else the next one.
+fn active_number(dir: &Path) -> u32 {
+    let last = segments(dir).ok().and_then(|found| found.last().cloned());
+    match last {
+        None => 1,
+        Some((number, path)) => {
+            let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            if size >= SEGMENT_MAX_BYTES {
+                number + 1
+            } else {
+                number
+            }
+        }
+    }
+}
+
+/// Every segment's rows in order. A segment that does not end in a newline ends in a torn append:
+/// dropped in memory, and with `truncate` cut from the file.
+fn load(dir: &Path, truncate: bool) -> crate::tick::Result<Vec<LedgerRow>> {
+    let mut rows = Vec::new();
+    for (_, path) in segments(dir)? {
+        let io = |source| crate::tick::TickError::Io {
+            path: path.clone(),
+            source,
+        };
+        let bytes = fs::read(&path).map_err(io)?;
+        let whole = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |at| at + 1);
+        if whole < bytes.len() && truncate {
+            let file = OpenOptions::new().write(true).open(&path).map_err(io)?;
+            file.set_len(whole as u64).map_err(io)?;
+            file.sync_all().map_err(io)?;
+        }
+        for (index, line) in bytes[..whole].split(|byte| *byte == b'\n').enumerate() {
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let row =
+                serde_json::from_slice(line).map_err(|source| crate::tick::TickError::Row {
+                    path: path.clone(),
+                    line: index + 1,
+                    source,
+                })?;
+            rows.push(row);
+        }
+    }
+    Ok(rows)
 }
 
 /// Relative to the campaign folder. `.cm/.gitignore`'s `lock` line keeps it out of git.
@@ -507,7 +1036,35 @@ pub struct TickLock {
 impl TickLock {
     /// `None` when another process holds it.
     pub fn try_acquire(root: &Path) -> crate::tick::Result<Option<TickLock>> {
-        todo!("tick/ledger")
+        let path = root.join(TICK_LOCK);
+        let io = |source| crate::tick::TickError::Io {
+            path: path.clone(),
+            source,
+        };
+        let cm = root.join(crate::store::CM_DIR);
+        fs::create_dir_all(root.join(LEDGER_DIR)).map_err(io)?;
+        // The same ignore file `store::lock` writes, so the lock never reaches a commit.
+        crate::store::create_new(
+            &cm.join(".gitignore"),
+            format!(
+                "{}\n{}\n",
+                crate::store::LOCK,
+                crate::store::LEGACY_JOURNAL_COPY
+            )
+            .as_bytes(),
+        )
+        .map_err(io)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(io)?;
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(Some(TickLock { _file: file })),
+            Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
+            Err(errno) => Err(io(errno.into())),
+        }
     }
 }
 
@@ -550,7 +1107,65 @@ pub fn reconcile(
     ledger: &mut EffectLedger,
     observer: &dyn Observer,
 ) -> crate::tick::Result<Reconciled> {
-    todo!("tick/ledger")
+    let mine: std::collections::BTreeSet<IntentId> = ledger.rows[ledger.loaded..]
+        .iter()
+        .filter_map(|row| match row {
+            LedgerRow::Intent(intent) => Some(intent.id.clone()),
+            LedgerRow::Emitted { intent, .. } => Some(intent.clone()),
+            _ => None,
+        })
+        .collect();
+    let candidates: Vec<(IntentRow, IntentState)> = ledger
+        .open_intents()
+        .into_iter()
+        .filter(|row| !mine.contains(&row.id))
+        .map(|row| {
+            (
+                row.clone(),
+                ledger.state(&row.id).unwrap_or(IntentState::Open),
+            )
+        })
+        .collect();
+    let mut out = Reconciled::default();
+    for (row, state) in candidates {
+        let mut seen = observer.observe(&row);
+        // R06: absence never reads as not done for a write that cannot be repeated safely once
+        // an earlier cycle emitted it.
+        if seen == Observation::NotDone
+            && unrepeatable(&row)
+            && ledger.unreceipted_emission(&row.id)
+        {
+            seen = Observation::Undecidable {
+                reason: "a non-idempotent effect was emitted in an earlier cycle with no \
+                         receipt and no evidence that it happened"
+                    .to_owned(),
+            };
+        }
+        match seen {
+            Observation::Done(bind) => {
+                ledger.bind(host, &row.id, bind)?;
+                out.bound.push(row.id);
+            }
+            Observation::Unread { .. } => out.unread.push(row.id),
+            // A handed intent is the coordinator's to perform: looked up for done, never
+            // re-emitted or parked here; its action deadline parks it (R18).
+            _ if state == IntentState::Handed => {}
+            Observation::NotDone => out.retry.push(row.id),
+            Observation::Undecidable { reason } => {
+                ledger.park(host, &row.id, &reason)?;
+                out.parked.push(row.id);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The non-idempotent effects: a second emission is a second write (R06, R10).
+fn unrepeatable(row: &IntentRow) -> bool {
+    matches!(
+        row.capability,
+        Some(Capability::GhWorkflowRun | Capability::GhPinUpdate)
+    )
 }
 
 /// What an intent's owning stage says about emitting it again (R05).
@@ -612,71 +1227,959 @@ pub fn readmit(cycle: &Cycle, row: &IntentRow) -> Readmit {
     }
 }
 
+/// The scratch git the `tick/ledger` tests share with `tests/tick_ledger.rs`.
 #[cfg(test)]
-mod tests {
+#[path = "../../tests/fixtures/tick-ledger/scratch.rs"]
+pub(crate) mod scratch;
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::Path;
+
+    use super::*;
+    use crate::tick::TickError;
+    use crate::tick::wire::ReceiptOutput;
+
+    pub(crate) use super::scratch;
+
+    pub(crate) struct Clock(pub jiff::Timestamp);
+
+    impl Host for Clock {
+        fn now(&self) -> jiff::Timestamp {
+            self.0
+        }
+
+        fn free_bytes(&self, _: &Path) -> std::io::Result<u64> {
+            Ok(100 << 30)
+        }
+
+        fn heavy_builds(&self) -> std::io::Result<u32> {
+            Ok(0)
+        }
+    }
+
+    /// The tick lock, retried briefly: in a multi-threaded test binary a sibling test's forked
+    /// git child can hold a just-closed lock descriptor until it execs.
+    pub(crate) fn tick_lock(root: &Path) -> TickLock {
+        for _ in 0..200 {
+            if let Some(lock) = TickLock::try_acquire(root).unwrap() {
+                return lock;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the tick lock stayed held");
+    }
+
+    pub(crate) fn clock() -> Clock {
+        Clock("2026-11-22T18:00:00Z".parse().unwrap())
+    }
+
+    pub(crate) fn draft(target: &str, kind: IntentKind, capability: Option<Capability>) -> Draft {
+        Draft {
+            target: target.to_owned(),
+            kind,
+            capability,
+            input: None,
+            repo: Some("dekopon-agents/cm".to_owned()),
+            pr: Some(7),
+            head: Some("a".repeat(40)),
+            nonce: None,
+            model: None,
+            effort: None,
+            family: None,
+            route: None,
+            attempt: None,
+            requested_by: None,
+            follows: None,
+        }
+    }
+
+    pub(crate) fn effect(target: &str, capability: Capability) -> Draft {
+        draft(target, IntentKind::Effect, Some(capability))
+    }
+
+    pub(crate) fn receipt(
+        id: &IntentId,
+        capability: Capability,
+        outcome: ReceiptOutcome,
+    ) -> Receipt {
+        Receipt {
+            intent: id.clone(),
+            capability,
+            outcome,
+            output: ReceiptOutput::Inline(format!("{outcome:?}")),
+        }
+    }
+
+    pub(crate) fn new_id(intended: Intended) -> IntentId {
+        match intended {
+            Intended::New(id) => id,
+            Intended::AlreadyOpen(id) => panic!("{id} was already open"),
+        }
+    }
+
+    fn segment(root: &Path) -> std::path::PathBuf {
+        root.join(LEDGER_DIR).join("effects-0001.jsonl")
+    }
+
+    /// Answers by intent id; counts every lookup.
+    struct Fixed {
+        answers: BTreeMap<IntentId, Observation>,
+        asked: RefCell<Vec<IntentId>>,
+    }
+
+    impl Fixed {
+        fn new(answers: &[(&IntentId, Observation)]) -> Fixed {
+            Fixed {
+                answers: answers
+                    .iter()
+                    .map(|(id, seen)| ((*id).clone(), seen.clone()))
+                    .collect(),
+                asked: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Observer for Fixed {
+        fn observe(&self, row: &IntentRow) -> Observation {
+            self.asked.borrow_mut().push(row.id.clone());
+            self.answers
+                .get(&row.id)
+                .cloned()
+                .unwrap_or(Observation::Unread {
+                    reason: "no answer".to_owned(),
+                })
+        }
+    }
+
+    fn states(ledger: &EffectLedger) -> Vec<(IntentId, IntentState)> {
+        ledger
+            .intents()
+            .map(|row| (row.id.clone(), ledger.state(&row.id).unwrap()))
+            .collect()
+    }
+
     #[test]
-    #[ignore = "skeleton: tick/ledger"]
     fn a_killed_append_leaves_no_partial_row_and_the_torn_line_is_dropped_on_open() {
-        todo!()
+        let dir = tempfile::tempdir().unwrap();
+        let host = clock();
+        let lock = tick_lock(dir.path());
+        let mut ledger = EffectLedger::open(dir.path(), &lock).unwrap();
+        let first = new_id(
+            ledger
+                .intend(&host, 1, effect("01-a/u/s", Capability::GhPinUpdate))
+                .unwrap(),
+        );
+        let whole = fs::read(segment(dir.path())).unwrap();
+        assert!(whole.ends_with(b"\n"), "one row is one whole line");
+        // A kill mid-append leaves part of a line and no newline.
+        let torn = br#"{"row":"emitted","intent":"i-2026"#;
+        scratch::append(&segment(dir.path()), std::str::from_utf8(torn).unwrap());
+        drop(ledger);
+
+        let mut ledger = EffectLedger::open(dir.path(), &lock).unwrap();
+        assert_eq!(ledger.rows().len(), 1);
+        assert_eq!(
+            fs::read(segment(dir.path())).unwrap(),
+            whole,
+            "the torn line is cut"
+        );
+        ledger.emitted(&host, &first, 1).unwrap();
+        let reopened = EffectLedger::open(dir.path(), &lock).unwrap();
+        assert_eq!(reopened.rows(), ledger.rows());
+        assert_eq!(reopened.last_emitted(&first), Some(1));
+
+        // A whole line that does not parse is not a torn append.
+        scratch::append(&segment(dir.path()), "{\"row\":\"nonsense\"}\n");
+        let error = EffectLedger::open(dir.path(), &lock).unwrap_err();
+        assert!(matches!(error, TickError::Row { line: 3, .. }), "{error}");
     }
 
     #[test]
-    #[ignore = "skeleton: tick/ledger"]
     fn a_reopened_ledger_reads_every_row_it_wrote_in_order_with_the_same_states() {
-        todo!()
+        let dir = tempfile::tempdir().unwrap();
+        let host = clock();
+        let lock = tick_lock(dir.path());
+        let mut ledger = EffectLedger::open(dir.path(), &lock).unwrap();
+        let merge = new_id(
+            ledger
+                .intend(&host, 3, effect("01-a/u/s", Capability::GhPullRequestMerge))
+                .unwrap(),
+        );
+        let pin = new_id(
+            ledger
+                .intend(&host, 3, effect("01-a/u/t", Capability::GhPinUpdate))
+                .unwrap(),
+        );
+        let run = new_id(
+            ledger
+                .intend(&host, 3, effect("01-a/u/v", Capability::GhWorkflowRun))
+                .unwrap(),
+        );
+        let handed = new_id(
+            ledger
+                .intend(
+                    &host,
+                    3,
+                    effect("01-a/u/w", Capability::KubectlAnnotateApplication),
+                )
+                .unwrap(),
+        );
+        let review = new_id(
+            ledger
+                .intend(&host, 3, draft("01-a/u/x", IntentKind::ReviewLaunch, None))
+                .unwrap(),
+        );
+        for id in [&merge, &pin, &run, &handed] {
+            ledger.emitted(&host, id, 3).unwrap();
+        }
+        ledger
+            .record(
+                &host,
+                3,
+                receipt(&merge, Capability::GhPullRequestMerge, ReceiptOutcome::Ok),
+            )
+            .unwrap();
+        ledger.park(&host, &pin, "undecidable").unwrap();
+        ledger
+            .record(
+                &host,
+                3,
+                receipt(&run, Capability::GhWorkflowRun, ReceiptOutcome::Failed),
+            )
+            .unwrap();
+        ledger
+            .bind(
+                &host,
+                &handed,
+                Bind::Action {
+                    key: "annotate".to_owned(),
+                },
+            )
+            .unwrap();
+        ledger
+            .verdict(
+                &host,
+                VerdictRow {
+                    intent: review.clone(),
+                    head: "a".repeat(40),
+                    word: crate::verdict::Verdict::Accept,
+                    proof: VerdictProof::Comment {
+                        id: 9,
+                        app: "astra".to_owned(),
+                    },
+                },
+            )
+            .unwrap();
+        let written = ledger.rows().to_vec();
+        let before = states(&ledger);
+        assert_eq!(
+            before.iter().map(|(_, state)| *state).collect::<Vec<_>>(),
+            [
+                IntentState::Received,
+                IntentState::Parked,
+                IntentState::Open,
+                IntentState::Handed,
+                IntentState::Closed
+            ]
+        );
+        drop(ledger);
+
+        for reopened in [
+            EffectLedger::open(dir.path(), &lock).unwrap(),
+            EffectLedger::snapshot(dir.path()).unwrap(),
+        ] {
+            assert_eq!(reopened.rows(), written.as_slice());
+            assert_eq!(states(&reopened), before);
+            assert_eq!(
+                reopened
+                    .open_intents()
+                    .iter()
+                    .map(|row| &row.id)
+                    .collect::<Vec<_>>(),
+                [&run, &handed]
+            );
+            assert_eq!(
+                reopened
+                    .parked()
+                    .iter()
+                    .map(|row| &row.id)
+                    .collect::<Vec<_>>(),
+                [&pin]
+            );
+        }
     }
 
     #[test]
-    #[ignore = "skeleton: tick/ledger"]
     fn open_intents_never_exceed_sixty_four_and_a_target_holds_one_open_intent_per_purpose() {
-        todo!()
+        let dir = tempfile::tempdir().unwrap();
+        let host = clock();
+        let lock = tick_lock(dir.path());
+        let mut ledger = EffectLedger::open(dir.path(), &lock).unwrap();
+        let first = new_id(
+            ledger
+                .intend(
+                    &host,
+                    1,
+                    effect("01-a/u/s0", Capability::GhPullRequestMerge),
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            ledger
+                .intend(
+                    &host,
+                    1,
+                    effect("01-a/u/s0", Capability::GhPullRequestMerge)
+                )
+                .unwrap(),
+            Intended::AlreadyOpen(first.clone()),
+            "one open intent per target and purpose"
+        );
+        // Another purpose on the same target, or the same purpose at another head, is new.
+        let enqueue = new_id(
+            ledger
+                .intend(
+                    &host,
+                    1,
+                    effect("01-a/u/s0", Capability::GhPullRequestEnqueue),
+                )
+                .unwrap(),
+        );
+        let mut moved = effect("01-a/u/s0", Capability::GhPullRequestMerge);
+        moved.head = Some("b".repeat(40));
+        new_id(ledger.intend(&host, 1, moved).unwrap());
+        for n in 3..MAX_OPEN_INTENTS {
+            new_id(
+                ledger
+                    .intend(
+                        &host,
+                        1,
+                        effect(&format!("01-a/u/s{n}"), Capability::GhPinMerge),
+                    )
+                    .unwrap(),
+            );
+        }
+        assert_eq!(ledger.open_intents().len(), MAX_OPEN_INTENTS);
+        let full = ledger
+            .intend(&host, 1, effect("01-a/u/over", Capability::GhPinMerge))
+            .unwrap_err();
+        assert!(
+            matches!(full, TickError::LedgerFull { open: 64, max: 64 }),
+            "{full}"
+        );
+        // A parked intent still counts and still answers AlreadyOpen.
+        ledger.park(&host, &enqueue, "undecidable").unwrap();
+        assert!(
+            ledger
+                .intend(&host, 1, effect("01-a/u/over", Capability::GhPinMerge))
+                .is_err()
+        );
+        assert_eq!(
+            ledger
+                .intend(
+                    &host,
+                    1,
+                    effect("01-a/u/s0", Capability::GhPullRequestEnqueue)
+                )
+                .unwrap(),
+            Intended::AlreadyOpen(enqueue)
+        );
+        // The cap gates new intents only: completion rows are written while full.
+        ledger.emitted(&host, &first, 1).unwrap();
+        ledger
+            .record(
+                &host,
+                2,
+                receipt(&first, Capability::GhPullRequestMerge, ReceiptOutcome::Ok),
+            )
+            .unwrap();
+        let next = new_id(
+            ledger
+                .intend(&host, 2, effect("01-a/u/over", Capability::GhPinMerge))
+                .unwrap(),
+        );
+        assert_ne!(next, first);
+        let ids: std::collections::BTreeSet<_> =
+            ledger.intents().map(|row| row.id.clone()).collect();
+        assert_eq!(ids.len(), ledger.intents().count(), "ids are unique");
+        assert!(ids.iter().all(|id| id.0.len() == INTENT_ID_MAX_LEN));
     }
 
     #[test]
-    #[ignore = "skeleton: tick/ledger"]
     fn a_restart_between_intent_and_effect_binds_retries_or_parks_and_never_launches_twice() {
-        todo!()
+        let dir = tempfile::tempdir().unwrap();
+        let host = clock();
+        let launches = RefCell::new(Vec::<IntentId>::new());
+        // The launch path every tick takes: an intent row, then the effect only for a new one.
+        let tick = |ledger: &mut EffectLedger, cycle: u64, target: &str, kill: bool| {
+            let intended = ledger
+                .intend(&host, cycle, draft(target, IntentKind::StepLaunch, None))
+                .unwrap();
+            if let Intended::New(id) = intended {
+                ledger.emitted(&host, &id, cycle).unwrap();
+                if !kill {
+                    launches.borrow_mut().push(id);
+                }
+            }
+        };
+        {
+            let lock = tick_lock(dir.path());
+            let mut ledger = EffectLedger::open(dir.path(), &lock).unwrap();
+            // Killed between each intent row and its launch.
+            for target in ["01-a/u/done", "01-a/u/gone", "01-a/u/murky"] {
+                tick(&mut ledger, 1, target, true);
+            }
+        }
+        let lock = tick_lock(dir.path());
+        let mut ledger = EffectLedger::open(dir.path(), &lock).unwrap();
+        let ids: Vec<IntentId> = ledger.intents().map(|row| row.id.clone()).collect();
+        let observer = Fixed::new(&[
+            (
+                &ids[0],
+                Observation::Done(Bind::Session {
+                    id: "session_1".to_owned(),
+                }),
+            ),
+            (&ids[1], Observation::NotDone),
+            (
+                &ids[2],
+                Observation::Undecidable {
+                    reason: "attempt unknown".to_owned(),
+                },
+            ),
+        ]);
+        let first = reconcile(&host, &mut ledger, &observer).unwrap();
+        assert_eq!(first.bound, [ids[0].clone()]);
+        assert_eq!(first.retry, [ids[1].clone()]);
+        assert_eq!(first.parked, [ids[2].clone()]);
+        assert!(first.unread.is_empty());
+        assert_eq!(ledger.state(&ids[0]), Some(IntentState::Bound));
+        assert_eq!(
+            ledger.state(&ids[1]),
+            Some(IntentState::Open),
+            "a retry is readmitted, not closed"
+        );
+        assert_eq!(ledger.state(&ids[2]), Some(IntentState::Parked));
+
+        // The next planning pass writes no second intent and launches nothing for any of them.
+        for target in ["01-a/u/done", "01-a/u/gone", "01-a/u/murky"] {
+            tick(&mut ledger, 2, target, false);
+        }
+        assert_eq!(
+            ledger.intents().count(),
+            4,
+            "only the bound target got a new intent"
+        );
+        let again = reconcile(&host, &mut ledger, &observer).unwrap();
+        assert!(again.bound.is_empty() && again.parked.is_empty());
+        assert_eq!(again.retry, [ids[1].clone()]);
+        assert_eq!(launches.borrow().len(), 1);
+        assert!(
+            !launches.borrow().iter().any(|id| ids.contains(id)),
+            "no intent launched twice"
+        );
+        assert!(
+            !observer.asked.borrow().contains(&launches.borrow()[0]),
+            "an intent this handle emitted is not observed"
+        );
     }
 
     #[test]
-    #[ignore = "skeleton: tick/ledger"]
     fn a_minted_nonce_is_unique_in_the_ledger_and_consumed_once_its_verdict_row_is_written() {
-        todo!()
+        let dir = tempfile::tempdir().unwrap();
+        let host = clock();
+        let lock = tick_lock(dir.path());
+        let mut ledger = EffectLedger::open(dir.path(), &lock).unwrap();
+        let mut nonces = std::collections::BTreeSet::new();
+        let mut reviews = Vec::new();
+        for n in 0..32 {
+            let target = format!("01-a/u/s{n}");
+            let id = new_id(
+                ledger
+                    .intend(&host, 1, draft(&target, IntentKind::ReviewLaunch, None))
+                    .unwrap(),
+            );
+            let nonce = ledger.mint_nonce(&id);
+            assert_eq!(
+                ledger.intent(&id).unwrap().nonce.as_ref(),
+                Some(&nonce),
+                "minted on the row"
+            );
+            assert_eq!(ledger.by_nonce(&nonce).map(|row| &row.id), Some(&id));
+            assert_eq!(nonce.0.len(), 32);
+            assert!(
+                nonce
+                    .0
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            );
+            assert_eq!(ledger.mint_nonce(&id), nonce, "minting is deterministic");
+            assert!(nonces.insert(nonce.0.clone()), "nonce {nonce:?} repeated");
+            reviews.push((id, nonce));
+        }
+        // The nonce travels on the intent row the launch writes.
+        let target = "01-a/u/review";
+        let mut row = draft(target, IntentKind::ReviewLaunch, None);
+        row.nonce = Some(Nonce("0123456789abcdef0123456789abcdef".to_owned()));
+        let carried = new_id(ledger.intend(&host, 1, row).unwrap());
+        let nonce = Nonce("0123456789abcdef0123456789abcdef".to_owned());
+        assert_eq!(ledger.by_nonce(&nonce).map(|row| &row.id), Some(&carried));
+        assert!(!ledger.nonce_consumed(&nonce));
+        ledger
+            .verdict(
+                &host,
+                VerdictRow {
+                    intent: carried.clone(),
+                    head: "a".repeat(40),
+                    word: crate::verdict::Verdict::FixRequired,
+                    proof: VerdictProof::Astra {
+                        report_sha256: "0".repeat(64),
+                    },
+                },
+            )
+            .unwrap();
+        assert!(ledger.nonce_consumed(&nonce));
+        assert_eq!(ledger.state(&carried), Some(IntentState::Closed));
+        assert_eq!(
+            ledger
+                .verdicts_at("dekopon-agents/cm", 7, &"a".repeat(40))
+                .len(),
+            1
+        );
+        assert!(
+            ledger
+                .verdicts_at("dekopon-agents/cm", 8, &"a".repeat(40))
+                .is_empty()
+        );
+        assert!(
+            !ledger.nonce_consumed(&reviews[0].1),
+            "another review's nonce is still free"
+        );
+        // Another epoch's ledger mints other nonces for the same id.
+        let other = tempfile::tempdir().unwrap();
+        fs::create_dir_all(other.path().join(".git")).unwrap();
+        let elsewhere = EffectLedger::snapshot(&other.path().join("store/epochs/other")).unwrap();
+        let here = EffectLedger::snapshot(&other.path().join("store/epochs/here")).unwrap();
+        assert_ne!(
+            elsewhere.mint_nonce(&reviews[0].0),
+            here.mint_nonce(&reviews[0].0)
+        );
     }
 
     #[test]
-    #[ignore = "skeleton: tick/ledger"]
     fn an_unread_lookup_leaves_the_intent_open_and_parks_nothing() {
-        todo!()
+        let dir = tempfile::tempdir().unwrap();
+        let host = clock();
+        {
+            let lock = tick_lock(dir.path());
+            let mut ledger = EffectLedger::open(dir.path(), &lock).unwrap();
+            for target in ["01-a/u/s", "01-a/u/t"] {
+                let id = new_id(
+                    ledger
+                        .intend(&host, 1, effect(target, Capability::GhWorkflowRun))
+                        .unwrap(),
+                );
+                ledger.emitted(&host, &id, 1).unwrap();
+            }
+        }
+        let lock = tick_lock(dir.path());
+        let mut ledger = EffectLedger::open(dir.path(), &lock).unwrap();
+        let before = ledger.rows().to_vec();
+        let ids: Vec<IntentId> = ledger.intents().map(|row| row.id.clone()).collect();
+        let down = Observation::Unread {
+            reason: "gh: HTTP 502".to_owned(),
+        };
+        let observer = Fixed::new(&[(&ids[0], down.clone()), (&ids[1], down)]);
+        for _ in 0..3 {
+            let seen = reconcile(&host, &mut ledger, &observer).unwrap();
+            assert_eq!(seen.unread, ids);
+            assert!(seen.parked.is_empty() && seen.bound.is_empty() && seen.retry.is_empty());
+        }
+        assert_eq!(ledger.rows(), before.as_slice(), "nothing is written");
+        assert!(ledger.parked().is_empty());
+        assert_eq!(ledger.open_intents().len(), 2);
     }
 
     #[test]
-    #[ignore = "skeleton: tick/ledger"]
     fn two_clones_appending_rows_merge_by_union_and_every_row_survives() {
-        todo!()
+        use crate::tick::push::{self, SystemGit};
+        let scratch = scratch::Scratch::new();
+        let host = clock();
+        let tick_clone = scratch.clone("tick");
+        let agent_clone = scratch.clone("agent");
+        let git = SystemGit::default();
+        let mut rows = Vec::new();
+        // The tick parks an intent and pushes it; both clones start from that.
+        let parked = {
+            let campaign = scratch::campaign(&tick_clone);
+            let lock = tick_lock(&campaign);
+            let mut ledger = EffectLedger::open(&campaign, &lock).unwrap();
+            let id = new_id(
+                ledger
+                    .intend(&host, 1, effect("01-a/u/s", Capability::GhPinUpdate))
+                    .unwrap(),
+            );
+            ledger.emitted(&host, &id, 1).unwrap();
+            ledger.park(&host, &id, "undecidable").unwrap();
+            let seg = std::path::Path::new(scratch::EPOCH).join(ledger.active_segment());
+            push::commit_and_push(&git, &tick_clone, &[seg], &[], "tick 1").unwrap();
+            id
+        };
+        scratch::git(
+            &agent_clone,
+            &["pull", "-q", "--no-rebase", "origin", "main"],
+        );
+        // Then each appends without seeing the other: the agent a ruling, the tick a new intent.
+        for (checkout, cycle) in [(&agent_clone, 0), (&tick_clone, 2)] {
+            let campaign = scratch::campaign(checkout);
+            let lock = tick_lock(&campaign);
+            let mut ledger = EffectLedger::open(&campaign, &lock).unwrap();
+            if cycle == 0 {
+                ledger.rule(&host, &parked, Ruling::Retry).unwrap();
+            } else {
+                let id = new_id(
+                    ledger
+                        .intend(&host, cycle, effect("01-a/u/t", Capability::GhPinMerge))
+                        .unwrap(),
+                );
+                ledger.emitted(&host, &id, cycle).unwrap();
+            }
+            rows.extend(ledger.rows().iter().cloned());
+            let seg = std::path::Path::new(scratch::EPOCH).join(ledger.active_segment());
+            let pushed = push::commit_and_push(&git, checkout, &[seg], &[], "append").unwrap();
+            assert!(pushed.commit.is_some());
+        }
+        scratch::git(
+            &agent_clone,
+            &["pull", "-q", "--no-rebase", "origin", "main"],
+        );
+        for checkout in [&tick_clone, &agent_clone] {
+            let ledger = EffectLedger::snapshot(&scratch::campaign(checkout)).unwrap();
+            for row in &rows {
+                assert!(ledger.rows().contains(row), "{row:?} lost in {checkout:?}");
+            }
+            assert_eq!(
+                ledger.rows().len(),
+                6,
+                "three shared rows, one ruling, two new rows"
+            );
+            assert_eq!(
+                ledger.state(&parked),
+                Some(IntentState::Open),
+                "the ruling folds in"
+            );
+        }
     }
 
     #[test]
-    #[ignore = "skeleton: tick/ledger"]
     fn a_snapshot_ignores_a_torn_line_and_never_writes() {
-        todo!()
+        let dir = tempfile::tempdir().unwrap();
+        let host = clock();
+        {
+            let lock = tick_lock(dir.path());
+            let mut ledger = EffectLedger::open(dir.path(), &lock).unwrap();
+            new_id(
+                ledger
+                    .intend(&host, 1, effect("01-a/u/s", Capability::GhPinUpdate))
+                    .unwrap(),
+            );
+        }
+        scratch::append(&segment(dir.path()), "{\"row\":\"parked\",\"int");
+        let bytes = fs::read(segment(dir.path())).unwrap();
+        // Taken while another process holds the lock.
+        let held = tick_lock(dir.path());
+        assert!(
+            TickLock::try_acquire(dir.path()).unwrap().is_none(),
+            "a second holder is refused"
+        );
+        let mut snapshot = EffectLedger::snapshot(dir.path()).unwrap();
+        assert_eq!(snapshot.rows().len(), 1);
+        let error = snapshot
+            .intend(&host, 1, effect("01-a/u/t", Capability::GhPinUpdate))
+            .unwrap_err();
+        assert!(matches!(error, TickError::Io { .. }), "{error}");
+        let id = snapshot.intents().next().unwrap().id.clone();
+        assert!(snapshot.park(&host, &id, "x").is_err());
+        assert_eq!(snapshot.rows().len(), 1);
+        assert_eq!(
+            fs::read(segment(dir.path())).unwrap(),
+            bytes,
+            "the torn line stays on disk"
+        );
+        let names: Vec<_> = fs::read_dir(dir.path().join(LEDGER_DIR))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 2, "the segment and the lock: {names:?}");
+        drop(held);
     }
 
     #[test]
-    #[ignore = "skeleton: tick/ledger"]
     fn an_intent_stays_within_its_row_budget_and_no_segment_reaches_one_mib() {
-        todo!()
+        let dir = tempfile::tempdir().unwrap();
+        let host = clock();
+        let lock = tick_lock(dir.path());
+        let mut ledger = EffectLedger::open(dir.path(), &lock).unwrap();
+        let cap = Capability::GhPinUpdate;
+        let id = new_id(ledger.intend(&host, 1, effect("01-a/u/s", cap)).unwrap());
+        let tries = crate::tick::timers::MAX_TRIES as u64;
+        for round in 0..=MAX_RULINGS_PER_INTENT as u64 {
+            for n in 0..tries {
+                ledger.emitted(&host, &id, round * 10 + n).unwrap();
+                let failed = receipt(&id, cap, ReceiptOutcome::Failed);
+                assert_eq!(
+                    ledger.record(&host, round * 10 + n, failed).unwrap(),
+                    Recorded::New
+                );
+            }
+            ledger.park(&host, &id, "five tries failed").unwrap();
+            if round < MAX_RULINGS_PER_INTENT as u64 {
+                ledger.rule(&host, &id, Ruling::Retry).unwrap();
+            }
+        }
+        assert!(
+            ledger.rule(&host, &id, Ruling::Retry).is_err(),
+            "only done or drop now"
+        );
+        ledger
+            .rule(
+                &host,
+                &id,
+                Ruling::Drop {
+                    reason: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(ledger.state(&id), Some(IntentState::Closed));
+        assert_eq!(MAX_ROWS_PER_INTENT, 38);
+        // Parking or binding again changes no state and writes no row.
+        let rows = ledger.rows().len();
+        ledger.park(&host, &id, "again").unwrap();
+        ledger
+            .bind(
+                &host,
+                &id,
+                Bind::Session {
+                    id: "late".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(ledger.rows().len(), rows);
+
+        // Many legal lifecycles of rows near the 9 KiB ceiling roll segments at 512 KiB, and
+        // none reaches 1 MiB.
+        let big = "r".repeat(9 * 1024 - 400);
+        for n in 0..60 {
+            let mut draft = effect(&format!("01-a/u/t{n}"), cap);
+            draft.input = Some(Value::String(big.clone()));
+            let other = new_id(ledger.intend(&host, 1, draft).unwrap());
+            ledger.emitted(&host, &other, 1).unwrap();
+            for _ in 0..3 {
+                ledger.park(&host, &other, &big).unwrap();
+            }
+            ledger
+                .rule(
+                    &host,
+                    &other,
+                    Ruling::Drop {
+                        reason: big.clone(),
+                    },
+                )
+                .unwrap();
+        }
+        let budget = ledger.intents().map(|row| {
+            let count = ledger
+                .rows()
+                .iter()
+                .filter(|other| subject(other) == Some(&row.id))
+                .count();
+            (row.id.clone(), count)
+        });
+        for (intent, count) in budget {
+            assert!(count <= MAX_ROWS_PER_INTENT, "{intent}: {count} rows");
+        }
+        let sizes: Vec<u64> = fs::read_dir(dir.path().join(LEDGER_DIR))
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(SEGMENT_PREFIX)
+            })
+            .map(|entry| entry.metadata().unwrap().len())
+            .collect();
+        assert!(sizes.len() >= 3, "{sizes:?}");
+        assert!(sizes.iter().all(|size| *size < 1024 * 1024), "{sizes:?}");
+        let reread = EffectLedger::snapshot(dir.path()).unwrap();
+        assert_eq!(reread.rows(), ledger.rows(), "segments read back in order");
+        assert_eq!(reread.active_segment(), ledger.active_segment());
     }
 
     #[test]
-    #[ignore = "skeleton: tick/ledger"]
     fn a_late_receipt_after_park_closes_the_intent_and_a_conflicting_one_is_refused() {
-        todo!()
+        let dir = tempfile::tempdir().unwrap();
+        let host = clock();
+        let lock = tick_lock(dir.path());
+        let mut ledger = EffectLedger::open(dir.path(), &lock).unwrap();
+        let cap = Capability::GhPinUpdate;
+        let parked = new_id(ledger.intend(&host, 1, effect("01-a/u/s", cap)).unwrap());
+        let handed = new_id(ledger.intend(&host, 1, effect("01-a/u/t", cap)).unwrap());
+        for id in [&parked, &handed] {
+            ledger.emitted(&host, id, 1).unwrap();
+        }
+        ledger.park(&host, &parked, "no receipt").unwrap();
+        ledger
+            .bind(
+                &host,
+                &handed,
+                Bind::Action {
+                    key: "pin".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(ledger.state(&handed), Some(IntentState::Handed));
+
+        let ok = receipt(&parked, cap, ReceiptOutcome::Ok);
+        assert_eq!(ledger.record(&host, 2, ok.clone()).unwrap(), Recorded::New);
+        assert_eq!(ledger.state(&parked), Some(IntentState::Received));
+        assert_eq!(
+            ledger.record(&host, 3, ok.clone()).unwrap(),
+            Recorded::Duplicate
+        );
+        let rows = ledger.rows().len();
+        let different = receipt(&parked, cap, ReceiptOutcome::Refused);
+        assert!(matches!(
+            ledger.record(&host, 3, different),
+            Err(TickError::ReceiptConflict(id)) if id == parked
+        ));
+        let mut wrong = receipt(&handed, Capability::GhPinMerge, ReceiptOutcome::Ok);
+        assert!(matches!(
+            ledger.record(&host, 3, wrong.clone()),
+            Err(TickError::ReceiptConflict(_))
+        ));
+        wrong.intent = IntentId("i-20261122T1800-9999".to_owned());
+        wrong.capability = cap;
+        assert!(matches!(
+            ledger.record(&host, 3, wrong),
+            Err(TickError::UnknownIntent(_))
+        ));
+        assert_eq!(ledger.rows().len(), rows, "refused receipts write nothing");
+
+        let refused = receipt(&handed, cap, ReceiptOutcome::Refused);
+        assert_eq!(
+            ledger.record(&host, 3, refused.clone()).unwrap(),
+            Recorded::New
+        );
+        assert_eq!(ledger.state(&handed), Some(IntentState::Received));
+        assert_eq!(ledger.receipt(&handed), Some(&refused));
+        assert_eq!(
+            ledger
+                .receipts_from(1)
+                .iter()
+                .map(|(cycle, r)| (*cycle, r.intent.clone()))
+                .collect::<Vec<_>>(),
+            [(3, handed.clone())]
+        );
+        assert!(ledger.open_intents().is_empty() && ledger.parked().is_empty());
     }
 
     #[test]
-    #[ignore = "skeleton: tick/ledger"]
     fn an_earlier_cycles_unreceipted_dispatch_parks_and_is_never_reemitted_by_absence() {
-        todo!()
+        let dir = tempfile::tempdir().unwrap();
+        let host = clock();
+        let (dispatched, pin, unsent, handed) = {
+            let lock = tick_lock(dir.path());
+            let mut ledger = EffectLedger::open(dir.path(), &lock).unwrap();
+            let dispatched = new_id(
+                ledger
+                    .intend(&host, 1, effect("01-a/u/r", Capability::GhWorkflowRun))
+                    .unwrap(),
+            );
+            let pin = new_id(
+                ledger
+                    .intend(&host, 1, effect("01-a/u/p", Capability::GhPinUpdate))
+                    .unwrap(),
+            );
+            let unsent = new_id(
+                ledger
+                    .intend(&host, 1, effect("01-a/u/u", Capability::GhWorkflowRun))
+                    .unwrap(),
+            );
+            let handed = new_id(
+                ledger
+                    .intend(&host, 1, effect("01-a/u/h", Capability::GhPinMerge))
+                    .unwrap(),
+            );
+            for id in [&dispatched, &pin, &handed] {
+                ledger.emitted(&host, id, 1).unwrap();
+            }
+            ledger
+                .bind(
+                    &host,
+                    &handed,
+                    Bind::Action {
+                        key: "pin-merge".to_owned(),
+                    },
+                )
+                .unwrap();
+            (dispatched, pin, unsent, handed)
+        };
+        let lock = tick_lock(dir.path());
+        let mut ledger = EffectLedger::open(dir.path(), &lock).unwrap();
+        // Every lookup finds nothing: absence.
+        let observer = Fixed::new(&[
+            (&dispatched, Observation::NotDone),
+            (&pin, Observation::NotDone),
+            (&unsent, Observation::NotDone),
+            (&handed, Observation::NotDone),
+        ]);
+        let seen = reconcile(&host, &mut ledger, &observer).unwrap();
+        assert_eq!(seen.parked, [dispatched.clone(), pin.clone()]);
+        assert_eq!(
+            seen.retry,
+            std::slice::from_ref(&unsent),
+            "never emitted, so absence is not done"
+        );
+        assert!(
+            !seen.retry.contains(&handed),
+            "a handed intent is never re-emitted"
+        );
+        assert_eq!(ledger.state(&handed), Some(IntentState::Handed));
+        // Positive evidence still binds one that was never parked.
+        let late = Fixed::new(&[(
+            &unsent,
+            Observation::Done(Bind::Pull {
+                number: 3,
+                head: "c".repeat(40),
+            }),
+        )]);
+        assert_eq!(
+            reconcile(&host, &mut ledger, &late).unwrap().bound,
+            [unsent]
+        );
+        let again = reconcile(&host, &mut ledger, &observer).unwrap();
+        assert!(
+            again.retry.is_empty() && again.parked.is_empty(),
+            "parked stays parked"
+        );
+        // A retry ruling, or a failed receipt, after the emission answers it: absence then goes
+        // to readmission like any other not-done intent.
+        ledger.rule(&host, &dispatched, Ruling::Retry).unwrap();
+        let failed = Receipt {
+            intent: pin.clone(),
+            capability: Capability::GhPinUpdate,
+            outcome: ReceiptOutcome::Failed,
+            output: ReceiptOutput::Inline("502".to_owned()),
+        };
+        ledger.record(&host, 2, failed).unwrap();
+        assert_eq!(ledger.state(&pin), Some(IntentState::Open));
+        let answered = reconcile(&host, &mut ledger, &observer).unwrap();
+        assert_eq!(answered.retry, [dispatched, pin]);
+        assert!(answered.parked.is_empty());
     }
 }
