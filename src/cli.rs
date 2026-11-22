@@ -635,6 +635,9 @@ enum MacLaneAct {
         /// A file holding the body; `-` reads stdin.
         #[arg(long, value_name = "FILE")]
         body_file: Option<PathBuf>,
+        /// Link the item to a declared step.
+        #[arg(long, value_parser = step_target, value_name = "NN-name/unit/step")]
+        step: Option<Target>,
     },
     /// Stamp item N `**DONE <date>** (<receipt>).`, replacing a leading PARTIAL, HELD, RUNNING or Receipt span.
     Done {
@@ -1072,13 +1075,24 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             crate::ledger::owner_queue_edit(host, &root()?, *number, &body)
         }
         Commands::MacLane {
-            act: MacLaneAct::Add { title, body_file },
+            act:
+                MacLaneAct::Add {
+                    title,
+                    body_file,
+                    step,
+                },
         } => {
             let body = body_file
                 .as_deref()
                 .map(|path| read_body(path, None))
                 .transpose()?;
-            crate::ledger::mac_lane_add(host, &root()?, title, body.as_deref().unwrap_or_default())
+            crate::ledger::mac_lane_add_with_step(
+                host,
+                &root()?,
+                title,
+                body.as_deref().unwrap_or_default(),
+                step.as_ref(),
+            )
         }
         Commands::MacLane {
             act: MacLaneAct::Partial { number, receipt },

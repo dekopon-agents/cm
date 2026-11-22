@@ -820,9 +820,13 @@ pub struct MacItem {
     pub number: u32,
     pub state: MacState,
     pub title: String,
+    step: Option<String>,
     head: usize,
     status_end: Option<usize>,
 }
+
+// Body-file continuation lines start with four spaces. The tab marks a generated link.
+const MAC_STEP_LINE: &str = "\tStep: `";
 
 fn list_number(line: &str) -> Option<(usize, Result<u32, String>)> {
     let line = line.trim_end_matches(['\r', '\n']);
@@ -939,6 +943,11 @@ pub fn mac_lane_items(text: &str) -> Result<Vec<MacItem>, Vec<Violation>> {
                     .join(" ")
                     .trim_end_matches(['.', ':'])
                     .to_owned(),
+                step: item.lines().find_map(|line| {
+                    let step = line.strip_prefix(MAC_STEP_LINE)?.strip_suffix('`')?;
+                    store::parse_target(step, true).ok()?;
+                    Some(step.to_owned())
+                }),
                 head,
                 status_end: status.map(|(state, close)| {
                     let close = if state == MacState::Partial {
@@ -1002,6 +1011,16 @@ pub fn lint_mac_lane(root: &Path) -> Vec<Violation> {
 }
 
 pub fn mac_lane_add(host: &dyn Host, root: &Path, title: &str, body: &str) -> Result<Outcome> {
+    mac_lane_add_with_step(host, root, title, body, None)
+}
+
+pub(crate) fn mac_lane_add_with_step(
+    host: &dyn Host,
+    root: &Path,
+    title: &str,
+    body: &str,
+    target: Option<&Target>,
+) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
     one_line("the title", title, &mut violations, MAC_LANE_FILE);
     if title.contains("**") || mac_status(title.trim()).is_some() {
@@ -1015,8 +1034,9 @@ pub fn mac_lane_add(host: &dyn Host, root: &Path, title: &str, body: &str) -> Re
         return Ok(Outcome::refused(violations));
     }
     let path = root.join(MAC_LANE_FILE);
-    let mut text = read_existing(&path)?.unwrap_or_else(|| MAC_LANE.to_owned());
-    let items = match mac_lane_items(&text) {
+    let previous = read_existing(&path)?;
+    let text = previous.as_deref().unwrap_or(MAC_LANE);
+    let items = match mac_lane_items(text) {
         Ok(items) => items,
         Err(violations) => return Ok(Outcome::refused(violations)),
     };
@@ -1033,6 +1053,29 @@ pub fn mac_lane_add(host: &dyn Host, root: &Path, title: &str, body: &str) -> Re
             "the next item number exceeds the supported range; renumber the items first",
         )]));
     };
+    let linked = if let Some(target) = target {
+        let name = target.step.as_deref().unwrap_or_default();
+        let full = format!("{}/{name}", target.unit);
+        let dir = root.join(&target.unit);
+        let unknown = || {
+            Outcome::refused(vec![Violation::new(
+                &full,
+                "step-unknown",
+                "the step is not declared",
+            )])
+        };
+        if !store::is_unit(&dir) {
+            return Ok(unknown());
+        }
+        let mut unit = store::load_unit(&dir)?;
+        let Some(step) = unit.steps.get_mut(name) else {
+            return Ok(unknown());
+        };
+        step.mac_lane_items.push(number);
+        Some((full, store::state_path(&dir), unit))
+    } else {
+        None
+    };
     let title = title.trim();
     let mut entry = format!("{number}. **{title}**");
     for (index, line) in body.trim().lines().enumerate() {
@@ -1047,14 +1090,31 @@ pub fn mac_lane_add(host: &dyn Host, root: &Path, title: &str, body: &str) -> Re
         entry.push_str(line.trim_end());
     }
     entry.push('\n');
+    if let Some((full, _, _)) = &linked {
+        entry.push_str(&format!("{MAC_STEP_LINE}{full}`\n"));
+    }
     if items.is_empty() {
-        append(&path, &text, &entry)?;
+        append(&path, text, &entry)?;
     } else {
+        let mut text = text.to_owned();
         if !text.ends_with('\n') {
             text.push('\n');
         }
         text.push_str(&entry);
         write_atomic(&path, text.as_bytes())?;
+    }
+    let mut outcome = Outcome::default();
+    if let Some((full, state_path, unit)) = linked {
+        // The link lives in the declaration and does not affect the rendered STATE.md.
+        if let Err(error) = store::write_json(&state_path, &unit) {
+            let restore = match previous {
+                Some(text) => write_atomic(&path, text.as_bytes()),
+                None => fs::remove_file(&path).map_err(Into::into),
+            };
+            restore.with_context(|| format!("{error:#}; restoring {MAC_LANE_FILE}"))?;
+            return Err(error);
+        }
+        outcome.field("step", full);
     }
     let at = stamp(host.now());
     let journal = journal_line(
@@ -1063,7 +1123,6 @@ pub fn mac_lane_add(host: &dyn Host, root: &Path, title: &str, body: &str) -> Re
         &format!("mac-lane add {number}. {title}"),
         &format!("- {MAC_LANE_FILE}: `{number}. **{title}**`\n"),
     )?;
-    let mut outcome = Outcome::default();
     outcome.line(format!("{number}. {title}"));
     outcome.field("item", number);
     outcome.field("journal", journal);
@@ -1182,29 +1241,25 @@ pub fn mac_lane_list(root: &Path) -> Result<Outcome> {
         Err(error) => return Ok(Outcome::refused(vec![error.downcast::<Violation>()?])),
     };
     let mut outcome = Outcome::default();
+    let mut items = Vec::new();
     for item in &open {
-        outcome.line(format!(
-            "{}. {} ({})",
-            item.number,
-            item.title,
-            item.state.name()
-        ));
+        let mut line = format!("{}. {} ({})", item.number, item.title, item.state.name());
+        let mut fields = serde_json::json!({
+            "item": item.number,
+            "state": item.state.name(),
+            "title": item.title,
+        });
+        if let Some(step) = &item.step {
+            line.push_str(&format!(" — {step}"));
+            fields["step"] = serde_json::json!(step);
+        }
+        outcome.line(line);
+        items.push(fields);
     }
     if open.is_empty() {
         outcome.line("no open Mac lane item");
     }
-    outcome.field(
-        "items",
-        open.iter()
-            .map(|item| {
-                serde_json::json!({
-                    "item": item.number,
-                    "state": item.state.name(),
-                    "title": item.title,
-                })
-            })
-            .collect::<Vec<_>>(),
-    );
+    outcome.field("items", items);
     Ok(outcome)
 }
 
