@@ -243,7 +243,6 @@ impl Default for SystemGit {
 }
 
 impl SystemGit {
-    /// One `git -C <repo>` child; its exit status is the caller's to read.
     fn raw(&self, repo: &Path, op: &'static str, args: &[&str]) -> crate::tick::Result<Output> {
         let repo = repo.to_string_lossy();
         let mut full = vec!["-C", repo.as_ref()];
@@ -261,7 +260,6 @@ impl SystemGit {
         })
     }
 
-    /// One child that must exit zero; its stdout.
     fn ok(&self, repo: &Path, op: &'static str, args: &[&str]) -> crate::tick::Result<String> {
         let output = self.raw(repo, op, args)?;
         if !output.status.success() {
@@ -270,12 +268,10 @@ impl SystemGit {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    /// One child whose exit status is the answer.
     fn test(&self, repo: &Path, op: &'static str, args: &[&str]) -> crate::tick::Result<bool> {
         Ok(self.raw(repo, op, args)?.status.success())
     }
 
-    /// `-z` output split into paths.
     fn paths(
         &self,
         repo: &Path,
@@ -808,11 +804,8 @@ pub fn rebuild(git: &dyn Git, checkout: &Path, campaign: &Path) -> crate::tick::
         .collect();
     let mut forced = Vec::new();
     let mut paths = Vec::new();
-    if !lost_ledger.is_empty() {
-        let handle = crate::tick::ledger::EffectLedger::snapshot(campaign)?;
-        let segment = campaign.join(handle.active_segment());
-        append_lines(&segment, &lost_ledger)?;
-        forced.push(inside(checkout, &segment));
+    for segment in crate::tick::ledger::append_lines(campaign, &lost_ledger)? {
+        forced.push(inside(checkout, &campaign.join(segment)));
     }
     if !lost_agents.is_empty() {
         append_lines(&agents, &lost_agents)?;
@@ -1412,7 +1405,24 @@ mod tests {
         let checkout = scratch.dir.path().join("jail");
         scratch::configure(&checkout);
         // The owned clone's tick wrote rows, an agent echo and a state change it cannot push.
-        let (mine, segment) = intend(&checkout, "01-a/u/s");
+        let (mine, _) = intend(&checkout, "01-a/u/s");
+        // Enough of them, near the row ceiling, to span several segments.
+        {
+            let lock = tick_lock(&campaign);
+            let mut ledger = EffectLedger::open(&campaign, &lock).unwrap();
+            let big = "r".repeat(9 * 1024 - 400);
+            for n in 0..60 {
+                let target = format!("01-a/u/b{n}");
+                let draft = effect(&target, Capability::GhPinMerge);
+                let id = new_id(ledger.intend(&clock(), 1, draft).unwrap());
+                ledger.park(&clock(), &id, &big).unwrap();
+                let drop = crate::tick::ledger::Ruling::Drop {
+                    reason: big.clone(),
+                };
+                ledger.rule(&clock(), &id, drop).unwrap();
+            }
+        }
+        let kept = EffectLedger::snapshot(&campaign).unwrap().rows().to_vec();
         scratch::append(
             &campaign.join("AGENTS.jsonl"),
             "{\"invocation\":\"mine\"}\n",
@@ -1421,7 +1431,7 @@ mod tests {
         system
             .commit(
                 &checkout,
-                &[segment],
+                &tick_files(&checkout, &campaign).unwrap(),
                 &[rel("STATE.md"), rel("AGENTS.jsonl")],
                 "tick 1",
             )
@@ -1460,11 +1470,23 @@ mod tests {
                 .unwrap()
                 .contains("theirs")
         );
+        let rebuilt = EffectLedger::snapshot(&campaign).unwrap();
+        assert!(rebuilt.intent(&mine).is_some());
+        for row in &kept {
+            assert!(rebuilt.rows().contains(row), "{row:?} lost in the rebuild");
+        }
+        let sizes: Vec<u64> = fs::read_dir(campaign.join(".cm/tick"))
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("effects-"))
+            .map(|entry| entry.metadata().unwrap().len())
+            .collect();
+        assert!(sizes.len() >= 2, "{sizes:?}");
+        assert!(sizes.iter().all(|size| *size < 1024 * 1024), "{sizes:?}");
         assert!(
-            EffectLedger::snapshot(&campaign)
-                .unwrap()
-                .intent(&mine)
-                .is_some()
+            system.dirty(&checkout, Path::new(".")).unwrap().is_empty()
+                && !system.unpushed(&checkout).unwrap(),
+            "every rebuilt segment is committed and pushed"
         );
 
         // A checkout cm did not clone gets the error instead.

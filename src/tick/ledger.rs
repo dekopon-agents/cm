@@ -395,41 +395,12 @@ impl EffectLedger {
 
     pub fn state(&self, id: &IntentId) -> Option<IntentState> {
         let intent = self.intent(id)?;
-        let mut state = IntentState::Open;
-        for row in &self.rows {
-            state = match row {
-                LedgerRow::Bound { intent, bind, .. } if intent == id && !closed(state) => {
-                    if matches!(bind, Bind::Action { .. }) {
-                        IntentState::Handed
-                    } else {
-                        IntentState::Bound
-                    }
-                }
-                LedgerRow::Parked { intent, .. } if intent == id && !closed(state) => {
-                    IntentState::Parked
-                }
-                LedgerRow::Receipt { receipt, .. }
-                    if receipt.intent == *id
-                        && !closed(state)
-                        && Some(receipt.capability) == intent.capability =>
-                {
-                    match receipt.outcome {
-                        ReceiptOutcome::Ok | ReceiptOutcome::Refused => IntentState::Received,
-                        ReceiptOutcome::Failed => IntentState::Open,
-                    }
-                }
-                LedgerRow::Ruled { intent, ruling, .. } if intent == id && !closed(state) => {
-                    match ruling {
-                        Ruling::Retry if state == IntentState::Parked => IntentState::Open,
-                        Ruling::Retry => state,
-                        Ruling::Done { .. } | Ruling::Drop { .. } => IntentState::Closed,
-                    }
-                }
-                LedgerRow::Verdict { verdict, .. } if verdict.intent == *id => IntentState::Closed,
-                _ => state,
-            };
-        }
-        Some(state)
+        Some(
+            self.rows
+                .iter()
+                .filter(|row| subject(row) == Some(id))
+                .fold(IntentState::Open, |state, row| step(intent, state, row)),
+        )
     }
 
     /// Intents in [`IntentState::Open`] or [`IntentState::Handed`], oldest first.
@@ -555,6 +526,12 @@ impl EffectLedger {
 
     pub fn bind(&mut self, host: &dyn Host, id: &IntentId, bind: Bind) -> crate::tick::Result<()> {
         self.known(id)?;
+        // Only a change of state is a row: a closed intent, or a handed one handed again, takes
+        // none, so an intent stays within its row budget.
+        let state = self.state(id).unwrap_or(IntentState::Open);
+        if closed(state) || (state == IntentState::Handed && matches!(bind, Bind::Action { .. })) {
+            return Ok(());
+        }
         self.append(LedgerRow::Bound {
             intent: id.clone(),
             at: crate::host::stamp(host.now()),
@@ -569,6 +546,13 @@ impl EffectLedger {
         reason: &str,
     ) -> crate::tick::Result<()> {
         self.known(id)?;
+        // Only an open or handed intent parks; parking again writes nothing (row budget).
+        if !matches!(
+            self.state(id),
+            Some(IntentState::Open | IntentState::Handed)
+        ) {
+            return Ok(());
+        }
         self.append(LedgerRow::Parked {
             intent: id.clone(),
             at: crate::host::stamp(host.now()),
@@ -713,12 +697,42 @@ impl EffectLedger {
     }
 
     fn intents_in(&self, states: &[IntentState]) -> Vec<&IntentRow> {
+        let mut folded: std::collections::BTreeMap<&IntentId, (&IntentRow, IntentState)> = self
+            .intents()
+            .map(|row| (&row.id, (row, IntentState::Open)))
+            .collect();
+        for row in &self.rows {
+            if let Some((intent, state)) = subject(row).and_then(|id| folded.get_mut(id)) {
+                *state = step(intent, *state, row);
+            }
+        }
         self.intents()
             .filter(|row| {
-                self.state(&row.id)
-                    .is_some_and(|state| states.contains(&state))
+                folded
+                    .get(&row.id)
+                    .is_some_and(|(_, state)| states.contains(state))
             })
             .collect()
+    }
+
+    /// Whether the intent's latest emission has neither a receipt nor a retry ruling after it.
+    fn unreceipted_emission(&self, id: &IntentId) -> bool {
+        let Some(at) = self
+            .rows
+            .iter()
+            .rposition(|row| matches!(row, LedgerRow::Emitted { intent, .. } if intent == id))
+        else {
+            return false;
+        };
+        !self.rows[at..].iter().any(|row| match row {
+            LedgerRow::Receipt { receipt, .. } => receipt.intent == *id,
+            LedgerRow::Ruled {
+                intent,
+                ruling: Ruling::Retry,
+                ..
+            } => intent == id,
+            _ => false,
+        })
     }
 
     fn known(&self, id: &IntentId) -> crate::tick::Result<&IntentRow> {
@@ -786,46 +800,124 @@ impl EffectLedger {
 
     /// One row as one `write` of one whole line, then fsync.
     fn append(&mut self, row: LedgerRow) -> crate::tick::Result<()> {
-        let number = active_number(&self.dir);
-        let path = self.dir.join(segment_name(number));
-        let io = |source| crate::tick::TickError::Io {
-            path: path.clone(),
-            source,
-        };
         if !self.writable {
-            return Err(io(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "a ledger snapshot never writes",
-            )));
+            return Err(crate::tick::TickError::Io {
+                path: self.dir.clone(),
+                source: io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "a ledger snapshot never writes",
+                ),
+            });
         }
-        let mut line = serde_json::to_vec(&row).map_err(|source| crate::tick::TickError::Row {
-            path: path.clone(),
+        let line = serde_json::to_string(&row).map_err(|source| crate::tick::TickError::Row {
+            path: self.dir.clone(),
             line: 0,
             source,
         })?;
-        line.push(b'\n');
-        fs::create_dir_all(&self.dir).map_err(io)?;
-        let created = !path.exists();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(io)?;
-        let written = file.write(&line).map_err(io)?;
-        if written != line.len() {
-            return Err(io(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "short write of a ledger row",
-            )));
-        }
-        file.sync_all().map_err(io)?;
-        if created {
-            File::open(&self.dir)
-                .and_then(|dir| dir.sync_all())
-                .map_err(io)?;
-        }
+        write_line(&self.dir, &line)?;
         self.rows.push(row);
         Ok(())
+    }
+}
+
+/// `push::rebuild`'s re-append (F3): each line, unparsed, goes to the active segment as one
+/// `write` and fsync, rolling segments as [`EffectLedger`]'s own appends do. Returns the
+/// segments it wrote, relative to the campaign folder.
+pub(crate) fn append_lines(root: &Path, lines: &[String]) -> crate::tick::Result<Vec<PathBuf>> {
+    let dir = root.join(LEDGER_DIR);
+    let mut touched: Vec<PathBuf> = Vec::new();
+    for line in lines {
+        let name = write_line(&dir, line)?;
+        let rel = Path::new(LEDGER_DIR).join(name);
+        if !touched.contains(&rel) {
+            touched.push(rel);
+        }
+    }
+    Ok(touched)
+}
+
+/// Appends `line` and a newline to the active segment in one `write`, then fsyncs; the segment's
+/// file name.
+fn write_line(dir: &Path, line: &str) -> crate::tick::Result<String> {
+    let name = segment_name(active_number(dir));
+    let path = dir.join(&name);
+    let io = |source| crate::tick::TickError::Io {
+        path: path.clone(),
+        source,
+    };
+    fs::create_dir_all(dir).map_err(io)?;
+    let existing = fs::metadata(&path).map(|meta| meta.len()).ok();
+    let mut bytes = Vec::with_capacity(line.len() + 2);
+    // A segment that does not end in a newline gets one first, so the row stays whole.
+    if existing.is_some_and(|len| len > 0) {
+        let mut last = [0u8; 1];
+        let file = File::open(&path).map_err(io)?;
+        std::os::unix::fs::FileExt::read_at(&file, &mut last, existing.unwrap_or(1) - 1)
+            .map_err(io)?;
+        if last[0] != b'\n' {
+            bytes.push(b'\n');
+        }
+    }
+    bytes.extend_from_slice(line.as_bytes());
+    bytes.push(b'\n');
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(io)?;
+    let written = file.write(&bytes).map_err(io)?;
+    if written != bytes.len() {
+        return Err(io(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "short write of a ledger row",
+        )));
+    }
+    file.sync_all().map_err(io)?;
+    if existing.is_none() {
+        File::open(dir).and_then(|dir| dir.sync_all()).map_err(io)?;
+    }
+    Ok(name)
+}
+
+/// The intent a row names.
+fn subject(row: &LedgerRow) -> Option<&IntentId> {
+    match row {
+        LedgerRow::Intent(intent) => Some(&intent.id),
+        LedgerRow::Emitted { intent, .. }
+        | LedgerRow::Bound { intent, .. }
+        | LedgerRow::Parked { intent, .. }
+        | LedgerRow::Ruled { intent, .. } => Some(intent),
+        LedgerRow::Receipt { receipt, .. } => Some(&receipt.intent),
+        LedgerRow::Verdict { verdict, .. } => Some(&verdict.intent),
+    }
+}
+
+/// The fold (module doc, Fold): `intent`'s state after `row`, a row that names it.
+fn step(intent: &IntentRow, state: IntentState, row: &LedgerRow) -> IntentState {
+    match row {
+        LedgerRow::Bound { bind, .. } if !closed(state) => {
+            if matches!(bind, Bind::Action { .. }) {
+                IntentState::Handed
+            } else {
+                IntentState::Bound
+            }
+        }
+        LedgerRow::Parked { .. } if !closed(state) => IntentState::Parked,
+        LedgerRow::Receipt { receipt, .. }
+            if !closed(state) && Some(receipt.capability) == intent.capability =>
+        {
+            match receipt.outcome {
+                ReceiptOutcome::Ok | ReceiptOutcome::Refused => IntentState::Received,
+                ReceiptOutcome::Failed => IntentState::Open,
+            }
+        }
+        LedgerRow::Ruled { ruling, .. } if !closed(state) => match ruling {
+            Ruling::Retry if state == IntentState::Parked => IntentState::Open,
+            Ruling::Retry => state,
+            Ruling::Done { .. } | Ruling::Drop { .. } => IntentState::Closed,
+        },
+        LedgerRow::Verdict { .. } => IntentState::Closed,
+        _ => state,
     }
 }
 
@@ -1041,7 +1133,7 @@ pub fn reconcile(
         // an earlier cycle emitted it.
         if seen == Observation::NotDone
             && unrepeatable(&row)
-            && ledger.last_emitted(&row.id).is_some()
+            && ledger.unreceipted_emission(&row.id)
         {
             seen = Observation::Undecidable {
                 reason: "a non-idempotent effect was emitted in an earlier cycle with no \
@@ -1863,27 +1955,52 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(ledger.state(&id), Some(IntentState::Closed));
-        let mine = ledger
-            .rows()
-            .iter()
-            .filter(|row| match row {
-                LedgerRow::Intent(row) => row.id == id,
-                LedgerRow::Emitted { intent, .. }
-                | LedgerRow::Bound { intent, .. }
-                | LedgerRow::Parked { intent, .. }
-                | LedgerRow::Ruled { intent, .. } => *intent == id,
-                LedgerRow::Receipt { receipt, .. } => receipt.intent == id,
-                LedgerRow::Verdict { verdict, .. } => verdict.intent == id,
-            })
-            .count();
-        assert!(mine <= MAX_ROWS_PER_INTENT, "{mine} rows");
         assert_eq!(MAX_ROWS_PER_INTENT, 38);
+        // Parking or binding again changes no state and writes no row.
+        let rows = ledger.rows().len();
+        ledger.park(&host, &id, "again").unwrap();
+        ledger
+            .bind(
+                &host,
+                &id,
+                Bind::Session {
+                    id: "late".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(ledger.rows().len(), rows);
 
-        // Rows near the 9 KiB ceiling roll segments at 512 KiB, and none reaches 1 MiB.
-        let other = new_id(ledger.intend(&host, 1, effect("01-a/u/t", cap)).unwrap());
-        let reason = "r".repeat(9 * 1024 - 200);
-        for _ in 0..200 {
-            ledger.park(&host, &other, &reason).unwrap();
+        // Many legal lifecycles of rows near the 9 KiB ceiling roll segments at 512 KiB, and
+        // none reaches 1 MiB.
+        let big = "r".repeat(9 * 1024 - 400);
+        for n in 0..60 {
+            let mut draft = effect(&format!("01-a/u/t{n}"), cap);
+            draft.input = Some(Value::String(big.clone()));
+            let other = new_id(ledger.intend(&host, 1, draft).unwrap());
+            ledger.emitted(&host, &other, 1).unwrap();
+            for _ in 0..3 {
+                ledger.park(&host, &other, &big).unwrap();
+            }
+            ledger
+                .rule(
+                    &host,
+                    &other,
+                    Ruling::Drop {
+                        reason: big.clone(),
+                    },
+                )
+                .unwrap();
+        }
+        let budget = ledger.intents().map(|row| {
+            let count = ledger
+                .rows()
+                .iter()
+                .filter(|other| subject(other) == Some(&row.id))
+                .count();
+            (row.id.clone(), count)
+        });
+        for (intent, count) in budget {
+            assert!(count <= MAX_ROWS_PER_INTENT, "{intent}: {count} rows");
         }
         let sizes: Vec<u64> = fs::read_dir(dir.path().join(LEDGER_DIR))
             .unwrap()
@@ -2050,5 +2167,19 @@ pub(crate) mod tests {
             again.retry.is_empty() && again.parked.is_empty(),
             "parked stays parked"
         );
+        // A retry ruling, or a failed receipt, after the emission answers it: absence then goes
+        // to readmission like any other not-done intent.
+        ledger.rule(&host, &dispatched, Ruling::Retry).unwrap();
+        let failed = Receipt {
+            intent: pin.clone(),
+            capability: Capability::GhPinUpdate,
+            outcome: ReceiptOutcome::Failed,
+            output: ReceiptOutput::Inline("502".to_owned()),
+        };
+        ledger.record(&host, 2, failed).unwrap();
+        assert_eq!(ledger.state(&pin), Some(IntentState::Open));
+        let answered = reconcile(&host, &mut ledger, &observer).unwrap();
+        assert_eq!(answered.retry, [dispatched, pin]);
+        assert!(answered.parked.is_empty());
     }
 }

@@ -53,9 +53,11 @@ pub fn resolve(
     {
         return Ok(refused(LEDGER_DIR, "ruling-refused", reason));
     }
+    // The segment the ruling goes to, taken before the append: the append can fill it to the
+    // rollover size, after which `active_segment` names the next, still absent, segment.
+    let segment = root.join(ledger.active_segment());
     ledger.rule(host, intent, ruling.clone())?;
     let checkout = git.toplevel(root)?;
-    let segment = root.join(ledger.active_segment());
     let forced = [segment
         .strip_prefix(&checkout)
         .map(Path::to_owned)
@@ -202,7 +204,7 @@ mod tests {
             .is_err()
         );
         // Closed is not parked either.
-        let done = resolve(
+        let done = ruled(
             &host,
             &git,
             &campaign,
@@ -284,7 +286,7 @@ mod tests {
         assert_eq!(on_main.matches("\"ruled\"").count(), 3);
 
         // And a drop closes one at its budget too.
-        let (_second, campaign, parked, _) = self::parked();
+        let (second, campaign, parked, _) = self::parked();
         for _ in 0..crate::tick::ledger::MAX_RULINGS_PER_INTENT {
             assert!(
                 ruled(&host, &git, &campaign, &parked, Ruling::Retry)
@@ -295,7 +297,17 @@ mod tests {
             let mut ledger = EffectLedger::open(&campaign, &lock).unwrap();
             ledger.park(&host, &parked, "again").unwrap();
         }
-        let drop = resolve(
+        // The drop row lands in a segment one byte short of the rollover size; it must still be
+        // the segment committed and pushed.
+        let segment = campaign.join(".cm/tick/effects-0001.jsonl");
+        let size = fs::metadata(&segment).unwrap().len();
+        let pad = crate::tick::ledger::SEGMENT_MAX_BYTES - 1 - size;
+        scratch::append(&segment, &format!("{}\n", " ".repeat(pad as usize - 1)));
+        assert_eq!(
+            fs::metadata(&segment).unwrap().len(),
+            crate::tick::ledger::SEGMENT_MAX_BYTES - 1
+        );
+        let drop = ruled(
             &host,
             &git,
             &campaign,
@@ -310,5 +322,10 @@ mod tests {
             EffectLedger::snapshot(&campaign).unwrap().state(&parked),
             Some(IntentState::Closed)
         );
+        let on_main = second
+            .on_main(&format!("{}/.cm/tick/effects-0001.jsonl", scratch::EPOCH))
+            .unwrap();
+        assert!(on_main.contains("\"owner\""), "the drop ruling was pushed");
+        assert!(!campaign.join(".cm/tick/effects-0002.jsonl").exists());
     }
 }
