@@ -106,51 +106,16 @@ pub struct PendingMark {
 impl PendingMark {
     /// `None` when no tick is pending.
     pub fn load(checkout: &Path) -> crate::tick::Result<Option<Self>> {
-        let path = checkout.join(PENDING_MARK);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(TickError::Io { path, source }),
-        };
-        serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|source| TickError::Row {
-                path,
-                line: 1,
-                source,
-            })
+        load_json(&checkout.join(PENDING_MARK))
     }
 
     /// Written whole (a temporary file renamed over it), then fsynced.
     pub fn save(&self, checkout: &Path) -> crate::tick::Result<()> {
-        let path = checkout.join(PENDING_MARK);
-        let io = |source| TickError::Io {
-            path: path.clone(),
-            source,
-        };
-        let dir = path.parent().unwrap_or(checkout);
-        let mut bytes = serde_json::to_vec(self).map_err(|source| TickError::Row {
-            path: path.clone(),
-            line: 1,
-            source,
-        })?;
-        bytes.push(b'\n');
-        let mut temporary = tempfile::NamedTempFile::new_in(dir).map_err(io)?;
-        temporary.write_all(&bytes).map_err(io)?;
-        temporary.as_file().sync_all().map_err(io)?;
-        temporary.persist(&path).map_err(|error| io(error.error))?;
-        fs::File::open(dir)
-            .and_then(|dir| dir.sync_all())
-            .map_err(io)
+        save_json(&checkout.join(PENDING_MARK), self)
     }
 
     pub fn clear(checkout: &Path) -> crate::tick::Result<()> {
-        let path = checkout.join(PENDING_MARK);
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(TickError::Io { path, source }),
-        }
+        remove(&checkout.join(PENDING_MARK))
     }
 }
 
@@ -689,15 +654,16 @@ pub fn ensure_checkout(git: &dyn Git, url: &str, campaign: &Path) -> crate::tick
 
 /// The tick's first git act, in the order the module doc gives.
 pub fn begin(git: &dyn Git, checkout: &Path, campaign: &Path) -> crate::tick::Result<()> {
-    // 0. A merge a killed git child left.
     git.abort_merge(checkout)?;
-    // 1. The union precondition (R03).
     let segment = inside(checkout, &campaign.join(crate::tick::ledger::LEDGER_DIR))
         .join(format!("{}0001.jsonl", crate::tick::ledger::SEGMENT_PREFIX));
     if git.merge_attr(checkout, &segment)?.as_deref() != Some("union") {
         return Err(TickError::LedgerNotUnion { path: segment });
     }
-    // 2. Recovery by the pending mark.
+    let owned = checkout.join(OWNED_MARK).exists();
+    if owned && Kept::load(checkout)?.is_some() {
+        rebuild(git, checkout, campaign)?;
+    }
     let mark = PendingMark::load(checkout)?;
     match &mark {
         Some(mark)
@@ -721,21 +687,17 @@ pub fn begin(git: &dyn Git, checkout: &Path, campaign: &Path) -> crate::tick::Re
             PendingMark::clear(checkout)?;
         }
     }
-    // Steps 3 and 4: a conflict or block rebuilds a checkout cm cloned; any other is a human's.
-    let owned = checkout.join(OWNED_MARK).exists();
     let wedged = |error: TickError| match error {
         TickError::PullConflict { .. } | TickError::PullBlocked { .. } if owned => {
             rebuild(git, checkout, campaign)
         }
         error => Err(error),
     };
-    // 3. An unpushed commit goes out before the pull.
     if git.unpushed(checkout)?
         && let Err(error) = commit_and_push(git, checkout, &[], &[], "cm tick: push")
     {
         return wedged(error);
     }
-    // 4. The pull.
     match git.pull_no_rebase(checkout)? {
         PullResult::Merged => Ok(()),
         PullResult::Conflict { paths } => wedged(TickError::PullConflict { paths }),
@@ -788,28 +750,42 @@ pub fn rebuild(git: &dyn Git, checkout: &Path, campaign: &Path) -> crate::tick::
     git.abort_merge(checkout)?;
     let ledger = campaign.join(crate::tick::ledger::LEDGER_DIR);
     let agents = campaign.join(crate::tick::agents::AGENTS_FILE);
-    let kept_ledger = ledger_lines(&ledger)?;
-    let kept_agents = whole_lines(&read_or_empty(&agents)?);
-    git.reset_to_origin(checkout)?;
-    // What main lacks, as lines, in local order (F3).
-    let main_ledger: BTreeSet<String> = ledger_lines(&ledger)?.into_iter().collect();
-    let lost_ledger: Vec<String> = kept_ledger
-        .into_iter()
-        .filter(|line| !main_ledger.contains(line))
-        .collect();
-    let main_agents: BTreeSet<String> = whole_lines(&read_or_empty(&agents)?).into_iter().collect();
-    let lost_agents: Vec<String> = kept_agents
-        .into_iter()
-        .filter(|line| !main_agents.contains(line))
-        .collect();
     let mut forced = Vec::new();
     let mut paths = Vec::new();
-    for segment in crate::tick::ledger::append_lines(campaign, &lost_ledger)? {
-        forced.push(inside(checkout, &campaign.join(segment)));
-    }
-    if !lost_agents.is_empty() {
-        append_lines(&agents, &lost_agents)?;
-        paths.push(inside(checkout, &agents));
+    {
+        // R16: no harvester appends to AGENTS.jsonl between the snapshot and the re-append.
+        let _lock =
+            crate::store::lock(campaign).map_err(|error| TickError::Cm { op: "lock", error })?;
+        // The kept lines are saved before the reset and dropped only once pushed, so a rebuild
+        // interrupted anywhere is finished by the next `begin`.
+        let mut kept = Kept::load(checkout)?.unwrap_or_default();
+        union_into(&mut kept.ledger, ledger_lines(&ledger)?);
+        union_into(&mut kept.agents, whole_lines(&read_or_empty(&agents)?));
+        kept.save(checkout)?;
+        git.reset_to_origin(checkout)?;
+        // Untracked segments survive a hard reset; their lines are in `kept`.
+        let head = git.head(checkout)?;
+        git.restore(checkout, &head, &[], &inside(checkout, &ledger))?;
+        let main_ledger: BTreeSet<String> = ledger_lines(&ledger)?.into_iter().collect();
+        let lost_ledger: Vec<String> = kept
+            .ledger
+            .into_iter()
+            .filter(|line| !main_ledger.contains(line))
+            .collect();
+        let main_agents: BTreeSet<String> =
+            whole_lines(&read_or_empty(&agents)?).into_iter().collect();
+        let lost_agents: Vec<String> = kept
+            .agents
+            .into_iter()
+            .filter(|line| !main_agents.contains(line))
+            .collect();
+        for segment in crate::tick::ledger::append_lines(campaign, &lost_ledger)? {
+            forced.push(inside(checkout, &campaign.join(segment)));
+        }
+        if !lost_agents.is_empty() {
+            append_lines(&agents, &lost_agents)?;
+            paths.push(inside(checkout, &agents));
+        }
     }
     commit_and_push(
         git,
@@ -818,7 +794,7 @@ pub fn rebuild(git: &dyn Git, checkout: &Path, campaign: &Path) -> crate::tick::
         &paths,
         "cm tick: rebuild from origin/main keeping ledger and agent rows",
     )?;
-    Ok(())
+    Kept::clear(checkout)
 }
 
 /// 11-D8: commit `forced` and `paths` ([`Git::commit`]), push, and on a non-fast-forward reject
@@ -860,6 +836,93 @@ pub fn commit_and_push(
                 PullResult::Blocked { paths } => return Err(TickError::PullBlocked { paths }),
             },
         }
+    }
+}
+
+/// A rebuild's kept lines, relative to the checkout (inside `.git`, never committed).
+const REBUILD_KEPT: &str = ".git/cm-tick-rebuild";
+
+/// What [`rebuild`] keeps across its reset: every local ledger and `AGENTS.jsonl` line.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Kept {
+    ledger: Vec<String>,
+    agents: Vec<String>,
+}
+
+impl Kept {
+    fn load(checkout: &Path) -> crate::tick::Result<Option<Kept>> {
+        load_json(&checkout.join(REBUILD_KEPT))
+    }
+
+    fn save(&self, checkout: &Path) -> crate::tick::Result<()> {
+        save_json(&checkout.join(REBUILD_KEPT), self)
+    }
+
+    fn clear(checkout: &Path) -> crate::tick::Result<()> {
+        remove(&checkout.join(REBUILD_KEPT))
+    }
+}
+
+/// Appends each of `lines` not already in `into`, in order.
+fn union_into(into: &mut Vec<String>, lines: Vec<String>) {
+    let mut seen: BTreeSet<String> = into.iter().cloned().collect();
+    for line in lines {
+        if seen.insert(line.clone()) {
+            into.push(line);
+        }
+    }
+}
+
+fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> crate::tick::Result<Option<T>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(TickError::Io {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|source| TickError::Row {
+            path: path.to_owned(),
+            line: 1,
+            source,
+        })
+}
+
+/// Written whole: a temporary file renamed over `path`, then fsynced with its directory.
+fn save_json<T: Serialize>(path: &Path, value: &T) -> crate::tick::Result<()> {
+    let io = |source| TickError::Io {
+        path: path.to_owned(),
+        source,
+    };
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut bytes = serde_json::to_vec(value).map_err(|source| TickError::Row {
+        path: path.to_owned(),
+        line: 1,
+        source,
+    })?;
+    bytes.push(b'\n');
+    let mut temporary = tempfile::NamedTempFile::new_in(dir).map_err(io)?;
+    temporary.write_all(&bytes).map_err(io)?;
+    temporary.as_file().sync_all().map_err(io)?;
+    temporary.persist(path).map_err(|error| io(error.error))?;
+    fs::File::open(dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(io)
+}
+
+fn remove(path: &Path) -> crate::tick::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(TickError::Io {
+            path: path.to_owned(),
+            source,
+        }),
     }
 }
 
@@ -1396,6 +1459,119 @@ mod tests {
         );
     }
 
+    /// Real git, with a hook just before `reset_to_origin` and an optional kill just after it.
+    struct Interrupted<'a> {
+        git: &'a SystemGit,
+        before_reset: Box<dyn Fn() + 'a>,
+        killed_after_reset: std::cell::Cell<bool>,
+    }
+
+    impl Git for Interrupted<'_> {
+        fn clone_into(&self, url: &str, dir: &Path) -> crate::tick::Result<()> {
+            self.git.clone_into(url, dir)
+        }
+        fn toplevel(&self, dir: &Path) -> crate::tick::Result<PathBuf> {
+            self.git.toplevel(dir)
+        }
+        fn merge_attr(&self, repo: &Path, path: &Path) -> crate::tick::Result<Option<String>> {
+            self.git.merge_attr(repo, path)
+        }
+        fn pull_no_rebase(&self, repo: &Path) -> crate::tick::Result<PullResult> {
+            self.git.pull_no_rebase(repo)
+        }
+        fn abort_merge(&self, repo: &Path) -> crate::tick::Result<bool> {
+            self.git.abort_merge(repo)
+        }
+        fn head(&self, repo: &Path) -> crate::tick::Result<String> {
+            self.git.head(repo)
+        }
+        fn dirty(&self, repo: &Path, under: &Path) -> crate::tick::Result<BTreeSet<PathBuf>> {
+            self.git.dirty(repo, under)
+        }
+        fn commit(
+            &self,
+            repo: &Path,
+            forced: &[PathBuf],
+            paths: &[PathBuf],
+            message: &str,
+        ) -> crate::tick::Result<Option<CommitSha>> {
+            self.git.commit(repo, forced, paths, message)
+        }
+        fn push_main(&self, repo: &Path) -> crate::tick::Result<PushResult> {
+            self.git.push_main(repo)
+        }
+        fn unpushed(&self, repo: &Path) -> crate::tick::Result<bool> {
+            self.git.unpushed(repo)
+        }
+        fn reset_to_origin(&self, repo: &Path) -> crate::tick::Result<()> {
+            (self.before_reset)();
+            self.git.reset_to_origin(repo)?;
+            if self.killed_after_reset.replace(false) {
+                return Err(TickError::Io {
+                    path: repo.to_owned(),
+                    source: io::Error::other("killed after the reset"),
+                });
+            }
+            Ok(())
+        }
+        fn restore(
+            &self,
+            repo: &Path,
+            base: &str,
+            paths: &[PathBuf],
+            clean: &Path,
+        ) -> crate::tick::Result<()> {
+            self.git.restore(repo, base, paths, clean)
+        }
+        fn show(&self, repo: &Path, sha: &str, path: &str) -> crate::tick::Result<Option<String>> {
+            self.git.show(repo, sha, path)
+        }
+        fn has_commit(&self, repo: &Path, sha: &str) -> crate::tick::Result<bool> {
+            self.git.has_commit(repo, sha)
+        }
+        fn fetch_sha(&self, repo: &Path, sha: &str) -> crate::tick::Result<bool> {
+            self.git.fetch_sha(repo, sha)
+        }
+    }
+
+    /// An owned clone at `<dir>/<name>` holding an unpushed commit with an `ok` receipt and a
+    /// state change that conflicts with main.
+    fn wedged_with_receipt(scratch: &Scratch, name: &str) -> (PathBuf, crate::tick::IntentId) {
+        let system = SystemGit::default();
+        let checkout = scratch.dir.path().join(name);
+        let campaign = checkout.join(EPOCH);
+        ensure_checkout(&system, scratch.origin.to_str().unwrap(), &campaign).unwrap();
+        scratch::configure(&checkout);
+        let (id, _) = intend(&checkout, &format!("01-a/u/{name}"));
+        {
+            let lock = tick_lock(&campaign);
+            let mut ledger = EffectLedger::open(&campaign, &lock).unwrap();
+            ledger.emitted(&clock(), &id, 1).unwrap();
+            let ok = crate::tick::ledger::tests::receipt(
+                &id,
+                Capability::GhPinUpdate,
+                crate::tick::wire::ReceiptOutcome::Ok,
+            );
+            ledger.record(&clock(), 1, ok).unwrap();
+        }
+        fs::write(campaign.join("STATE.md"), format!("# State\n\n{name}\n")).unwrap();
+        system
+            .commit(
+                &checkout,
+                &tick_files(&checkout, &campaign).unwrap(),
+                &[rel("STATE.md")],
+                "receipts",
+            )
+            .unwrap()
+            .unwrap();
+        let other = scratch.clone(&format!("{name}-other"));
+        let theirs = format!("# State\n\nother {name}\n");
+        fs::write(scratch::campaign(&other).join("STATE.md"), theirs).unwrap();
+        scratch::commit_all(&other, "other");
+        git(&other, &["push", "-q", "origin", "HEAD:main"]);
+        (checkout, id)
+    }
+
     #[test]
     fn a_wedged_owned_checkout_rebuilds_from_origin_keeping_every_ledger_and_agent_row() {
         let scratch = Scratch::new();
@@ -1487,6 +1663,51 @@ mod tests {
             system.dirty(&checkout, Path::new(".")).unwrap().is_empty()
                 && !system.unpushed(&checkout).unwrap(),
             "every rebuilt segment is committed and pushed"
+        );
+
+        // A rebuild killed right after its hard reset loses no recorded receipt: the next
+        // begin finishes it from the saved lines.
+        let (killed, receipted) = wedged_with_receipt(&scratch, "killed");
+        let interrupted = Interrupted {
+            git: &system,
+            before_reset: Box::new(|| {}),
+            killed_after_reset: std::cell::Cell::new(true),
+        };
+        let campaign = killed.join(EPOCH);
+        assert!(begin(&interrupted, &killed, &campaign).is_err());
+        assert!(killed.join(REBUILD_KEPT).exists());
+        begin(&system, &killed, &campaign).unwrap();
+        assert!(!killed.join(REBUILD_KEPT).exists(), "dropped once pushed");
+        let ledger = EffectLedger::snapshot(&campaign).unwrap();
+        assert_eq!(ledger.state(&receipted), Some(IntentState::Received));
+        let fresh = scratch.clone("fresh");
+        let on_main = EffectLedger::snapshot(&scratch::campaign(&fresh)).unwrap();
+        assert_eq!(on_main.state(&receipted), Some(IntentState::Received));
+
+        // A harvester waiting on the campaign lock appends only after the re-append, so its row
+        // is never reset away.
+        let (raced, _) = wedged_with_receipt(&scratch, "raced");
+        let campaign = raced.join(EPOCH);
+        let harvester = std::cell::RefCell::new(None);
+        let interrupted = Interrupted {
+            git: &system,
+            before_reset: Box::new(|| {
+                let campaign = campaign.clone();
+                *harvester.borrow_mut() = Some(std::thread::spawn(move || {
+                    let _lock = crate::store::lock(&campaign).unwrap();
+                    scratch::append(&campaign.join("AGENTS.jsonl"), "{\"harvested\":2}\n");
+                }));
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }),
+            killed_after_reset: std::cell::Cell::new(false),
+        };
+        begin(&interrupted, &raced, &campaign).unwrap();
+        harvester.borrow_mut().take().unwrap().join().unwrap();
+        assert!(
+            fs::read_to_string(campaign.join("AGENTS.jsonl"))
+                .unwrap()
+                .contains("harvested"),
+            "the harvester's row survives the rebuild"
         );
 
         // A checkout cm did not clone gets the error instead.
