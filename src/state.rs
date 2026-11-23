@@ -414,15 +414,17 @@ pub enum Lane {
     Fable,
     Owner,
     Coordinator,
+    Mac,
 }
 
-pub const LANES: [Lane; 6] = [
+pub const LANES: [Lane; 7] = [
     Lane::Pi,
     Lane::Codex,
     Lane::ClaudeCloud,
     Lane::Fable,
     Lane::Owner,
     Lane::Coordinator,
+    Lane::Mac,
 ];
 
 impl Lane {
@@ -434,15 +436,19 @@ impl Lane {
             Lane::Fable => "fable",
             Lane::Owner => "owner",
             Lane::Coordinator => "coordinator",
+            Lane::Mac => "mac",
         }
     }
 
     pub fn is_local(self) -> bool {
         match self {
             Lane::Pi => true,
-            Lane::Codex | Lane::ClaudeCloud | Lane::Fable | Lane::Owner | Lane::Coordinator => {
-                false
-            }
+            Lane::Codex
+            | Lane::ClaudeCloud
+            | Lane::Fable
+            | Lane::Owner
+            | Lane::Coordinator
+            | Lane::Mac => false,
         }
     }
 }
@@ -1224,7 +1230,7 @@ impl Step {
     pub fn finish(&self, release: bool) -> Finish {
         match (self.work, self.lane) {
             (Work::Rollout, _) => Finish::Rollout,
-            (Work::Study, _) | (Work::Code, Some(Lane::Owner)) => Finish::Evidence,
+            (Work::Study, _) | (Work::Code, Some(Lane::Owner | Lane::Mac)) => Finish::Evidence,
             (Work::Code, Some(Lane::Coordinator))
                 if !release
                     && self.track.evidence.pr.is_none()

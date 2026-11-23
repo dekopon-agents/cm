@@ -820,9 +820,13 @@ pub struct MacItem {
     pub number: u32,
     pub state: MacState,
     pub title: String,
+    step: Option<String>,
     head: usize,
     status_end: Option<usize>,
 }
+
+// Body-file continuation lines start with four spaces. The tab marks a generated link.
+const MAC_STEP_LINE: &str = "\tStep: `";
 
 fn list_number(line: &str) -> Option<(usize, Result<u32, String>)> {
     let line = line.trim_end_matches(['\r', '\n']);
@@ -939,6 +943,11 @@ pub fn mac_lane_items(text: &str) -> Result<Vec<MacItem>, Vec<Violation>> {
                     .join(" ")
                     .trim_end_matches(['.', ':'])
                     .to_owned(),
+                step: item.lines().find_map(|line| {
+                    let step = line.strip_prefix(MAC_STEP_LINE)?.strip_suffix('`')?;
+                    store::parse_target(step, true).ok()?;
+                    Some(step.to_owned())
+                }),
                 head,
                 status_end: status.map(|(state, close)| {
                     let close = if state == MacState::Partial {
@@ -1002,6 +1011,16 @@ pub fn lint_mac_lane(root: &Path) -> Vec<Violation> {
 }
 
 pub fn mac_lane_add(host: &dyn Host, root: &Path, title: &str, body: &str) -> Result<Outcome> {
+    mac_lane_add_with_step(host, root, title, body, None)
+}
+
+pub(crate) fn mac_lane_add_with_step(
+    host: &dyn Host,
+    root: &Path,
+    title: &str,
+    body: &str,
+    target: Option<&Target>,
+) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
     one_line("the title", title, &mut violations, MAC_LANE_FILE);
     if title.contains("**") || mac_status(title.trim()).is_some() {
@@ -1033,6 +1052,26 @@ pub fn mac_lane_add(host: &dyn Host, root: &Path, title: &str, body: &str) -> Re
             "the next item number exceeds the supported range; renumber the items first",
         )]));
     };
+    let linked = if let Some(target) = target {
+        let name = target.step.as_deref().unwrap_or_default();
+        let full = format!("{}/{name}", target.unit);
+        let dir = root.join(&target.unit);
+        let declared = store::is_unit(&dir)
+            && store::load_unit(&dir)?
+                .steps
+                .get(name)
+                .is_some_and(|step| step.lane.is_some());
+        if !declared {
+            return Ok(Outcome::refused(vec![Violation::new(
+                &full,
+                "step-unknown",
+                "the step is not declared",
+            )]));
+        }
+        Some(full)
+    } else {
+        None
+    };
     let title = title.trim();
     let mut entry = format!("{number}. **{title}**");
     for (index, line) in body.trim().lines().enumerate() {
@@ -1047,6 +1086,9 @@ pub fn mac_lane_add(host: &dyn Host, root: &Path, title: &str, body: &str) -> Re
         entry.push_str(line.trim_end());
     }
     entry.push('\n');
+    if let Some(full) = &linked {
+        entry.push_str(&format!("{MAC_STEP_LINE}{full}`\n"));
+    }
     if items.is_empty() {
         append(&path, &text, &entry)?;
     } else {
@@ -1056,14 +1098,19 @@ pub fn mac_lane_add(host: &dyn Host, root: &Path, title: &str, body: &str) -> Re
         text.push_str(&entry);
         write_atomic(&path, text.as_bytes())?;
     }
+    let mut outcome = Outcome::default();
+    let mut journal_body = format!("- {MAC_LANE_FILE}: `{number}. **{title}**`\n");
+    if let Some(full) = linked {
+        journal_body.push_str(&format!("- step: `{full}`\n"));
+        outcome.field("step", full);
+    }
     let at = stamp(host.now());
     let journal = journal_line(
         root,
         &at,
         &format!("mac-lane add {number}. {title}"),
-        &format!("- {MAC_LANE_FILE}: `{number}. **{title}**`\n"),
+        &journal_body,
     )?;
-    let mut outcome = Outcome::default();
     outcome.line(format!("{number}. {title}"));
     outcome.field("item", number);
     outcome.field("journal", journal);
@@ -1182,29 +1229,25 @@ pub fn mac_lane_list(root: &Path) -> Result<Outcome> {
         Err(error) => return Ok(Outcome::refused(vec![error.downcast::<Violation>()?])),
     };
     let mut outcome = Outcome::default();
+    let mut items = Vec::new();
     for item in &open {
-        outcome.line(format!(
-            "{}. {} ({})",
-            item.number,
-            item.title,
-            item.state.name()
-        ));
+        let mut line = format!("{}. {} ({})", item.number, item.title, item.state.name());
+        let mut fields = serde_json::json!({
+            "item": item.number,
+            "state": item.state.name(),
+            "title": item.title,
+        });
+        if let Some(step) = &item.step {
+            line.push_str(&format!(" — {step}"));
+            fields["step"] = serde_json::json!(step);
+        }
+        outcome.line(line);
+        items.push(fields);
     }
     if open.is_empty() {
         outcome.line("no open Mac lane item");
     }
-    outcome.field(
-        "items",
-        open.iter()
-            .map(|item| {
-                serde_json::json!({
-                    "item": item.number,
-                    "state": item.state.name(),
-                    "title": item.title,
-                })
-            })
-            .collect::<Vec<_>>(),
-    );
+    outcome.field("items", items);
     Ok(outcome)
 }
 

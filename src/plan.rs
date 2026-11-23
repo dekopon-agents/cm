@@ -286,7 +286,7 @@ fn candidates<'a>(root: &Path, units: &'a Units) -> Vec<Candidate<'a>> {
                 .iter()
                 .map(move |(name, step)| (format!("{unit}/{name}"), step))
         })
-        .filter(|(_, step)| step.lane.is_some())
+        .filter(|(_, step)| step.lane.is_some_and(|lane| lane != Lane::Mac))
         .map(|(target, step)| Candidate {
             kickoff: kickoff(root, &target),
             gates: gates(root, units, step),
@@ -595,6 +595,14 @@ pub struct Next {
     pub waiting: Vec<(String, Vec<String>)>,
 }
 
+pub(crate) fn mac_dispatch_refusal(target: &str) -> Violation {
+    Violation::new(
+        target,
+        "mac-lane-dispatch",
+        "Mac lane work goes through the Mac queue. See `cm mac-lane list` for open items",
+    )
+}
+
 pub(crate) fn launch_command(target: &str, lane: Option<Lane>, finish: Finish) -> String {
     if lane == Some(Lane::Owner) && finish == Finish::Evidence {
         return format!("cm advance {target} done --evidence '<owner-evidence-file>'");
@@ -775,7 +783,12 @@ pub fn next_at(
             return Ok(outcome);
         }
         let Some(candidate) = candidate else {
-            let message = match step(&units, &full) {
+            let step = step(&units, &full);
+            if step.is_some_and(|step| step.lane == Some(Lane::Mac)) {
+                outcome.violations.push(mac_dispatch_refusal(&full));
+                return Ok(outcome);
+            }
+            let message = match step {
                 Some(step) if step.lane.is_none() => format!(
                     "{full} was launched without a declaration; only steps declared with `cm init {full} --lane …` are handed out"
                 ),

@@ -505,6 +505,45 @@ fn restart(host: &Fake, root: &Path, token: &str, file: Option<PathBuf>) -> Outc
 }
 
 #[test]
+fn restart_refuses_a_requested_or_declared_mac_lane_without_writing() {
+    let host = at("2026-10-19T09:00:00Z");
+    let c = campaign(&host);
+    let token = launched(&host, &c, Some(30));
+    assert!(end(&host, &c.root, &token, AttemptOutcome::Unknown, None).ok());
+
+    let before = c.files();
+    let requested_mac = act(
+        &host,
+        &c.root,
+        &token,
+        Act::Restart {
+            lane: Lane::Mac,
+            file: None,
+        },
+    );
+    assert_eq!(rules(&requested_mac), ["mac-lane-dispatch"]);
+    assert_eq!(c.files(), before);
+
+    let amended = commands::amend(
+        &host,
+        &c.root,
+        &target("01-a/u/S1"),
+        &commands::Amendment {
+            lane: Some(Lane::Mac),
+            ..commands::Amendment::default()
+        },
+    )
+    .unwrap();
+    assert!(amended.ok(), "{:?}", amended.violations);
+    let before = c.files();
+    assert_eq!(
+        rules(&restart(&host, &c.root, &token, None)),
+        ["mac-lane-dispatch"]
+    );
+    assert_eq!(c.files(), before);
+}
+
+#[test]
 fn restart_archives_unknown_and_dispatches_under_the_same_claim_and_cap() {
     for pending in [false, true] {
         let host = at("2026-10-19T09:00:00Z");

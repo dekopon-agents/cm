@@ -22,6 +22,237 @@ fn json(output: &Output) -> Value {
 }
 
 #[test]
+fn mac_lane_add_links_the_declared_step_and_lists_it_until_done() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let step = "01-first/alpha/mac-work";
+    assert!(cm(root, &["init"]).status.success());
+    assert!(cm(root, &["init", step, "--lane", "mac"]).status.success());
+    assert!(
+        cm(root, &["mac-lane", "add", "Existing request"])
+            .status
+            .success()
+    );
+    let unit = root.join("01-first/alpha");
+    let state_paths = [cm::store::state_path(&unit), unit.join("STATE.md")];
+    let snapshot = || state_paths.each_ref().map(|path| fs::read(path).unwrap());
+    let before = snapshot();
+    let journal_path = root.join("JOURNAL.md");
+    let journal_before = fs::read_to_string(&journal_path).unwrap();
+
+    let added = cm(
+        root,
+        &["--json", "mac-lane", "add", "Mac work", "--step", step],
+    );
+    assert!(added.status.success(), "{added:?}");
+    assert_eq!(json(&added)["item"], 2);
+    assert_eq!(snapshot(), before);
+    assert!(
+        fs::read_to_string(root.join("MAC-LANE.md"))
+            .unwrap()
+            .ends_with(&format!(
+                "1. **Existing request**\n2. **Mac work**\n\tStep: `{step}`\n"
+            ))
+    );
+    let step_state = || cm::store::load_unit(&unit).unwrap().steps["mac-work"].clone();
+    let journal = fs::read_to_string(journal_path).unwrap();
+    assert!(
+        journal
+            .strip_prefix(&journal_before)
+            .unwrap()
+            .ends_with(&format!(
+                "- MAC-LANE.md: `2. **Mac work**`\n- step: `{step}`\n"
+            ))
+    );
+
+    let listed = cm(root, &["mac-lane", "list"]);
+    assert_eq!(
+        String::from_utf8(listed.stdout).unwrap(),
+        format!("1. Existing request (open)\n2. Mac work (open) — {step}\n")
+    );
+    let listed = cm(root, &["--json", "mac-lane", "list"]);
+    assert_eq!(
+        json(&listed)["items"],
+        serde_json::json!([
+            {"item": 1, "state": "open", "title": "Existing request"},
+            {"item": 2, "state": "open", "title": "Mac work", "step": step},
+        ])
+    );
+
+    let done = cm(
+        root,
+        &["mac-lane", "done", "2", "--receipt", "verified on Mac"],
+    );
+    assert!(done.status.success(), "{done:?}");
+    assert_eq!(step_state().track.state, cm::state::Phase::Drafted);
+    assert_eq!(snapshot(), before);
+    let listed = cm(root, &["--json", "mac-lane", "list"]);
+    assert_eq!(json(&listed)["items"].as_array().unwrap().len(), 1);
+    let receipt = String::from_utf8(done.stdout).unwrap();
+    fs::write(root.join("receipt.md"), receipt).unwrap();
+    let advance = cm(root, &["advance", step, "done", "--evidence", "receipt.md"]);
+    assert!(advance.status.success(), "{advance:?}");
+    assert_eq!(step_state().track.state, cm::state::Phase::Done);
+}
+
+#[test]
+fn mac_lane_work_is_omitted_from_dispatch_and_refuses_direct_launch() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let mac = "01-first/alpha/mac-work";
+    let codex = "01-first/alpha/codex-work";
+    assert!(cm(root, &["init"]).status.success());
+    fs::write(root.join("kickoff.md"), "Go.\n").unwrap();
+    for (step, lane) in [(mac, "mac"), (codex, "codex")] {
+        let declared = cm(
+            root,
+            &["init", step, "--lane", lane, "--kickoff-file", "kickoff.md"],
+        );
+        assert!(declared.status.success(), "{declared:?}");
+    }
+    let added = cm(root, &["mac-lane", "add", "Mac work", "--step", mac]);
+    assert!(added.status.success(), "{added:?}");
+
+    for args in [
+        &["--json", "next"][..],
+        &["--json", "next", "--lane", "codex"][..],
+    ] {
+        let next = cm(root, args);
+        assert!(next.status.success(), "{next:?}");
+        let report = json(&next);
+        let steps = report["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 1, "{report}");
+        assert_eq!(steps[0]["target"], codex);
+        assert_eq!(report["waiting"], serde_json::json!([]));
+    }
+
+    let state = root.join("01-first/alpha/.cm/state.json");
+    let before = fs::read(&state).unwrap();
+    for command in ["next", "launch"] {
+        let output = cm(root, &["--json", command, mac]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(json(&output)["violations"][0]["rule"], "mac-lane-dispatch");
+    }
+    assert_eq!(fs::read(state).unwrap(), before);
+}
+
+#[test]
+fn mac_lane_add_refuses_an_undeclared_step_without_writing() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    assert!(cm(root, &["init"]).status.success());
+    assert!(cm(root, &["init", "01-first/alpha"]).status.success());
+    let journal = root.join("JOURNAL.md");
+    let target = "01-first/alpha/undeclared";
+    let assert_refused = || {
+        let refused = cm(
+            root,
+            &["--json", "mac-lane", "add", "Mac work", "--step", target],
+        );
+        assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+        let violation = &json(&refused)["violations"][0];
+        assert_eq!(violation["rule"], "step-unknown");
+        assert_eq!(violation["path"], target);
+    };
+
+    let before = fs::read(&journal).unwrap();
+    assert_refused();
+    assert!(!root.join("MAC-LANE.md").exists());
+    assert_eq!(fs::read(&journal).unwrap(), before);
+
+    let unit_dir = root.join("01-first/alpha");
+    let mut unit = cm::store::load_unit(&unit_dir).unwrap();
+    let mut step = cm::state::Step::new(&unit.track.since);
+    step.track.state = cm::state::Phase::Launched;
+    step.launches = 1;
+    unit.steps.insert("undeclared".to_owned(), step);
+    cm::commands::write_unit(&unit_dir, &unit).unwrap();
+    assert!(
+        cm(root, &["mac-lane", "add", "Existing request"])
+            .status
+            .success()
+    );
+    let paths = [
+        root.join("MAC-LANE.md"),
+        cm::store::state_path(&unit_dir),
+        cm::store::state_path(root),
+        journal,
+    ];
+    let snapshot = || paths.each_ref().map(|path| fs::read(path).unwrap());
+    let before = snapshot();
+    assert_refused();
+    assert_eq!(snapshot(), before);
+}
+
+#[test]
+fn init_help_advertises_all_supported_lanes() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = cm(temp.path(), &["init", "--help"]);
+    assert!(output.status.success(), "{output:?}");
+    let help = String::from_utf8(output.stdout).unwrap();
+    let lane_help = help
+        .lines()
+        .find(|line| line.contains("--lane <LANE>"))
+        .unwrap();
+    let lanes = cm::state::LANES.map(cm::state::Lane::name).join(", ");
+    assert!(lane_help.contains(&lanes), "{lane_help}");
+}
+
+#[test]
+fn mac_lane_rejects_rollouts_on_init_and_amend() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let step = "01-first/alpha/rollout";
+    assert!(cm(root, &["init"]).status.success());
+    let refused = cm(
+        root,
+        &["--json", "init", step, "--lane", "mac", "--kind", "rollout"],
+    );
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert_eq!(json(&refused)["violations"][0]["rule"], "mac-lane-rollout");
+    assert!(!root.join(step).exists());
+
+    let declared = cm(
+        root,
+        &["init", step, "--lane", "codex", "--kind", "rollout"],
+    );
+    assert!(declared.status.success(), "{declared:?}");
+    let state = cm::store::state_path(&root.join("01-first/alpha"));
+    let before = fs::read(&state).unwrap();
+    let refused = cm(root, &["--json", "amend", step, "--lane", "mac"]);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert_eq!(json(&refused)["violations"][0]["rule"], "mac-lane-rollout");
+    assert_eq!(fs::read(state).unwrap(), before);
+}
+
+#[test]
+fn mac_lane_round_trips_through_declare_amend_and_state_render() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let unit = root.join("01-first/alpha");
+    let step = "01-first/alpha/mac-work";
+    assert!(cm(root, &["init"]).status.success());
+    let check_lane = || {
+        let state = cm::store::load_unit(&unit).unwrap();
+        assert_eq!(state.steps["mac-work"].lane, Some(cm::state::Lane::Mac));
+        assert!(
+            fs::read_to_string(unit.join("STATE.md"))
+                .unwrap()
+                .contains("| mac-work | mac |")
+        );
+    };
+    assert!(cm(root, &["init", step, "--lane", "mac"]).status.success());
+    check_lane();
+    assert!(
+        cm(root, &["amend", step, "--lane", "coordinator"])
+            .status
+            .success()
+    );
+    assert!(cm(root, &["amend", step, "--lane", "mac"]).status.success());
+    check_lane();
+}
+
+#[test]
 fn init_then_lint_is_clean_and_two_hand_edits_are_both_listed() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

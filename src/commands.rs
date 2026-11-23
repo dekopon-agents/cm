@@ -485,6 +485,16 @@ fn repair(
     Ok(outcome)
 }
 
+fn check_work_lane(full: &str, work: Work, lane: Option<Lane>) -> Option<Violation> {
+    (work == Work::Rollout && lane == Some(Lane::Mac)).then(|| {
+        Violation::new(
+            full,
+            "mac-lane-rollout",
+            "`--kind rollout` requires a lane that can launch. Choose a lane other than `mac`",
+        )
+    })
+}
+
 fn init_step(
     host: &dyn Host,
     root: &Path,
@@ -500,6 +510,7 @@ fn init_step(
     let mut violations = journal::check(root, &campaign);
     violations.extend(closed(root, &campaign));
     violations.extend(check_kickoff(&full, declaration.kickoff.as_deref()));
+    violations.extend(check_work_lane(&full, work, Some(lane)));
     let artifacts = parse_artifacts(&full, &declaration.artifacts, &mut violations);
     let units: Units = plan::load_units(root)?;
     let mut parsed = Vec::new();
@@ -938,6 +949,9 @@ pub fn launch_remote(
         violations.extend(lint::undeclared_parts(root, &full, step)?);
     }
     let declared = plan::step(&units, &full).and_then(|step| step.lane);
+    if declared == Some(Lane::Mac) {
+        violations.push(plan::mac_dispatch_refusal(&full));
+    }
     let local = declared.is_none_or(Lane::is_local);
     let mut report: Vec<_> = rate_limit.into_iter().collect();
     let limits = match fs::read_to_string(root.join("LIMITS.toml")) {
@@ -1894,7 +1908,7 @@ pub fn advance_gated(
             &full,
             "done-code-step",
             format!(
-                "{full} is a code step: it finishes at deployed, or merged where it has no release; `done --evidence <path>` finishes an owner-lane step, a non-release coordinator-lane step without a PR, SHA or declared parts or one declared with --study"
+                "{full} is a code step: it finishes at deployed, or merged where it has no release; `done --evidence <path>` finishes a Mac-lane step, a non-rollout owner-lane step, a non-release coordinator-lane step without a PR, SHA or declared parts or one declared with --study"
             ),
         )
     };
@@ -2950,6 +2964,7 @@ pub fn amend(
             ));
         }
     }
+    violations.extend(check_work_lane(&full, next.work, next.lane));
     if next == step && amendment.kickoff.is_none() && violations.is_empty() {
         violations.push(Violation::new(
             &full,

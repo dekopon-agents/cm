@@ -12,7 +12,7 @@ use crate::host::{Host, System};
 use crate::idea::{self, Maturity, Word};
 use crate::lint;
 use crate::outcome::{Outcome, Violation};
-use crate::state::{Evidence, Lane, Phase, Work};
+use crate::state::{Evidence, LANES, Lane, Phase, Work};
 use crate::store::{self, Target, parse_target};
 
 #[derive(Parser)]
@@ -55,8 +55,7 @@ enum Commands {
         /// The folder to initialize.
         #[arg(default_value = ".")]
         dir: PathBuf,
-        /// The step's lane: pi, codex, claude-cloud, fable, owner or coordinator.
-        #[arg(long)]
+        #[arg(long, help = format!("The step's lane. Choose from {}.", LANES.map(Lane::name).join(", ")))]
         lane: Option<Lane>,
         /// The step is a study: it ships no PR and finishes with `cm advance <step> done --evidence <path>`.
         #[arg(long)]
@@ -209,7 +208,7 @@ enum Commands {
         /// <NN-name>/<unit> or <NN-name>/<unit>/<step>
         #[arg(value_parser = any_target)]
         target: Target,
-        /// pr-open, merged, released, deployed, done, superseded or blocked:<reason>. An owner-lane or study step moves to done, with --evidence, from drafted or launched.
+        /// pr-open, merged, released, deployed, done, superseded or blocked:<reason>. A Mac-lane, non-rollout owner-lane or study step moves to done with --evidence.
         state: Phase,
         /// A commit: the PR head for pr-open, the merge commit for merged.
         #[arg(long)]
@@ -635,6 +634,9 @@ enum MacLaneAct {
         /// A file holding the body; `-` reads stdin.
         #[arg(long, value_name = "FILE")]
         body_file: Option<PathBuf>,
+        /// Link the item to a declared step.
+        #[arg(long, value_parser = step_target, value_name = "NN-name/unit/step")]
+        step: Option<Target>,
     },
     /// Stamp item N `**DONE <date>** (<receipt>).`, replacing a leading PARTIAL, HELD, RUNNING or Receipt span.
     Done {
@@ -1072,13 +1074,24 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             crate::ledger::owner_queue_edit(host, &root()?, *number, &body)
         }
         Commands::MacLane {
-            act: MacLaneAct::Add { title, body_file },
+            act:
+                MacLaneAct::Add {
+                    title,
+                    body_file,
+                    step,
+                },
         } => {
             let body = body_file
                 .as_deref()
                 .map(|path| read_body(path, None))
                 .transpose()?;
-            crate::ledger::mac_lane_add(host, &root()?, title, body.as_deref().unwrap_or_default())
+            crate::ledger::mac_lane_add_with_step(
+                host,
+                &root()?,
+                title,
+                body.as_deref().unwrap_or_default(),
+                step.as_ref(),
+            )
         }
         Commands::MacLane {
             act: MacLaneAct::Partial { number, receipt },
