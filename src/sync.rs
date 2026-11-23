@@ -27,9 +27,25 @@ pub struct Moved {
 
 type Read<T> = Result<T, ForgeError>;
 
+const PULL_MAX_AGE: jiff::SignedDuration = jiff::SignedDuration::from_mins(30);
+
+#[derive(Clone)]
+struct PullRead {
+    pull: Pull,
+    etags: BTreeMap<String, String>,
+    cached_at: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct OpenChecks {
+    completed: bool,
+    etags: BTreeMap<String, String>,
+}
+
 #[derive(Default)]
 struct Reads {
-    pulls: BTreeMap<String, Read<Pull>>,
+    pulls: BTreeMap<String, Read<PullRead>>,
+    open_checks: BTreeMap<(GithubRepo, CommitSha), Read<OpenChecks>>,
     tags: BTreeMap<(GithubRepo, TagName), Read<bool>>,
     contains: BTreeMap<(GithubRepo, TagName, CommitSha), Read<bool>>,
     checks: BTreeMap<(GithubRepo, CommitSha), Read<Vec<CheckState>>>,
@@ -363,9 +379,56 @@ impl<'a> Run<'a> {
         self.dirty.insert(unit_name.to_owned());
     }
 
-    fn pull(&mut self, url: &str) -> Option<Read<Pull>> {
+    fn pull(&mut self, url: &str, target: &str) -> Option<Read<PullRead>> {
+        let previous = self.seen.get(url).filter(|seen| {
+            seen.target == target
+                && seen.at.parse::<jiff::Timestamp>().is_ok_and(|at| {
+                    (jiff::SignedDuration::ZERO..PULL_MAX_AGE)
+                        .contains(&self.now.duration_since(at))
+                })
+        });
+        let empty = BTreeMap::new();
         cached(&mut self.reads.pulls, url.to_owned(), self.forge, |forge| {
-            forge.pull(url)
+            let mut etags = BTreeMap::new();
+            let validators = previous.map_or(&empty, |seen| &seen.etags);
+            if let Some(pull) = forge.pull_conditional(url, validators, &mut etags)? {
+                return Ok(PullRead {
+                    pull,
+                    etags,
+                    cached_at: None,
+                });
+            }
+            let seen = previous.ok_or(ForgeError::Json)?;
+            let pull = Pull {
+                state: PullState::Open,
+                merge_commit: None,
+                merged_at: None,
+                head: seen.head.as_ref().map(CommitSha::new),
+                base: seen.base.as_ref().map(CommitSha::new),
+                mergeable_state: seen.mergeable_state.clone(),
+            };
+            Ok(PullRead {
+                pull,
+                etags,
+                cached_at: Some(seen.at.clone()),
+            })
+        })
+    }
+
+    fn open_checks(
+        &mut self,
+        repo: &GithubRepo,
+        head: &CommitSha,
+        previous: &BTreeMap<String, String>,
+    ) -> Option<Read<OpenChecks>> {
+        let key = (repo.clone(), head.clone());
+        cached(&mut self.reads.open_checks, key, self.forge, |forge| {
+            let mut etags = BTreeMap::new();
+            let checks = forge.checks_conditional(repo, head, previous, &mut etags)?;
+            let completed = checks.is_some_and(|checks| {
+                !checks.is_empty() && checks.iter().all(CheckState::completed)
+            });
+            Ok(OpenChecks { completed, etags })
         })
     }
 
@@ -512,25 +575,43 @@ impl<'a> Run<'a> {
             let Some(url) = tracked.track.evidence.pr.clone() else {
                 continue;
             };
-            let head_of = |pull: &Read<Pull>| match pull {
-                Ok(pull) => pull.head.as_ref().map(ToString::to_string),
-                Err(_) => None,
-            };
-            let Some(read) = self.pull(&url) else {
+            let Some(read) = self.pull(&url, &target) else {
                 continue;
             };
-            if let Some(head) = head_of(&read) {
-                self.heads.insert(target.clone(), head);
+            let PullRead {
+                pull,
+                mut etags,
+                cached_at,
+            } = match read {
+                Ok(read) => read,
+                Err(error) => {
+                    self.unknown(&target, format!("{url}: {error}"));
+                    continue;
+                }
+            };
+            if let Some(at) = &cached_at
+                && let Some(seen) = self.seen.get(&url).filter(|seen| seen.target == target)
+                && (seen.at != *at
+                    || seen.head.as_deref() != pull.head.as_ref().map(CommitSha::as_str)
+                    || seen.base.as_deref() != pull.base.as_ref().map(CommitSha::as_str)
+                    || seen.mergeable_state != pull.mergeable_state)
+            {
+                // Another sync published a full read while this read was in flight.
+                self.open.insert(url, seen.clone());
+                continue;
             }
-            match read {
-                Ok(Pull {
+            if let Some(head) = &pull.head {
+                self.heads.insert(target.clone(), head.to_string());
+            }
+            match pull {
+                Pull {
                     state: PullState::Merged,
                     merge_commit: Some(sha),
                     merged_at,
                     head,
                     base,
                     ..
-                }) => {
+                } => {
                     if let Some(used) = self.gate_holds(
                         &tracked.target,
                         tracked.part.as_deref(),
@@ -555,39 +636,45 @@ impl<'a> Run<'a> {
                         );
                     }
                 }
-                Ok(Pull {
+                Pull {
                     state: PullState::Merged,
                     merge_commit: None,
                     ..
-                }) => self.unknown(&target, format!("{url} is merged but has no merge commit")),
-                Ok(Pull {
+                } => self.unknown(&target, format!("{url} is merged but has no merge commit")),
+                Pull {
                     state: PullState::Closed,
                     ..
-                }) => self.violations.push(Violation::new(
+                } => self.violations.push(Violation::new(
                     &target,
                     "pr-closed",
                     format!(
                         "{url} closed unmerged; reopen it, or `cm advance {target} blocked:<reason>`"
                     ),
                 )),
-                Ok(Pull {
+                Pull {
                     state: PullState::Open,
                     head,
                     mergeable_state,
                     base,
                     ..
-                }) => {
+                } => {
                     let previous = self.seen.get(&url).filter(|seen| seen.target == target);
-                    let mut ci_head = previous.as_ref().and_then(|seen| seen.ci_head.clone());
-                    let mut ci_base = previous.as_ref().and_then(|seen| seen.ci_base.clone());
+                    let mut ci_head = previous.and_then(|seen| seen.ci_head.clone());
+                    let mut ci_base = previous.and_then(|seen| seen.ci_base.clone());
                     if let (Some(head), Some(base), Some(repo)) = (&head, &base, GithubRepo::of_pr(&url))
                         && ci_head.as_deref() != Some(head.as_str())
-                        && let Some(Ok(checks)) = self.checks(&repo, head)
-                        && !checks.is_empty()
-                        && checks.iter().all(|check| ["success", "neutral", "skipped", "failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale", "error"].iter().any(|state| check.state == *state))
                     {
-                        ci_head = Some(head.to_string());
-                        ci_base = Some(base.to_string());
+                        let validators = previous
+                            .filter(|seen| seen.head.as_deref() == Some(head.as_str()))
+                            .map(|seen| seen.etags.clone())
+                            .unwrap_or_default();
+                        if let Some(Ok(checks)) = self.open_checks(&repo, head, &validators) {
+                            etags.extend(checks.etags);
+                            if checks.completed {
+                                ci_head = Some(head.to_string());
+                                ci_base = Some(base.to_string());
+                            }
+                        }
                     }
                     self.open.insert(
                         url.clone(),
@@ -596,13 +683,13 @@ impl<'a> Run<'a> {
                             ci_head,
                             ci_base,
                             target: target.clone(),
-                            at: self.at.clone(),
+                            at: cached_at.unwrap_or_else(|| self.at.clone()),
                             head: head.map(|head| head.to_string()),
                             mergeable_state,
+                            etags,
                         },
                     );
                 }
-                Err(error) => self.unknown(&target, format!("{url}: {error}")),
             }
         }
     }
