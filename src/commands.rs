@@ -938,6 +938,9 @@ pub fn launch_remote(
         violations.extend(lint::undeclared_parts(root, &full, step)?);
     }
     let declared = plan::step(&units, &full).and_then(|step| step.lane);
+    if declared == Some(Lane::Mac) {
+        violations.push(plan::mac_dispatch_refusal(&full));
+    }
     let local = declared.is_none_or(Lane::is_local);
     let mut report: Vec<_> = rate_limit.into_iter().collect();
     let limits = match fs::read_to_string(root.join("LIMITS.toml")) {

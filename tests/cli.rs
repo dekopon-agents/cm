@@ -82,6 +82,47 @@ fn mac_lane_add_links_the_declared_step_and_lists_it_until_done() {
 }
 
 #[test]
+fn mac_lane_work_is_omitted_from_dispatch_and_refuses_direct_launch() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let mac = "01-first/alpha/mac-work";
+    let codex = "01-first/alpha/codex-work";
+    assert!(cm(root, &["init"]).status.success());
+    fs::write(root.join("kickoff.md"), "Go.\n").unwrap();
+    for (step, lane) in [(mac, "mac"), (codex, "codex")] {
+        let declared = cm(
+            root,
+            &["init", step, "--lane", lane, "--kickoff-file", "kickoff.md"],
+        );
+        assert!(declared.status.success(), "{declared:?}");
+    }
+    let added = cm(root, &["mac-lane", "add", "Mac work", "--step", mac]);
+    assert!(added.status.success(), "{added:?}");
+
+    for args in [
+        &["--json", "next"][..],
+        &["--json", "next", "--lane", "codex"][..],
+    ] {
+        let next = cm(root, args);
+        assert!(next.status.success(), "{next:?}");
+        let report = json(&next);
+        let steps = report["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 1, "{report}");
+        assert_eq!(steps[0]["target"], codex);
+        assert_eq!(report["waiting"], serde_json::json!([]));
+    }
+
+    let state = root.join("01-first/alpha/.cm/state.json");
+    let before = fs::read(&state).unwrap();
+    for command in ["next", "launch"] {
+        let output = cm(root, &["--json", command, mac]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(json(&output)["violations"][0]["rule"], "mac-lane-dispatch");
+    }
+    assert_eq!(fs::read(state).unwrap(), before);
+}
+
+#[test]
 fn mac_lane_add_refuses_an_undeclared_step_without_writing() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
