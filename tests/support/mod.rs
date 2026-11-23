@@ -33,6 +33,16 @@ pub struct FakeGh {
 impl FakeGh {
     /// A `gh` that runs `script` (sh) with `$FAKE_GH` set to a scratch folder it may write.
     pub fn new(script: &str) -> Self {
+        Self::with_http(&format!(
+            r#"if [ "$1" = api ] && [ "${{3:-}}" = --include ]; then
+    printf 'HTTP/2.0 200 OK\r\n\r\n'
+fi
+{script}"#
+        ))
+    }
+
+    #[allow(dead_code)]
+    pub fn with_http(script: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("bin")).unwrap();
         let gh = dir.path().join("bin/gh");

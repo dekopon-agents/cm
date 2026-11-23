@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -338,7 +339,28 @@ impl fmt::Display for Conclusion {
     }
 }
 
+fn completed_check(state: &str) -> bool {
+    [
+        "success",
+        "neutral",
+        "skipped",
+        "failure",
+        "cancelled",
+        "timed_out",
+        "action_required",
+        "startup_failure",
+        "stale",
+        "error",
+    ]
+    .iter()
+    .any(|terminal| state.eq_ignore_ascii_case(terminal))
+}
+
 impl CheckState {
+    pub(crate) fn completed(&self) -> bool {
+        completed_check(self.state.as_str())
+    }
+
     pub fn green(&self) -> bool {
         match self.state {
             Conclusion::Success | Conclusion::Neutral | Conclusion::Skipped => true,
@@ -353,8 +375,32 @@ pub fn ci_green(checks: &[CheckState]) -> bool {
 
 pub trait Forge {
     fn pull(&self, url: &str) -> Result<Pull, ForgeError>;
+
+    /// Read a pull and save its validator. A 304 returns no new pull.
+    fn pull_conditional(
+        &self,
+        url: &str,
+        _previous: &BTreeMap<String, String>,
+        _etags: &mut BTreeMap<String, String>,
+    ) -> Result<Option<Pull>, ForgeError> {
+        self.pull(url).map(Some)
+    }
+
     /// Every check run and commit status GitHub reports on `sha`.
     fn checks(&self, repo: &GithubRepo, sha: &CommitSha) -> Result<Vec<CheckState>, ForgeError>;
+
+    /// Read checks for an open PR. A 304 on a page known to have a pending check
+    /// returns no new result, so the caller leaves CI pending.
+    fn checks_conditional(
+        &self,
+        repo: &GithubRepo,
+        sha: &CommitSha,
+        _previous: &BTreeMap<String, String>,
+        _etags: &mut BTreeMap<String, String>,
+    ) -> Result<Option<Vec<CheckState>>, ForgeError> {
+        self.checks(repo, sha).map(Some)
+    }
+
     /// The named checks' latest completed results along the base branch's first-parent history.
     /// Unavailable history is an error, never evidence that a check failed.
     fn latest_completed_checks(
@@ -420,13 +466,19 @@ impl Default for Gh {
 /// Pages a list endpoint reads, 100 items each; more than this many pages is an error.
 const MAX_PAGES: usize = 50;
 
+struct PageEtags<'a> {
+    previous: &'a BTreeMap<String, String>,
+    observed: &'a mut BTreeMap<String, String>,
+}
+
 impl Gh {
     fn read_checks(
         &self,
         repo: &GithubRepo,
         sha: &CommitSha,
         completed: bool,
-    ) -> Result<Vec<CheckState>, ForgeError> {
+        mut etags: Option<&mut PageEtags<'_>>,
+    ) -> Result<Option<Vec<CheckState>>, ForgeError> {
         #[derive(Deserialize)]
         struct Runs {
             total_count: usize,
@@ -452,7 +504,16 @@ impl Gh {
             context: String,
             state: String,
         }
-        let mut runs = self.pages(
+        impl Run {
+            fn state(&self) -> &str {
+                if self.status == "completed" {
+                    self.conclusion.as_deref().unwrap_or(&self.status)
+                } else {
+                    &self.status
+                }
+            }
+        }
+        let Some(mut runs) = self.pages(
             &format!(
                 "repos/{repo}/commits/{sha}/check-runs{}",
                 if completed {
@@ -462,7 +523,12 @@ impl Gh {
                 }
             ),
             |page: Runs| (page.total_count, page.check_runs),
-        )?;
+            |run| !completed_check(run.state()),
+            etags.as_deref_mut(),
+        )?
+        else {
+            return Ok(None);
+        };
         let mut statuses = if completed {
             let mut statuses = Vec::new();
             for page in 1..=MAX_PAGES {
@@ -481,10 +547,16 @@ impl Gh {
             }
             statuses
         } else {
-            self.pages(
+            let Some(statuses) = self.pages(
                 &format!("repos/{repo}/commits/{sha}/status"),
                 |page: Combined| (page.total_count, page.statuses),
+                |status| !completed_check(&status.state),
+                etags,
             )?
+            else {
+                return Ok(None);
+            };
+            statuses
         };
         if completed {
             runs.retain(|run| run.status == "completed");
@@ -497,18 +569,14 @@ impl Gh {
             statuses.retain(|status| names.insert(status.context.clone()));
         }
         let runs = runs.into_iter().map(|run| CheckState {
-            state: match (run.status.as_str(), run.conclusion) {
-                ("completed", Some(conclusion)) => conclusion.to_lowercase(),
-                (status, _) => status.to_lowercase(),
-            }
-            .into(),
+            state: run.state().to_lowercase().into(),
             name: run.name,
         });
         let statuses = statuses.into_iter().map(|status| CheckState {
             name: status.context,
             state: status.state.to_lowercase().into(),
         });
-        Ok(runs.chain(statuses).collect())
+        Ok(Some(runs.chain(statuses).collect()))
     }
 
     /// Every item of a paginated list endpoint whose pages report `total_count`: page after page
@@ -518,20 +586,38 @@ impl Gh {
         &self,
         path: &str,
         split: impl Fn(P) -> (usize, Vec<T>),
-    ) -> Result<Vec<T>, ForgeError> {
+        pending: impl Fn(&T) -> bool,
+        mut etags: Option<&mut PageEtags<'_>>,
+    ) -> Result<Option<Vec<T>>, ForgeError> {
         let mut out = Vec::new();
         for page in 1..=MAX_PAGES {
-            let (total, items) = split(self.json(&[
-                "api",
-                &format!(
-                    "{path}{}per_page=100&page={page}",
-                    if path.contains('?') { '&' } else { '?' }
-                ),
-            ])?);
+            let path = format!(
+                "{path}{}per_page=100&page={page}",
+                if path.contains('?') { '&' } else { '?' }
+            );
+            let (total, items) = if let Some(etags) = etags.as_deref_mut() {
+                let cached = etags.previous.get(&path);
+                let (body, etag) = self.api_with_etag::<P>(&path, cached)?;
+                let Some(body) = body else {
+                    if let Some(cached) = cached {
+                        etags.observed.insert(path, cached.clone());
+                    }
+                    return Ok(None);
+                };
+                let (total, items) = split(body);
+                if let Some(etag) = etag
+                    && items.iter().any(&pending)
+                {
+                    etags.observed.insert(path, etag);
+                }
+                (total, items)
+            } else {
+                split(self.json(&["api", &path])?)
+            };
             let empty = items.is_empty();
             out.extend(items);
             if out.len() >= total {
-                return Ok(out);
+                return Ok(Some(out));
             }
             if empty {
                 return Err(ForgeError::Json);
@@ -546,6 +632,60 @@ impl Gh {
             return Err(ForgeError::Exit(output.status.code()));
         }
         serde_json::from_slice(&output.stdout).map_err(|_| ForgeError::Json)
+    }
+
+    /// `gh api --include` writes the status and headers before the body. A 304
+    /// exits nonzero, so look at the status before treating a nonzero exit as an error.
+    fn api_with_etag<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        cached: Option<&String>,
+    ) -> Result<(Option<T>, Option<String>), ForgeError> {
+        let mut args = vec!["api", path, "--include"];
+        let header;
+        if let Some(cached) = cached {
+            header = format!("If-None-Match: {cached}");
+            args.extend(["-H", &header]);
+        }
+        let output = run(&self.program, &args, self.timeout, None)?;
+        let mut lines = output.stdout.split_inclusive(|byte| *byte == b'\n');
+        let first = lines.next().ok_or(ForgeError::Exit(output.status.code()))?;
+        let status = std::str::from_utf8(first).ok().and_then(|line| {
+            let mut words = line.split_ascii_whitespace();
+            words.next()?.starts_with("HTTP/").then_some(())?;
+            words.next()?.parse::<u16>().ok()
+        });
+        if status == Some(304) && cached.is_some() {
+            return Ok((None, None));
+        }
+        if !output.status.success() {
+            return Err(ForgeError::Exit(output.status.code()));
+        }
+        if status != Some(200) {
+            return Err(status.map_or(ForgeError::Json, ForgeError::Http));
+        }
+        let mut offset = first.len();
+        let mut etag = None;
+        for line in lines {
+            offset += line.len();
+            let line = std::str::from_utf8(line)
+                .map_err(|_| ForgeError::Json)?
+                .trim_end();
+            if line.is_empty() {
+                let body = serde_json::from_slice(&output.stdout[offset..])
+                    .map_err(|_| ForgeError::Json)?;
+                return Ok((Some(body), etag));
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("etag")
+            {
+                let value = value.trim();
+                if !value.is_empty() {
+                    etag = Some(value.to_owned());
+                }
+            }
+        }
+        Err(ForgeError::Json)
     }
 
     fn http(&self, args: &[&str], input: Option<&[u8]>) -> Result<(u16, String), ForgeError> {
@@ -823,8 +963,12 @@ pub(crate) fn publication(
     out
 }
 
-impl Forge for Gh {
-    fn pull(&self, url: &str) -> Result<Pull, ForgeError> {
+impl Gh {
+    fn read_pull(
+        &self,
+        url: &str,
+        etags: Option<PageEtags<'_>>,
+    ) -> Result<Option<Pull>, ForgeError> {
         #[derive(Deserialize)]
         struct Rest {
             state: String,
@@ -848,14 +992,26 @@ impl Forge for Gh {
             .and_then(|rest| rest.split_once("/pull/"))
             .map(|(repo, number)| format!("repos/{repo}/pulls/{number}"))
             .ok_or(ForgeError::Url)?;
-        let rest: Rest = self.json(&["api", &path])?;
+        let rest: Rest = if let Some(etags) = etags {
+            let cached = etags.previous.get(&path);
+            let (body, etag) = self.api_with_etag(&path, cached)?;
+            if let Some(etag) = etag.or_else(|| cached.filter(|_| body.is_none()).cloned()) {
+                etags.observed.insert(path, etag);
+            }
+            let Some(body) = body else {
+                return Ok(None);
+            };
+            body
+        } else {
+            self.json(&["api", &path])?
+        };
         let state = match (rest.merged, rest.state.as_str()) {
             (true, _) => PullState::Merged,
             (false, "open") => PullState::Open,
             (false, "closed") => PullState::Closed,
             _ => return Err(ForgeError::Json),
         };
-        Ok(Pull {
+        Ok(Some(Pull {
             state,
             merge_commit: rest
                 .merge_commit_sha
@@ -867,11 +1023,51 @@ impl Forge for Gh {
             mergeable_state: rest
                 .mergeable_state
                 .map(|state| state.to_lowercase().into()),
-        })
+        }))
+    }
+}
+
+impl Forge for Gh {
+    fn pull(&self, url: &str) -> Result<Pull, ForgeError> {
+        self.read_pull(url, None)?.ok_or(ForgeError::Json)
+    }
+
+    fn pull_conditional(
+        &self,
+        url: &str,
+        previous: &BTreeMap<String, String>,
+        etags: &mut BTreeMap<String, String>,
+    ) -> Result<Option<Pull>, ForgeError> {
+        self.read_pull(
+            url,
+            Some(PageEtags {
+                previous,
+                observed: etags,
+            }),
+        )
     }
 
     fn checks(&self, repo: &GithubRepo, sha: &CommitSha) -> Result<Vec<CheckState>, ForgeError> {
-        self.read_checks(repo, sha, false)
+        self.read_checks(repo, sha, false, None)?
+            .ok_or(ForgeError::Json)
+    }
+
+    fn checks_conditional(
+        &self,
+        repo: &GithubRepo,
+        sha: &CommitSha,
+        previous: &BTreeMap<String, String>,
+        etags: &mut BTreeMap<String, String>,
+    ) -> Result<Option<Vec<CheckState>>, ForgeError> {
+        self.read_checks(
+            repo,
+            sha,
+            false,
+            Some(&mut PageEtags {
+                previous,
+                observed: etags,
+            }),
+        )
     }
 
     fn latest_completed_checks(
@@ -892,7 +1088,9 @@ impl Forge for Gh {
         let mut found = Vec::new();
         let mut sha = base.clone();
         while !remaining.is_empty() {
-            let checks = self.read_checks(repo, &sha, true)?;
+            let checks = self
+                .read_checks(repo, &sha, true, None)?
+                .ok_or(ForgeError::Json)?;
             let named: Vec<_> = checks
                 .into_iter()
                 .filter(|check| remaining.contains(&check.name))

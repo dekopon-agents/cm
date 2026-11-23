@@ -1835,6 +1835,218 @@ echo '{"state":"closed","merged":true,"merge_commit_sha":"abc123"}'
 
 #[test]
 #[cfg(unix)]
+fn sync_reuses_validated_pull_and_pending_check_pages_until_a_full_read_is_due() {
+    use std::time::Duration;
+
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let target = "01-a/u/S1";
+    let pr = "https://github.com/o/r/pull/1";
+    assert!(declare(&host, &c, target, Lane::Pi, &[]).ok());
+    kickoff(&c, target);
+    open_pr(&host, &c, target, pr);
+
+    let gh = support::FakeGh::with_http(
+        r#"printf '%s\n' "$*" >>"$FAKE_GH/args"
+[ "$1" = api ] && [ "$3" = --include ] || exit 90
+mode=$(cat "$FAKE_GH/mode")
+case "$2" in
+repos/o/r/pulls/1)
+    case "$mode" in
+    first)
+        [ "$#" = 3 ] || exit 91
+        printf 'HTTP/2.0 200 OK\r\nETag: W/"old-pull"\r\n\r\n'
+        echo '{"state":"open","merged":false,"head":{"sha":"head"},"base":{"sha":"old"},"mergeable_state":"dirty"}' ;;
+    same)
+        [ "$#" = 5 ] && [ "$4" = -H ] && [ "$5" = 'If-None-Match: W/"old-pull"' ] || exit 92
+        printf 'HTTP/2.0 304 Not Modified\r\n\r\n\377'
+        exit 1 ;;
+    aged)
+        [ "$#" = 3 ] || exit 93
+        printf 'HTTP/2.0 200 OK\r\nETag: "new-pull"\r\n\r\n'
+        echo '{"state":"open","merged":false,"head":{"sha":"head"},"base":{"sha":"new"},"mergeable_state":"clean"}' ;;
+    broken)
+        [ "${5:-}" = 'If-None-Match: "new-pull"' ] || exit 94
+        printf 'HTTP/2.0 503 Service Unavailable\r\n\r\n'
+        exit 1 ;;
+    slow)
+        [ "${5:-}" = 'If-None-Match: "new-pull"' ] || exit 95
+        exec sleep 30 ;;
+    esac ;;
+'repos/o/r/commits/head/check-runs?per_page=100&page=1')
+    [ "$#" = 3 ] || exit 96
+    printf 'HTTP/2.0 200 OK\r\nETag: "runs-one"\r\n\r\n'
+    echo '{"total_count":2,"check_runs":[{"name":"lint","status":"completed","conclusion":"success"}]}' ;;
+'repos/o/r/commits/head/check-runs?per_page=100&page=2')
+    case "$mode" in
+    first)
+        [ "$#" = 3 ] || exit 97
+        printf 'HTTP/2.0 200 OK\r\nETag: "runs-two"\r\n\r\n'
+        echo '{"total_count":2,"check_runs":[{"name":"build","status":"in_progress"}]}' ;;
+    same)
+        [ "$#" = 5 ] && [ "$4" = -H ] && [ "$5" = 'If-None-Match: "runs-two"' ] || exit 98
+        printf 'HTTP/2.0 304 Not Modified\r\n\r\n\377'
+        exit 1 ;;
+    aged)
+        [ "${5:-}" = 'If-None-Match: "runs-two"' ] || exit 99
+        printf 'HTTP/2.0 200 OK\r\nETag: "runs-three"\r\n\r\n'
+        echo '{"total_count":2,"check_runs":[{"name":"build","status":"completed","conclusion":"success"}]}' ;;
+    esac ;;
+'repos/o/r/commits/head/status?per_page=100&page=1')
+    [ "$#" = 3 ] || exit 100
+    printf 'HTTP/2.0 200 OK\r\n\r\n'
+    echo '{"total_count":0,"statuses":[]}' ;;
+*) exit 101 ;;
+esac
+"#,
+    );
+    let forge = Gh {
+        program: gh.program(),
+        timeout: Duration::from_secs(1),
+    };
+    let pulls_path = plan::pulls_path(&c.root);
+    let args_path = gh.fixture().join("args");
+    let observe = |mode, now| {
+        fs::write(gh.fixture().join("mode"), mode).unwrap();
+        fs::write(&args_path, "").unwrap();
+        let outcome = sync(&at(now), &forge, &c.root).unwrap();
+        let pulls = store::read_json::<BTreeMap<String, plan::Observed>>(&pulls_path).unwrap();
+        (
+            outcome,
+            pulls[pr].clone(),
+            fs::read_to_string(&args_path).unwrap(),
+        )
+    };
+    let pull = "repos/o/r/pulls/1";
+    let runs = "repos/o/r/commits/head/check-runs?per_page=100&page=";
+    let status = "repos/o/r/commits/head/status?per_page=100&page=1";
+
+    let (outcome, first, args) = observe("first", "2026-10-17T08:00:00Z");
+    assert!(outcome.ok(), "{:?}", outcome.violations);
+    assert_eq!(
+        first.etags,
+        BTreeMap::from([
+            (pull.to_owned(), "W/\"old-pull\"".to_owned()),
+            (format!("{runs}2"), "\"runs-two\"".to_owned()),
+        ])
+    );
+    assert_eq!(
+        args,
+        format!(
+            "api {pull} --include\napi {runs}1 --include\napi {runs}2 --include\napi {status} --include\n"
+        )
+    );
+
+    let (outcome, same, args) = observe("same", "2026-10-17T08:29:00Z");
+    assert!(outcome.ok(), "{:?}", outcome.violations);
+    assert_eq!(same, first);
+    assert_eq!(
+        args,
+        format!(
+            "api {pull} --include -H If-None-Match: W/\"old-pull\"\napi {runs}1 --include\napi {runs}2 --include -H If-None-Match: \"runs-two\"\n"
+        )
+    );
+
+    let (outcome, aged, args) = observe("aged", "2026-10-17T08:30:00Z");
+    assert!(outcome.ok(), "{:?}", outcome.violations);
+    assert_eq!(aged.at, "2026-10-17T08:30Z");
+    assert_eq!(aged.ci_base.as_deref(), Some("new"));
+    assert_eq!(aged.mergeable_state, Some("clean".to_owned().into()));
+    assert_eq!(
+        aged.etags,
+        BTreeMap::from([(pull.to_owned(), "\"new-pull\"".to_owned())])
+    );
+    assert_eq!(
+        args,
+        format!(
+            "api {pull} --include\napi {runs}1 --include\napi {runs}2 --include -H If-None-Match: \"runs-two\"\napi {status} --include\n"
+        )
+    );
+
+    for mode in ["broken", "slow"] {
+        let (outcome, observed, args) = observe(mode, "2026-10-17T08:31:00Z");
+        assert_eq!(rules(&outcome), vec!["sync-unknown"]);
+        assert_eq!(observed, aged);
+        assert_eq!(
+            args,
+            format!("api {pull} --include -H If-None-Match: \"new-pull\"\n")
+        );
+    }
+    assert_eq!(state(&c, target), Phase::PrOpen);
+}
+
+#[test]
+#[cfg(unix)]
+fn an_in_flight_304_cannot_restore_a_pull_observation_removed_by_a_concurrent_sync() {
+    use std::time::{Duration, Instant};
+
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let target = "01-a/u/S1";
+    let pr = "https://github.com/o/r/pull/1";
+    assert!(declare(&host, &c, target, Lane::Pi, &[]).ok());
+    kickoff(&c, target);
+    open_pr(&host, &c, target, pr);
+
+    let gh = support::FakeGh::with_http(
+        r#"[ "$#" = 2 ] && [ "$2" = rate_limit ] && exit 1
+[ "$1" = api ] && [ "$2" = repos/o/r/pulls/1 ] && [ "$3" = --include ] || exit 90
+if [ "$#" = 3 ]; then
+    printf 'HTTP/2.0 200 OK\r\nETag: "open"\r\n\r\n'
+    echo '{"state":"open","merged":false,"mergeable_state":"dirty"}'
+elif [ "$#" = 5 ] && [ "$4" = -H ] && [ "$5" = 'If-None-Match: "open"' ]; then
+    if [ -f "$FAKE_GH/started" ]; then
+        printf 'HTTP/2.0 200 OK\r\n\r\n'
+        echo '{"state":"closed","merged":false}'
+    else
+        touch "$FAKE_GH/started"
+        while [ ! -f "$FAKE_GH/release" ]; do sleep 0.02; done
+        printf 'HTTP/2.0 304 Not Modified\r\n\r\n'
+        exit 1
+    fi
+else
+    exit 91
+fi
+"#,
+    );
+    let forge = Gh {
+        program: gh.program(),
+        timeout: Duration::from_secs(10),
+    };
+    let observe = || sync(&host, &forge, &c.root).unwrap();
+    let pulls = || {
+        store::read_json::<BTreeMap<String, plan::Observed>>(&plan::pulls_path(&c.root)).unwrap()
+    };
+    assert!(observe().ok());
+    assert_eq!(
+        pulls()[pr].mergeable_state,
+        Some(cm::forge::MergeableState::Dirty)
+    );
+
+    std::thread::scope(|scope| {
+        let waiting = scope.spawn(observe);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !gh.fixture().join("started").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "conditional request did not start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let closed = observe();
+        let after_close = pulls();
+        fs::write(gh.fixture().join("release"), "").unwrap();
+        let resumed = waiting.join().unwrap();
+
+        assert_eq!(rules(&closed), vec!["pr-closed"]);
+        assert!(after_close.is_empty());
+        assert!(resumed.ok(), "{:?}", resumed.violations);
+        assert!(pulls().is_empty(), "the closed PR returned to pulls.json");
+    });
+}
+
+#[test]
+#[cfg(unix)]
 fn a_stalled_gh_is_killed_at_its_timeout() {
     use std::time::{Duration, Instant};
 
