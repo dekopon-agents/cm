@@ -33,6 +33,12 @@ fn mac_lane_add_links_the_declared_step_and_lists_it_until_done() {
             .status
             .success()
     );
+    let unit = root.join("01-first/alpha");
+    let state_paths = [cm::store::state_path(&unit), unit.join("STATE.md")];
+    let snapshot = || state_paths.each_ref().map(|path| fs::read(path).unwrap());
+    let before = snapshot();
+    let journal_path = root.join("JOURNAL.md");
+    let journal_before = fs::read_to_string(&journal_path).unwrap();
 
     let added = cm(
         root,
@@ -40,6 +46,7 @@ fn mac_lane_add_links_the_declared_step_and_lists_it_until_done() {
     );
     assert!(added.status.success(), "{added:?}");
     assert_eq!(json(&added)["item"], 2);
+    assert_eq!(snapshot(), before);
     assert!(
         fs::read_to_string(root.join("MAC-LANE.md"))
             .unwrap()
@@ -47,9 +54,16 @@ fn mac_lane_add_links_the_declared_step_and_lists_it_until_done() {
                 "1. **Existing request**\n2. **Mac work**\n\tStep: `{step}`\n"
             ))
     );
-    let unit = root.join("01-first/alpha");
     let step_state = || cm::store::load_unit(&unit).unwrap().steps["mac-work"].clone();
-    assert_eq!(step_state().mac_lane_items, [2]);
+    let journal = fs::read_to_string(journal_path).unwrap();
+    assert!(
+        journal
+            .strip_prefix(&journal_before)
+            .unwrap()
+            .ends_with(&format!(
+                "- MAC-LANE.md: `2. **Mac work**`\n- step: `{step}`\n"
+            ))
+    );
 
     let listed = cm(root, &["mac-lane", "list"]);
     assert_eq!(
@@ -71,7 +85,7 @@ fn mac_lane_add_links_the_declared_step_and_lists_it_until_done() {
     );
     assert!(done.status.success(), "{done:?}");
     assert_eq!(step_state().track.state, cm::state::Phase::Drafted);
-    assert_eq!(step_state().mac_lane_items, [2]);
+    assert_eq!(snapshot(), before);
     let listed = cm(root, &["--json", "mac-lane", "list"]);
     assert_eq!(json(&listed)["items"].as_array().unwrap().len(), 1);
     let receipt = String::from_utf8(done.stdout).unwrap();
@@ -185,29 +199,30 @@ fn init_help_advertises_all_supported_lanes() {
 }
 
 #[test]
-fn mac_lane_add_restores_the_queue_if_writing_the_step_link_fails() {
+fn mac_lane_rejects_rollouts_on_init_and_amend() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    let step = "01-first/alpha/mac-work";
+    let step = "01-first/alpha/rollout";
     assert!(cm(root, &["init"]).status.success());
-    assert!(cm(root, &["init", step, "--lane", "mac"]).status.success());
-    assert!(
-        cm(root, &["mac-lane", "add", "Existing request"])
-            .status
-            .success()
+    let refused = cm(
+        root,
+        &["--json", "init", step, "--lane", "mac", "--kind", "rollout"],
     );
-    let queue = root.join("MAC-LANE.md");
-    let before = fs::read(&queue).unwrap();
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert_eq!(json(&refused)["violations"][0]["rule"], "mac-lane-rollout");
+    assert!(!root.join(step).exists());
 
-    let blocked = root.join("01-first/alpha/.cm/.state.json.cm-tmp");
-    fs::create_dir(&blocked).unwrap();
-    let args = ["--json", "mac-lane", "add", "Mac work", "--step", step];
-    assert_eq!(cm(root, &args).status.code(), Some(1));
-    assert_eq!(fs::read(queue).unwrap(), before);
-    fs::remove_dir(blocked).unwrap();
-    let retry = cm(root, &args);
-    assert!(retry.status.success(), "{retry:?}");
-    assert_eq!(json(&retry)["item"], 2);
+    let declared = cm(
+        root,
+        &["init", step, "--lane", "codex", "--kind", "rollout"],
+    );
+    assert!(declared.status.success(), "{declared:?}");
+    let state = cm::store::state_path(&root.join("01-first/alpha"));
+    let before = fs::read(&state).unwrap();
+    let refused = cm(root, &["--json", "amend", step, "--lane", "mac"]);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert_eq!(json(&refused)["violations"][0]["rule"], "mac-lane-rollout");
+    assert_eq!(fs::read(state).unwrap(), before);
 }
 
 #[test]

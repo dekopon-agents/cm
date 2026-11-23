@@ -599,7 +599,7 @@ pub(crate) fn mac_dispatch_refusal(target: &str) -> Violation {
     Violation::new(
         target,
         "mac-lane-dispatch",
-        "the step runs in the Mac lane. See `cm mac-lane list` for queue items",
+        "Mac lane work goes through the Mac queue. See `cm mac-lane list` for open items",
     )
 }
 

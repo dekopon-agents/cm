@@ -208,7 +208,7 @@ enum Commands {
         /// <NN-name>/<unit> or <NN-name>/<unit>/<step>
         #[arg(value_parser = any_target)]
         target: Target,
-        /// pr-open, merged, released, deployed, done, superseded or blocked:<reason>. An owner-lane or study step moves to done, with --evidence, from drafted or launched.
+        /// pr-open, merged, released, deployed, done, superseded or blocked:<reason>. A Mac-lane, non-rollout owner-lane or study step moves to done with --evidence.
         state: Phase,
         /// A commit: the PR head for pr-open, the merge commit for merged.
         #[arg(long)]

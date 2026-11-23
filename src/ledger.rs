@@ -1034,9 +1034,8 @@ pub(crate) fn mac_lane_add_with_step(
         return Ok(Outcome::refused(violations));
     }
     let path = root.join(MAC_LANE_FILE);
-    let previous = read_existing(&path)?;
-    let text = previous.as_deref().unwrap_or(MAC_LANE);
-    let items = match mac_lane_items(text) {
+    let mut text = read_existing(&path)?.unwrap_or_else(|| MAC_LANE.to_owned());
+    let items = match mac_lane_items(&text) {
         Ok(items) => items,
         Err(violations) => return Ok(Outcome::refused(violations)),
     };
@@ -1057,22 +1056,19 @@ pub(crate) fn mac_lane_add_with_step(
         let name = target.step.as_deref().unwrap_or_default();
         let full = format!("{}/{name}", target.unit);
         let dir = root.join(&target.unit);
-        let unknown = || {
-            Outcome::refused(vec![Violation::new(
+        let declared = store::is_unit(&dir)
+            && store::load_unit(&dir)?
+                .steps
+                .get(name)
+                .is_some_and(|step| step.lane.is_some());
+        if !declared {
+            return Ok(Outcome::refused(vec![Violation::new(
                 &full,
                 "step-unknown",
                 "the step is not declared",
-            )])
-        };
-        if !store::is_unit(&dir) {
-            return Ok(unknown());
+            )]));
         }
-        let mut unit = store::load_unit(&dir)?;
-        let Some(step) = unit.steps.get_mut(name).filter(|step| step.lane.is_some()) else {
-            return Ok(unknown());
-        };
-        step.mac_lane_items.push(number);
-        Some((full, store::state_path(&dir), unit))
+        Some(full)
     } else {
         None
     };
@@ -1090,13 +1086,12 @@ pub(crate) fn mac_lane_add_with_step(
         entry.push_str(line.trim_end());
     }
     entry.push('\n');
-    if let Some((full, _, _)) = &linked {
+    if let Some(full) = &linked {
         entry.push_str(&format!("{MAC_STEP_LINE}{full}`\n"));
     }
     if items.is_empty() {
-        append(&path, text, &entry)?;
+        append(&path, &text, &entry)?;
     } else {
-        let mut text = text.to_owned();
         if !text.ends_with('\n') {
             text.push('\n');
         }
@@ -1104,16 +1099,9 @@ pub(crate) fn mac_lane_add_with_step(
         write_atomic(&path, text.as_bytes())?;
     }
     let mut outcome = Outcome::default();
-    if let Some((full, state_path, unit)) = linked {
-        // The link lives in the declaration and does not affect the rendered STATE.md.
-        if let Err(error) = store::write_json(&state_path, &unit) {
-            let restore = match previous {
-                Some(text) => write_atomic(&path, text.as_bytes()),
-                None => fs::remove_file(&path).map_err(Into::into),
-            };
-            restore.with_context(|| format!("{error:#}; restoring {MAC_LANE_FILE}"))?;
-            return Err(error);
-        }
+    let mut journal_body = format!("- {MAC_LANE_FILE}: `{number}. **{title}**`\n");
+    if let Some(full) = linked {
+        journal_body.push_str(&format!("- step: `{full}`\n"));
         outcome.field("step", full);
     }
     let at = stamp(host.now());
@@ -1121,7 +1109,7 @@ pub(crate) fn mac_lane_add_with_step(
         root,
         &at,
         &format!("mac-lane add {number}. {title}"),
-        &format!("- {MAC_LANE_FILE}: `{number}. **{title}**`\n"),
+        &journal_body,
     )?;
     outcome.line(format!("{number}. {title}"));
     outcome.field("item", number);

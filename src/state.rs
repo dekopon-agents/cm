@@ -783,8 +783,6 @@ pub struct Step {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<Lane>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub mac_lane_items: Vec<u32>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub after: Vec<After>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<GithubRepo>,
@@ -1125,7 +1123,6 @@ impl Step {
             worktree: String::new(),
             launches: 0,
             lane: None,
-            mac_lane_items: Vec::new(),
             after: Vec::new(),
             github: None,
             tag: None,

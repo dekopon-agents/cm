@@ -132,6 +132,16 @@ pub fn attempt(
         violations.extend(journal::check(root, &campaign));
         violations.extend(closed(root, &campaign));
     }
+    if matches!(
+        act,
+        Act::Restart {
+            lane: Lane::Mac,
+            ..
+        }
+    ) {
+        violations.push(crate::plan::mac_dispatch_refusal(&full));
+        return Ok(Outcome::refused(violations));
+    }
     let dir = root.join(&target.unit);
     let mut unit = if store::is_unit(&dir) {
         store::load_unit(&dir)?
@@ -144,11 +154,12 @@ pub fn attempt(
         return Ok(Outcome::refused(violations));
     };
     let step_name = target.step.clone().unwrap_or_default();
-    let Some(mut attempt) = unit
-        .steps
-        .get(&step_name)
-        .and_then(|step| step.attempt.clone())
-    else {
+    let step = unit.steps.get(&step_name);
+    if matches!(act, Act::Restart { .. }) && step.is_some_and(|step| step.lane == Some(Lane::Mac)) {
+        violations.push(crate::plan::mac_dispatch_refusal(&full));
+        return Ok(Outcome::refused(violations));
+    }
+    let Some(mut attempt) = step.and_then(|step| step.attempt.clone()) else {
         violations.push(Violation::new(
             &full,
             "attempt-missing",
