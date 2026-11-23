@@ -7,7 +7,7 @@ use anyhow::Result;
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
-use crate::attempt::remote_turn;
+use crate::attempt::{remote_turn, turn_began};
 use crate::commands::shell_word;
 use crate::forge::{GithubRepo, MergeableState, TagName};
 use crate::limits;
@@ -431,13 +431,16 @@ pub(crate) fn stalls(units: &Units, inputs: &ActionInputs) -> Vec<Stall> {
                 .as_ref()
                 .map_or(step.track.since.as_str(), |attempt| &attempt.claimed_at);
             if let Some(attempt) = step.attempt.as_ref()
-                && let Some(turn) = lane.and_then(|lane| remote_turn(attempt, lane))
-                && let Some(read) = turn.observation(attempt)
+                && let Some(lane) = lane
+                && inputs.turn_commands.for_lane(lane).is_some()
             {
-                if read.completed_at.is_some() {
+                if remote_turn(attempt, lane)
+                    .and_then(|turn| turn.observation(attempt))
+                    .is_some_and(|read| read.completed_at.is_some())
+                {
                     return None;
                 }
-                since = turn.began;
+                since = turn_began(attempt, lane).unwrap_or(since);
             }
             let limit = inputs.stall_limits.hours(lane);
             let age = inputs.now.duration_since(instant(since)?).as_secs_f64() / 3600.0;
@@ -636,25 +639,19 @@ fn actionable(
         if step.track.state == Phase::Launched
             && let Some(attempt) = active_attempt(step)
             && let Some(lane) = attempt.lane.or(step.lane)
+            && let Some(programs) = inputs.turn_commands.for_lane(lane)
             && let Some(turn) = remote_turn(attempt, lane)
             && let Some(completed_at) = turn
                 .observation(attempt)
                 .and_then(|read| read.completed_at.as_deref())
         {
-            let command = inputs
-                .turn_commands
-                .argv(lane, limits::TurnCommand::Logs, turn.thread, turn.turn)
-                .ok()
-                .flatten()
-                .map_or_else(
-                    || format!("cm attempt {}", shell_word(&target)),
-                    |argv| {
-                        argv.iter()
-                            .map(|arg| shell_word(arg))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    },
-                );
+            let command = programs
+                .logs
+                .argv(turn.thread, turn.turn)
+                .iter()
+                .map(|arg| shell_word(arg))
+                .collect::<Vec<_>>()
+                .join(" ");
             actions.push(Action::new(
                 ActionKind::TurnEnded,
                 &target,

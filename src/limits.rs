@@ -65,57 +65,41 @@ impl StallLimits {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum TurnCommand {
-    Reader,
-    Logs,
-}
+pub(crate) struct TurnProgram(Vec<String>);
 
-#[derive(Default)]
-pub(crate) struct TurnCommands(Table);
-
-impl TurnCommands {
-    pub(crate) fn read(root: &Path) -> Self {
-        Self(
-            std::fs::read_to_string(root.join("LIMITS.toml"))
-                .ok()
-                .and_then(|text| text.parse().ok())
-                .unwrap_or_default(),
-        )
-    }
-
-    pub(crate) fn argv(
-        &self,
-        lane: Lane,
-        kind: TurnCommand,
-        thread: &str,
-        turn: &str,
-    ) -> Result<Option<Vec<String>>, String> {
-        let suffix = match kind {
-            TurnCommand::Reader => "reader",
-            TurnCommand::Logs => "logs",
-        };
-        let key = format!("{}_turn_{suffix}", lane.name().replace('-', "_"));
-        let Some(value) = self.0.get(&key) else {
-            return Ok(None);
-        };
+impl TurnProgram {
+    fn parse(table: &Table, key: &str) -> Result<Self, String> {
+        let missing = || format!("LIMITS.toml is missing `{key}` for the remote turn command pair");
         let invalid = || {
             format!("LIMITS.toml `{key}` must be a nonempty argv array with a literal executable")
         };
-        let args = value.as_array().ok_or_else(invalid)?;
+        let args = table
+            .get(key)
+            .ok_or_else(missing)?
+            .as_array()
+            .ok_or_else(invalid)?;
         let program = args.first().and_then(Value::as_str).ok_or_else(invalid)?;
         if program.trim().is_empty() || program.contains(['{', '}']) {
             return Err(invalid());
         }
         args.iter()
             .map(|arg| {
-                let arg = arg
-                    .as_str()
+                arg.as_str()
                     .filter(|arg| !arg.chars().any(char::is_control))
-                    .ok_or_else(invalid)?;
+                    .map(str::to_owned)
+                    .ok_or_else(invalid)
+            })
+            .collect::<Result<_, _>>()
+            .map(Self)
+    }
+
+    pub(crate) fn argv(&self, thread: &str, turn: &str) -> Vec<String> {
+        self.0
+            .iter()
+            .map(|arg| {
                 // Substitute the template once so braces in an identifier stay literal.
                 let mut expanded = String::new();
-                let mut tail = arg;
+                let mut tail = arg.as_str();
                 while let Some((prefix, rest)) = tail.split_once('{') {
                     expanded.push_str(prefix);
                     if let Some(rest) = rest.strip_prefix("thread}") {
@@ -133,15 +117,63 @@ impl TurnCommands {
                 if let Some(relative) = expanded.strip_prefix("~/")
                     && let Some(home) = std::env::var_os("HOME")
                 {
-                    return Ok(PathBuf::from(home)
+                    return PathBuf::from(home)
                         .join(relative)
                         .to_string_lossy()
-                        .into_owned());
+                        .into_owned();
                 }
-                Ok(expanded)
+                expanded
             })
-            .collect::<Result<_, _>>()
-            .map(Some)
+            .collect()
+    }
+}
+
+pub(crate) struct TurnPair {
+    pub reader: TurnProgram,
+    pub logs: TurnProgram,
+}
+
+impl TurnPair {
+    fn read(table: &Table, lane: Lane) -> Result<Option<Self>, Vec<String>> {
+        let prefix = lane.name().replace('-', "_");
+        let reader_key = format!("{prefix}_turn_reader");
+        let logs_key = format!("{prefix}_turn_logs");
+        if !table.contains_key(&reader_key) && !table.contains_key(&logs_key) {
+            return Ok(None);
+        }
+        match (
+            TurnProgram::parse(table, &reader_key),
+            TurnProgram::parse(table, &logs_key),
+        ) {
+            (Ok(reader), Ok(logs)) => Ok(Some(Self { reader, logs })),
+            (reader, logs) => Err(reader.err().into_iter().chain(logs.err()).collect()),
+        }
+    }
+}
+
+const TURN_READER_LANES: [Lane; 2] = [Lane::Codex, Lane::ClaudeCloud];
+
+pub(crate) struct TurnCommands([Result<Option<TurnPair>, Vec<String>>; TURN_READER_LANES.len()]);
+
+impl TurnCommands {
+    pub(crate) fn read(root: &Path) -> Self {
+        let table = std::fs::read_to_string(root.join("LIMITS.toml"))
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or_default();
+        Self(TURN_READER_LANES.map(|lane| TurnPair::read(&table, lane)))
+    }
+
+    pub(crate) fn for_lane(&self, lane: Lane) -> Option<&TurnPair> {
+        let index = TURN_READER_LANES.iter().position(|known| *known == lane)?;
+        self.0[index].as_ref().ok()?.as_ref()
+    }
+
+    pub(crate) fn errors(&self) -> impl Iterator<Item = &String> {
+        self.0
+            .iter()
+            .filter_map(|configured| configured.as_ref().err())
+            .flatten()
     }
 }
 

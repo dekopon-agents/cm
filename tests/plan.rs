@@ -5469,9 +5469,38 @@ fn a_review_ledger_row_clears_only_its_pr() {
 }
 
 #[cfg(unix)]
+fn record_attempt_action(
+    host: &Fake,
+    c: &Campaign,
+    target: &str,
+    claim: &str,
+    kind: &str,
+    id: &str,
+) {
+    use cm::attempt::Act;
+
+    attempt_action(
+        host,
+        c,
+        target,
+        Some(claim),
+        Act::Begin { kind: kind.into() },
+    );
+    attempt_action(
+        host,
+        c,
+        target,
+        Some(claim),
+        Act::Record {
+            kind: kind.into(),
+            id: id.into(),
+        },
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn sync_observes_remote_turns_and_lists_ended_turns_before_other_actions() {
-    use cm::attempt::Act;
     use cm::forge::MergeableState;
 
     const WITH_PR: &str = "01-a/u/with-pr";
@@ -5487,25 +5516,6 @@ fn sync_observes_remote_turns_and_lists_ended_turns_before_other_actions() {
     let began = at("2026-11-23T03:25:00Z");
     let now = at("2026-11-23T03:30:00Z");
     let c = campaign(&claimed);
-    let record = |host: &Fake, target: &str, claim: &str, kind: &str, id: &str| {
-        attempt_action(
-            host,
-            &c,
-            target,
-            Some(claim),
-            Act::Begin { kind: kind.into() },
-        );
-        attempt_action(
-            host,
-            &c,
-            target,
-            Some(claim),
-            Act::Record {
-                kind: kind.into(),
-                id: id.into(),
-            },
-        );
-    };
     let mut claims = BTreeMap::new();
     for (target, thread, lane) in [
         (WITH_PR, "with-pr", Lane::Codex),
@@ -5518,9 +5528,9 @@ fn sync_observes_remote_turns_and_lists_ended_turns_before_other_actions() {
         assert!(declare(&claimed, &c, target, lane, &[]).ok());
         let claim = launch_for(&claimed, &c, target, "session_current");
         c.kickoff(target, "repo: o/r\n\n# Kickoff\n");
-        record(&claimed, target, &claim, "thread", thread);
-        record(&claimed, target, &claim, "turn", "old-turn");
-        record(&began, target, &claim, "turn", "latest-turn");
+        record_attempt_action(&claimed, &c, target, &claim, "thread", thread);
+        record_attempt_action(&claimed, &c, target, &claim, "turn", "old-turn");
+        record_attempt_action(&began, &c, target, &claim, "turn", "latest-turn");
         claims.insert(target, claim);
     }
     assert!(declare(&now, &c, "01-a/u/packet", Lane::Owner, &[]).ok());
@@ -5536,6 +5546,7 @@ fn sync_observes_remote_turns_and_lists_ended_turns_before_other_actions() {
         &format!(
             r#"#!/bin/sh
 [ "$#" = 2 ] || exit 2
+if [ "$1" = running ] && [ -f "$0.fail-running" ]; then exit 18; fi
 case "$1/$2" in
     with-pr/latest-turn)
         echo '{{"done":true,"successful":true,"turn_status":"completed","thread_id":"with-pr","turn_id":"latest-turn","pr_url":"{PR}"}}' ;;
@@ -5579,6 +5590,10 @@ codex_turn_logs = ["turn-logs", "{{thread}}", "--turn-id", "{{turn}}"]
         ..Default::default()
     };
 
+    let before_read = plan::next_at(&c.root, None, None, now.now).unwrap();
+    assert_eq!(before_read.fields["stalled"].as_array().unwrap().len(), 1);
+    assert_eq!(before_read.fields["stalled"][0]["target"], UNCONFIGURED);
+
     let synced = sync(&now, &forge, &c.root).unwrap();
     assert!(synced.ok(), "{:?}", synced.violations);
     assert_eq!(synced.fields["moves"].as_array().unwrap().len(), 1);
@@ -5604,10 +5619,7 @@ codex_turn_logs = ["turn-logs", "{{thread}}", "--turn-id", "{{turn}}"]
                 stall["since"].as_str().unwrap()
             ))
             .collect::<Vec<_>>(),
-        [
-            (FAILING, "2026-11-22T19:00Z"),
-            (UNCONFIGURED, "2026-11-22T19:00Z")
-        ]
+        [(UNCONFIGURED, "2026-11-22T19:00Z")]
     );
 
     let act = coordinator_cm(&c, &["next", "--act"]).output().unwrap();
@@ -5649,16 +5661,41 @@ codex_turn_logs = ["turn-logs", "{{thread}}", "--turn-id", "{{turn}}"]
     );
     assert_eq!(act["actionable"][2]["kind"], "pr-open-unreviewed");
 
+    fs::write(reader.with_extension("fail-running"), "").unwrap();
+    let failed_after_running = sync(&now, &forge, &c.root).unwrap();
+    assert!(
+        failed_after_running.ok(),
+        "{:?}",
+        failed_after_running.violations
+    );
+    assert_eq!(
+        failed_after_running.fields["turn_reader_warnings"][1],
+        "01-a/u/running: turn reader exited 18; check access with turn reader"
+    );
+    assert_eq!(
+        failed_after_running.fields["stalled"],
+        synced.fields["stalled"]
+    );
+
     let later = at("2026-11-23T06:30:00Z");
-    record(&later, NO_PR, &claims[NO_PR], "turn", "replacement-turn");
+    record_attempt_action(
+        &later,
+        &c,
+        NO_PR,
+        &claims[NO_PR],
+        "turn",
+        "replacement-turn",
+    );
     assert!(sync(&later, &forge, &c.root).unwrap().ok());
     let next = plan::next_at(&c.root, None, None, later.now).unwrap();
     let stalled = next.fields["stalled"].as_array().unwrap();
-    let running = stalled
-        .iter()
-        .find(|stall| stall["target"] == RUNNING)
-        .unwrap();
-    assert_eq!(running["since"], "2026-11-23T03:25Z");
+    for target in [RUNNING, FAILING] {
+        let stall = stalled
+            .iter()
+            .find(|stall| stall["target"] == target)
+            .unwrap();
+        assert_eq!(stall["since"], "2026-11-23T03:25Z");
+    }
     let actions = next.fields["actionable"].as_array().unwrap();
     let ended: Vec<_> = actions
         .iter()
@@ -5667,4 +5704,67 @@ codex_turn_logs = ["turn-logs", "{{thread}}", "--turn-id", "{{turn}}"]
     assert_eq!(ended.len(), 1);
     assert_eq!(ended[0]["target"], FOREIGN_PR);
     assert_eq!(ended[0]["since"], "2026-11-23T03:30Z");
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_requires_a_valid_remote_reader_and_logs_pair() {
+    let claimed = at("2026-11-22T19:00:00Z");
+    let now = at("2026-11-23T03:30:00Z");
+    let c = campaign(&claimed);
+    let target = "01-a/u/unpaired";
+    assert!(declare(&claimed, &c, target, Lane::Codex, &[]).ok());
+    let claim = launch_for(&claimed, &c, target, "session_current");
+    record_attempt_action(&claimed, &c, target, &claim, "thread", "thread");
+    record_attempt_action(&claimed, &c, target, &claim, "turn", "turn");
+
+    let reader = c._temp.path().join("unpaired-reader");
+    support::write_executable(
+        &reader,
+        r#"#!/bin/sh
+: > "$0.ran"
+echo '{"done":true,"successful":true,"turn_status":"completed"}'
+"#,
+    );
+    let path = c.root.join("LIMITS.toml");
+    let original = fs::read_to_string(&path).unwrap();
+    let reader_argv = serde_json::json!([reader, "{thread}", "{turn}"]);
+    for (settings, diagnostic) in [
+        (
+            format!("codex_turn_reader = {reader_argv}"),
+            "missing `codex_turn_logs`",
+        ),
+        (
+            format!("codex_turn_reader = {reader_argv}\ncodex_turn_logs = []"),
+            "`codex_turn_logs` must",
+        ),
+        (
+            r#"codex_turn_logs = ["turn-logs", "{thread}"]"#.to_owned(),
+            "missing `codex_turn_reader`",
+        ),
+    ] {
+        fs::write(&path, format!("{original}\n{settings}\n")).unwrap();
+        let synced = sync(&now, &FakeForge::default(), &c.root).unwrap();
+        assert!(synced.ok(), "{:?}", synced.violations);
+        let warnings = synced.fields["turn_reader_warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].as_str().unwrap().contains(diagnostic),
+            "{warnings:?}"
+        );
+        assert!(
+            !reader.with_extension("ran").exists(),
+            "reader ran with an invalid pair"
+        );
+
+        let next = plan::next_at(&c.root, None, None, now.now).unwrap();
+        assert_eq!(next.fields["stalled"][0]["target"], target);
+        assert!(
+            next.fields["actionable"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|action| action["kind"] != "turn-ended")
+        );
+    }
 }

@@ -825,15 +825,18 @@ pub(crate) struct TurnRead {
     pub pr_url: Option<String>,
 }
 
+pub(crate) const TURN_READER_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub(crate) fn read_remote_turn(
     argv: &[String],
     thread: &str,
     turn: &str,
+    timeout: Duration,
 ) -> Result<TurnRead, String> {
     let read = || {
         let (program, args) = argv.split_first().ok_or(ForgeError::Spawn)?;
         let args: Vec<_> = args.iter().map(String::as_str).collect();
-        let output = run(Path::new(program), &args, Duration::from_secs(15), None)?;
+        let output = run(Path::new(program), &args, timeout, None)?;
         if !output.status.success() {
             return Err(ForgeError::Exit(output.status.code()));
         }
@@ -1405,6 +1408,24 @@ impl Forge for Gh {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_times_out_after_its_successful_parent_exits_with_stdout_held_open() {
+        let argv = [
+            "sh",
+            "-c",
+            r#"printf '%s\n' '{"done":true,"successful":true,"turn_status":"completed"}'; sleep 3 & exit 0"#,
+        ].map(str::to_owned);
+        let timeout = Duration::from_millis(250);
+        let start = Instant::now();
+        let result = read_remote_turn(&argv, "thread", "turn", timeout);
+        assert!((timeout..Duration::from_secs(2)).contains(&start.elapsed()));
+        let error = result
+            .err()
+            .expect("held stdout must time out even after valid JSON");
+        assert!(error.starts_with("turn reader did not answer"), "{error}");
+    }
 
     #[test]
     fn repos_and_tags_refuse_noise() {

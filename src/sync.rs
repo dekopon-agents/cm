@@ -7,12 +7,12 @@ use serde_json::json;
 use crate::attempt::{recorded_id, remote_turn};
 use crate::commands::{check_release_pr, closed, is_pr_url, write_unit};
 use crate::forge::{
-    CheckState, CommitSha, Forge, ForgeError, GithubRepo, Pull, PullState, TagName, TurnRead,
-    ci_green, read_remote_turn,
+    CheckState, CommitSha, Forge, ForgeError, GithubRepo, Pull, PullState, TURN_READER_TIMEOUT,
+    TagName, TurnRead, ci_green, read_remote_turn,
 };
 use crate::host::{Host, stamp};
 use crate::journal;
-use crate::limits::{TurnCommand, TurnCommands};
+use crate::limits::TurnCommands;
 use crate::outcome::{Outcome, Violation};
 use crate::plan::{self, Units};
 use crate::render;
@@ -134,6 +134,8 @@ impl<'a> Run<'a> {
         units: Units,
         owner_unread: Vec<String>,
     ) -> Self {
+        let turn_commands = TurnCommands::read(root);
+        let turn_warnings = turn_commands.errors().cloned().collect();
         Run {
             root,
             forge,
@@ -150,8 +152,8 @@ impl<'a> Run<'a> {
             notes: Vec::new(),
             owner_unread,
             discovery_warnings: Vec::new(),
-            turn_commands: TurnCommands::read(root),
-            turn_warnings: Vec::new(),
+            turn_commands,
+            turn_warnings,
         }
     }
 
@@ -594,7 +596,10 @@ impl<'a> Run<'a> {
             else {
                 continue;
             };
-            let Some(lane @ (Lane::Codex | Lane::ClaudeCloud)) = attempt.lane.or(step.lane) else {
+            let Some(lane) = attempt.lane.or(step.lane) else {
+                continue;
+            };
+            let Some(programs) = self.turn_commands.for_lane(lane) else {
                 continue;
             };
             let Some(turn) = remote_turn(attempt, lane) else {
@@ -603,54 +608,39 @@ impl<'a> Run<'a> {
             let ended = turn
                 .observation(attempt)
                 .filter(|read| read.completed_at.is_some());
-            let mut observed = ended.cloned();
-            match self
-                .turn_commands
-                .argv(lane, TurnCommand::Reader, turn.thread, turn.turn)
-            {
-                Ok(Some(argv)) => {
-                    let key = (
-                        attempt.id.clone(),
-                        turn.thread.to_owned(),
-                        turn.turn.to_owned(),
-                        argv.clone(),
-                    );
-                    match cached(&mut self.reads.turns, key, self.forge, |_| {
-                        read_remote_turn(&argv, turn.thread, turn.turn)
-                    }) {
-                        Some(Ok(read)) if read.done => {
-                            let completed_at = read
-                                .completed_at
-                                .filter(|at| plan::instant(at).is_some())
-                                .or_else(|| ended.and_then(|read| read.completed_at.clone()))
-                                .or_else(|| Some(self.at.clone()));
-                            let pr_url = read
-                                .pr_url
-                                .or_else(|| ended.and_then(|read| read.pr_url.clone()));
-                            observed = Some(ObservedTurn {
-                                thread: turn.thread.to_owned(),
-                                turn: turn.turn.to_owned(),
-                                completed_at,
-                                pr_url,
-                            });
-                        }
-                        Some(Ok(_)) if ended.is_none() => {
-                            observed = Some(ObservedTurn {
-                                thread: turn.thread.to_owned(),
-                                turn: turn.turn.to_owned(),
-                                completed_at: None,
-                                pr_url: None,
-                            });
-                        }
-                        Some(Err(error)) => self.turn_warnings.push(format!("{target}: {error}")),
-                        Some(Ok(_)) => {}
-                        // A new record or configuration observed under lock has no read to apply.
-                        None => continue,
-                    }
+            let argv = programs.reader.argv(turn.thread, turn.turn);
+            let key = (
+                attempt.id.clone(),
+                turn.thread.to_owned(),
+                turn.turn.to_owned(),
+                argv.clone(),
+            );
+            let observed = match cached(&mut self.reads.turns, key, self.forge, |_| {
+                read_remote_turn(&argv, turn.thread, turn.turn, TURN_READER_TIMEOUT)
+            }) {
+                Some(Ok(read)) if read.done => {
+                    let completed_at = read
+                        .completed_at
+                        .filter(|at| plan::instant(at).is_some())
+                        .or_else(|| ended.and_then(|read| read.completed_at.clone()))
+                        .or_else(|| Some(self.at.clone()));
+                    Some(ObservedTurn {
+                        thread: turn.thread.to_owned(),
+                        turn: turn.turn.to_owned(),
+                        completed_at,
+                        pr_url: read
+                            .pr_url
+                            .or_else(|| ended.and_then(|read| read.pr_url.clone())),
+                    })
                 }
-                Ok(None) => {}
-                Err(error) => self.turn_warnings.push(format!("{target}: {error}")),
-            }
+                Some(Ok(_)) => ended.cloned(),
+                Some(Err(error)) => {
+                    self.turn_warnings.push(format!("{target}: {error}"));
+                    ended.cloned()
+                }
+                // A new record or configuration observed under lock has no read to apply.
+                None => continue,
+            };
             if observed != attempt.observed_turn {
                 let (unit, name) = plan::split(&target).expect("step target has a unit and name");
                 let attempt = self
@@ -722,6 +712,7 @@ impl<'a> Run<'a> {
                 }
             }
             if let Some(declared) = declared
+                && self.turn_commands.for_lane(lane).is_some()
                 && let Some(url) = remote_turn(attempt, lane)
                     .and_then(|turn| turn.observation(attempt))
                     .filter(|read| read.completed_at.is_some())

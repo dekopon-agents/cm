@@ -69,7 +69,6 @@ pub(crate) fn recorded_id<'a>(attempt: &'a Attempt, kind: &str) -> Option<&'a st
 pub(crate) struct RemoteTurn<'a> {
     pub thread: &'a str,
     pub turn: &'a str,
-    pub began: &'a str,
 }
 
 impl RemoteTurn<'_> {
@@ -82,7 +81,7 @@ impl RemoteTurn<'_> {
 }
 
 /// An in-flight registration of a newer thread or turn supersedes an earlier observation.
-pub(crate) fn remote_turn(attempt: &Attempt, lane: Lane) -> Option<RemoteTurn<'_>> {
+fn turn_actions(attempt: &Attempt, lane: Lane) -> Option<(&External, Option<&External>)> {
     let mut actions = attempt.actions.iter().rev();
     let is_thread =
         |kind: &str| kind == "thread" || (lane == Lane::ClaudeCloud && kind == "session");
@@ -90,11 +89,19 @@ pub(crate) fn remote_turn(attempt: &Attempt, lane: Lane) -> Option<RemoteTurn<'_
     if turn.kind != "turn" {
         return None;
     }
-    let thread = actions.find(|action| is_thread(&action.kind))?;
+    let thread = actions.find(|action| is_thread(&action.kind));
+    Some((turn, thread))
+}
+
+pub(crate) fn turn_began(attempt: &Attempt, lane: Lane) -> Option<&str> {
+    turn_actions(attempt, lane).map(|(turn, _)| turn.began.as_str())
+}
+
+pub(crate) fn remote_turn(attempt: &Attempt, lane: Lane) -> Option<RemoteTurn<'_>> {
+    let (turn, thread) = turn_actions(attempt, lane)?;
     Some(RemoteTurn {
-        thread: thread.id.as_deref()?,
+        thread: thread?.id.as_deref()?,
         turn: turn.id.as_deref()?,
-        began: &turn.began,
     })
 }
 
