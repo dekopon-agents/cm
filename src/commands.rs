@@ -1111,6 +1111,7 @@ pub fn launch_remote(
                 .map(|minutes| stamp(host.now() + jiff::SignedDuration::from_mins(minutes.into()))),
             claim: String::new(),
             actions: Vec::new(),
+            observed_turn: None,
             ended: None,
         });
         if let Some(attempt) = step.attempt.as_mut() {

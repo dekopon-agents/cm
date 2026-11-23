@@ -814,6 +814,43 @@ fn run(
     })
 }
 
+#[derive(Clone, Deserialize)]
+pub(crate) struct TurnRead {
+    pub done: bool,
+    successful: bool,
+    turn_status: String,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    pub completed_at: Option<String>,
+    pub pr_url: Option<String>,
+}
+
+pub(crate) fn read_remote_turn(
+    argv: &[String],
+    thread: &str,
+    turn: &str,
+) -> Result<TurnRead, String> {
+    let read = || {
+        let (program, args) = argv.split_first().ok_or(ForgeError::Spawn)?;
+        let args: Vec<_> = args.iter().map(String::as_str).collect();
+        let output = run(Path::new(program), &args, Duration::from_secs(15), None)?;
+        if !output.status.success() {
+            return Err(ForgeError::Exit(output.status.code()));
+        }
+        let status: TurnRead =
+            serde_json::from_slice(&output.stdout).map_err(|_| ForgeError::Json)?;
+        if status.turn_status.trim().is_empty()
+            || (status.successful && !status.done)
+            || status.thread_id.as_deref().is_some_and(|id| id != thread)
+            || status.turn_id.as_deref().is_some_and(|id| id != turn)
+        {
+            return Err(ForgeError::Json);
+        }
+        Ok(status)
+    };
+    read().map_err(|error| fmt::from_fn(|f| error.fmt_program("turn reader", f)).to_string())
+}
+
 fn crate_read(
     status: u16,
     body: &str,

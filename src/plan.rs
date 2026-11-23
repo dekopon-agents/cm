@@ -7,6 +7,7 @@ use anyhow::Result;
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
+use crate::attempt::remote_turn;
 use crate::commands::shell_word;
 use crate::forge::{GithubRepo, MergeableState, TagName};
 use crate::limits;
@@ -366,6 +367,7 @@ pub(crate) struct ActionInputs {
     now: Timestamp,
     coordinator: Option<String>,
     stall_limits: limits::StallLimits,
+    turn_commands: limits::TurnCommands,
 }
 
 impl ActionInputs {
@@ -374,6 +376,7 @@ impl ActionInputs {
             now,
             coordinator: crate::attempt::coordinator_label(&None),
             stall_limits: limits::StallLimits::read(root),
+            turn_commands: limits::TurnCommands::read(root),
         }
     }
 }
@@ -422,16 +425,25 @@ pub(crate) fn stalls(units: &Units, inputs: &ActionInputs) -> Vec<Stall> {
             if active.is_none() && step.lane != Some(Lane::Codex) {
                 return None;
             }
-            let since = step
+            let lane = active.and_then(|attempt| attempt.lane).or(step.lane);
+            let mut since = step
                 .attempt
                 .as_ref()
-                .map_or(&step.track.since, |attempt| &attempt.claimed_at);
-            let lane = active.and_then(|attempt| attempt.lane).or(step.lane);
+                .map_or(step.track.since.as_str(), |attempt| &attempt.claimed_at);
+            if let Some(attempt) = step.attempt.as_ref()
+                && let Some(turn) = lane.and_then(|lane| remote_turn(attempt, lane))
+                && let Some(read) = turn.observation(attempt)
+            {
+                if read.completed_at.is_some() {
+                    return None;
+                }
+                since = turn.began;
+            }
             let limit = inputs.stall_limits.hours(lane);
             let age = inputs.now.duration_since(instant(since)?).as_secs_f64() / 3600.0;
             (age > limit).then(|| Stall {
                 target,
-                since: since.clone(),
+                since: since.to_owned(),
                 hours: (age * 10.0).round() / 10.0,
                 limit,
                 lane,
@@ -464,12 +476,35 @@ pub(crate) fn stall_line(stall: &Stall) -> String {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(into = "&'static str")]
 enum ActionKind {
-    ReviewNotBegun,
+    TurnEnded,
+    PrOpenUnreviewed,
     MissingKickoff,
     StalledAttempt,
     EarlierCoordinator,
+}
+
+impl From<ActionKind> for &'static str {
+    fn from(kind: ActionKind) -> Self {
+        match kind {
+            ActionKind::TurnEnded => "turn-ended",
+            ActionKind::PrOpenUnreviewed => "pr-open-unreviewed",
+            ActionKind::MissingKickoff => "missing-kickoff",
+            ActionKind::StalledAttempt => "stalled-attempt",
+            ActionKind::EarlierCoordinator => "earlier-coordinator",
+        }
+    }
+}
+
+impl ActionKind {
+    fn act_priority(self) -> u8 {
+        match self {
+            Self::TurnEnded => 0,
+            Self::PrOpenUnreviewed => 1,
+            Self::MissingKickoff | Self::StalledAttempt | Self::EarlierCoordinator => 2,
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -503,15 +538,18 @@ impl Action {
         }
     }
 
-    fn line(&self, number: &mut usize) -> String {
-        next_item(
-            number,
-            &format!(
-                "{} since {} ({} waiting)",
-                self.description, self.since, self.waiting_count
-            ),
-            &self.command,
-        )
+    fn summary(&self) -> String {
+        let kind = <&str>::from(self.kind);
+        let detail = self.description.replace(char::is_control, " ");
+        let prefix = format!("{kind} {}: {detail}", self.target);
+        if self.kind == ActionKind::TurnEnded {
+            prefix
+        } else {
+            format!(
+                "{prefix} since {} ({} waiting)",
+                self.since, self.waiting_count
+            )
+        }
     }
 }
 
@@ -572,7 +610,7 @@ fn actionable(
                 &candidate.target,
                 &candidate.step.track.since,
                 waiting_command(root, &candidate.target),
-                format!("missing kickoff {}", candidate.target),
+                "kickoff.md is missing".to_owned(),
             ));
         }
     }
@@ -592,7 +630,37 @@ fn actionable(
                     shell_word(&target),
                     attempt.generation
                 ),
-                format!("earlier coordinator {target} ({})", attempt.coordinator),
+                format!("claimed by {}", attempt.coordinator),
+            ));
+        }
+        if step.track.state == Phase::Launched
+            && let Some(attempt) = active_attempt(step)
+            && let Some(lane) = attempt.lane.or(step.lane)
+            && let Some(turn) = remote_turn(attempt, lane)
+            && let Some(completed_at) = turn
+                .observation(attempt)
+                .and_then(|read| read.completed_at.as_deref())
+        {
+            let command = inputs
+                .turn_commands
+                .argv(lane, limits::TurnCommand::Logs, turn.thread, turn.turn)
+                .ok()
+                .flatten()
+                .map_or_else(
+                    || format!("cm attempt {}", shell_word(&target)),
+                    |argv| {
+                        argv.iter()
+                            .map(|arg| shell_word(arg))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    },
+                );
+            actions.push(Action::new(
+                ActionKind::TurnEnded,
+                &target,
+                completed_at,
+                command,
+                format!("thread {} completed {completed_at}, no PR", turn.thread),
             ));
         }
         let mut review = |part: Option<&str>, track: &Track| {
@@ -608,13 +676,16 @@ fn actionable(
             {
                 return;
             }
-            let scope = part.map_or_else(|| target.clone(), |part| format!("{target}#{part}"));
+            let detail = part.map_or_else(
+                || format!("PR {pr}"),
+                |part| format!("part {part}, PR {pr}"),
+            );
             let mut action = Action::new(
-                ActionKind::ReviewNotBegun,
+                ActionKind::PrOpenUnreviewed,
                 &target,
                 &track.since,
                 format!("cm brief {}", shell_word(&target)),
-                format!("review not begun {scope} ({pr})"),
+                detail,
             );
             action.part = part.map(str::to_owned);
             actions.push(action);
@@ -676,7 +747,7 @@ fn action_scope(
 
 fn append_actions(outcome: &mut Outcome, number: &mut usize, actions: &[Action]) {
     for action in actions {
-        outcome.line(action.line(number));
+        outcome.line(next_item(number, &action.summary(), &action.command));
     }
     outcome.field("actionable", json!(actions));
 }
@@ -706,7 +777,7 @@ pub(crate) fn next_act(
     now: Timestamp,
 ) -> Result<(Outcome, bool)> {
     let mut outcome = Outcome::default();
-    let actions = if store::load_campaign(root)?.closed.is_some() {
+    let mut actions = if store::load_campaign(root)?.closed.is_some() {
         Vec::new()
     } else {
         let units = load_units(root)?;
@@ -720,7 +791,11 @@ pub(crate) fn next_act(
             lane,
         )
     };
-    append_actions(&mut outcome, &mut 1, &actions);
+    actions.sort_by_key(|action| action.kind.act_priority());
+    for action in &actions {
+        outcome.line(format!("{} — `{}`", action.summary(), action.command));
+    }
+    outcome.field("actionable", json!(actions));
     Ok((outcome, !actions.is_empty()))
 }
 

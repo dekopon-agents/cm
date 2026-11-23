@@ -5,11 +5,10 @@ use jiff::Timestamp;
 
 use crate::commands::{closed, write_unit};
 use crate::evidence::CampaignFile;
-use crate::forge::GithubRepo;
 use crate::host::{Host, stamp};
 use crate::journal;
 use crate::outcome::{Outcome, Violation};
-use crate::state::{Attempt, AttemptOutcome, Ended, External, Lane};
+use crate::state::{Attempt, AttemptOutcome, Ended, External, Lane, ObservedTurn};
 use crate::store::{self, Target, is_name, lock};
 
 #[derive(Debug, Clone)]
@@ -57,22 +56,46 @@ fn launch_metadata(kind: &str) -> bool {
 
 /// Read launch metadata from this attempt only. A newer unfinished record must not revive
 /// an older value of the same kind.
-pub(crate) fn launch_branch<'a>(
-    attempt: &'a Attempt,
-    github: Option<&GithubRepo>,
-) -> Option<(GithubRepo, &'a str)> {
-    let recorded = |kind| {
+pub(crate) fn recorded_id<'a>(attempt: &'a Attempt, kind: &str) -> Option<&'a str> {
+    attempt
+        .actions
+        .iter()
+        .rev()
+        .find(|action| action.kind == kind)?
+        .id
+        .as_deref()
+}
+
+pub(crate) struct RemoteTurn<'a> {
+    pub thread: &'a str,
+    pub turn: &'a str,
+    pub began: &'a str,
+}
+
+impl RemoteTurn<'_> {
+    pub(crate) fn observation<'a>(&self, attempt: &'a Attempt) -> Option<&'a ObservedTurn> {
         attempt
-            .actions
-            .iter()
-            .rev()
-            .find(|action| action.kind == kind)?
-            .id
-            .as_deref()
-    };
-    let branch = recorded("branch").filter(|branch| !branch.starts_with('-'))?;
-    let repo = github.cloned().or_else(|| recorded("repo")?.parse().ok())?;
-    Some((repo, branch))
+            .observed_turn
+            .as_ref()
+            .filter(|read| read.thread == self.thread && read.turn == self.turn)
+    }
+}
+
+/// An in-flight registration of a newer thread or turn supersedes an earlier observation.
+pub(crate) fn remote_turn(attempt: &Attempt, lane: Lane) -> Option<RemoteTurn<'_>> {
+    let mut actions = attempt.actions.iter().rev();
+    let is_thread =
+        |kind: &str| kind == "thread" || (lane == Lane::ClaudeCloud && kind == "session");
+    let turn = actions.find(|action| action.kind == "turn" || is_thread(&action.kind))?;
+    if turn.kind != "turn" {
+        return None;
+    }
+    let thread = actions.find(|action| is_thread(&action.kind))?;
+    Some(RemoteTurn {
+        thread: thread.id.as_deref()?,
+        turn: turn.id.as_deref()?,
+        began: &turn.began,
+    })
 }
 
 pub(crate) fn check_coordinator(full: &str, coordinator: &str) -> Option<Violation> {
@@ -388,6 +411,7 @@ pub fn attempt(
             attempt.id = format!("{full}#{}", step.launches);
             attempt.lane = Some(*lane);
             attempt.actions.clear();
+            attempt.observed_turn = None;
             attempt.ended = None;
         }
         Act::Claim { coordinator, .. } => {

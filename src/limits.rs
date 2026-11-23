@@ -66,6 +66,86 @@ impl StallLimits {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) enum TurnCommand {
+    Reader,
+    Logs,
+}
+
+#[derive(Default)]
+pub(crate) struct TurnCommands(Table);
+
+impl TurnCommands {
+    pub(crate) fn read(root: &Path) -> Self {
+        Self(
+            std::fs::read_to_string(root.join("LIMITS.toml"))
+                .ok()
+                .and_then(|text| text.parse().ok())
+                .unwrap_or_default(),
+        )
+    }
+
+    pub(crate) fn argv(
+        &self,
+        lane: Lane,
+        kind: TurnCommand,
+        thread: &str,
+        turn: &str,
+    ) -> Result<Option<Vec<String>>, String> {
+        let suffix = match kind {
+            TurnCommand::Reader => "reader",
+            TurnCommand::Logs => "logs",
+        };
+        let key = format!("{}_turn_{suffix}", lane.name().replace('-', "_"));
+        let Some(value) = self.0.get(&key) else {
+            return Ok(None);
+        };
+        let invalid = || {
+            format!("LIMITS.toml `{key}` must be a nonempty argv array with a literal executable")
+        };
+        let args = value.as_array().ok_or_else(invalid)?;
+        let program = args.first().and_then(Value::as_str).ok_or_else(invalid)?;
+        if program.trim().is_empty() || program.contains(['{', '}']) {
+            return Err(invalid());
+        }
+        args.iter()
+            .map(|arg| {
+                let arg = arg
+                    .as_str()
+                    .filter(|arg| !arg.chars().any(char::is_control))
+                    .ok_or_else(invalid)?;
+                // Substitute the template once so braces in an identifier stay literal.
+                let mut expanded = String::new();
+                let mut tail = arg;
+                while let Some((prefix, rest)) = tail.split_once('{') {
+                    expanded.push_str(prefix);
+                    if let Some(rest) = rest.strip_prefix("thread}") {
+                        expanded.push_str(thread);
+                        tail = rest;
+                    } else if let Some(rest) = rest.strip_prefix("turn}") {
+                        expanded.push_str(turn);
+                        tail = rest;
+                    } else {
+                        expanded.push('{');
+                        tail = rest;
+                    }
+                }
+                expanded.push_str(tail);
+                if let Some(relative) = expanded.strip_prefix("~/")
+                    && let Some(home) = std::env::var_os("HOME")
+                {
+                    return Ok(PathBuf::from(home)
+                        .join(relative)
+                        .to_string_lossy()
+                        .into_owned());
+                }
+                Ok(expanded)
+            })
+            .collect::<Result<_, _>>()
+            .map(Some)
+    }
+}
+
+#[derive(Clone, Copy)]
 enum Shape {
     Bool,
     Number,

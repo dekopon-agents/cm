@@ -5255,7 +5255,7 @@ fn next_act_orders_coordinator_actions_and_matches_the_card_until_they_clear() {
     assert_eq!(
         order,
         [
-            ("review-not-begun", 3),
+            ("pr-open-unreviewed", 3),
             ("missing-kickoff", 2),
             ("stalled-attempt", 1),
             ("earlier-coordinator", 0),
@@ -5267,6 +5267,9 @@ fn next_act_orders_coordinator_actions_and_matches_the_card_until_they_clear() {
     let lines = String::from_utf8(text.stdout).unwrap();
     assert_eq!(lines.lines().count(), actions.len());
     for (line, action) in lines.lines().zip(actions) {
+        let kind = action["kind"].as_str().unwrap();
+        let target = action["target"].as_str().unwrap();
+        assert!(line.starts_with(&format!("{kind} {target}:")), "{line}");
         assert!(line.contains(action["since"].as_str().unwrap()), "{line}");
         assert!(
             line.ends_with(&format!("`{}`", action["command"].as_str().unwrap())),
@@ -5463,4 +5466,205 @@ fn a_review_ledger_row_clears_only_its_pr() {
     let outcome: serde_json::Value = serde_json::from_slice(&outcome.stdout).unwrap();
     assert_eq!(outcome["actionable"].as_array().unwrap().len(), 1);
     assert_eq!(outcome["actionable"][0]["target"], other);
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_observes_remote_turns_and_lists_ended_turns_before_other_actions() {
+    use cm::attempt::Act;
+    use cm::forge::MergeableState;
+
+    const WITH_PR: &str = "01-a/u/with-pr";
+    const NO_PR: &str = "01-a/u/no-pr";
+    const FOREIGN_PR: &str = "01-a/u/wrong-repo";
+    const RUNNING: &str = "01-a/u/running";
+    const FAILING: &str = "01-a/u/failing";
+    const UNCONFIGURED: &str = "01-a/u/unconfigured";
+    const PR: &str = "https://github.com/o/r/pull/17";
+    const HEAD: &str = "89abcdef0123456789abcdef0123456789abcdef";
+
+    let claimed = at("2026-11-22T19:00:00Z");
+    let began = at("2026-11-23T03:25:00Z");
+    let now = at("2026-11-23T03:30:00Z");
+    let c = campaign(&claimed);
+    let record = |host: &Fake, target: &str, claim: &str, kind: &str, id: &str| {
+        attempt_action(
+            host,
+            &c,
+            target,
+            Some(claim),
+            Act::Begin { kind: kind.into() },
+        );
+        attempt_action(
+            host,
+            &c,
+            target,
+            Some(claim),
+            Act::Record {
+                kind: kind.into(),
+                id: id.into(),
+            },
+        );
+    };
+    let mut claims = BTreeMap::new();
+    for (target, thread, lane) in [
+        (WITH_PR, "with-pr", Lane::Codex),
+        (NO_PR, "no-pr", Lane::Codex),
+        (FOREIGN_PR, "wrong-repo", Lane::Codex),
+        (RUNNING, "running", Lane::Codex),
+        (FAILING, "failing", Lane::Codex),
+        (UNCONFIGURED, "unconfigured", Lane::ClaudeCloud),
+    ] {
+        assert!(declare(&claimed, &c, target, lane, &[]).ok());
+        let claim = launch_for(&claimed, &c, target, "session_current");
+        c.kickoff(target, "repo: o/r\n\n# Kickoff\n");
+        record(&claimed, target, &claim, "thread", thread);
+        record(&claimed, target, &claim, "turn", "old-turn");
+        record(&began, target, &claim, "turn", "latest-turn");
+        claims.insert(target, claim);
+    }
+    assert!(declare(&now, &c, "01-a/u/packet", Lane::Owner, &[]).ok());
+    for child in ["first", "second"] {
+        let target = format!("01-a/u/{child}");
+        assert!(declare(&now, &c, &target, Lane::Codex, &["packet"]).ok());
+        kickoff(&c, &target);
+    }
+
+    let reader = c._temp.path().join("turn-reader");
+    support::write_executable(
+        &reader,
+        &format!(
+            r#"#!/bin/sh
+[ "$#" = 2 ] || exit 2
+case "$1/$2" in
+    with-pr/latest-turn)
+        echo '{{"done":true,"successful":true,"turn_status":"completed","thread_id":"with-pr","turn_id":"latest-turn","pr_url":"{PR}"}}' ;;
+    no-pr/latest-turn)
+        echo '{{"done":true,"successful":false,"turn_status":"failed","completed_at":"2026-11-23T03:29:42Z"}}' ;;
+    wrong-repo/latest-turn)
+        echo '{{"done":true,"successful":true,"turn_status":"completed","pr_url":"https://github.com/elsewhere/r/pull/17"}}' ;;
+    running/latest-turn|no-pr/replacement-turn)
+        echo '{{"done":false,"successful":false,"turn_status":"inProgress"}}' ;;
+    failing/latest-turn) exit 17 ;;
+    *) exit 2 ;;
+esac
+"#
+        ),
+    );
+    let path = c.root.join("LIMITS.toml");
+    let original = fs::read_to_string(&path).unwrap();
+    let argv = serde_json::json!([reader, "{thread}", "{turn}"]);
+    fs::write(
+        &path,
+        format!(
+            r#"{original}
+codex_turn_reader = {argv}
+codex_turn_logs = ["turn-logs", "{{thread}}", "--turn-id", "{{turn}}"]
+"#
+        ),
+    )
+    .unwrap();
+    let forge = FakeForge {
+        pulls: BTreeMap::from([(
+            PR.to_owned(),
+            Pull {
+                state: PullState::Open,
+                merge_commit: None,
+                merged_at: None,
+                head: Some(CommitSha::new(HEAD)),
+                base: None,
+                mergeable_state: Some(MergeableState::Other("clean".into())),
+            },
+        )]),
+        ..Default::default()
+    };
+
+    let synced = sync(&now, &forge, &c.root).unwrap();
+    assert!(synced.ok(), "{:?}", synced.violations);
+    assert_eq!(synced.fields["moves"].as_array().unwrap().len(), 1);
+    let units = plan::load_units(&c.root).unwrap();
+    let opened = plan::track(&units, WITH_PR).unwrap();
+    assert_eq!(opened.state, Phase::PrOpen);
+    assert_eq!(opened.evidence.pr.as_deref(), Some(PR));
+    assert_eq!(opened.evidence.sha.as_deref(), Some(HEAD));
+    for target in [NO_PR, FOREIGN_PR, RUNNING, FAILING, UNCONFIGURED] {
+        assert_eq!(plan::track(&units, target).unwrap().state, Phase::Launched);
+    }
+    assert_eq!(
+        synced.fields["turn_reader_warnings"],
+        serde_json::json!(["01-a/u/failing: turn reader exited 17; check access with turn reader"])
+    );
+    assert_eq!(
+        synced.fields["stalled"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|stall| (
+                stall["target"].as_str().unwrap(),
+                stall["since"].as_str().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (FAILING, "2026-11-22T19:00Z"),
+            (UNCONFIGURED, "2026-11-22T19:00Z")
+        ]
+    );
+
+    let act = coordinator_cm(&c, &["next", "--act"]).output().unwrap();
+    assert_eq!(act.status.code(), Some(1), "{act:?}");
+    let lines = String::from_utf8(act.stdout).unwrap();
+    let mut lines = lines.lines();
+    assert_eq!(
+        lines.next(),
+        Some(
+            "turn-ended 01-a/u/no-pr: thread no-pr completed 2026-11-23T03:29:42Z, no PR — `turn-logs no-pr --turn-id latest-turn`"
+        )
+    );
+    assert_eq!(
+        lines.next(),
+        Some(
+            "turn-ended 01-a/u/wrong-repo: thread wrong-repo completed 2026-11-23T03:30Z, no PR — `turn-logs wrong-repo --turn-id latest-turn`"
+        )
+    );
+    assert!(
+        lines
+            .next()
+            .unwrap()
+            .starts_with("pr-open-unreviewed 01-a/u/with-pr:")
+    );
+    assert!(
+        lines
+            .next()
+            .unwrap()
+            .starts_with("missing-kickoff 01-a/u/packet:")
+    );
+    let act = coordinator_cm(&c, &["next", "--act", "--json"])
+        .output()
+        .unwrap();
+    let act: serde_json::Value = serde_json::from_slice(&act.stdout).unwrap();
+    assert_eq!(act["actionable"][0]["kind"], "turn-ended");
+    assert_eq!(
+        act["actionable"][0]["command"],
+        "turn-logs no-pr --turn-id latest-turn"
+    );
+    assert_eq!(act["actionable"][2]["kind"], "pr-open-unreviewed");
+
+    let later = at("2026-11-23T06:30:00Z");
+    record(&later, NO_PR, &claims[NO_PR], "turn", "replacement-turn");
+    assert!(sync(&later, &forge, &c.root).unwrap().ok());
+    let next = plan::next_at(&c.root, None, None, later.now).unwrap();
+    let stalled = next.fields["stalled"].as_array().unwrap();
+    let running = stalled
+        .iter()
+        .find(|stall| stall["target"] == RUNNING)
+        .unwrap();
+    assert_eq!(running["since"], "2026-11-23T03:25Z");
+    let actions = next.fields["actionable"].as_array().unwrap();
+    let ended: Vec<_> = actions
+        .iter()
+        .filter(|action| action["kind"] == "turn-ended")
+        .collect();
+    assert_eq!(ended.len(), 1);
+    assert_eq!(ended[0]["target"], FOREIGN_PR);
+    assert_eq!(ended[0]["since"], "2026-11-23T03:30Z");
 }
