@@ -1225,7 +1225,7 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
     let stalled = plan::stalls(&run.units, &inputs);
     let dirty = plan::dirty(root, &run.units);
     for stall in &stalled {
-        outcome.line(plan::stall_line(stall, &run.units));
+        outcome.line(plan::stall_line(stall));
     }
     for (url, observed) in &dirty {
         outcome.line(plan::dirty_line(url, observed));

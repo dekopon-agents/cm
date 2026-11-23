@@ -405,19 +405,21 @@ fn steps(units: &Units) -> impl Iterator<Item = (String, &Step)> {
 }
 
 fn active_attempt(step: &Step) -> Option<&Attempt> {
-    step.attempt
-        .as_ref()
-        .filter(|attempt| attempt.ended.is_none() && !step.track.state.is_final())
+    step.attempt.as_ref().filter(|attempt| {
+        attempt.ended.is_none() && matches!(step.track.resting(), Phase::Launched | Phase::PrOpen)
+    })
 }
 
 pub(crate) fn stalls(units: &Units, inputs: &ActionInputs) -> Vec<Stall> {
     steps(units)
         .filter_map(|(target, step)| {
+            if step.track.state != Phase::Launched || step.track.evidence.pr.is_some() {
+                return None;
+            }
             let active = active_attempt(step);
-            let legacy_codex = step.lane == Some(Lane::Codex)
-                && step.track.state == Phase::Launched
-                && step.track.evidence.pr.is_none();
-            if active.is_none() && !legacy_codex {
+            // Keep the existing Codex stalled report for launches that predate attempt records
+            // or whose coordinator has already ended the attempt.
+            if active.is_none() && step.lane != Some(Lane::Codex) {
                 return None;
             }
             let since = step
@@ -449,11 +451,8 @@ pub(crate) fn stall_json(stall: &Stall) -> Value {
     })
 }
 
-pub(crate) fn stall_line(stall: &Stall, units: &Units) -> String {
-    let reason = if stall.lane == Some(Lane::Codex)
-        && step(units, &stall.target).is_some_and(|step| {
-            step.track.state == Phase::Launched && step.track.evidence.pr.is_none()
-        }) {
+pub(crate) fn stall_line(stall: &Stall) -> String {
+    let reason = if stall.lane == Some(Lane::Codex) {
         "codex launch with no PR".to_owned()
     } else {
         format!("{} attempt", stall.lane.map_or("remote", Lane::name))
@@ -635,7 +634,7 @@ fn actionable(
             &stall.since,
             format!("cm attempt {}", shell_word(&stall.target)),
             format!(
-                "stalled attempt {} ({}; {}h > {}h)",
+                "stalled attempt {} ({}, {}h > {}h)",
                 stall.target,
                 stall.lane.map_or("remote", Lane::name),
                 stall.hours,
@@ -1246,7 +1245,7 @@ pub fn next_at(
     for stall in &stalled {
         outcome.line(next_item(
             &mut number,
-            &stall_line(stall, &units),
+            &stall_line(stall),
             stall_json(stall)["command"].as_str().unwrap(),
         ));
     }
