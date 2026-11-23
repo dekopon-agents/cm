@@ -431,6 +431,9 @@ pub trait Forge {
     fn image_manifest(&self, _image: &ImageRef, _tag: &str) -> Result<Read, ForgeError> {
         Err(ForgeError::Json)
     }
+    fn rate_limit(&self) -> Option<String> {
+        None
+    }
     fn tag_exists(&self, repo: &GithubRepo, tag: &TagName) -> Result<bool, ForgeError>;
     fn tag_contains(
         &self,
@@ -441,6 +444,7 @@ pub trait Forge {
 }
 
 pub const GH_TIMEOUT: Duration = Duration::from_secs(60);
+const RATE_LIMIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 const IMAGE_ACCEPT_HEADER: &str = concat!(
     "Accept: application/vnd.oci.image.index.v1+json, ",
@@ -715,6 +719,7 @@ fn run(
     timeout: Duration,
     input: Option<&[u8]>,
 ) -> Result<Output, ForgeError> {
+    let deadline = Instant::now() + timeout;
     let mut child = Command::new(program)
         .args(args)
         .env("GH_PROMPT_DISABLED", "1")
@@ -728,11 +733,11 @@ fn run(
         .spawn()
         .map_err(|_| ForgeError::Spawn)?;
     let mut stdout = child.stdout.take().ok_or(ForgeError::Spawn)?;
-    let reader = std::thread::spawn(move || {
+    let (send, reader) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
+        let _ = send.send(stdout.read_to_end(&mut bytes).map(|_| bytes));
     });
-    let deadline = Instant::now() + timeout;
     let writer = if let Some(input) = input {
         let mut stdin = child.stdin.take().ok_or(ForgeError::Spawn)?;
         let bytes = input.to_vec();
@@ -743,7 +748,11 @@ fn run(
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(20)),
+            ),
             Ok(None) | Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -752,8 +761,11 @@ fn run(
         }
     };
     let stdout = reader
-        .join()
-        .map_err(|_| ForgeError::Json)?
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => ForgeError::Timeout(timeout),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => ForgeError::Json,
+        })?
         .map_err(|_| ForgeError::Json)?;
     if let Some(writer) = writer {
         let sent = writer.join().map_err(|_| ForgeError::Spawn)?;
@@ -1217,6 +1229,38 @@ impl Forge for Gh {
             image_read(status, &headers)
         })()
         .map_err(|error| ForgeError::Curl(Box::new(error)))
+    }
+
+    fn rate_limit(&self) -> Option<String> {
+        #[derive(Deserialize)]
+        struct RateLimit {
+            resources: Resources,
+        }
+        #[derive(Deserialize)]
+        struct Resources {
+            core: Core,
+        }
+        #[derive(Deserialize)]
+        struct Core {
+            used: u64,
+            limit: u64,
+            reset: u64,
+        }
+        let output = run(
+            &self.program,
+            &["api", "rate_limit"],
+            self.timeout.min(RATE_LIMIT_TIMEOUT),
+            None,
+        )
+        .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let sample: RateLimit = serde_json::from_slice(&output.stdout).ok()?;
+        let Core { used, limit, reset } = sample.resources.core;
+        Some(format!(
+            "GitHub REST core: {used}/{limit} used (reset {reset})"
+        ))
     }
 
     fn tag_exists(&self, repo: &GithubRepo, tag: &TagName) -> Result<bool, ForgeError> {

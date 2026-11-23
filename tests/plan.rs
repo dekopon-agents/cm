@@ -1847,7 +1847,8 @@ fn sync_reuses_validated_pull_and_pending_check_pages_until_a_full_read_is_due()
     open_pr(&host, &c, target, pr);
 
     let gh = support::FakeGh::with_http(
-        r#"printf '%s\n' "$*" >>"$FAKE_GH/args"
+        r#"if [ "$2" = rate_limit ]; then exit 1; fi
+printf '%s\n' "$*" >>"$FAKE_GH/args"
 [ "$1" = api ] && [ "$3" = --include ] || exit 90
 mode=$(cat "$FAKE_GH/mode")
 case "$2" in
@@ -2043,6 +2044,101 @@ fi
         assert!(resumed.ok(), "{:?}", resumed.violations);
         assert!(pulls().is_empty(), "the closed PR returned to pulls.json");
     });
+}
+
+#[test]
+#[cfg(unix)]
+fn quota_sampling_records_core_usage_and_leaves_events_successful_when_unavailable() {
+    use std::time::{Duration, Instant};
+
+    let host = at("2026-10-17T08:00:00Z");
+    let step = "01-a/u/S1";
+    let stamp = "GitHub REST core: 17/5000 used (reset 1792227600)";
+    let gh = support::FakeGh::new(
+        r#"printf '%s\n' "$*" >>"$FAKE_GH/args"
+[ "$#" = 2 ] && [ "$1" = api ] && [ "$2" = rate_limit ] || exit 90
+case "$(cat "$FAKE_GH/mode")" in
+valid)
+    echo '{"rate":{"used":99,"limit":60,"reset":0},"resources":{"core":{"used":17,"limit":5000,"reset":1792227600}}}' ;;
+absent)
+    exit 1 ;;
+malformed)
+    echo '{"resources":{"core":{"used":"seventeen","limit":5000,"reset":1792227600}}}' ;;
+slow)
+    sleep 9 &
+    exit 0 ;;
+esac
+"#,
+    );
+    let args_path = gh.fixture().join("args");
+    for mode in ["valid", "absent", "malformed", "slow"] {
+        let c = campaign(&host);
+        assert!(declare(&host, &c, step, Lane::ClaudeCloud, &[]).ok());
+        kickoff(&c, step);
+        fs::write(gh.fixture().join("mode"), mode).unwrap();
+        fs::write(&args_path, "").unwrap();
+        let cm = |args: &[&str]| {
+            let start = Instant::now();
+            let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+                .arg("-C")
+                .arg(&c.root)
+                .args(args)
+                .env("PATH", gh.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?} ({mode}): {output:?}");
+            if mode == "slow" {
+                assert!(
+                    (Duration::from_secs(4)..Duration::from_secs(8)).contains(&start.elapsed()),
+                    "{args:?} spent {:?} waiting for the quota sample",
+                    start.elapsed()
+                );
+            }
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let launch = cm(&["launch", step, "--coordinator", "session_quota_fixture"]);
+        let launched = store::load_unit(&c.root.join("01-a/u")).unwrap();
+        let claim = &launched.steps["S1"].attempt.as_ref().unwrap().claim;
+        let end = cm(&["attempt", step, "--claim", claim, "end", "complete"]);
+        cm(&["sync"]);
+
+        let ended = store::load_unit(&c.root.join("01-a/u")).unwrap();
+        let outcome = ended.steps["S1"]
+            .attempt
+            .as_ref()
+            .unwrap()
+            .ended
+            .as_ref()
+            .unwrap()
+            .outcome;
+        assert_eq!(outcome, cm::state::AttemptOutcome::Complete);
+
+        let expected = usize::from(mode == "valid");
+        for report in [&launch, &end] {
+            assert_eq!(
+                report.lines().filter(|line| *line == stamp).count(),
+                expected
+            );
+        }
+        let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+        let journal_stamp = format!("- {stamp}");
+        assert_eq!(
+            journal
+                .lines()
+                .filter(|line| *line == journal_stamp)
+                .count(),
+            2 * expected
+        );
+        let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+        assert_eq!(
+            card.lines().nth(1),
+            Some(if mode == "valid" { stamp } else { "" })
+        );
+        assert_eq!(
+            fs::read_to_string(&args_path).unwrap(),
+            "api rate_limit\napi rate_limit\napi rate_limit\n"
+        );
+    }
 }
 
 #[test]

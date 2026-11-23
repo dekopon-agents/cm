@@ -121,6 +121,10 @@ pub fn attempt(
         target.unit,
         target.step.as_deref().unwrap_or_default()
     );
+    let rate_limit = match act {
+        Act::End { .. } => host.github_rate_limit(),
+        _ => None,
+    };
     let _lock = lock(root)?;
     let campaign = store::load_campaign(root)?;
     let mut violations = Vec::new();
@@ -361,13 +365,16 @@ pub fn attempt(
             step.attempt = Some(attempt.clone());
         }
         write_unit(&dir, &unit)?;
-        let body = format!(
+        let mut body = format!(
             "- generation: {}\n- evidence: {}\n",
             attempt.generation,
             evidence
                 .as_ref()
                 .map_or("—".to_owned(), ToString::to_string)
         );
+        if let Some(line) = &rate_limit {
+            body.push_str(&format!("- {line}\n"));
+        }
         let heading = journal::heading(&at, &format!("attempt {full}: {title}"));
         journal::append(
             root,
@@ -388,6 +395,9 @@ pub fn attempt(
     }
     let (code, next) = plan(&attempt, now);
     outcome.line(format!("{}: claim {}; {next}", attempt.id, attempt.claim));
+    if let Some(line) = rate_limit {
+        outcome.line(line);
+    }
     outcome.field("claim", attempt.claim.clone());
     outcome.field("target", full);
     outcome.field("plan", code);
