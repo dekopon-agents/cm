@@ -4,16 +4,21 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::json;
 
-use crate::commands::{closed, write_unit};
+use crate::attempt::{recorded_id, remote_turn};
+use crate::commands::{check_release_pr, closed, is_pr_url, write_unit};
 use crate::forge::{
-    CheckState, CommitSha, Forge, ForgeError, GithubRepo, Pull, PullState, TagName, ci_green,
+    CheckState, CommitSha, Forge, ForgeError, GithubRepo, Pull, PullState, TURN_READER_TIMEOUT,
+    TagName, TurnRead, ci_green, read_remote_turn,
 };
 use crate::host::{Host, stamp};
 use crate::journal;
+use crate::limits::TurnCommands;
 use crate::outcome::{Outcome, Violation};
 use crate::plan::{self, Units};
 use crate::render;
-use crate::state::{Evidence, Lane, Move, Phase, Release, Step, Track, Version, Work};
+use crate::state::{
+    Evidence, Lane, Move, ObservedTurn, Phase, Release, Step, Track, Version, Work,
+};
 use crate::store::{self, lock, parse_target, write_atomic};
 
 pub const CARD: &str = "CARD.md";
@@ -26,6 +31,7 @@ pub struct Moved {
 }
 
 type Read<T> = Result<T, ForgeError>;
+type TurnQuery = (String, String, String, Vec<String>);
 
 const PULL_MAX_AGE: jiff::SignedDuration = jiff::SignedDuration::from_mins(30);
 
@@ -44,6 +50,8 @@ struct OpenChecks {
 
 #[derive(Default)]
 struct Reads {
+    branch_pulls: BTreeMap<(String, GithubRepo, String), Read<Option<String>>>,
+    turns: BTreeMap<TurnQuery, Result<TurnRead, String>>,
     pulls: BTreeMap<String, Read<PullRead>>,
     open_checks: BTreeMap<(GithubRepo, CommitSha), Read<OpenChecks>>,
     tags: BTreeMap<(GithubRepo, TagName), Read<bool>>,
@@ -55,11 +63,11 @@ struct Reads {
 }
 
 fn cached<K: Ord, T: Clone>(
-    cache: &mut BTreeMap<K, Read<T>>,
+    cache: &mut BTreeMap<K, T>,
     key: K,
     forge: Option<&dyn Forge>,
-    read: impl FnOnce(&dyn Forge) -> Read<T>,
-) -> Option<Read<T>> {
+    read: impl FnOnce(&dyn Forge) -> T,
+) -> Option<T> {
     if let Some(hit) = cache.get(&key) {
         return Some(hit.clone());
     }
@@ -90,6 +98,9 @@ struct Run<'a> {
     heads: BTreeMap<String, String>,
     notes: Vec<(String, String)>,
     owner_unread: Vec<String>,
+    discovery_warnings: Vec<String>,
+    turn_commands: TurnCommands,
+    turn_warnings: Vec<String>,
 }
 
 struct Tracked {
@@ -123,6 +134,8 @@ impl<'a> Run<'a> {
         units: Units,
         owner_unread: Vec<String>,
     ) -> Self {
+        let turn_commands = TurnCommands::read(root);
+        let turn_warnings = turn_commands.errors().cloned().collect();
         Run {
             root,
             forge,
@@ -138,10 +151,15 @@ impl<'a> Run<'a> {
             heads: BTreeMap::new(),
             notes: Vec::new(),
             owner_unread,
+            discovery_warnings: Vec::new(),
+            turn_commands,
+            turn_warnings,
         }
     }
 
     fn walk(&mut self) {
+        self.observe_turns();
+        self.discover_pulls();
         self.merges();
         self.tags();
         self.released();
@@ -379,9 +397,9 @@ impl<'a> Run<'a> {
         self.dirty.insert(unit_name.to_owned());
     }
 
-    fn pull(&mut self, url: &str, target: &str) -> Option<Read<PullRead>> {
+    fn pull(&mut self, url: &str, target: Option<&str>) -> Option<Read<PullRead>> {
         let previous = self.seen.get(url).filter(|seen| {
-            seen.target == target
+            Some(seen.target.as_str()) == target
                 && seen.at.parse::<jiff::Timestamp>().is_ok_and(|at| {
                     (jiff::SignedDuration::ZERO..PULL_MAX_AGE)
                         .contains(&self.now.duration_since(at))
@@ -404,6 +422,7 @@ impl<'a> Run<'a> {
                 merge_commit: None,
                 merged_at: None,
                 head: seen.head.as_ref().map(CommitSha::new),
+                head_ref: None,
                 base: seen.base.as_ref().map(CommitSha::new),
                 mergeable_state: seen.mergeable_state.clone(),
             };
@@ -569,13 +588,202 @@ impl<'a> Run<'a> {
         gaps.is_empty().then_some(used)
     }
 
+    fn observe_turns(&mut self) {
+        for (target, step) in self.steps_at(&Phase::Launched) {
+            let Some(attempt) = step
+                .attempt
+                .as_ref()
+                .filter(|attempt| attempt.ended.is_none())
+            else {
+                continue;
+            };
+            let Some(lane) = attempt.lane.or(step.lane) else {
+                continue;
+            };
+            let Some(programs) = self.turn_commands.for_lane(lane) else {
+                continue;
+            };
+            let Some(turn) = remote_turn(attempt, lane) else {
+                continue;
+            };
+            let ended = turn
+                .observation(attempt)
+                .filter(|read| read.completed_at.is_some());
+            let argv = programs.reader.argv(turn.thread, turn.turn);
+            let key = (
+                attempt.id.clone(),
+                turn.thread.to_owned(),
+                turn.turn.to_owned(),
+                argv.clone(),
+            );
+            let observed = match cached(&mut self.reads.turns, key, self.forge, |_| {
+                read_remote_turn(&argv, turn.thread, turn.turn, TURN_READER_TIMEOUT)
+            }) {
+                Some(Ok(read)) if read.done => {
+                    let completed_at = read
+                        .completed_at
+                        .filter(|at| plan::instant(at).is_some())
+                        .or_else(|| ended.and_then(|read| read.completed_at.clone()))
+                        .or_else(|| Some(self.at.clone()));
+                    Some(ObservedTurn {
+                        thread: turn.thread.to_owned(),
+                        turn: turn.turn.to_owned(),
+                        completed_at,
+                        pr_url: read
+                            .pr_url
+                            .or_else(|| ended.and_then(|read| read.pr_url.clone())),
+                    })
+                }
+                Some(Ok(_)) => ended.cloned(),
+                Some(Err(error)) => {
+                    self.turn_warnings.push(format!("{target}: {error}"));
+                    ended.cloned()
+                }
+                // A new record or configuration observed under lock has no read to apply.
+                None => continue,
+            };
+            if observed != attempt.observed_turn {
+                let (unit, name) = plan::split(&target).expect("step target has a unit and name");
+                let attempt = self
+                    .units
+                    .get_mut(unit)
+                    .expect("scanned unit")
+                    .steps
+                    .get_mut(name)
+                    .expect("scanned step")
+                    .attempt
+                    .as_mut()
+                    .expect("scanned attempt");
+                attempt.observed_turn = observed;
+                self.dirty.insert(unit.to_owned());
+            }
+        }
+    }
+
+    fn discover_pulls(&mut self) {
+        for (target, step) in self.steps_at(&Phase::Launched) {
+            let release = Release::of_target(&target);
+            // A recorded branch or returned URL belongs to the attempt, with no part identity.
+            if !step.parts.is_empty() || (release.is_some() && !self.owner_unread.is_empty()) {
+                continue;
+            }
+            let Some(attempt) = &step.attempt else {
+                continue;
+            };
+            let Some(lane @ (Lane::Codex | Lane::ClaudeCloud)) = attempt.lane.or(step.lane) else {
+                continue;
+            };
+            let kickoff = std::fs::read_to_string(self.root.join(&target).join("kickoff.md")).ok();
+            let kickoff_repo = kickoff.as_deref().and_then(|text| {
+                text.lines()
+                    .take_while(|line| !line.starts_with('#'))
+                    .find_map(|line| line.strip_prefix("repo:"))
+                    .and_then(|repo| repo.trim().parse::<GithubRepo>().ok())
+            });
+            let declared = step.github.clone().or(kickoff_repo);
+            let repo = declared
+                .clone()
+                .or_else(|| recorded_id(attempt, "repo")?.parse().ok());
+            let Some(repo) = repo else {
+                continue;
+            };
+            if step
+                .track
+                .check(&Phase::PrOpen, step.finish(release.is_some()))
+                .is_err()
+                || release.as_ref().is_some_and(|release| {
+                    check_release_pr(&target, &step, release, &repo).is_some()
+                })
+            {
+                continue;
+            }
+            let recorded_branch = recorded_id(attempt, "branch");
+            if let Some(branch) = recorded_branch.filter(|branch| !branch.starts_with('-')) {
+                // Replay requires the same attempt and launch metadata that the read used.
+                let key = (attempt.id.clone(), repo.clone(), branch.to_owned());
+                match cached(&mut self.reads.branch_pulls, key, self.forge, |forge| {
+                    forge.open_pull_for_branch(&repo, branch)
+                }) {
+                    Some(Ok(Some(url))) if self.discover_pr(&target, &repo, &url, None) => continue,
+                    Some(Err(error)) => self.discovery_warnings.push(format!(
+                        "{target}: could not look up {repo} branch {branch}: {error}"
+                    )),
+                    Some(Ok(_)) | None => {}
+                }
+            }
+            if let Some(declared) = declared
+                && self.turn_commands.for_lane(lane).is_some()
+                && let Some(url) = remote_turn(attempt, lane)
+                    .and_then(|turn| turn.observation(attempt))
+                    .filter(|read| read.completed_at.is_some())
+                    .and_then(|read| read.pr_url.as_deref())
+            {
+                self.discover_pr(&target, &declared, url, recorded_branch);
+            }
+        }
+    }
+
+    fn discover_pr(
+        &mut self,
+        target: &str,
+        repo: &GithubRepo,
+        url: &str,
+        recorded_branch: Option<&str>,
+    ) -> bool {
+        if !is_pr_url(url)
+            || !GithubRepo::of_pr(url)
+                .is_some_and(|pr_repo| pr_repo.to_string().eq_ignore_ascii_case(&repo.to_string()))
+        {
+            self.discovery_warnings
+                .push(format!("{target}: invalid PR URL for {repo}: {url}"));
+            return false;
+        }
+        // Fetch a full observation for a newly discovered PR, including its head branch.
+        match self.pull(url, None) {
+            Some(Ok(read)) if read.pull.state == PullState::Open => {
+                if let Some(branch) = recorded_branch
+                    && read.pull.head_ref.as_deref() != Some(branch)
+                {
+                    let actual = read.pull.head_ref.as_deref().unwrap_or("unreported");
+                    self.discovery_warnings.push(format!(
+                        "{target}: {url} head branch {actual} does not match recorded branch {branch}"
+                    ));
+                    return false;
+                }
+                let head = read.pull.head.filter(|head| {
+                    head.as_str().len() == 40 && crate::state::is_commit(head.as_str())
+                });
+                if let Some(sha) = head {
+                    self.advance(
+                        target,
+                        None,
+                        Phase::PrOpen,
+                        Evidence {
+                            pr: Some(url.to_owned()),
+                            sha: Some(sha.to_string()),
+                            ..Evidence::default()
+                        },
+                    );
+                    return true;
+                }
+                self.discovery_warnings
+                    .push(format!("{target}: {url} has no valid head commit"));
+            }
+            Some(Err(error)) => self
+                .discovery_warnings
+                .push(format!("{target}: {url}: {error}")),
+            Some(Ok(_)) | None => {}
+        }
+        false
+    }
+
     fn merges(&mut self) {
         for tracked in self.tracks_at(&Phase::PrOpen) {
             let target = tracked.name();
             let Some(url) = tracked.track.evidence.pr.clone() else {
                 continue;
             };
-            let Some(read) = self.pull(&url, &target) else {
+            let Some(read) = self.pull(&url, Some(&target)) else {
                 continue;
             };
             let PullRead {
@@ -1056,6 +1264,18 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
     store::write_json(&plan::pulls_path(root), &open)?;
     let mut outcome = Outcome::refused(std::mem::take(&mut run.violations));
     crate::ledger::owner_queue_banner(root, &mut outcome)?;
+    if !run.turn_warnings.is_empty() {
+        for warning in &run.turn_warnings {
+            outcome.line(format!("remote turn: {warning}"));
+        }
+        outcome.field("turn_reader_warnings", json!(run.turn_warnings));
+    }
+    if !run.discovery_warnings.is_empty() {
+        for warning in &run.discovery_warnings {
+            outcome.line(format!("PR discovery: {warning}"));
+        }
+        outcome.field("pr_discovery_warnings", json!(run.discovery_warnings));
+    }
     let marker_path = root.join(store::CM_DIR).join("unblock-notified.json");
     let mut notified: BTreeSet<String> = if marker_path.exists() {
         store::read_json(&marker_path)?
@@ -1132,21 +1352,18 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
             moved.evidence.summary()
         ));
     }
-    let limit = plan::stall_hours(root);
-    let stalled = plan::stalls(&run.units, host.now(), limit);
+    let inputs = plan::ActionInputs::read(root, now);
+    let stalled = plan::stalls(&run.units, &inputs);
     let dirty = plan::dirty(root, &run.units);
     for stall in &stalled {
-        outcome.line(plan::stall_line(stall, limit));
+        outcome.line(plan::stall_line(stall));
     }
     for (url, observed) in &dirty {
         outcome.line(plan::dirty_line(url, observed));
     }
     outcome.field(
         "stalled",
-        stalled
-            .iter()
-            .map(|stall| plan::stall_json(stall, limit))
-            .collect::<Vec<_>>(),
+        stalled.iter().map(plan::stall_json).collect::<Vec<_>>(),
     );
     outcome.field(
         "dirty",

@@ -19,6 +19,7 @@ pub enum ForgeError {
     Http(u16),
     Curl(Box<ForgeError>),
     Url,
+    AmbiguousPull,
 }
 
 impl ForgeError {
@@ -33,11 +34,9 @@ impl ForgeError {
                 write!(f, "{program} exited {code}; check access with {program}")
             }
             ForgeError::Exit(None) => write!(f, "{program} exited by signal"),
-            ForgeError::Timeout(after) => write!(
-                f,
-                "{program} did not answer within {}s; killed it",
-                after.as_secs()
-            ),
+            ForgeError::Timeout(after) => {
+                write!(f, "{program} did not answer within {}s", after.as_secs())
+            }
             ForgeError::Json => write!(f, "{program} returned JSON cm cannot read"),
             ForgeError::UnsupportedFormula => {
                 f.write_str("tap formula uses unsupported or invalid publication content")
@@ -45,6 +44,7 @@ impl ForgeError {
             ForgeError::ManifestDigest => {
                 f.write_str("image manifest response is missing docker-content-digest")
             }
+            ForgeError::AmbiguousPull => f.write_str("multiple open PRs for the recorded branch"),
             ForgeError::Url => f.write_str("not a https://github.com/<owner>/<repo>/pull/<n> URL"),
         }
     }
@@ -246,6 +246,8 @@ pub struct Pull {
     pub merged_at: Option<String>,
     /// The PR's head commit, as GitHub reports it.
     pub head: Option<CommitSha>,
+    /// The PR's head branch, when GitHub reports it.
+    pub head_ref: Option<String>,
     /// The base branch's tip, as GitHub reports it.
     pub base: Option<CommitSha>,
     /// GitHub's `mergeable_state` (`clean`, `dirty`, `blocked`, `unknown`, …), lower case.
@@ -375,6 +377,15 @@ pub fn ci_green(checks: &[CheckState]) -> bool {
 
 pub trait Forge {
     fn pull(&self, url: &str) -> Result<Pull, ForgeError>;
+
+    /// The sole open PR for a branch owned by this repository, if present.
+    fn open_pull_for_branch(
+        &self,
+        _repo: &GithubRepo,
+        _branch: &str,
+    ) -> Result<Option<String>, ForgeError> {
+        Ok(None)
+    }
 
     /// Read a pull and save its validator. A 304 returns no new pull.
     fn pull_conditional(
@@ -803,6 +814,46 @@ fn run(
     })
 }
 
+#[derive(Clone, Deserialize)]
+pub(crate) struct TurnRead {
+    pub done: bool,
+    successful: bool,
+    turn_status: String,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    pub completed_at: Option<String>,
+    pub pr_url: Option<String>,
+}
+
+pub(crate) const TURN_READER_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub(crate) fn read_remote_turn(
+    argv: &[String],
+    thread: &str,
+    turn: &str,
+    timeout: Duration,
+) -> Result<TurnRead, String> {
+    let read = || {
+        let (program, args) = argv.split_first().ok_or(ForgeError::Spawn)?;
+        let args: Vec<_> = args.iter().map(String::as_str).collect();
+        let output = run(Path::new(program), &args, timeout, None)?;
+        if !output.status.success() {
+            return Err(ForgeError::Exit(output.status.code()));
+        }
+        let status: TurnRead =
+            serde_json::from_slice(&output.stdout).map_err(|_| ForgeError::Json)?;
+        if status.turn_status.trim().is_empty()
+            || (status.successful && !status.done)
+            || status.thread_id.as_deref().is_some_and(|id| id != thread)
+            || status.turn_id.as_deref().is_some_and(|id| id != turn)
+        {
+            return Err(ForgeError::Json);
+        }
+        Ok(status)
+    };
+    read().map_err(|error| fmt::from_fn(|f| error.fmt_program("turn reader", f)).to_string())
+}
+
 fn crate_read(
     status: u16,
     body: &str,
@@ -1021,6 +1072,8 @@ impl Gh {
         #[derive(Deserialize)]
         struct Head {
             sha: String,
+            #[serde(rename = "ref")]
+            name: Option<String>,
         }
         let path = url
             .strip_prefix("https://github.com/")
@@ -1053,6 +1106,7 @@ impl Gh {
                 .filter(|_| state == PullState::Merged)
                 .map(CommitSha::new),
             merged_at: rest.merged_at.filter(|_| state == PullState::Merged),
+            head_ref: rest.head.as_ref().and_then(|head| head.name.clone()),
             head: rest.head.map(|head| CommitSha::new(head.sha)),
             base: rest.base.map(|base| CommitSha::new(base.sha)),
             mergeable_state: rest
@@ -1063,6 +1117,35 @@ impl Gh {
 }
 
 impl Forge for Gh {
+    fn open_pull_for_branch(
+        &self,
+        repo: &GithubRepo,
+        branch: &str,
+    ) -> Result<Option<String>, ForgeError> {
+        #[derive(Deserialize)]
+        struct Entry {
+            html_url: String,
+        }
+        // Two rows are sufficient to tell an unambiguous PR from multiple open PRs.
+        let pulls: Vec<Entry> = self.json(&[
+            "api",
+            "--method",
+            "GET",
+            &format!("repos/{repo}/pulls"),
+            "-f",
+            "state=open",
+            "-f",
+            &format!("head={}:{branch}", repo.owner),
+            "-f",
+            "per_page=2",
+        ])?;
+        match pulls.as_slice() {
+            [] => Ok(None),
+            [pull] => Ok(Some(pull.html_url.clone())),
+            _ => Err(ForgeError::AmbiguousPull),
+        }
+    }
+
     fn pull(&self, url: &str) -> Result<Pull, ForgeError> {
         self.read_pull(url, None)?.ok_or(ForgeError::Json)
     }
@@ -1328,6 +1411,24 @@ impl Forge for Gh {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_times_out_after_its_successful_parent_exits_with_stdout_held_open() {
+        let argv = [
+            "sh",
+            "-c",
+            r#"printf '%s\n' '{"done":true,"successful":true,"turn_status":"completed"}'; sleep 3 & exit 0"#,
+        ].map(str::to_owned);
+        let timeout = Duration::from_millis(250);
+        let start = Instant::now();
+        let result = read_remote_turn(&argv, "thread", "turn", timeout);
+        assert!((timeout..Duration::from_secs(2)).contains(&start.elapsed()));
+        let error = result
+            .err()
+            .expect("held stdout must time out even after valid JSON");
+        assert!(error.starts_with("turn reader did not answer"), "{error}");
+    }
 
     #[test]
     fn repos_and_tags_refuse_noise() {

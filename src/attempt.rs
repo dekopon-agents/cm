@@ -8,7 +8,7 @@ use crate::evidence::CampaignFile;
 use crate::host::{Host, stamp};
 use crate::journal;
 use crate::outcome::{Outcome, Violation};
-use crate::state::{Attempt, AttemptOutcome, Ended, External, Lane};
+use crate::state::{Attempt, AttemptOutcome, Ended, External, Lane, ObservedTurn};
 use crate::store::{self, Target, is_name, lock};
 
 #[derive(Debug, Clone)]
@@ -35,6 +35,76 @@ pub enum Act {
     },
 }
 
+pub(crate) fn coordinator_label(given: &Option<String>) -> Option<String> {
+    given.clone().or_else(|| {
+        let value = std::env::var("CLAUDE_CODE_REMOTE_SESSION_ID").ok()?;
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(match value.strip_prefix("cse_") {
+                Some(id) => format!("session_{id}"),
+                None => value.to_owned(),
+            })
+        }
+    })
+}
+
+fn launch_metadata(kind: &str) -> bool {
+    matches!(kind, "branch" | "repo")
+}
+
+/// Read launch metadata from this attempt only. A newer unfinished record must not revive
+/// an older value of the same kind.
+pub(crate) fn recorded_id<'a>(attempt: &'a Attempt, kind: &str) -> Option<&'a str> {
+    attempt
+        .actions
+        .iter()
+        .rev()
+        .find(|action| action.kind == kind)?
+        .id
+        .as_deref()
+}
+
+pub(crate) struct RemoteTurn<'a> {
+    pub thread: &'a str,
+    pub turn: &'a str,
+}
+
+impl RemoteTurn<'_> {
+    pub(crate) fn observation<'a>(&self, attempt: &'a Attempt) -> Option<&'a ObservedTurn> {
+        attempt
+            .observed_turn
+            .as_ref()
+            .filter(|read| read.thread == self.thread && read.turn == self.turn)
+    }
+}
+
+/// An in-flight registration of a newer thread or turn supersedes an earlier observation.
+fn turn_actions(attempt: &Attempt, lane: Lane) -> Option<(&External, Option<&External>)> {
+    let mut actions = attempt.actions.iter().rev();
+    let is_thread =
+        |kind: &str| kind == "thread" || (lane == Lane::ClaudeCloud && kind == "session");
+    let turn = actions.find(|action| action.kind == "turn" || is_thread(&action.kind))?;
+    if turn.kind != "turn" {
+        return None;
+    }
+    let thread = actions.find(|action| is_thread(&action.kind));
+    Some((turn, thread))
+}
+
+pub(crate) fn turn_began(attempt: &Attempt, lane: Lane) -> Option<&str> {
+    turn_actions(attempt, lane).map(|(turn, _)| turn.began.as_str())
+}
+
+pub(crate) fn remote_turn(attempt: &Attempt, lane: Lane) -> Option<RemoteTurn<'_>> {
+    let (turn, thread) = turn_actions(attempt, lane)?;
+    Some(RemoteTurn {
+        thread: thread?.id.as_deref()?,
+        turn: turn.id.as_deref()?,
+    })
+}
+
 pub(crate) fn check_coordinator(full: &str, coordinator: &str) -> Option<Violation> {
     (coordinator.trim().is_empty() || coordinator.contains(['\n', '\r']))
         .then(|| Violation::new(full, "attempt-claim", "--coordinator is one non-empty line"))
@@ -51,11 +121,10 @@ fn expired(attempt: &Attempt, now: Timestamp) -> bool {
 
 /// What a coordinator holding only the committed state does next, as `(code, instruction)`.
 pub fn plan(attempt: &Attempt, now: Timestamp) -> (&'static str, String) {
-    let last = attempt.actions.last();
     if let Some(ended) = &attempt.ended {
         return ("ended", format!("ended {} at {}", ended.outcome, ended.at));
     }
-    if let Some(action) = last.filter(|action| action.id.is_none()) {
+    if let Some(action) = attempt.actions.last().filter(|action| action.id.is_none()) {
         return (
             "unknown",
             format!(
@@ -69,6 +138,7 @@ pub fn plan(attempt: &Attempt, now: Timestamp) -> (&'static str, String) {
             .actions
             .iter()
             .rev()
+            .filter(|action| !launch_metadata(&action.kind))
             .filter_map(|action| {
                 action.id.as_ref().map(|id| {
                     if action.kind == "cancel" {
@@ -92,7 +162,12 @@ pub fn plan(attempt: &Attempt, now: Timestamp) -> (&'static str, String) {
             ),
         );
     }
-    match last {
+    match attempt
+        .actions
+        .iter()
+        .rev()
+        .find(|action| !launch_metadata(&action.kind))
+    {
         None => (
             "dispatch",
             "nothing reached the runtime: `cm attempt <step> begin <kind>`, then dispatch"
@@ -343,6 +418,7 @@ pub fn attempt(
             attempt.id = format!("{full}#{}", step.launches);
             attempt.lane = Some(*lane);
             attempt.actions.clear();
+            attempt.observed_turn = None;
             attempt.ended = None;
         }
         Act::Claim { coordinator, .. } => {

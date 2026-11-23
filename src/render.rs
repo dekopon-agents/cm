@@ -395,6 +395,9 @@ pub(crate) fn card_with_rate_limit(
     out.push_str(&format!(
         "\n# {name} card\n\nRendered by `cm sync` from cm state after reading GitHub; the next sync overwrites it.\n\n"
     ));
+    let (count, oldest) = crate::plan::action_summary(root, units, now);
+    let oldest = oldest.as_deref().unwrap_or("—");
+    out.push_str(&format!("Actionable: {count} (oldest: {oldest})\n\n"));
     if next.paused {
         out.push_str("**Paused:** LIMITS.toml has `paused = true`; nothing launches.\n\n");
     }

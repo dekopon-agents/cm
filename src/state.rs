@@ -1036,7 +1036,20 @@ pub struct Attempt {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<External>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) observed_turn: Option<ObservedTurn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended: Option<Ended>,
+}
+
+/// A status sync observed for the turn identified by the current attempt's records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ObservedTurn {
+    pub thread: String,
+    pub turn: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
 }
 
 /// One external action: `began` is written before the call, `id` once it returns.

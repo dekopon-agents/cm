@@ -177,6 +177,12 @@ fn next_and_card_number_actions_with_the_same_commands() {
             0,
             "cm watch 01-a/u/WATCH resolve 1 --evidence '<watch-evidence-file>'",
         ),
+        ("actionable", 0, "cm brief 01-a/u/DIRTY"),
+        (
+            "actionable",
+            1,
+            "cm amend 01-a/u/NO-KICKOFF --kickoff-file '<kickoff-file>'",
+        ),
     ];
     let text = output(false);
     let numbered: Vec<_> = text
@@ -1212,6 +1218,7 @@ fn merged(sha: &str) -> Pull {
         merge_commit: Some(CommitSha::new(sha)),
         merged_at: None,
         head: None,
+        head_ref: None,
         base: None,
         mergeable_state: None,
     }
@@ -1270,6 +1277,7 @@ fn sync_moves_steps_from_github_state_and_renders_the_card() {
             merge_commit: None,
             merged_at: None,
             head: None,
+            head_ref: None,
             base: None,
             mergeable_state: None,
         },
@@ -2996,6 +3004,7 @@ fn open(head: &str) -> Pull {
         merge_commit: None,
         merged_at: None,
         head: Some(CommitSha::new(head)),
+        head_ref: None,
         base: None,
         mergeable_state: None,
     }
@@ -5029,4 +5038,825 @@ fn adding_parts_to_a_blocked_step_preserves_the_review_wait_start() {
         unit.steps["DIRTY"].track.blocked_from,
         Some(Phase::Launched)
     );
+}
+
+fn launch_for(host: &Fake, c: &Campaign, step: &str, coordinator: &str) -> String {
+    kickoff(c, step);
+    let outcome = commands::launch_remote(
+        host,
+        &c.root,
+        &parse_target(step, true).unwrap(),
+        None,
+        &commands::Remote {
+            coordinator: Some(coordinator.to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(outcome.ok(), "{:?}", outcome.violations);
+    outcome.fields["attempt"]["claim"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+fn attempt_action(
+    host: &Fake,
+    c: &Campaign,
+    step: &str,
+    claim: Option<&str>,
+    act: cm::attempt::Act,
+) {
+    let outcome = cm::attempt::attempt(
+        host,
+        &c.root,
+        &parse_target(step, true).unwrap(),
+        claim,
+        &act,
+    )
+    .unwrap();
+    assert!(outcome.ok(), "{:?}", outcome.violations);
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_opens_only_launched_steps_with_an_open_pr_for_their_recorded_branch() {
+    use cm::attempt::Act;
+
+    const HEAD: &str = "89abcdef0123456789abcdef0123456789abcdef";
+    const OPEN: &str = "01-a/u/open";
+    const MISSING: &str = "01-a/u/missing";
+    const NO_BRANCH: &str = "01-a/u/legacy";
+    const INVALID: &str = "01-a/u/invalid";
+    const MULTIPART: &str = "01-a/u/multipart";
+    const PR: &str = "https://github.com/o/r/pull/7";
+    let host = at("2026-11-22T18:00:00Z");
+    let c = campaign(&host);
+    for (step, lane, branch) in [
+        (OPEN, Lane::Codex, Some("work/open")),
+        (MISSING, Lane::ClaudeCloud, Some("work/missing")),
+        (NO_BRANCH, Lane::Codex, None),
+        (INVALID, Lane::ClaudeCloud, Some("work/invalid")),
+        (MULTIPART, Lane::Codex, Some("work/open")),
+    ] {
+        let parts = if step == MULTIPART {
+            vec!["one".into(), "two".into()]
+        } else {
+            Vec::new()
+        };
+        let declared = commands::declare(
+            &host,
+            &c.root.join(step),
+            &Declaration {
+                lane: Some(lane),
+                parts,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(declared.ok(), "{:?}", declared.violations);
+        let claim = launch_for(&host, &c, step, "session_current");
+        for (kind, id) in [("repo", Some("o/r")), ("branch", branch)] {
+            if let Some(id) = id {
+                attempt_action(
+                    &host,
+                    &c,
+                    step,
+                    Some(&claim),
+                    Act::Begin { kind: kind.into() },
+                );
+                attempt_action(
+                    &host,
+                    &c,
+                    step,
+                    Some(&claim),
+                    Act::Record {
+                        kind: kind.into(),
+                        id: id.into(),
+                    },
+                );
+            }
+        }
+    }
+    let gh = support::FakeGh::new(&format!(
+        r#"
+case "$*" in
+    'api --method GET repos/o/r/pulls -f state=open -f head=o:work/open -f per_page=2')
+        echo '[{{"html_url":"{PR}"}}]' ;;
+    'api --method GET repos/o/r/pulls -f state=open -f head=o:work/missing -f per_page=2')
+        echo '[]' ;;
+    'api --method GET repos/o/r/pulls -f state=open -f head=o:work/invalid -f per_page=2')
+        echo '[{{"html_url":"https://github.com/o/r/pull/8"}}]' ;;
+    'api repos/o/r/pulls/7 --include')
+        echo '{{"state":"open","merged":false,"merge_commit_sha":null,"head":{{"sha":"{HEAD}"}}}}' ;;
+    'api repos/o/r/pulls/8 --include')
+        echo '{{"state":"open","merged":false,"merge_commit_sha":null,"head":{{"sha":"abcdefg"}}}}' ;;
+    *) echo "$*" >&2; exit 1 ;;
+esac
+"#
+    ));
+    let synced = sync(
+        &host,
+        &Gh {
+            program: gh.program(),
+            timeout: std::time::Duration::from_secs(5),
+        },
+        &c.root,
+    )
+    .unwrap();
+    assert!(synced.ok(), "{:?}", synced.violations);
+    assert_eq!(synced.fields["moves"].as_array().unwrap().len(), 1);
+    assert_eq!(synced.fields["moves"][0]["to"], "pr-open");
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    let opened = &unit.steps["open"].track;
+    assert_eq!(opened.state, Phase::PrOpen);
+    assert_eq!(opened.evidence.pr.as_deref(), Some(PR));
+    assert_eq!(opened.evidence.sha.as_deref(), Some(HEAD));
+    for step in [MISSING, NO_BRANCH, INVALID, MULTIPART] {
+        assert_eq!(state(&c, step), Phase::Launched);
+    }
+    assert_eq!(
+        synced.fields["pr_discovery_warnings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+fn coordinator_cm(c: &Campaign, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cm"));
+    command
+        .arg("-C")
+        .arg(&c.root)
+        .args(args)
+        .env("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_current")
+        .env_remove("CM_CODEX_WEEKLY_PCT");
+    command
+}
+
+#[test]
+#[cfg(unix)]
+fn next_act_orders_coordinator_actions_and_matches_the_card_until_they_clear() {
+    use cm::attempt::Act;
+
+    const REVIEW: &str = "01-a/u/review";
+    const PACKET: &str = "01-a/u/packet";
+    const STALL: &str = "01-a/u/stalled";
+    const EARLIER: &str = "01-a/u/earlier";
+    const PR: &str = "https://github.com/o/r/pull/1";
+
+    let host = Fake {
+        now: Timestamp::now(),
+    };
+    let old = Fake {
+        now: host.now - jiff::SignedDuration::from_hours(3),
+    };
+    let c = campaign(&old);
+    assert!(declare(&host, &c, REVIEW, Lane::Pi, &[]).ok());
+    kickoff(&c, REVIEW);
+    open_pr(&host, &c, REVIEW, PR);
+    assert!(declare(&host, &c, PACKET, Lane::Codex, &["pr-open:review"]).ok());
+    assert!(declare(&old, &c, STALL, Lane::ClaudeCloud, &[]).ok());
+    let stall_claim = launch_for(&old, &c, STALL, "session_current");
+    assert!(declare(&host, &c, EARLIER, Lane::Codex, &[]).ok());
+    launch_for(&host, &c, EARLIER, "session_earlier");
+    for (step, after) in [
+        ("left", &["review"][..]),
+        ("right", &["review"]),
+        ("join", &["left", "right"]),
+        ("packet-dependent", &["packet"]),
+        ("packet-leaf", &["packet-dependent"]),
+        ("stall-dependent", &["stalled"]),
+    ] {
+        let step = format!("01-a/u/{step}");
+        assert!(declare(&host, &c, &step, Lane::Codex, after).ok());
+        if !step.ends_with("/join") {
+            kickoff(&c, &step);
+        }
+    }
+
+    let regular = coordinator_cm(&c, &["next", "--json"]).output().unwrap();
+    assert!(regular.status.success(), "{regular:?}");
+    let regular: serde_json::Value = serde_json::from_slice(&regular.stdout).unwrap();
+    let outcome = coordinator_cm(&c, &["next", "--act", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(outcome.status.code(), Some(1), "{outcome:?}");
+    let act: serde_json::Value = serde_json::from_slice(&outcome.stdout).unwrap();
+    assert_eq!(regular["actionable"], act["actionable"]);
+    let actions = act["actionable"].as_array().unwrap();
+    let order: Vec<_> = actions
+        .iter()
+        .map(|action| {
+            (
+                action["kind"].as_str().unwrap(),
+                action["waiting_count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [
+            ("pr-open-unreviewed", 3),
+            ("missing-kickoff", 2),
+            ("stalled-attempt", 1),
+            ("earlier-coordinator", 0),
+        ]
+    );
+
+    let text = coordinator_cm(&c, &["next", "--act"]).output().unwrap();
+    assert_eq!(text.status.code(), Some(1), "{text:?}");
+    let lines = String::from_utf8(text.stdout).unwrap();
+    assert_eq!(lines.lines().count(), actions.len());
+    for (line, action) in lines.lines().zip(actions) {
+        let kind = action["kind"].as_str().unwrap();
+        let target = action["target"].as_str().unwrap();
+        assert!(line.starts_with(&format!("{kind} {target}:")), "{line}");
+        assert!(line.contains(action["since"].as_str().unwrap()), "{line}");
+        assert!(
+            line.ends_with(&format!("`{}`", action["command"].as_str().unwrap())),
+            "{line}"
+        );
+    }
+
+    let units = plan::load_units(&c.root).unwrap();
+    let head = plan::track(&units, REVIEW)
+        .unwrap()
+        .evidence
+        .sha
+        .clone()
+        .unwrap();
+    let gh = support::FakeGh::new(&format!(
+        r#"case "$*" in
+    'api repos/o/r/pulls/1 --include')
+        echo '{{"state":"open","merged":false,"merge_commit_sha":null,"head":{{"sha":"{head}"}}}}' ;;
+    *) echo "$*" >&2; exit 1 ;;
+esac"#
+    ));
+    let sync_card = || {
+        let synced = coordinator_cm(&c, &["sync"])
+            .env("PATH", gh.path())
+            .output()
+            .unwrap();
+        assert!(synced.status.success(), "{synced:?}");
+        fs::read_to_string(c.root.join("CARD.md")).unwrap()
+    };
+    let card = sync_card();
+    assert_eq!(
+        card.lines().find(|line| line.starts_with("Actionable: ")),
+        Some(
+            format!(
+                "Actionable: {} (oldest: {})",
+                lines.lines().count(),
+                cm::host::stamp(old.now)
+            )
+            .as_str()
+        )
+    );
+
+    let deadline = (Timestamp::now() + jiff::SignedDuration::from_secs(1)).to_string();
+    let waited = coordinator_cm(
+        &c,
+        &[
+            "review",
+            "wait",
+            REVIEW,
+            "--head",
+            &head,
+            "--reviewer",
+            "astra",
+            "--deadline",
+            &deadline,
+        ],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(waited.status.code(), Some(3), "{waited:?}");
+    kickoff(&c, PACKET);
+    attempt_action(
+        &host,
+        &c,
+        STALL,
+        Some(&stall_claim),
+        Act::End {
+            outcome: cm::state::AttemptOutcome::Complete,
+            file: None,
+        },
+    );
+    attempt_action(
+        &host,
+        &c,
+        EARLIER,
+        None,
+        Act::Claim {
+            coordinator: "session_current".into(),
+            expect: 1,
+        },
+    );
+    let clear = coordinator_cm(&c, &["next", "--act"]).output().unwrap();
+    assert!(clear.status.success(), "{clear:?}");
+    assert!(clear.stdout.is_empty(), "{clear:?}");
+    assert!(
+        sync_card()
+            .lines()
+            .any(|line| line == "Actionable: 0 (oldest: —)")
+    );
+}
+
+#[test]
+fn attempt_stall_limits_default_to_two_hours_and_apply_to_the_configured_lane() {
+    let host = at("2026-11-22T16:00:00Z");
+    let late = at("2026-11-22T18:30:00Z");
+    let c = campaign(&host);
+    for (target, lane) in [
+        ("01-a/u/cloud", Lane::ClaudeCloud),
+        ("01-a/u/fable", Lane::Fable),
+    ] {
+        assert!(declare(&host, &c, target, lane, &[]).ok());
+        launch_for(&host, &c, target, "session_current");
+    }
+    let limits = c.root.join("LIMITS.toml");
+    let original = fs::read_to_string(&limits).unwrap();
+    let default = plan::next_at(&c.root, None, None, late.now).unwrap();
+    assert_eq!(default.fields["stalled"][0]["limit_hours"], 2.0);
+    assert_eq!(default.fields["stalled"][1]["limit_hours"], 2.0);
+
+    fs::write(
+        &limits,
+        format!("{original}\nclaude_cloud_stall_hours = 3\n"),
+    )
+    .unwrap();
+    let configured = plan::next_at(&c.root, None, None, late.now).unwrap();
+    assert_eq!(configured.fields["stalled"].as_array().unwrap().len(), 1);
+    assert_eq!(configured.fields["stalled"][0]["target"], "01-a/u/fable");
+}
+
+#[cfg(unix)]
+#[test]
+fn pauses_explain_dispatch_holds_without_becoming_actions() {
+    let host = at("2026-11-22T18:00:00Z");
+    let c = campaign(&host);
+    let codex = "01-a/u/codex";
+    let cloud = "01-a/u/cloud";
+    for (target, lane) in [(codex, Lane::Codex), (cloud, Lane::ClaudeCloud)] {
+        assert!(declare(&host, &c, target, lane, &[]).ok());
+        kickoff(&c, target);
+    }
+    let gh = support::FakeGh::new("exit 1");
+    let quota = |args: &[&str]| {
+        coordinator_cm(&c, args)
+            .env("CM_CODEX_WEEKLY_PCT", "85")
+            .env("PATH", gh.path())
+            .output()
+            .unwrap()
+    };
+    let held = quota(&["next", "--json"]);
+    assert!(held.status.success(), "{held:?}");
+    let held: serde_json::Value = serde_json::from_slice(&held.stdout).unwrap();
+    assert_eq!(held["steps"].as_array().unwrap().len(), 1);
+    assert_eq!(held["steps"][0]["target"], cloud);
+    assert_eq!(held["waiting"][0]["target"], codex);
+    assert_eq!(
+        held["waiting"][0]["waits_on"][0],
+        "Codex dispatch held: weekly usage 85% reached the 85% pause"
+    );
+    let named = quota(&["next", codex, "--json"]);
+    assert_eq!(named.status.code(), Some(1), "{named:?}");
+    let named: serde_json::Value = serde_json::from_slice(&named.stdout).unwrap();
+    assert_eq!(named["violations"][0]["rule"], "codex-paused");
+    assert_eq!(
+        named["waiting"][0]["waits_on"],
+        held["waiting"][0]["waits_on"]
+    );
+
+    let refused = quota(&["launch", codex, "--json"]);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let refused: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refused["violations"][0], named["violations"][0]);
+    assert_eq!(state(&c, codex), Phase::Drafted);
+    let act = quota(&["next", "--act"]);
+    assert!(act.status.success() && act.stdout.is_empty(), "{act:?}");
+
+    let launched = quota(&["launch", cloud]);
+    assert!(launched.status.success(), "{launched:?}");
+    assert_eq!(state(&c, cloud), Phase::Launched);
+
+    let path = c.root.join("LIMITS.toml");
+    let paused = fs::read_to_string(&path)
+        .unwrap()
+        .replace("paused = false", "paused = true");
+    fs::write(path, paused).unwrap();
+    let held = coordinator_cm(&c, &["next"]).output().unwrap();
+    assert!(held.status.success(), "{held:?}");
+    assert!(
+        String::from_utf8(held.stdout)
+            .unwrap()
+            .contains("paused = true")
+    );
+    let act = coordinator_cm(&c, &["next", "--act"]).output().unwrap();
+    assert!(act.status.success() && act.stdout.is_empty(), "{act:?}");
+}
+
+#[test]
+fn a_review_ledger_row_clears_only_its_pr() {
+    let host = at("2026-11-22T18:00:00Z");
+    let c = campaign(&host);
+    let reviewed = "01-a/u/reviewed";
+    let other = "01-a/u/other";
+    let pr = "https://github.com/owner/repo/pull/7";
+    for (target, url) in [
+        (reviewed, pr),
+        (other, "https://github.com/other/repo/pull/7"),
+    ] {
+        assert!(declare(&host, &c, target, Lane::Pi, &[]).ok());
+        kickoff(&c, target);
+        open_pr(&host, &c, target, url);
+    }
+    let reviews = cm::review::Reviews {
+        preamble: String::new(),
+        postamble: String::new(),
+        rows: vec![cm::review::Row::Imported {
+            cells: vec!["1".into(), "repo#7".into(), reviewed.into()],
+        }],
+    };
+    store::write_json(&c.root.join(".cm/reviews.json"), &reviews).unwrap();
+    let outcome = coordinator_cm(&c, &["next", "--act", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(outcome.status.code(), Some(1), "{outcome:?}");
+    let outcome: serde_json::Value = serde_json::from_slice(&outcome.stdout).unwrap();
+    assert_eq!(outcome["actionable"].as_array().unwrap().len(), 1);
+    assert_eq!(outcome["actionable"][0]["target"], other);
+}
+
+#[cfg(unix)]
+fn record_attempt_action(
+    host: &Fake,
+    c: &Campaign,
+    target: &str,
+    claim: &str,
+    kind: &str,
+    id: &str,
+) {
+    use cm::attempt::Act;
+
+    attempt_action(
+        host,
+        c,
+        target,
+        Some(claim),
+        Act::Begin { kind: kind.into() },
+    );
+    attempt_action(
+        host,
+        c,
+        target,
+        Some(claim),
+        Act::Record {
+            kind: kind.into(),
+            id: id.into(),
+        },
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_observes_remote_turns_and_lists_ended_turns_before_other_actions() {
+    use cm::attempt::Act;
+
+    const WITH_PR: &str = "01-a/u/with-pr";
+    const NO_PR: &str = "01-a/u/no-pr";
+    const WRONG_BRANCH: &str = "01-a/u/wrong-branch";
+    const FOREIGN_PR: &str = "01-a/u/wrong-repo";
+    const RUNNING: &str = "01-a/u/running";
+    const FAILING: &str = "01-a/u/failing";
+    const UNCONFIGURED: &str = "01-a/u/unconfigured";
+    const PR: &str = "https://github.com/o/r/pull/17";
+    const UNRELATED_PR: &str = "https://github.com/o/r/pull/18";
+    const HEAD: &str = "89abcdef0123456789abcdef0123456789abcdef";
+
+    let claimed = at("2026-11-22T19:00:00Z");
+    let began = at("2026-11-23T03:25:00Z");
+    let now = at("2026-11-23T03:30:00Z");
+    let c = campaign(&claimed);
+    let mut claims = BTreeMap::new();
+    for (target, thread, lane) in [
+        (WITH_PR, "with-pr", Lane::Codex),
+        (NO_PR, "no-pr", Lane::Codex),
+        (WRONG_BRANCH, "wrong-branch", Lane::Codex),
+        (FOREIGN_PR, "wrong-repo", Lane::Codex),
+        (RUNNING, "running", Lane::Codex),
+        (FAILING, "failing", Lane::Codex),
+        (UNCONFIGURED, "unconfigured", Lane::ClaudeCloud),
+    ] {
+        assert!(declare(&claimed, &c, target, lane, &[]).ok());
+        let claim = launch_for(&claimed, &c, target, "session_current");
+        c.kickoff(target, "repo: o/r\n\n# Kickoff\n");
+        record_attempt_action(&claimed, &c, target, &claim, "thread", thread);
+        record_attempt_action(&claimed, &c, target, &claim, "turn", "old-turn");
+        record_attempt_action(&began, &c, target, &claim, "turn", "latest-turn");
+        if matches!(target, WITH_PR | WRONG_BRANCH) {
+            record_attempt_action(
+                &began,
+                &c,
+                target,
+                &claim,
+                "branch",
+                &format!("work/{thread}"),
+            );
+        }
+        claims.insert(target, claim);
+    }
+    assert!(declare(&now, &c, "01-a/u/packet", Lane::Owner, &[]).ok());
+    for child in ["first", "second"] {
+        let target = format!("01-a/u/{child}");
+        assert!(declare(&now, &c, &target, Lane::Codex, &["packet"]).ok());
+        kickoff(&c, &target);
+    }
+
+    let reader = c._temp.path().join("turn-reader");
+    support::write_executable(
+        &reader,
+        &format!(
+            r#"#!/bin/sh
+[ "$#" = 2 ] || exit 2
+if [ "$1" = running ] && [ -f "$0.fail-running" ]; then exit 18; fi
+case "$1/$2" in
+    with-pr/latest-turn)
+        echo '{{"done":true,"successful":true,"turn_status":"completed","thread_id":"with-pr","turn_id":"latest-turn","pr_url":"{PR}"}}' ;;
+    no-pr/latest-turn)
+        echo '{{"done":true,"successful":false,"turn_status":"failed","completed_at":"2026-11-23T03:29:42Z"}}' ;;
+    wrong-branch/latest-turn)
+        echo '{{"done":true,"successful":true,"turn_status":"completed","pr_url":"{UNRELATED_PR}"}}' ;;
+    wrong-repo/latest-turn)
+        echo '{{"done":true,"successful":true,"turn_status":"completed","pr_url":"https://github.com/elsewhere/r/pull/17"}}' ;;
+    running/latest-turn|no-pr/replacement-turn)
+        echo '{{"done":false,"successful":false,"turn_status":"inProgress"}}' ;;
+    failing/latest-turn) exit 17 ;;
+    *) exit 2 ;;
+esac
+"#
+        ),
+    );
+    let path = c.root.join("LIMITS.toml");
+    let original = fs::read_to_string(&path).unwrap();
+    let argv = serde_json::json!([reader, "{thread}", "{turn}"]);
+    fs::write(
+        &path,
+        format!(
+            r#"{original}
+codex_turn_reader = {argv}
+codex_turn_logs = ["turn-logs", "{{thread}}", "--turn-id", "{{turn}}"]
+"#
+        ),
+    )
+    .unwrap();
+    let gh = support::FakeGh::new(&format!(
+        r#"
+case "$*" in
+    'api --method GET repos/o/r/pulls -f state=open -f head=o:work/with-pr -f per_page=2'|'api --method GET repos/o/r/pulls -f state=open -f head=o:work/wrong-branch -f per_page=2')
+        echo '[]' ;;
+    'api repos/o/r/pulls/17 --include')
+        echo '{{"state":"open","merged":false,"merge_commit_sha":null,"head":{{"sha":"{HEAD}","ref":"work/with-pr"}}}}' ;;
+    'api repos/o/r/pulls/18 --include')
+        echo '{{"state":"open","merged":false,"merge_commit_sha":null,"head":{{"sha":"{HEAD}","ref":"work/unrelated"}}}}' ;;
+    *) exit 1 ;;
+esac
+"#
+    ));
+    let forge = Gh {
+        program: gh.program(),
+        timeout: std::time::Duration::from_secs(5),
+    };
+
+    let before_read = plan::next_at(&c.root, None, None, now.now).unwrap();
+    assert_eq!(before_read.fields["stalled"].as_array().unwrap().len(), 1);
+    assert_eq!(before_read.fields["stalled"][0]["target"], UNCONFIGURED);
+
+    let synced = sync(&now, &forge, &c.root).unwrap();
+    assert!(synced.ok(), "{:?}", synced.violations);
+    assert_eq!(synced.fields["moves"].as_array().unwrap().len(), 1);
+    let units = plan::load_units(&c.root).unwrap();
+    let opened = plan::track(&units, WITH_PR).unwrap();
+    assert_eq!(opened.state, Phase::PrOpen);
+    assert_eq!(opened.evidence.pr.as_deref(), Some(PR));
+    assert_eq!(opened.evidence.sha.as_deref(), Some(HEAD));
+    for target in [
+        NO_PR,
+        WRONG_BRANCH,
+        FOREIGN_PR,
+        RUNNING,
+        FAILING,
+        UNCONFIGURED,
+    ] {
+        assert_eq!(plan::track(&units, target).unwrap().state, Phase::Launched);
+    }
+    assert_eq!(
+        synced.fields["pr_discovery_warnings"][0],
+        format!(
+            "{WRONG_BRANCH}: {UNRELATED_PR} head branch work/unrelated does not match recorded branch work/wrong-branch"
+        )
+    );
+    assert_eq!(
+        synced.fields["turn_reader_warnings"],
+        serde_json::json!(["01-a/u/failing: turn reader exited 17; check access with turn reader"])
+    );
+    assert_eq!(
+        synced.fields["stalled"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|stall| (
+                stall["target"].as_str().unwrap(),
+                stall["since"].as_str().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        [(UNCONFIGURED, "2026-11-22T19:00Z")]
+    );
+
+    let act = coordinator_cm(&c, &["next", "--act"]).output().unwrap();
+    assert_eq!(act.status.code(), Some(1), "{act:?}");
+    let lines = String::from_utf8(act.stdout).unwrap();
+    let mut lines = lines.lines();
+    assert_eq!(
+        lines.next(),
+        Some(
+            "turn-ended 01-a/u/no-pr: thread no-pr completed 2026-11-23T03:29:42Z, no PR — `turn-logs no-pr --turn-id latest-turn`"
+        )
+    );
+    assert!(
+        lines
+            .next()
+            .unwrap()
+            .starts_with("turn-ended 01-a/u/wrong-branch:")
+    );
+    assert_eq!(
+        lines.next(),
+        Some(
+            "turn-ended 01-a/u/wrong-repo: thread wrong-repo completed 2026-11-23T03:30Z, no PR — `turn-logs wrong-repo --turn-id latest-turn`"
+        )
+    );
+    assert!(
+        lines
+            .next()
+            .unwrap()
+            .starts_with("pr-open-unreviewed 01-a/u/with-pr:")
+    );
+    assert!(
+        lines
+            .next()
+            .unwrap()
+            .starts_with("missing-kickoff 01-a/u/packet:")
+    );
+    let act = coordinator_cm(&c, &["next", "--act", "--json"])
+        .output()
+        .unwrap();
+    let act: serde_json::Value = serde_json::from_slice(&act.stdout).unwrap();
+    assert_eq!(act["actionable"][0]["kind"], "turn-ended");
+    assert_eq!(
+        act["actionable"][0]["command"],
+        "turn-logs no-pr --turn-id latest-turn"
+    );
+    assert_eq!(act["actionable"][3]["kind"], "pr-open-unreviewed");
+
+    fs::write(reader.with_extension("fail-running"), "").unwrap();
+    let failed_after_running = sync(&now, &forge, &c.root).unwrap();
+    assert!(
+        failed_after_running.ok(),
+        "{:?}",
+        failed_after_running.violations
+    );
+    assert_eq!(
+        failed_after_running.fields["turn_reader_warnings"][1],
+        "01-a/u/running: turn reader exited 18; check access with turn reader"
+    );
+    assert_eq!(
+        failed_after_running.fields["stalled"],
+        synced.fields["stalled"]
+    );
+
+    let later = at("2026-11-23T06:30:00Z");
+    record_attempt_action(
+        &later,
+        &c,
+        NO_PR,
+        &claims[NO_PR],
+        "turn",
+        "replacement-turn",
+    );
+    assert!(sync(&later, &forge, &c.root).unwrap().ok());
+    let next = plan::next_at(&c.root, None, None, later.now).unwrap();
+    let stalled = next.fields["stalled"].as_array().unwrap();
+    for target in [RUNNING, FAILING] {
+        let stall = stalled
+            .iter()
+            .find(|stall| stall["target"] == target)
+            .unwrap();
+        assert_eq!(stall["since"], "2026-11-23T03:25Z");
+    }
+    let actions = next.fields["actionable"].as_array().unwrap();
+    let ended: Vec<_> = actions
+        .iter()
+        .filter(|action| action["kind"] == "turn-ended")
+        .collect();
+    assert_eq!(ended.len(), 2);
+    assert_eq!(ended[1]["target"], FOREIGN_PR);
+    assert_eq!(ended[1]["since"], "2026-11-23T03:30Z");
+
+    attempt_action(
+        &later,
+        &c,
+        FOREIGN_PR,
+        Some(&claims[FOREIGN_PR]),
+        Act::End {
+            outcome: cm::state::AttemptOutcome::Unknown,
+            file: None,
+        },
+    );
+    let next = plan::next_at(&c.root, None, None, later.now).unwrap();
+    let stale = next.fields["stalled"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stall| stall["target"] == FOREIGN_PR)
+        .expect("ended Codex attempt still has an age stall");
+    assert_eq!(stale["since"], "2026-11-23T03:25Z");
+    assert!(
+        !next.fields["actionable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["target"] == FOREIGN_PR && action["kind"] == "turn-ended")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_requires_a_valid_remote_reader_and_logs_pair() {
+    let claimed = at("2026-11-22T19:00:00Z");
+    let now = at("2026-11-23T03:30:00Z");
+    let c = campaign(&claimed);
+    let target = "01-a/u/unpaired";
+    assert!(declare(&claimed, &c, target, Lane::Codex, &[]).ok());
+    let claim = launch_for(&claimed, &c, target, "session_current");
+    record_attempt_action(&claimed, &c, target, &claim, "thread", "thread");
+    record_attempt_action(&claimed, &c, target, &claim, "turn", "turn");
+
+    let reader = c._temp.path().join("unpaired-reader");
+    support::write_executable(
+        &reader,
+        r#"#!/bin/sh
+: > "$0.ran"
+echo '{"done":true,"successful":true,"turn_status":"completed"}'
+"#,
+    );
+    let path = c.root.join("LIMITS.toml");
+    let original = fs::read_to_string(&path).unwrap();
+    let reader_argv = serde_json::json!([reader, "{thread}", "{turn}"]);
+    for (settings, diagnostic) in [
+        (
+            format!("codex_turn_reader = {reader_argv}"),
+            "missing `codex_turn_logs`",
+        ),
+        (
+            format!("codex_turn_reader = {reader_argv}\ncodex_turn_logs = []"),
+            "`codex_turn_logs` must",
+        ),
+        (
+            r#"codex_turn_logs = ["turn-logs", "{thread}"]"#.to_owned(),
+            "missing `codex_turn_reader`",
+        ),
+        (
+            format!("codex_turn_reader = {reader_argv}\ncodex_turn_logs = ["),
+            "cannot parse LIMITS.toml:",
+        ),
+    ] {
+        fs::write(&path, format!("{original}\n{settings}\n")).unwrap();
+        let synced = sync(&now, &FakeForge::default(), &c.root).unwrap();
+        assert!(synced.ok(), "{:?}", synced.violations);
+        let warnings = synced.fields["turn_reader_warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].as_str().unwrap().contains(diagnostic),
+            "{warnings:?}"
+        );
+        assert!(
+            !reader.with_extension("ran").exists(),
+            "reader ran with an invalid pair"
+        );
+
+        assert_eq!(synced.fields["stalled"][0]["target"], target);
+        let next = coordinator_cm(&c, &["next", "--act", "--json"])
+            .output()
+            .unwrap();
+        let next: serde_json::Value = serde_json::from_slice(&next.stdout).unwrap();
+        assert!(
+            next["actionable"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|action| action["kind"] != "turn-ended")
+        );
+    }
 }
