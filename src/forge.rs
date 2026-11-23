@@ -19,6 +19,7 @@ pub enum ForgeError {
     Http(u16),
     Curl(Box<ForgeError>),
     Url,
+    AmbiguousPull,
 }
 
 impl ForgeError {
@@ -45,6 +46,7 @@ impl ForgeError {
             ForgeError::ManifestDigest => {
                 f.write_str("image manifest response is missing docker-content-digest")
             }
+            ForgeError::AmbiguousPull => f.write_str("multiple open PRs for the recorded branch"),
             ForgeError::Url => f.write_str("not a https://github.com/<owner>/<repo>/pull/<n> URL"),
         }
     }
@@ -375,6 +377,15 @@ pub fn ci_green(checks: &[CheckState]) -> bool {
 
 pub trait Forge {
     fn pull(&self, url: &str) -> Result<Pull, ForgeError>;
+
+    /// The sole open PR for a branch owned by this repository, if present.
+    fn open_pull_for_branch(
+        &self,
+        _repo: &GithubRepo,
+        _branch: &str,
+    ) -> Result<Option<String>, ForgeError> {
+        Ok(None)
+    }
 
     /// Read a pull and save its validator. A 304 returns no new pull.
     fn pull_conditional(
@@ -1063,6 +1074,35 @@ impl Gh {
 }
 
 impl Forge for Gh {
+    fn open_pull_for_branch(
+        &self,
+        repo: &GithubRepo,
+        branch: &str,
+    ) -> Result<Option<String>, ForgeError> {
+        #[derive(Deserialize)]
+        struct Entry {
+            html_url: String,
+        }
+        // Two rows are sufficient to tell an unambiguous PR from multiple open PRs.
+        let pulls: Vec<Entry> = self.json(&[
+            "api",
+            "--method",
+            "GET",
+            &format!("repos/{repo}/pulls"),
+            "-f",
+            "state=open",
+            "-f",
+            &format!("head={}:{branch}", repo.owner),
+            "-f",
+            "per_page=2",
+        ])?;
+        match pulls.as_slice() {
+            [] => Ok(None),
+            [pull] => Ok(Some(pull.html_url.clone())),
+            _ => Err(ForgeError::AmbiguousPull),
+        }
+    }
+
     fn pull(&self, url: &str) -> Result<Pull, ForgeError> {
         self.read_pull(url, None)?.ok_or(ForgeError::Json)
     }

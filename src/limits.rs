@@ -1,8 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use toml::{Table, Value};
 
 use crate::outcome::Violation;
+use crate::state::Lane;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Limits {
@@ -15,6 +16,7 @@ pub struct Limits {
     pub supervisor_model: String,
     pub supervisor_effort: String,
     pub codex_stall_hours: f64,
+    stall_limits: StallLimits,
 }
 
 /// `codex_stall_hours` when LIMITS.toml leaves it out.
@@ -22,6 +24,46 @@ pub const CODEX_STALL_HOURS: f64 = 2.0;
 
 /// Keys a campaign may leave out; each is checked when present.
 const OPTIONAL: [(&str, Shape); 1] = [("codex_stall_hours", Shape::Number)];
+
+/// The keys for other lanes were previously ignored by lint. Invalid values still default.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct StallLimits {
+    hours: std::collections::BTreeMap<String, f64>,
+}
+
+impl StallLimits {
+    fn from_table(table: &Table) -> Self {
+        let hours = crate::state::LANES
+            .into_iter()
+            .filter_map(|lane| {
+                let name = lane.name();
+                let key = format!("{}_stall_hours", name.replace('-', "_"));
+                let value = table.get(&key)?;
+                let hours = match value {
+                    Value::Integer(hours) => *hours as f64,
+                    Value::Float(hours) => *hours,
+                    _ => return None,
+                };
+                (hours >= 0.0 && (hours.is_finite() || lane == Lane::Codex))
+                    .then(|| (name.to_owned(), hours))
+            })
+            .collect();
+        Self { hours }
+    }
+
+    pub(crate) fn read(root: &Path) -> Self {
+        std::fs::read_to_string(root.join("LIMITS.toml"))
+            .ok()
+            .and_then(|text| check(&text).ok())
+            .map(|limits| limits.stall_limits)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn hours(&self, lane: Option<Lane>) -> f64 {
+        lane.and_then(|lane| self.hours.get(lane.name()).copied())
+            .unwrap_or(CODEX_STALL_HOURS)
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Shape {
@@ -146,6 +188,7 @@ pub fn check(text: &str) -> Result<Limits, Vec<Violation>> {
             .unwrap_or(0),
         supervisor_model: text_of("supervisor_model"),
         supervisor_effort: text_of("supervisor_effort"),
+        stall_limits: StallLimits::from_table(&table),
         codex_stall_hours: if table.contains_key("codex_stall_hours") {
             number("codex_stall_hours")
         } else {

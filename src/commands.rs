@@ -1284,7 +1284,7 @@ fn read_tag(
     }
 }
 
-fn is_pr_url(url: &str) -> bool {
+pub(crate) fn is_pr_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://github.com/") else {
         return false;
     };
@@ -1294,6 +1294,24 @@ fn is_pr_url(url: &str) -> bool {
         && parts[2] == "pull"
         && !parts[3].is_empty()
         && parts[3].bytes().all(|byte| byte.is_ascii_digit())
+}
+
+pub(crate) fn check_release_pr(
+    target: &str,
+    step: &Step,
+    release: &Release,
+    repo: &GithubRepo,
+) -> Option<Violation> {
+    (!step.ships_from(release, repo)).then(|| {
+        Violation::new(
+            target,
+            "release-repo",
+            format!(
+                "the prep PR is in {repo}, but {release} ships from {}",
+                step.release_repo(release)
+            ),
+        )
+    })
 }
 
 fn is_digest(digest: &str) -> bool {
@@ -2087,17 +2105,8 @@ pub fn advance_gated(
                 ),
             ));
         }
-        if let Some(repo) = given.pr.as_deref().and_then(GithubRepo::of_pr)
-            && !step.ships_from(&release, &repo)
-        {
-            violations.push(Violation::new(
-                &full,
-                "release-repo",
-                format!(
-                    "the prep PR is in {repo}, but {release} ships from {}",
-                    step.release_repo(&release)
-                ),
-            ));
+        if let Some(repo) = given.pr.as_deref().and_then(GithubRepo::of_pr) {
+            violations.extend(check_release_pr(&full, step, &release, &repo));
         }
     }
     let needs_repo = given.sha.is_some() || given.tag.is_some();
@@ -2130,9 +2139,7 @@ pub fn advance_gated(
         violations.push(Violation::new(&full, "evidence-repo", message));
     } else {
         if let Some(sha) = &given.sha {
-            let hex = sha.len() >= 7
-                && sha.len() <= 40
-                && sha.bytes().all(|byte| byte.is_ascii_hexdigit());
+            let hex = crate::state::is_commit(sha);
             match repos
                 .iter()
                 .find_map(|repo| {

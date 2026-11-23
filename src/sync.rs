@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::json;
 
-use crate::commands::{closed, write_unit};
+use crate::commands::{check_release_pr, closed, is_pr_url, write_unit};
 use crate::forge::{
     CheckState, CommitSha, Forge, ForgeError, GithubRepo, Pull, PullState, TagName, ci_green,
 };
@@ -44,6 +44,7 @@ struct OpenChecks {
 
 #[derive(Default)]
 struct Reads {
+    branch_pulls: BTreeMap<(String, GithubRepo, String), Read<Option<String>>>,
     pulls: BTreeMap<String, Read<PullRead>>,
     open_checks: BTreeMap<(GithubRepo, CommitSha), Read<OpenChecks>>,
     tags: BTreeMap<(GithubRepo, TagName), Read<bool>>,
@@ -90,6 +91,7 @@ struct Run<'a> {
     heads: BTreeMap<String, String>,
     notes: Vec<(String, String)>,
     owner_unread: Vec<String>,
+    discovery_warnings: Vec<String>,
 }
 
 struct Tracked {
@@ -138,10 +140,12 @@ impl<'a> Run<'a> {
             heads: BTreeMap::new(),
             notes: Vec::new(),
             owner_unread,
+            discovery_warnings: Vec::new(),
         }
     }
 
     fn walk(&mut self) {
+        self.discover_pulls();
         self.merges();
         self.tags();
         self.released();
@@ -567,6 +571,85 @@ impl<'a> Run<'a> {
             ));
         }
         gaps.is_empty().then_some(used)
+    }
+
+    fn discover_pulls(&mut self) {
+        for (target, step) in self.steps_at(&Phase::Launched) {
+            let release = Release::of_target(&target);
+            // The recorded branch belongs to the whole attempt, with no way to identify a part.
+            if !step.parts.is_empty()
+                || !matches!(step.lane, Some(Lane::Codex | Lane::ClaudeCloud))
+                || (release.is_some() && !self.owner_unread.is_empty())
+            {
+                continue;
+            }
+            let Some(attempt) = &step.attempt else {
+                continue;
+            };
+            let Some((repo, branch)) = crate::attempt::launch_branch(attempt, step.github.as_ref())
+            else {
+                continue;
+            };
+            if step
+                .track
+                .check(&Phase::PrOpen, step.finish(release.is_some()))
+                .is_err()
+                || release.as_ref().is_some_and(|release| {
+                    check_release_pr(&target, &step, release, &repo).is_some()
+                })
+            {
+                continue;
+            }
+            // The locked replay has to see the same attempt and launch metadata as the read.
+            let key = (attempt.id.clone(), repo.clone(), branch.to_owned());
+            let url = match cached(&mut self.reads.branch_pulls, key, self.forge, |forge| {
+                forge.open_pull_for_branch(&repo, branch)
+            }) {
+                Some(Ok(Some(url)))
+                    if is_pr_url(&url) && GithubRepo::of_pr(&url).as_ref() == Some(&repo) =>
+                {
+                    url
+                }
+                Some(Ok(Some(url))) => {
+                    self.discovery_warnings
+                        .push(format!("{target}: invalid PR URL for {repo}: {url}"));
+                    continue;
+                }
+                Some(Err(error)) => {
+                    self.discovery_warnings.push(format!(
+                        "{target}: could not look up {repo} branch {branch}: {error}"
+                    ));
+                    continue;
+                }
+                Some(Ok(None)) | None => continue,
+            };
+            match self.pull(&url, &target) {
+                Some(Ok(read)) if read.pull.state == PullState::Open => {
+                    let head = read.pull.head.filter(|head| {
+                        head.as_str().len() == 40 && crate::state::is_commit(head.as_str())
+                    });
+                    if let Some(sha) = head {
+                        self.advance(
+                            &target,
+                            None,
+                            Phase::PrOpen,
+                            Evidence {
+                                pr: Some(url),
+                                sha: Some(sha.to_string()),
+                                ..Evidence::default()
+                            },
+                        );
+                    } else {
+                        self.discovery_warnings
+                            .push(format!("{target}: {url} has no valid head commit"));
+                    }
+                }
+                Some(Err(error)) => self
+                    .discovery_warnings
+                    .push(format!("{target}: {url}: {error}")),
+                Some(Ok(_)) | None => {}
+            }
+        }
     }
 
     fn merges(&mut self) {
@@ -1056,6 +1139,12 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
     store::write_json(&plan::pulls_path(root), &open)?;
     let mut outcome = Outcome::refused(std::mem::take(&mut run.violations));
     crate::ledger::owner_queue_banner(root, &mut outcome)?;
+    if !run.discovery_warnings.is_empty() {
+        for warning in &run.discovery_warnings {
+            outcome.line(format!("PR discovery: {warning}"));
+        }
+        outcome.field("pr_discovery_warnings", json!(run.discovery_warnings));
+    }
     let marker_path = root.join(store::CM_DIR).join("unblock-notified.json");
     let mut notified: BTreeSet<String> = if marker_path.exists() {
         store::read_json(&marker_path)?
@@ -1132,21 +1221,18 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
             moved.evidence.summary()
         ));
     }
-    let limit = plan::stall_hours(root);
-    let stalled = plan::stalls(&run.units, host.now(), limit);
+    let inputs = plan::ActionInputs::read(root, now);
+    let stalled = plan::stalls(&run.units, &inputs);
     let dirty = plan::dirty(root, &run.units);
     for stall in &stalled {
-        outcome.line(plan::stall_line(stall, limit));
+        outcome.line(plan::stall_line(stall, &run.units));
     }
     for (url, observed) in &dirty {
         outcome.line(plan::dirty_line(url, observed));
     }
     outcome.field(
         "stalled",
-        stalled
-            .iter()
-            .map(|stall| plan::stall_json(stall, limit))
-            .collect::<Vec<_>>(),
+        stalled.iter().map(plan::stall_json).collect::<Vec<_>>(),
     );
     outcome.field(
         "dirty",

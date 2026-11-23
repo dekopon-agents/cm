@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -12,7 +13,7 @@ use crate::limits;
 use crate::lint::unit_dirs;
 use crate::outcome::{Outcome, Violation};
 use crate::render::next_item;
-use crate::state::{After, Finish, Lane, Phase, Release, Step, Track, UnitState};
+use crate::state::{After, Attempt, Finish, Lane, Phase, Release, Step, Track, UnitState};
 use crate::store::{self, Target, relative, state_path};
 
 pub type Units = BTreeMap<String, UnitState>;
@@ -269,9 +270,15 @@ impl Candidate<'_> {
         })
     }
 
-    fn waiting_json(&self, root: &Path) -> Value {
+    fn dispatch_hold<'a>(&self, quota: Option<&'a str>) -> Option<&'a str> {
+        quota.filter(|_| self.lane() == Some(Lane::Codex) && self.ready())
+    }
+
+    fn waiting_json(&self, root: &Path, quota: Option<&str>) -> Value {
         let mut value = self.to_json(root);
-        value["waits_on"] = json!(self.waits_on());
+        let mut on = self.waits_on();
+        on.extend(self.dispatch_hold(quota).map(str::to_owned));
+        value["waits_on"] = json!(on);
         value["command"] = json!(waiting_command(root, &self.target));
         value
     }
@@ -355,12 +362,29 @@ pub fn paused(root: &Path) -> Result<bool, Vec<Violation>> {
     }
 }
 
-/// A codex-lane step launched with no PR whose latest attempt is older than `codex_stall_hours`.
-pub struct Stall {
-    pub target: String,
-    /// The attempt's claim stamp, or the launch stamp for a step launched without one.
-    pub since: String,
-    pub hours: f64,
+pub(crate) struct ActionInputs {
+    now: Timestamp,
+    coordinator: Option<String>,
+    stall_limits: limits::StallLimits,
+}
+
+impl ActionInputs {
+    pub(crate) fn read(root: &Path, now: Timestamp) -> Self {
+        Self {
+            now,
+            coordinator: crate::attempt::coordinator_label(&None),
+            stall_limits: limits::StallLimits::read(root),
+        }
+    }
+}
+
+pub(crate) struct Stall {
+    target: String,
+    since: String,
+    hours: f64,
+    limit: f64,
+    lane: Option<Lane>,
+    active: bool,
 }
 
 /// Reads a cm stamp (`2026-10-08T07:04Z`) or any RFC 3339 instant.
@@ -371,58 +395,344 @@ pub fn instant(text: &str) -> Option<Timestamp> {
     })
 }
 
-pub fn stall_hours(root: &Path) -> f64 {
-    fs::read_to_string(root.join("LIMITS.toml"))
-        .ok()
-        .and_then(|text| limits::check(&text).ok())
-        .map_or(limits::CODEX_STALL_HOURS, |limits| limits.codex_stall_hours)
+fn steps(units: &Units) -> impl Iterator<Item = (String, &Step)> {
+    units.iter().flat_map(|(unit, state)| {
+        state
+            .steps
+            .iter()
+            .map(move |(name, step)| (format!("{unit}/{name}"), step))
+    })
 }
 
-pub fn stalls(units: &Units, now: Timestamp, limit: f64) -> Vec<Stall> {
-    units
-        .iter()
-        .flat_map(|(unit, state)| {
-            state
-                .steps
-                .iter()
-                .map(move |(name, step)| (format!("{unit}/{name}"), step))
-        })
-        .filter(|(_, step)| {
-            step.lane == Some(Lane::Codex)
-                && step.track.state == Phase::Launched
-                && step.track.evidence.pr.is_none()
-        })
+fn active_attempt(step: &Step) -> Option<&Attempt> {
+    step.attempt
+        .as_ref()
+        .filter(|attempt| attempt.ended.is_none() && !step.track.state.is_final())
+}
+
+pub(crate) fn stalls(units: &Units, inputs: &ActionInputs) -> Vec<Stall> {
+    steps(units)
         .filter_map(|(target, step)| {
+            let active = active_attempt(step);
+            let legacy_codex = step.lane == Some(Lane::Codex)
+                && step.track.state == Phase::Launched
+                && step.track.evidence.pr.is_none();
+            if active.is_none() && !legacy_codex {
+                return None;
+            }
             let since = step
                 .attempt
                 .as_ref()
-                .map_or(&step.track.since, |attempt| &attempt.claimed_at)
-                .clone();
-            let age = now.duration_since(instant(&since)?).as_secs_f64() / 3600.0;
-            (age > limit).then_some(Stall {
+                .map_or(&step.track.since, |attempt| &attempt.claimed_at);
+            let lane = active.and_then(|attempt| attempt.lane).or(step.lane);
+            let limit = inputs.stall_limits.hours(lane);
+            let age = inputs.now.duration_since(instant(since)?).as_secs_f64() / 3600.0;
+            (age > limit).then(|| Stall {
                 target,
-                since,
+                since: since.clone(),
                 hours: (age * 10.0).round() / 10.0,
+                limit,
+                lane,
+                active: active.is_some(),
             })
         })
         .collect()
 }
 
-pub fn stall_json(stall: &Stall, limit: f64) -> Value {
+pub(crate) fn stall_json(stall: &Stall) -> Value {
     json!({
         "target": stall.target,
         "command": format!("cm attempt {}", stall.target),
         "since": stall.since,
         "hours": stall.hours,
-        "limit_hours": limit,
+        "limit_hours": stall.limit,
     })
 }
 
-pub fn stall_line(stall: &Stall, limit: f64) -> String {
+pub(crate) fn stall_line(stall: &Stall, units: &Units) -> String {
+    let reason = if stall.lane == Some(Lane::Codex)
+        && step(units, &stall.target).is_some_and(|step| {
+            step.track.state == Phase::Launched && step.track.evidence.pr.is_none()
+        }) {
+        "codex launch with no PR".to_owned()
+    } else {
+        format!("{} attempt", stall.lane.map_or("remote", Lane::name))
+    };
     format!(
-        "stalled {}: codex launch with no PR, attempt since {} ({}h > {limit}h)",
-        stall.target, stall.since, stall.hours
+        "stalled {}: {reason}, attempt since {} ({}h > {}h)",
+        stall.target, stall.since, stall.hours, stall.limit
     )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ActionKind {
+    ReviewNotBegun,
+    MissingKickoff,
+    StalledAttempt,
+    EarlierCoordinator,
+}
+
+#[derive(serde::Serialize)]
+struct Action {
+    kind: ActionKind,
+    target: String,
+    part: Option<String>,
+    since: String,
+    waiting_count: usize,
+    command: String,
+    #[serde(skip)]
+    description: String,
+}
+
+impl Action {
+    fn new(
+        kind: ActionKind,
+        target: &str,
+        since: &str,
+        command: String,
+        description: String,
+    ) -> Self {
+        Self {
+            kind,
+            target: target.to_owned(),
+            part: None,
+            since: since.to_owned(),
+            waiting_count: 0,
+            command,
+            description,
+        }
+    }
+
+    fn line(&self, number: &mut usize) -> String {
+        next_item(
+            number,
+            &format!(
+                "{} since {} ({} waiting)",
+                self.description, self.since, self.waiting_count
+            ),
+            &self.command,
+        )
+    }
+}
+
+fn waiting_counts(root: &Path, units: &Units, actions: &mut [Action]) {
+    if actions.is_empty() {
+        return;
+    }
+    let mut dependents: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (target, step) in steps(units).filter(|(_, step)| !step.track.state.is_final()) {
+        for gate in gates(root, units, step)
+            .into_iter()
+            .filter(|gate| !gate.met())
+        {
+            dependents
+                .entry(gate.after.target())
+                .or_default()
+                .push(target.clone());
+        }
+    }
+    let mut counts = BTreeMap::new();
+    for action in actions {
+        action.waiting_count = *counts.entry(action.target.clone()).or_insert_with(|| {
+            let mut seen = BTreeSet::from([&action.target]);
+            let mut queue = vec![&action.target];
+            while let Some(target) = queue.pop() {
+                for dependent in dependents.get(target).into_iter().flatten() {
+                    if seen.insert(dependent) {
+                        queue.push(dependent);
+                    }
+                }
+            }
+            seen.len() - 1
+        });
+    }
+}
+
+fn actionable(
+    root: &Path,
+    units: &Units,
+    inputs: &ActionInputs,
+    stalled: &[Stall],
+    verdicts: &crate::verdict::Verdicts,
+) -> Vec<Action> {
+    let reviews = crate::review::reviews(root);
+    let verdict_prs: BTreeSet<_> = verdicts
+        .reviews
+        .iter()
+        .filter_map(|row| row.pr.as_deref())
+        .collect();
+    let mut actions = Vec::new();
+    for candidate in candidates(root, units) {
+        if candidate.step.track.state == Phase::Drafted
+            && candidate.kickoff.is_none()
+            && candidate.gates.iter().all(Gate::met)
+        {
+            actions.push(Action::new(
+                ActionKind::MissingKickoff,
+                &candidate.target,
+                &candidate.step.track.since,
+                waiting_command(root, &candidate.target),
+                format!("missing kickoff {}", candidate.target),
+            ));
+        }
+    }
+    for (target, step) in steps(units) {
+        if let Some(attempt) = active_attempt(step)
+            && inputs
+                .coordinator
+                .as_deref()
+                .is_some_and(|label| label != attempt.coordinator)
+        {
+            actions.push(Action::new(
+                ActionKind::EarlierCoordinator,
+                &target,
+                &attempt.claimed_at,
+                format!(
+                    "cm attempt {} claim --expect {}",
+                    shell_word(&target),
+                    attempt.generation
+                ),
+                format!("earlier coordinator {target} ({})", attempt.coordinator),
+            ));
+        }
+        let mut review = |part: Option<&str>, track: &Track| {
+            let Some(pr) = track.evidence.pr.as_deref() else {
+                return;
+            };
+            if track.state != Phase::PrOpen
+                || verdict_prs.contains(pr)
+                || reviews
+                    .as_ref()
+                    .is_some_and(|rows| crate::review::reviewed(rows, pr, &target))
+                || crate::review::wait_marker(root, pr).is_some_and(|mark| mark.is_file())
+            {
+                return;
+            }
+            let scope = part.map_or_else(|| target.clone(), |part| format!("{target}#{part}"));
+            let mut action = Action::new(
+                ActionKind::ReviewNotBegun,
+                &target,
+                &track.since,
+                format!("cm brief {}", shell_word(&target)),
+                format!("review not begun {scope} ({pr})"),
+            );
+            action.part = part.map(str::to_owned);
+            actions.push(action);
+        };
+        if step.parts.is_empty() {
+            review(None, &step.track);
+        } else {
+            for (part, track) in &step.parts {
+                review(Some(part), track);
+            }
+        }
+    }
+    actions.extend(stalled.iter().filter(|stall| stall.active).map(|stall| {
+        Action::new(
+            ActionKind::StalledAttempt,
+            &stall.target,
+            &stall.since,
+            format!("cm attempt {}", shell_word(&stall.target)),
+            format!(
+                "stalled attempt {} ({}; {}h > {}h)",
+                stall.target,
+                stall.lane.map_or("remote", Lane::name),
+                stall.hours,
+                stall.limit
+            ),
+        )
+    }));
+    waiting_counts(root, units, &mut actions);
+    actions.sort_by(|a, b| {
+        (Reverse(a.waiting_count), &a.target, &a.part, a.kind).cmp(&(
+            Reverse(b.waiting_count),
+            &b.target,
+            &b.part,
+            b.kind,
+        ))
+    });
+    actions
+}
+
+fn action_scope(
+    actions: Vec<Action>,
+    units: &Units,
+    target: Option<&Target>,
+    lane: Option<Lane>,
+) -> Vec<Action> {
+    actions
+        .into_iter()
+        .filter(|action| {
+            target.is_none_or(|target| {
+                split(&action.target).is_some_and(|(unit, name)| {
+                    unit == target.unit && Some(name) == target.step.as_deref()
+                })
+            }) && lane.is_none_or(|lane| {
+                step(units, &action.target).is_some_and(|step| step.lane == Some(lane))
+            })
+        })
+        .collect()
+}
+
+fn append_actions(outcome: &mut Outcome, number: &mut usize, actions: &[Action]) {
+    for action in actions {
+        outcome.line(action.line(number));
+    }
+    outcome.field("actionable", json!(actions));
+}
+
+pub(crate) fn action_summary(
+    root: &Path,
+    units: &Units,
+    now: Timestamp,
+) -> (usize, Option<String>) {
+    let inputs = ActionInputs::read(root, now);
+    let stalled = stalls(units, &inputs);
+    // Unlike next, sync has not historically refused an unreadable review ledger.
+    let verdicts = crate::verdict::load(root).unwrap_or_default();
+    let actions = actionable(root, units, &inputs, &stalled, &verdicts);
+    let oldest = actions
+        .iter()
+        .filter_map(|action| Some((instant(&action.since)?, &action.since)))
+        .min()
+        .map(|(_, since)| since.clone());
+    (actions.len(), oldest)
+}
+
+pub(crate) fn next_act(
+    root: &Path,
+    target: Option<&Target>,
+    lane: Option<Lane>,
+    now: Timestamp,
+) -> Result<(Outcome, bool)> {
+    let mut outcome = Outcome::default();
+    let actions = if store::load_campaign(root)?.closed.is_some() {
+        Vec::new()
+    } else {
+        let units = load_units(root)?;
+        let inputs = ActionInputs::read(root, now);
+        let stalled = stalls(&units, &inputs);
+        let verdicts = crate::verdict::load(root)?;
+        action_scope(
+            actionable(root, &units, &inputs, &stalled, &verdicts),
+            &units,
+            target,
+            lane,
+        )
+    };
+    append_actions(&mut outcome, &mut 1, &actions);
+    Ok((outcome, !actions.is_empty()))
+}
+
+fn codex_pause() -> Option<String> {
+    let used = std::env::var("CM_CODEX_WEEKLY_PCT")
+        .ok()?
+        .parse::<f64>()
+        .ok()?;
+    (85.0..=100.0)
+        .contains(&used)
+        .then(|| format!("Codex dispatch held: weekly usage {used}% reached the 85% pause"))
 }
 
 /// What `cm sync` last saw of an open PR, in `.cm/pulls.json`.
@@ -633,17 +943,21 @@ pub(crate) fn unblock_command(target: &str, condition_met: bool) -> String {
 
 pub fn summary(root: &Path, units: &Units) -> Next {
     let paused = paused(root).unwrap_or(true);
+    let quota = codex_pause();
     let mut ready = Vec::new();
     let mut waiting = Vec::new();
     for candidate in candidates(root, units) {
-        if !paused && candidate.ready() {
+        let quota_hold = candidate.dispatch_hold(quota.as_deref());
+        if !paused && candidate.ready() && quota_hold.is_none() {
             ready.push((
                 candidate.target.clone(),
                 candidate.lane(),
                 candidate.finish(),
             ));
         } else {
-            waiting.push((candidate.target.clone(), candidate.waits_on()));
+            let mut on = candidate.waits_on();
+            on.extend(quota_hold.map(str::to_owned));
+            waiting.push((candidate.target.clone(), on));
         }
     }
     Next {
@@ -709,6 +1023,16 @@ pub fn next_at(
     }
     outcome.field("review_waits", review_waits);
     let verdicts = crate::verdict::load(root)?;
+    let inputs = ActionInputs::read(root, now);
+    let stalled = stalls(&units, &inputs);
+    let actions = action_scope(
+        actionable(root, &units, &inputs, &stalled, &verdicts),
+        &units,
+        target,
+        lane,
+    );
+    let quota = codex_pause();
+    let quota = (!paused).then_some(quota.as_deref()).flatten();
     let fresh_readers: Vec<Value> = crate::verdict::fresh_readers(&verdicts)
         .into_iter()
         .filter(|review| {
@@ -780,6 +1104,7 @@ pub fn next_at(
         if has_fresh_reader && !candidate.is_some_and(Candidate::warns_pin) {
             outcome.field("steps", Vec::<Value>::new());
             outcome.field("waiting", Vec::<Value>::new());
+            append_actions(&mut outcome, &mut number, &actions);
             return Ok(outcome);
         }
         let Some(candidate) = candidate else {
@@ -803,6 +1128,7 @@ pub fn next_at(
             outcome
                 .violations
                 .push(Violation::new(&full, "next-state", message));
+            append_actions(&mut outcome, &mut number, &actions);
             return Ok(outcome);
         };
         if lane.is_some_and(|lane| candidate.lane() != Some(lane)) {
@@ -830,7 +1156,8 @@ pub fn next_at(
                 "`paused = true`: nothing launches",
             ));
         }
-        if outcome.ok() {
+        let quota_hold = candidate.dispatch_hold(quota);
+        if outcome.ok() && quota_hold.is_none() {
             outcome.line(next_item(
                 &mut number,
                 &format!(
@@ -842,7 +1169,8 @@ pub fn next_at(
             outcome.field("steps", vec![candidate.to_json(root)]);
             outcome.field("waiting", Vec::<Value>::new());
         } else {
-            let on = candidate.waits_on();
+            let mut on = candidate.waits_on();
+            on.extend(quota_hold.map(str::to_owned));
             if !on.is_empty() {
                 outcome.line(next_item(
                     &mut number,
@@ -851,20 +1179,25 @@ pub fn next_at(
                 ));
             }
             outcome.field("steps", Vec::<Value>::new());
-            outcome.field("waiting", vec![candidate.waiting_json(root)]);
+            outcome.field("waiting", vec![candidate.waiting_json(root, quota)]);
         }
+        append_actions(&mut outcome, &mut number, &actions);
         return Ok(outcome);
     }
     let in_lane = |candidate: &&Candidate| lane.is_none_or(|lane| candidate.lane() == Some(lane));
     let ready: Vec<&Candidate> = all
         .iter()
         .filter(in_lane)
-        .filter(|candidate| !paused && candidate.ready())
+        .filter(|candidate| {
+            !paused && candidate.ready() && candidate.dispatch_hold(quota).is_none()
+        })
         .collect();
     let waiting: Vec<&Candidate> = all
         .iter()
         .filter(in_lane)
-        .filter(|candidate| paused || !candidate.ready())
+        .filter(|candidate| {
+            paused || !candidate.ready() || candidate.dispatch_hold(quota).is_some()
+        })
         .collect();
     if paused {
         outcome.line("paused: nothing is next while LIMITS.toml has `paused = true`");
@@ -881,7 +1214,8 @@ pub fn next_at(
         ));
     }
     for candidate in &waiting {
-        let on = candidate.waits_on();
+        let mut on = candidate.waits_on();
+        on.extend(candidate.dispatch_hold(quota).map(str::to_owned));
         if !on.is_empty() {
             outcome.line(next_item(
                 &mut number,
@@ -908,14 +1242,12 @@ pub fn next_at(
     if ready.is_empty() && waiting.is_empty() && tags.is_empty() && !has_fresh_reader {
         outcome.line("nothing is declared and drafted");
     }
-    let limit = stall_hours(root);
-    let stalled = stalls(&units, now, limit);
     let dirty = dirty(root, &units);
     for stall in &stalled {
         outcome.line(next_item(
             &mut number,
-            &stall_line(stall, limit),
-            stall_json(stall, limit)["command"].as_str().unwrap(),
+            &stall_line(stall, &units),
+            stall_json(stall)["command"].as_str().unwrap(),
         ));
     }
     for (url, observed) in &dirty {
@@ -947,10 +1279,7 @@ pub fn next_at(
     outcome.field("stale", held.stale);
     outcome.field(
         "stalled",
-        stalled
-            .iter()
-            .map(|stall| stall_json(stall, limit))
-            .collect::<Vec<_>>(),
+        stalled.iter().map(stall_json).collect::<Vec<_>>(),
     );
     outcome.field(
         "dirty",
@@ -970,7 +1299,7 @@ pub fn next_at(
         "waiting",
         waiting
             .iter()
-            .map(|candidate| candidate.waiting_json(root))
+            .map(|candidate| candidate.waiting_json(root, quota))
             .collect::<Vec<_>>(),
     );
     outcome.field(
@@ -988,6 +1317,7 @@ pub fn next_at(
             })
             .collect::<Vec<_>>(),
     );
+    append_actions(&mut outcome, &mut number, &actions);
     Ok(outcome)
 }
 

@@ -564,6 +564,47 @@ pub(crate) fn wait_root(root: Option<&Path>) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
+pub(crate) fn wait_marker(root: &Path, pr: &str) -> Option<PathBuf> {
+    if !crate::commands::is_pr_url(pr) {
+        return None;
+    }
+    let relative = pr.strip_prefix("https://github.com/")?;
+    Some(
+        root.join(CM_DIR)
+            .join("review-waits")
+            .join(relative.to_ascii_lowercase()),
+    )
+}
+
+pub(crate) fn reviews(root: &Path) -> Option<Reviews> {
+    read_json(&reviews_path(root)).ok()
+}
+
+pub(crate) fn reviewed(rows: &Reviews, pr: &str, target: &str) -> bool {
+    rows.rows.iter().any(|row| match row {
+        Row::Review(review) => review.pr.eq_ignore_ascii_case(pr),
+        Row::Imported { cells } => {
+            let Some(id) = cells.get(1).and_then(|cell| cell.split_whitespace().next()) else {
+                return false;
+            };
+            if id.eq_ignore_ascii_case(pr) {
+                return true;
+            }
+            let Some((repo, number)) = pr
+                .strip_prefix("https://github.com/")
+                .and_then(|url| url.split_once("/pull/"))
+            else {
+                return false;
+            };
+            id.eq_ignore_ascii_case(&format!("{repo}#{number}"))
+                || (cells.get(2).and_then(|kind| kind.split_whitespace().next()) == Some(target)
+                    && repo.rsplit_once('/').is_some_and(|(_, name)| {
+                        id.eq_ignore_ascii_case(&format!("{name}#{number}"))
+                    }))
+        }
+    })
+}
+
 /// Wait for a recorded round without preventing the recording process from taking the lock.
 pub(crate) fn wait(
     root: &Path,
@@ -582,6 +623,7 @@ pub(crate) fn wait(
     let remaining = (deadline.as_nanosecond() - now.as_nanosecond()).max(0);
     let budget = std::time::Duration::from_nanos(remaining.min(u64::MAX as i128) as u64);
     let started = std::time::Instant::now();
+    let mut marked = None;
     loop {
         match fs::metadata(crate::store::state_path(&root.join(&target.unit))) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -662,6 +704,26 @@ pub(crate) fn wait(
                 outcome,
             });
         };
+        if let Some(pr) = pr.as_deref()
+            && marked.as_deref() != Some(pr)
+            && track.state == crate::state::Phase::PrOpen
+            && track
+                .evidence
+                .sha
+                .as_deref()
+                .is_some_and(|sha| crate::state::same_commit(sha, head))
+            && let Some(path) = wait_marker(root, pr)
+        {
+            // A PR-specific atomic marker keeps the wait read loop independent of the campaign lock.
+            // Read-only campaigns can still wait and get the same result.
+            if let Some(parent) = path.parent()
+                && fs::create_dir_all(parent)
+                    .and_then(|()| crate::store::create_new(&path, b""))
+                    .is_ok()
+            {
+                marked = Some(pr.to_owned());
+            }
+        }
         std::thread::sleep(left.min(std::time::Duration::from_secs(1)));
     }
 }

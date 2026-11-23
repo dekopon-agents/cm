@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 
+use crate::attempt::coordinator_label;
 use crate::commands;
 use crate::epoch::{self, Status};
 use crate::forge::GithubRepo;
@@ -87,6 +88,9 @@ enum Commands {
         /// Only steps in this lane.
         #[arg(long)]
         lane: Option<Lane>,
+        /// Print only coordinator actions. Exit 1 when any remain.
+        #[arg(long)]
+        act: bool,
     },
     /// Read PR state and release tags from GitHub (read-only `gh`), move steps pr-open → merged → released (→ deployed after their release's receipt), and render CARD.md.
     Sync,
@@ -486,21 +490,6 @@ enum WatchAct {
     },
 }
 
-fn coordinator_label(given: &Option<String>) -> Option<String> {
-    given.clone().or_else(|| {
-        let value = std::env::var("CLAUDE_CODE_REMOTE_SESSION_ID").ok()?;
-        let value = value.trim();
-        if value.is_empty() {
-            None
-        } else {
-            Some(match value.strip_prefix("cse_") {
-                Some(id) => format!("session_{id}"),
-                None => value.to_owned(),
-            })
-        }
-    })
-}
-
 #[derive(Subcommand)]
 enum AttemptAct {
     /// End an unknown attempt as relaned and dispatch its successor under the same claim and cap.
@@ -830,7 +819,12 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             };
             commands::declare(host, &under_root(cli, dir), &declaration)
         }
-        Commands::Next { target, lane } => {
+        Commands::Next { target, lane, act } => {
+            if *act {
+                let (outcome, actionable) =
+                    crate::plan::next_act(&root()?, target.as_ref(), *lane, host.now())?;
+                return Ok((outcome, ExitCode::from(u8::from(actionable))));
+            }
             crate::plan::next_at(&root()?, target.as_ref(), *lane, host.now())
         }
         Commands::Sync => crate::sync::sync(host, &crate::forge::Gh::default(), &root()?),

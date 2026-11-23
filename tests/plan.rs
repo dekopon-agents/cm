@@ -177,6 +177,12 @@ fn next_and_card_number_actions_with_the_same_commands() {
             0,
             "cm watch 01-a/u/WATCH resolve 1 --evidence '<watch-evidence-file>'",
         ),
+        ("actionable", 0, "cm brief 01-a/u/DIRTY"),
+        (
+            "actionable",
+            1,
+            "cm amend 01-a/u/NO-KICKOFF --kickoff-file '<kickoff-file>'",
+        ),
     ];
     let text = output(false);
     let numbered: Vec<_> = text
@@ -5029,4 +5035,432 @@ fn adding_parts_to_a_blocked_step_preserves_the_review_wait_start() {
         unit.steps["DIRTY"].track.blocked_from,
         Some(Phase::Launched)
     );
+}
+
+fn launch_for(host: &Fake, c: &Campaign, step: &str, coordinator: &str) -> String {
+    kickoff(c, step);
+    let outcome = commands::launch_remote(
+        host,
+        &c.root,
+        &parse_target(step, true).unwrap(),
+        None,
+        &commands::Remote {
+            coordinator: Some(coordinator.to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(outcome.ok(), "{:?}", outcome.violations);
+    outcome.fields["attempt"]["claim"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+fn attempt_action(
+    host: &Fake,
+    c: &Campaign,
+    step: &str,
+    claim: Option<&str>,
+    act: cm::attempt::Act,
+) {
+    let outcome = cm::attempt::attempt(
+        host,
+        &c.root,
+        &parse_target(step, true).unwrap(),
+        claim,
+        &act,
+    )
+    .unwrap();
+    assert!(outcome.ok(), "{:?}", outcome.violations);
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_opens_only_launched_steps_with_an_open_pr_for_their_recorded_branch() {
+    use cm::attempt::Act;
+
+    const HEAD: &str = "89abcdef0123456789abcdef0123456789abcdef";
+    const OPEN: &str = "01-a/u/open";
+    const MISSING: &str = "01-a/u/missing";
+    const NO_BRANCH: &str = "01-a/u/legacy";
+    const INVALID: &str = "01-a/u/invalid";
+    const MULTIPART: &str = "01-a/u/multipart";
+    const PR: &str = "https://github.com/o/r/pull/7";
+    let host = at("2026-11-22T18:00:00Z");
+    let c = campaign(&host);
+    for (step, lane, branch) in [
+        (OPEN, Lane::Codex, Some("work/open")),
+        (MISSING, Lane::ClaudeCloud, Some("work/missing")),
+        (NO_BRANCH, Lane::Codex, None),
+        (INVALID, Lane::ClaudeCloud, Some("work/invalid")),
+        (MULTIPART, Lane::Codex, Some("work/open")),
+    ] {
+        let parts = if step == MULTIPART {
+            vec!["one".into(), "two".into()]
+        } else {
+            Vec::new()
+        };
+        let declared = commands::declare(
+            &host,
+            &c.root.join(step),
+            &Declaration {
+                lane: Some(lane),
+                parts,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(declared.ok(), "{:?}", declared.violations);
+        let claim = launch_for(&host, &c, step, "session_current");
+        for (kind, id) in [("repo", Some("o/r")), ("branch", branch)] {
+            if let Some(id) = id {
+                attempt_action(
+                    &host,
+                    &c,
+                    step,
+                    Some(&claim),
+                    Act::Begin { kind: kind.into() },
+                );
+                attempt_action(
+                    &host,
+                    &c,
+                    step,
+                    Some(&claim),
+                    Act::Record {
+                        kind: kind.into(),
+                        id: id.into(),
+                    },
+                );
+            }
+        }
+    }
+    let gh = support::FakeGh::new(&format!(
+        r#"
+case "$*" in
+    'api --method GET repos/o/r/pulls -f state=open -f head=o:work/open -f per_page=2')
+        echo '[{{"html_url":"{PR}"}}]' ;;
+    'api --method GET repos/o/r/pulls -f state=open -f head=o:work/missing -f per_page=2')
+        echo '[]' ;;
+    'api --method GET repos/o/r/pulls -f state=open -f head=o:work/invalid -f per_page=2')
+        echo '[{{"html_url":"https://github.com/o/r/pull/8"}}]' ;;
+    'api repos/o/r/pulls/7 --include')
+        echo '{{"state":"open","merged":false,"merge_commit_sha":null,"head":{{"sha":"{HEAD}"}}}}' ;;
+    'api repos/o/r/pulls/8 --include')
+        echo '{{"state":"open","merged":false,"merge_commit_sha":null,"head":{{"sha":"abcdefg"}}}}' ;;
+    *) echo "$*" >&2; exit 1 ;;
+esac
+"#
+    ));
+    let synced = sync(
+        &host,
+        &Gh {
+            program: gh.program(),
+            timeout: std::time::Duration::from_secs(5),
+        },
+        &c.root,
+    )
+    .unwrap();
+    assert!(synced.ok(), "{:?}", synced.violations);
+    assert_eq!(synced.fields["moves"].as_array().unwrap().len(), 1);
+    assert_eq!(synced.fields["moves"][0]["to"], "pr-open");
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    let opened = &unit.steps["open"].track;
+    assert_eq!(opened.state, Phase::PrOpen);
+    assert_eq!(opened.evidence.pr.as_deref(), Some(PR));
+    assert_eq!(opened.evidence.sha.as_deref(), Some(HEAD));
+    for step in [MISSING, NO_BRANCH, INVALID, MULTIPART] {
+        assert_eq!(state(&c, step), Phase::Launched);
+    }
+    assert_eq!(
+        synced.fields["pr_discovery_warnings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+fn coordinator_cm(c: &Campaign, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cm"));
+    command
+        .arg("-C")
+        .arg(&c.root)
+        .args(args)
+        .env("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_current")
+        .env_remove("CM_CODEX_WEEKLY_PCT");
+    command
+}
+
+#[test]
+#[cfg(unix)]
+fn next_act_orders_coordinator_actions_and_matches_the_card_until_they_clear() {
+    use cm::attempt::Act;
+
+    const REVIEW: &str = "01-a/u/review";
+    const PACKET: &str = "01-a/u/packet";
+    const STALL: &str = "01-a/u/stalled";
+    const EARLIER: &str = "01-a/u/earlier";
+    const PR: &str = "https://github.com/o/r/pull/1";
+
+    let host = Fake {
+        now: Timestamp::now(),
+    };
+    let old = Fake {
+        now: host.now - jiff::SignedDuration::from_hours(3),
+    };
+    let c = campaign(&old);
+    assert!(declare(&host, &c, REVIEW, Lane::Pi, &[]).ok());
+    kickoff(&c, REVIEW);
+    open_pr(&host, &c, REVIEW, PR);
+    assert!(declare(&host, &c, PACKET, Lane::Codex, &["pr-open:review"]).ok());
+    assert!(declare(&old, &c, STALL, Lane::ClaudeCloud, &[]).ok());
+    let stall_claim = launch_for(&old, &c, STALL, "session_current");
+    assert!(declare(&host, &c, EARLIER, Lane::Codex, &[]).ok());
+    launch_for(&host, &c, EARLIER, "session_earlier");
+    for (step, after) in [
+        ("left", &["review"][..]),
+        ("right", &["review"]),
+        ("join", &["left", "right"]),
+        ("packet-dependent", &["packet"]),
+        ("packet-leaf", &["packet-dependent"]),
+        ("stall-dependent", &["stalled"]),
+    ] {
+        let step = format!("01-a/u/{step}");
+        assert!(declare(&host, &c, &step, Lane::Codex, after).ok());
+        if !step.ends_with("/join") {
+            kickoff(&c, &step);
+        }
+    }
+
+    let regular = coordinator_cm(&c, &["next", "--json"]).output().unwrap();
+    assert!(regular.status.success(), "{regular:?}");
+    let regular: serde_json::Value = serde_json::from_slice(&regular.stdout).unwrap();
+    let outcome = coordinator_cm(&c, &["next", "--act", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(outcome.status.code(), Some(1), "{outcome:?}");
+    let act: serde_json::Value = serde_json::from_slice(&outcome.stdout).unwrap();
+    assert_eq!(regular["actionable"], act["actionable"]);
+    let actions = act["actionable"].as_array().unwrap();
+    let order: Vec<_> = actions
+        .iter()
+        .map(|action| {
+            (
+                action["kind"].as_str().unwrap(),
+                action["waiting_count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [
+            ("review-not-begun", 3),
+            ("missing-kickoff", 2),
+            ("stalled-attempt", 1),
+            ("earlier-coordinator", 0),
+        ]
+    );
+
+    let text = coordinator_cm(&c, &["next", "--act"]).output().unwrap();
+    assert_eq!(text.status.code(), Some(1), "{text:?}");
+    let lines = String::from_utf8(text.stdout).unwrap();
+    assert_eq!(lines.lines().count(), actions.len());
+    for (line, action) in lines.lines().zip(actions) {
+        assert!(line.contains(action["since"].as_str().unwrap()), "{line}");
+        assert!(
+            line.ends_with(&format!("`{}`", action["command"].as_str().unwrap())),
+            "{line}"
+        );
+    }
+
+    let units = plan::load_units(&c.root).unwrap();
+    let head = plan::track(&units, REVIEW)
+        .unwrap()
+        .evidence
+        .sha
+        .clone()
+        .unwrap();
+    let gh = support::FakeGh::new(&format!(
+        r#"case "$*" in
+    'api repos/o/r/pulls/1 --include')
+        echo '{{"state":"open","merged":false,"merge_commit_sha":null,"head":{{"sha":"{head}"}}}}' ;;
+    *) echo "$*" >&2; exit 1 ;;
+esac"#
+    ));
+    let sync_card = || {
+        let synced = coordinator_cm(&c, &["sync"])
+            .env("PATH", gh.path())
+            .output()
+            .unwrap();
+        assert!(synced.status.success(), "{synced:?}");
+        fs::read_to_string(c.root.join("CARD.md")).unwrap()
+    };
+    let card = sync_card();
+    assert_eq!(
+        card.lines().find(|line| line.starts_with("Actionable: ")),
+        Some(
+            format!(
+                "Actionable: {} (oldest: {})",
+                lines.lines().count(),
+                cm::host::stamp(old.now)
+            )
+            .as_str()
+        )
+    );
+
+    let deadline = (Timestamp::now() + jiff::SignedDuration::from_secs(1)).to_string();
+    let waited = coordinator_cm(
+        &c,
+        &[
+            "review",
+            "wait",
+            REVIEW,
+            "--head",
+            &head,
+            "--reviewer",
+            "astra",
+            "--deadline",
+            &deadline,
+        ],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(waited.status.code(), Some(3), "{waited:?}");
+    kickoff(&c, PACKET);
+    attempt_action(
+        &host,
+        &c,
+        STALL,
+        Some(&stall_claim),
+        Act::End {
+            outcome: cm::state::AttemptOutcome::Complete,
+            file: None,
+        },
+    );
+    attempt_action(
+        &host,
+        &c,
+        EARLIER,
+        None,
+        Act::Claim {
+            coordinator: "session_current".into(),
+            expect: 1,
+        },
+    );
+    let clear = coordinator_cm(&c, &["next", "--act"]).output().unwrap();
+    assert!(clear.status.success(), "{clear:?}");
+    assert!(clear.stdout.is_empty(), "{clear:?}");
+    assert!(
+        sync_card()
+            .lines()
+            .any(|line| line == "Actionable: 0 (oldest: —)")
+    );
+}
+
+#[test]
+fn attempt_stall_limits_default_to_two_hours_and_apply_to_the_configured_lane() {
+    let host = at("2026-11-22T16:00:00Z");
+    let late = at("2026-11-22T18:30:00Z");
+    let c = campaign(&host);
+    for (target, lane) in [
+        ("01-a/u/cloud", Lane::ClaudeCloud),
+        ("01-a/u/fable", Lane::Fable),
+    ] {
+        assert!(declare(&host, &c, target, lane, &[]).ok());
+        launch_for(&host, &c, target, "session_current");
+    }
+    let limits = c.root.join("LIMITS.toml");
+    let original = fs::read_to_string(&limits).unwrap();
+    let default = plan::next_at(&c.root, None, None, late.now).unwrap();
+    assert_eq!(default.fields["stalled"][0]["limit_hours"], 2.0);
+    assert_eq!(default.fields["stalled"][1]["limit_hours"], 2.0);
+
+    fs::write(
+        &limits,
+        format!("{original}\nclaude_cloud_stall_hours = 3\n"),
+    )
+    .unwrap();
+    let configured = plan::next_at(&c.root, None, None, late.now).unwrap();
+    assert_eq!(configured.fields["stalled"].as_array().unwrap().len(), 1);
+    assert_eq!(configured.fields["stalled"][0]["target"], "01-a/u/fable");
+}
+
+#[test]
+fn pauses_explain_dispatch_holds_without_becoming_actions() {
+    let host = at("2026-11-22T18:00:00Z");
+    let c = campaign(&host);
+    let codex = "01-a/u/codex";
+    let cloud = "01-a/u/cloud";
+    for (target, lane) in [(codex, Lane::Codex), (cloud, Lane::ClaudeCloud)] {
+        assert!(declare(&host, &c, target, lane, &[]).ok());
+        kickoff(&c, target);
+    }
+    let quota = |args: &[&str]| {
+        coordinator_cm(&c, args)
+            .env("CM_CODEX_WEEKLY_PCT", "85")
+            .output()
+            .unwrap()
+    };
+    let held = quota(&["next", "--json"]);
+    assert!(held.status.success(), "{held:?}");
+    let held: serde_json::Value = serde_json::from_slice(&held.stdout).unwrap();
+    assert_eq!(held["steps"].as_array().unwrap().len(), 1);
+    assert_eq!(held["steps"][0]["target"], cloud);
+    assert_eq!(held["waiting"][0]["target"], codex);
+    assert_eq!(
+        held["waiting"][0]["waits_on"][0],
+        "Codex dispatch held: weekly usage 85% reached the 85% pause"
+    );
+    let named = quota(&["next", codex]);
+    assert!(named.status.success(), "{named:?}");
+    let act = quota(&["next", "--act"]);
+    assert!(act.status.success() && act.stdout.is_empty(), "{act:?}");
+
+    let path = c.root.join("LIMITS.toml");
+    let paused = fs::read_to_string(&path)
+        .unwrap()
+        .replace("paused = false", "paused = true");
+    fs::write(path, paused).unwrap();
+    let held = coordinator_cm(&c, &["next"]).output().unwrap();
+    assert!(held.status.success(), "{held:?}");
+    assert!(
+        String::from_utf8(held.stdout)
+            .unwrap()
+            .contains("paused = true")
+    );
+    let act = coordinator_cm(&c, &["next", "--act"]).output().unwrap();
+    assert!(act.status.success() && act.stdout.is_empty(), "{act:?}");
+}
+
+#[test]
+fn a_review_ledger_row_clears_only_its_pr() {
+    let host = at("2026-11-22T18:00:00Z");
+    let c = campaign(&host);
+    let reviewed = "01-a/u/reviewed";
+    let other = "01-a/u/other";
+    let pr = "https://github.com/owner/repo/pull/7";
+    for (target, url) in [
+        (reviewed, pr),
+        (other, "https://github.com/other/repo/pull/7"),
+    ] {
+        assert!(declare(&host, &c, target, Lane::Pi, &[]).ok());
+        kickoff(&c, target);
+        open_pr(&host, &c, target, url);
+    }
+    let reviews = cm::review::Reviews {
+        preamble: String::new(),
+        postamble: String::new(),
+        rows: vec![cm::review::Row::Imported {
+            cells: vec!["1".into(), "repo#7".into(), reviewed.into()],
+        }],
+    };
+    store::write_json(&c.root.join(".cm/reviews.json"), &reviews).unwrap();
+    let outcome = coordinator_cm(&c, &["next", "--act", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(outcome.status.code(), Some(1), "{outcome:?}");
+    let outcome: serde_json::Value = serde_json::from_slice(&outcome.stdout).unwrap();
+    assert_eq!(outcome["actionable"].as_array().unwrap().len(), 1);
+    assert_eq!(outcome["actionable"][0]["target"], other);
 }

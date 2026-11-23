@@ -5,6 +5,7 @@ use jiff::Timestamp;
 
 use crate::commands::{closed, write_unit};
 use crate::evidence::CampaignFile;
+use crate::forge::GithubRepo;
 use crate::host::{Host, stamp};
 use crate::journal;
 use crate::outcome::{Outcome, Violation};
@@ -35,6 +36,45 @@ pub enum Act {
     },
 }
 
+pub(crate) fn coordinator_label(given: &Option<String>) -> Option<String> {
+    given.clone().or_else(|| {
+        let value = std::env::var("CLAUDE_CODE_REMOTE_SESSION_ID").ok()?;
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(match value.strip_prefix("cse_") {
+                Some(id) => format!("session_{id}"),
+                None => value.to_owned(),
+            })
+        }
+    })
+}
+
+fn launch_metadata(kind: &str) -> bool {
+    matches!(kind, "branch" | "repo")
+}
+
+/// Read launch metadata from this attempt only. A newer unfinished record must not revive
+/// an older value of the same kind.
+pub(crate) fn launch_branch<'a>(
+    attempt: &'a Attempt,
+    github: Option<&GithubRepo>,
+) -> Option<(GithubRepo, &'a str)> {
+    let recorded = |kind| {
+        attempt
+            .actions
+            .iter()
+            .rev()
+            .find(|action| action.kind == kind)?
+            .id
+            .as_deref()
+    };
+    let branch = recorded("branch").filter(|branch| !branch.starts_with('-'))?;
+    let repo = github.cloned().or_else(|| recorded("repo")?.parse().ok())?;
+    Some((repo, branch))
+}
+
 pub(crate) fn check_coordinator(full: &str, coordinator: &str) -> Option<Violation> {
     (coordinator.trim().is_empty() || coordinator.contains(['\n', '\r']))
         .then(|| Violation::new(full, "attempt-claim", "--coordinator is one non-empty line"))
@@ -51,11 +91,10 @@ fn expired(attempt: &Attempt, now: Timestamp) -> bool {
 
 /// What a coordinator holding only the committed state does next, as `(code, instruction)`.
 pub fn plan(attempt: &Attempt, now: Timestamp) -> (&'static str, String) {
-    let last = attempt.actions.last();
     if let Some(ended) = &attempt.ended {
         return ("ended", format!("ended {} at {}", ended.outcome, ended.at));
     }
-    if let Some(action) = last.filter(|action| action.id.is_none()) {
+    if let Some(action) = attempt.actions.last().filter(|action| action.id.is_none()) {
         return (
             "unknown",
             format!(
@@ -69,6 +108,7 @@ pub fn plan(attempt: &Attempt, now: Timestamp) -> (&'static str, String) {
             .actions
             .iter()
             .rev()
+            .filter(|action| !launch_metadata(&action.kind))
             .filter_map(|action| {
                 action.id.as_ref().map(|id| {
                     if action.kind == "cancel" {
@@ -92,7 +132,12 @@ pub fn plan(attempt: &Attempt, now: Timestamp) -> (&'static str, String) {
             ),
         );
     }
-    match last {
+    match attempt
+        .actions
+        .iter()
+        .rev()
+        .find(|action| !launch_metadata(&action.kind))
+    {
         None => (
             "dispatch",
             "nothing reached the runtime: `cm attempt <step> begin <kind>`, then dispatch"
