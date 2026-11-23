@@ -397,9 +397,9 @@ impl<'a> Run<'a> {
         self.dirty.insert(unit_name.to_owned());
     }
 
-    fn pull(&mut self, url: &str, target: &str) -> Option<Read<PullRead>> {
+    fn pull(&mut self, url: &str, target: Option<&str>) -> Option<Read<PullRead>> {
         let previous = self.seen.get(url).filter(|seen| {
-            seen.target == target
+            Some(seen.target.as_str()) == target
                 && seen.at.parse::<jiff::Timestamp>().is_ok_and(|at| {
                     (jiff::SignedDuration::ZERO..PULL_MAX_AGE)
                         .contains(&self.now.duration_since(at))
@@ -422,6 +422,7 @@ impl<'a> Run<'a> {
                 merge_commit: None,
                 merged_at: None,
                 head: seen.head.as_ref().map(CommitSha::new),
+                head_ref: None,
                 base: seen.base.as_ref().map(CommitSha::new),
                 mergeable_state: seen.mergeable_state.clone(),
             };
@@ -696,15 +697,14 @@ impl<'a> Run<'a> {
             {
                 continue;
             }
-            if let Some(branch) =
-                recorded_id(attempt, "branch").filter(|branch| !branch.starts_with('-'))
-            {
+            let recorded_branch = recorded_id(attempt, "branch");
+            if let Some(branch) = recorded_branch.filter(|branch| !branch.starts_with('-')) {
                 // Replay requires the same attempt and launch metadata that the read used.
                 let key = (attempt.id.clone(), repo.clone(), branch.to_owned());
                 match cached(&mut self.reads.branch_pulls, key, self.forge, |forge| {
                     forge.open_pull_for_branch(&repo, branch)
                 }) {
-                    Some(Ok(Some(url))) if self.discover_pr(&target, &repo, &url) => continue,
+                    Some(Ok(Some(url))) if self.discover_pr(&target, &repo, &url, None) => continue,
                     Some(Err(error)) => self.discovery_warnings.push(format!(
                         "{target}: could not look up {repo} branch {branch}: {error}"
                     )),
@@ -718,12 +718,18 @@ impl<'a> Run<'a> {
                     .filter(|read| read.completed_at.is_some())
                     .and_then(|read| read.pr_url.as_deref())
             {
-                self.discover_pr(&target, &declared, url);
+                self.discover_pr(&target, &declared, url, recorded_branch);
             }
         }
     }
 
-    fn discover_pr(&mut self, target: &str, repo: &GithubRepo, url: &str) -> bool {
+    fn discover_pr(
+        &mut self,
+        target: &str,
+        repo: &GithubRepo,
+        url: &str,
+        recorded_branch: Option<&str>,
+    ) -> bool {
         if !is_pr_url(url)
             || !GithubRepo::of_pr(url)
                 .is_some_and(|pr_repo| pr_repo.to_string().eq_ignore_ascii_case(&repo.to_string()))
@@ -732,8 +738,18 @@ impl<'a> Run<'a> {
                 .push(format!("{target}: invalid PR URL for {repo}: {url}"));
             return false;
         }
-        match self.pull(url, target) {
+        // Fetch a full observation for a newly discovered PR, including its head branch.
+        match self.pull(url, None) {
             Some(Ok(read)) if read.pull.state == PullState::Open => {
+                if let Some(branch) = recorded_branch
+                    && read.pull.head_ref.as_deref() != Some(branch)
+                {
+                    let actual = read.pull.head_ref.as_deref().unwrap_or("unreported");
+                    self.discovery_warnings.push(format!(
+                        "{target}: {url} head branch {actual} does not match recorded branch {branch}"
+                    ));
+                    return false;
+                }
                 let head = read.pull.head.filter(|head| {
                     head.as_str().len() == 40 && crate::state::is_commit(head.as_str())
                 });
@@ -767,7 +783,7 @@ impl<'a> Run<'a> {
             let Some(url) = tracked.track.evidence.pr.clone() else {
                 continue;
             };
-            let Some(read) = self.pull(&url, &target) else {
+            let Some(read) = self.pull(&url, Some(&target)) else {
                 continue;
             };
             let PullRead {

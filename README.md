@@ -400,6 +400,11 @@ became multipart also names the required part input. An `until:` block offers `c
 while its condition is unmet; that command lists the unblock action once it holds. Free-text
 blocks offer `cm unblock`.
 
+When `CM_CODEX_WEEKLY_PCT` contains a valid percentage at or above 85, `cm next`
+lists ready Codex steps as waiting and shows the reason. Named `cm next <step>` and
+`cm launch <step>` refuse the held dispatch with exit 1 and `codex-paused`. The
+hold appears in regular `cm next` and CARD dispatch guidance.
+
 ### Remote turns
 
 For a lane with a configured reader, a launch's stall clock starts at the latest turn's
@@ -413,13 +418,16 @@ Use `claude_cloud_turn_reader` and `claude_cloud_turn_logs` for Claude Cloud. Ea
 an argv array. cm substitutes `{thread}` and `{turn}` in arguments and expands leading `~/`.
 The reader runs outside the campaign lock with a 15-second deadline through stdout completion.
 It returns `done`, `successful`, and `turn_status` as JSON, with optional `completed_at` and
-`pr_url`. Sync reports invalid command pairs and reader failures in `turn_reader_warnings`.
+`pr_url`. A PR URL from the reader must match the step’s repository and, when a branch was
+recorded at launch, GitHub must report that branch as the PR head. Sync reports unparseable
+LIMITS.toml, invalid command pairs, and reader failures in `turn_reader_warnings`.
 
 `cm next --act` prints only actionable lines, each starting with `<kind> <step>:`. It lists
 `turn-ended` first, then `pr-open-unreviewed`, then the other kinds by the number of steps waiting
 behind them. An ended turn without a PR shows its configured logs command in place of the age
-stall. JSON carries `kind`, `since`, and `command` in the `actionable` list. Exit 1 means actions
-remain. Exit 0 means the list is empty.
+stall while the attempt is active. Codex launches with an ended attempt retain the informational
+stall report. JSON carries `kind`, `since`, and `command` in the `actionable` list. Exit 1 means
+actions remain. Exit 0 means the list is empty.
 
 ### Finishing
 

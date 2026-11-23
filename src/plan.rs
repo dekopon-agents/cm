@@ -434,9 +434,10 @@ pub(crate) fn stalls(units: &Units, inputs: &ActionInputs) -> Vec<Stall> {
                 && let Some(lane) = lane
                 && inputs.turn_commands.for_lane(lane).is_some()
             {
-                if remote_turn(attempt, lane)
-                    .and_then(|turn| turn.observation(attempt))
-                    .is_some_and(|read| read.completed_at.is_some())
+                if active.is_some()
+                    && remote_turn(attempt, lane)
+                        .and_then(|turn| turn.observation(attempt))
+                        .is_some_and(|read| read.completed_at.is_some())
                 {
                     return None;
                 }
@@ -796,16 +797,6 @@ pub(crate) fn next_act(
     Ok((outcome, !actions.is_empty()))
 }
 
-fn codex_pause() -> Option<String> {
-    let used = std::env::var("CM_CODEX_WEEKLY_PCT")
-        .ok()?
-        .parse::<f64>()
-        .ok()?;
-    (85.0..=100.0)
-        .contains(&used)
-        .then(|| format!("Codex dispatch held: weekly usage {used}% reached the 85% pause"))
-}
-
 /// What `cm sync` last saw of an open PR, in `.cm/pulls.json`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Observed {
@@ -1014,7 +1005,7 @@ pub(crate) fn unblock_command(target: &str, condition_met: bool) -> String {
 
 pub fn summary(root: &Path, units: &Units) -> Next {
     let paused = paused(root).unwrap_or(true);
-    let quota = codex_pause();
+    let quota = limits::codex_pause();
     let mut ready = Vec::new();
     let mut waiting = Vec::new();
     for candidate in candidates(root, units) {
@@ -1102,7 +1093,7 @@ pub fn next_at(
         target,
         lane,
     );
-    let quota = codex_pause();
+    let quota = limits::codex_pause();
     let quota = (!paused).then_some(quota.as_deref()).flatten();
     let fresh_readers: Vec<Value> = crate::verdict::fresh_readers(&verdicts)
         .into_iter()
@@ -1228,7 +1219,12 @@ pub fn next_at(
             ));
         }
         let quota_hold = candidate.dispatch_hold(quota);
-        if outcome.ok() && quota_hold.is_none() {
+        if let Some(reason) = quota_hold {
+            outcome
+                .violations
+                .push(limits::codex_pause_violation(&full, reason));
+        }
+        if outcome.ok() {
             outcome.line(next_item(
                 &mut number,
                 &format!(

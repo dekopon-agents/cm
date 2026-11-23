@@ -34,11 +34,9 @@ impl ForgeError {
                 write!(f, "{program} exited {code}; check access with {program}")
             }
             ForgeError::Exit(None) => write!(f, "{program} exited by signal"),
-            ForgeError::Timeout(after) => write!(
-                f,
-                "{program} did not answer within {}s; killed it",
-                after.as_secs()
-            ),
+            ForgeError::Timeout(after) => {
+                write!(f, "{program} did not answer within {}s", after.as_secs())
+            }
             ForgeError::Json => write!(f, "{program} returned JSON cm cannot read"),
             ForgeError::UnsupportedFormula => {
                 f.write_str("tap formula uses unsupported or invalid publication content")
@@ -248,6 +246,8 @@ pub struct Pull {
     pub merged_at: Option<String>,
     /// The PR's head commit, as GitHub reports it.
     pub head: Option<CommitSha>,
+    /// The PR's head branch, when GitHub reports it.
+    pub head_ref: Option<String>,
     /// The base branch's tip, as GitHub reports it.
     pub base: Option<CommitSha>,
     /// GitHub's `mergeable_state` (`clean`, `dirty`, `blocked`, `unknown`, …), lower case.
@@ -1072,6 +1072,8 @@ impl Gh {
         #[derive(Deserialize)]
         struct Head {
             sha: String,
+            #[serde(rename = "ref")]
+            name: Option<String>,
         }
         let path = url
             .strip_prefix("https://github.com/")
@@ -1104,6 +1106,7 @@ impl Gh {
                 .filter(|_| state == PullState::Merged)
                 .map(CommitSha::new),
             merged_at: rest.merged_at.filter(|_| state == PullState::Merged),
+            head_ref: rest.head.as_ref().and_then(|head| head.name.clone()),
             head: rest.head.map(|head| CommitSha::new(head.sha)),
             base: rest.base.map(|base| CommitSha::new(base.sha)),
             mergeable_state: rest

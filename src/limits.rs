@@ -153,28 +153,50 @@ impl TurnPair {
 
 const TURN_READER_LANES: [Lane; 2] = [Lane::Codex, Lane::ClaudeCloud];
 
-pub(crate) struct TurnCommands([Result<Option<TurnPair>, Vec<String>>; TURN_READER_LANES.len()]);
+type TurnSetup = Result<Option<TurnPair>, Vec<String>>;
+
+pub(crate) struct TurnCommands(Result<[TurnSetup; TURN_READER_LANES.len()], String>);
 
 impl TurnCommands {
     pub(crate) fn read(root: &Path) -> Self {
-        let table = std::fs::read_to_string(root.join("LIMITS.toml"))
-            .ok()
-            .and_then(|text| text.parse().ok())
-            .unwrap_or_default();
-        Self(TURN_READER_LANES.map(|lane| TurnPair::read(&table, lane)))
+        let table = match std::fs::read_to_string(root.join("LIMITS.toml")) {
+            Ok(text) => text.parse().map_err(|error: toml::de::Error| {
+                format!("cannot parse LIMITS.toml: {}", error.message())
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Table::new()),
+            Err(error) => Err(format!("cannot read LIMITS.toml: {error}")),
+        };
+        Self(table.map(|table| TURN_READER_LANES.map(|lane| TurnPair::read(&table, lane))))
     }
 
     pub(crate) fn for_lane(&self, lane: Lane) -> Option<&TurnPair> {
         let index = TURN_READER_LANES.iter().position(|known| *known == lane)?;
-        self.0[index].as_ref().ok()?.as_ref()
+        self.0.as_ref().ok()?[index].as_ref().ok()?.as_ref()
     }
 
     pub(crate) fn errors(&self) -> impl Iterator<Item = &String> {
-        self.0
-            .iter()
-            .filter_map(|configured| configured.as_ref().err())
-            .flatten()
+        self.0.as_ref().err().into_iter().chain(
+            self.0
+                .iter()
+                .flatten()
+                .filter_map(|configured| configured.as_ref().err())
+                .flatten(),
+        )
     }
+}
+
+pub(crate) fn codex_pause() -> Option<String> {
+    let used = std::env::var("CM_CODEX_WEEKLY_PCT")
+        .ok()?
+        .parse::<f64>()
+        .ok()?;
+    (85.0..=100.0)
+        .contains(&used)
+        .then(|| format!("Codex dispatch held: weekly usage {used}% reached the 85% pause"))
+}
+
+pub(crate) fn codex_pause_violation(target: &str, reason: &str) -> Violation {
+    Violation::new(target, "codex-paused", reason)
 }
 
 #[derive(Clone, Copy)]

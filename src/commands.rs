@@ -980,6 +980,10 @@ pub fn launch_remote(
                 "limits-paused",
                 "`paused = true`: nothing launches",
             ));
+        } else if declared == Some(Lane::Codex)
+            && let Some(reason) = limits::codex_pause()
+        {
+            violations.push(limits::codex_pause_violation(&full, &reason));
         }
     }
     let unit_dir = root.join(&target.unit);

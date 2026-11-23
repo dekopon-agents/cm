@@ -1218,6 +1218,7 @@ fn merged(sha: &str) -> Pull {
         merge_commit: Some(CommitSha::new(sha)),
         merged_at: None,
         head: None,
+        head_ref: None,
         base: None,
         mergeable_state: None,
     }
@@ -1276,6 +1277,7 @@ fn sync_moves_steps_from_github_state_and_renders_the_card() {
             merge_commit: None,
             merged_at: None,
             head: None,
+            head_ref: None,
             base: None,
             mergeable_state: None,
         },
@@ -3002,6 +3004,7 @@ fn open(head: &str) -> Pull {
         merge_commit: None,
         merged_at: None,
         head: Some(CommitSha::new(head)),
+        head_ref: None,
         base: None,
         mergeable_state: None,
     }
@@ -5389,6 +5392,7 @@ fn attempt_stall_limits_default_to_two_hours_and_apply_to_the_configured_lane() 
     assert_eq!(configured.fields["stalled"][0]["target"], "01-a/u/fable");
 }
 
+#[cfg(unix)]
 #[test]
 fn pauses_explain_dispatch_holds_without_becoming_actions() {
     let host = at("2026-11-22T18:00:00Z");
@@ -5399,9 +5403,11 @@ fn pauses_explain_dispatch_holds_without_becoming_actions() {
         assert!(declare(&host, &c, target, lane, &[]).ok());
         kickoff(&c, target);
     }
+    let gh = support::FakeGh::new("exit 1");
     let quota = |args: &[&str]| {
         coordinator_cm(&c, args)
             .env("CM_CODEX_WEEKLY_PCT", "85")
+            .env("PATH", gh.path())
             .output()
             .unwrap()
     };
@@ -5415,10 +5421,26 @@ fn pauses_explain_dispatch_holds_without_becoming_actions() {
         held["waiting"][0]["waits_on"][0],
         "Codex dispatch held: weekly usage 85% reached the 85% pause"
     );
-    let named = quota(&["next", codex]);
-    assert!(named.status.success(), "{named:?}");
+    let named = quota(&["next", codex, "--json"]);
+    assert_eq!(named.status.code(), Some(1), "{named:?}");
+    let named: serde_json::Value = serde_json::from_slice(&named.stdout).unwrap();
+    assert_eq!(named["violations"][0]["rule"], "codex-paused");
+    assert_eq!(
+        named["waiting"][0]["waits_on"],
+        held["waiting"][0]["waits_on"]
+    );
+
+    let refused = quota(&["launch", codex, "--json"]);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let refused: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refused["violations"][0], named["violations"][0]);
+    assert_eq!(state(&c, codex), Phase::Drafted);
     let act = quota(&["next", "--act"]);
     assert!(act.status.success() && act.stdout.is_empty(), "{act:?}");
+
+    let launched = quota(&["launch", cloud]);
+    assert!(launched.status.success(), "{launched:?}");
+    assert_eq!(state(&c, cloud), Phase::Launched);
 
     let path = c.root.join("LIMITS.toml");
     let paused = fs::read_to_string(&path)
@@ -5501,15 +5523,17 @@ fn record_attempt_action(
 #[cfg(unix)]
 #[test]
 fn sync_observes_remote_turns_and_lists_ended_turns_before_other_actions() {
-    use cm::forge::MergeableState;
+    use cm::attempt::Act;
 
     const WITH_PR: &str = "01-a/u/with-pr";
     const NO_PR: &str = "01-a/u/no-pr";
+    const WRONG_BRANCH: &str = "01-a/u/wrong-branch";
     const FOREIGN_PR: &str = "01-a/u/wrong-repo";
     const RUNNING: &str = "01-a/u/running";
     const FAILING: &str = "01-a/u/failing";
     const UNCONFIGURED: &str = "01-a/u/unconfigured";
     const PR: &str = "https://github.com/o/r/pull/17";
+    const UNRELATED_PR: &str = "https://github.com/o/r/pull/18";
     const HEAD: &str = "89abcdef0123456789abcdef0123456789abcdef";
 
     let claimed = at("2026-11-22T19:00:00Z");
@@ -5520,6 +5544,7 @@ fn sync_observes_remote_turns_and_lists_ended_turns_before_other_actions() {
     for (target, thread, lane) in [
         (WITH_PR, "with-pr", Lane::Codex),
         (NO_PR, "no-pr", Lane::Codex),
+        (WRONG_BRANCH, "wrong-branch", Lane::Codex),
         (FOREIGN_PR, "wrong-repo", Lane::Codex),
         (RUNNING, "running", Lane::Codex),
         (FAILING, "failing", Lane::Codex),
@@ -5531,6 +5556,16 @@ fn sync_observes_remote_turns_and_lists_ended_turns_before_other_actions() {
         record_attempt_action(&claimed, &c, target, &claim, "thread", thread);
         record_attempt_action(&claimed, &c, target, &claim, "turn", "old-turn");
         record_attempt_action(&began, &c, target, &claim, "turn", "latest-turn");
+        if matches!(target, WITH_PR | WRONG_BRANCH) {
+            record_attempt_action(
+                &began,
+                &c,
+                target,
+                &claim,
+                "branch",
+                &format!("work/{thread}"),
+            );
+        }
         claims.insert(target, claim);
     }
     assert!(declare(&now, &c, "01-a/u/packet", Lane::Owner, &[]).ok());
@@ -5552,6 +5587,8 @@ case "$1/$2" in
         echo '{{"done":true,"successful":true,"turn_status":"completed","thread_id":"with-pr","turn_id":"latest-turn","pr_url":"{PR}"}}' ;;
     no-pr/latest-turn)
         echo '{{"done":true,"successful":false,"turn_status":"failed","completed_at":"2026-11-23T03:29:42Z"}}' ;;
+    wrong-branch/latest-turn)
+        echo '{{"done":true,"successful":true,"turn_status":"completed","pr_url":"{UNRELATED_PR}"}}' ;;
     wrong-repo/latest-turn)
         echo '{{"done":true,"successful":true,"turn_status":"completed","pr_url":"https://github.com/elsewhere/r/pull/17"}}' ;;
     running/latest-turn|no-pr/replacement-turn)
@@ -5575,19 +5612,22 @@ codex_turn_logs = ["turn-logs", "{{thread}}", "--turn-id", "{{turn}}"]
         ),
     )
     .unwrap();
-    let forge = FakeForge {
-        pulls: BTreeMap::from([(
-            PR.to_owned(),
-            Pull {
-                state: PullState::Open,
-                merge_commit: None,
-                merged_at: None,
-                head: Some(CommitSha::new(HEAD)),
-                base: None,
-                mergeable_state: Some(MergeableState::Other("clean".into())),
-            },
-        )]),
-        ..Default::default()
+    let gh = support::FakeGh::new(&format!(
+        r#"
+case "$*" in
+    'api --method GET repos/o/r/pulls -f state=open -f head=o:work/with-pr -f per_page=2'|'api --method GET repos/o/r/pulls -f state=open -f head=o:work/wrong-branch -f per_page=2')
+        echo '[]' ;;
+    'api repos/o/r/pulls/17 --include')
+        echo '{{"state":"open","merged":false,"merge_commit_sha":null,"head":{{"sha":"{HEAD}","ref":"work/with-pr"}}}}' ;;
+    'api repos/o/r/pulls/18 --include')
+        echo '{{"state":"open","merged":false,"merge_commit_sha":null,"head":{{"sha":"{HEAD}","ref":"work/unrelated"}}}}' ;;
+    *) exit 1 ;;
+esac
+"#
+    ));
+    let forge = Gh {
+        program: gh.program(),
+        timeout: std::time::Duration::from_secs(5),
     };
 
     let before_read = plan::next_at(&c.root, None, None, now.now).unwrap();
@@ -5602,9 +5642,22 @@ codex_turn_logs = ["turn-logs", "{{thread}}", "--turn-id", "{{turn}}"]
     assert_eq!(opened.state, Phase::PrOpen);
     assert_eq!(opened.evidence.pr.as_deref(), Some(PR));
     assert_eq!(opened.evidence.sha.as_deref(), Some(HEAD));
-    for target in [NO_PR, FOREIGN_PR, RUNNING, FAILING, UNCONFIGURED] {
+    for target in [
+        NO_PR,
+        WRONG_BRANCH,
+        FOREIGN_PR,
+        RUNNING,
+        FAILING,
+        UNCONFIGURED,
+    ] {
         assert_eq!(plan::track(&units, target).unwrap().state, Phase::Launched);
     }
+    assert_eq!(
+        synced.fields["pr_discovery_warnings"][0],
+        format!(
+            "{WRONG_BRANCH}: {UNRELATED_PR} head branch work/unrelated does not match recorded branch work/wrong-branch"
+        )
+    );
     assert_eq!(
         synced.fields["turn_reader_warnings"],
         serde_json::json!(["01-a/u/failing: turn reader exited 17; check access with turn reader"])
@@ -5631,6 +5684,12 @@ codex_turn_logs = ["turn-logs", "{{thread}}", "--turn-id", "{{turn}}"]
         Some(
             "turn-ended 01-a/u/no-pr: thread no-pr completed 2026-11-23T03:29:42Z, no PR — `turn-logs no-pr --turn-id latest-turn`"
         )
+    );
+    assert!(
+        lines
+            .next()
+            .unwrap()
+            .starts_with("turn-ended 01-a/u/wrong-branch:")
     );
     assert_eq!(
         lines.next(),
@@ -5659,7 +5718,7 @@ codex_turn_logs = ["turn-logs", "{{thread}}", "--turn-id", "{{turn}}"]
         act["actionable"][0]["command"],
         "turn-logs no-pr --turn-id latest-turn"
     );
-    assert_eq!(act["actionable"][2]["kind"], "pr-open-unreviewed");
+    assert_eq!(act["actionable"][3]["kind"], "pr-open-unreviewed");
 
     fs::write(reader.with_extension("fail-running"), "").unwrap();
     let failed_after_running = sync(&now, &forge, &c.root).unwrap();
@@ -5701,9 +5760,35 @@ codex_turn_logs = ["turn-logs", "{{thread}}", "--turn-id", "{{turn}}"]
         .iter()
         .filter(|action| action["kind"] == "turn-ended")
         .collect();
-    assert_eq!(ended.len(), 1);
-    assert_eq!(ended[0]["target"], FOREIGN_PR);
-    assert_eq!(ended[0]["since"], "2026-11-23T03:30Z");
+    assert_eq!(ended.len(), 2);
+    assert_eq!(ended[1]["target"], FOREIGN_PR);
+    assert_eq!(ended[1]["since"], "2026-11-23T03:30Z");
+
+    attempt_action(
+        &later,
+        &c,
+        FOREIGN_PR,
+        Some(&claims[FOREIGN_PR]),
+        Act::End {
+            outcome: cm::state::AttemptOutcome::Unknown,
+            file: None,
+        },
+    );
+    let next = plan::next_at(&c.root, None, None, later.now).unwrap();
+    let stale = next.fields["stalled"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stall| stall["target"] == FOREIGN_PR)
+        .expect("ended Codex attempt still has an age stall");
+    assert_eq!(stale["since"], "2026-11-23T03:25Z");
+    assert!(
+        !next.fields["actionable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["target"] == FOREIGN_PR && action["kind"] == "turn-ended")
+    );
 }
 
 #[cfg(unix)]
@@ -5742,6 +5827,10 @@ echo '{"done":true,"successful":true,"turn_status":"completed"}'
             r#"codex_turn_logs = ["turn-logs", "{thread}"]"#.to_owned(),
             "missing `codex_turn_reader`",
         ),
+        (
+            format!("codex_turn_reader = {reader_argv}\ncodex_turn_logs = ["),
+            "cannot parse LIMITS.toml:",
+        ),
     ] {
         fs::write(&path, format!("{original}\n{settings}\n")).unwrap();
         let synced = sync(&now, &FakeForge::default(), &c.root).unwrap();
@@ -5757,10 +5846,13 @@ echo '{"done":true,"successful":true,"turn_status":"completed"}'
             "reader ran with an invalid pair"
         );
 
-        let next = plan::next_at(&c.root, None, None, now.now).unwrap();
-        assert_eq!(next.fields["stalled"][0]["target"], target);
+        assert_eq!(synced.fields["stalled"][0]["target"], target);
+        let next = coordinator_cm(&c, &["next", "--act", "--json"])
+            .output()
+            .unwrap();
+        let next: serde_json::Value = serde_json::from_slice(&next.stdout).unwrap();
         assert!(
-            next.fields["actionable"]
+            next["actionable"]
                 .as_array()
                 .unwrap()
                 .iter()

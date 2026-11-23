@@ -112,6 +112,7 @@ impl Forge for FakeForge {
             merge_commit: (self.state == PullState::Merged)
                 .then(|| CommitSha::new(self.head.clone())),
             head: Some(CommitSha::new(self.head.clone())),
+            head_ref: None,
             base: self.base.clone().map(CommitSha::new),
             mergeable_state: Some(self.mergeable.to_owned().into()),
         })
