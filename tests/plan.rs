@@ -2145,6 +2145,51 @@ esac
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn sync_omits_a_quota_sample_when_its_response_buffer_cannot_grow() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let gh = support::FakeGh::new(
+        r#"[ "$#" = 2 ] && [ "$1" = api ] && [ "$2" = rate_limit ] || exit 90
+printf '%s\n' "$*" >>"$FAKE_GH/requests"
+if [ -f "$FAKE_GH/large" ]; then
+    exec dd if=/dev/zero bs=65536 count=1024
+fi
+echo '{"resources":{"core":{"used":17,"limit":5000,"reset":1792227600}}}'
+"#,
+    );
+    let sync = || {
+        let output = Command::new("sh")
+            .args([
+                "-c",
+                r#"ulimit -c 0 && ulimit -v 32768 && exec "$@""#,
+                "sh",
+                env!("CARGO_BIN_EXE_cm"),
+                "-C",
+            ])
+            .arg(&c.root)
+            .arg("sync")
+            .env("PATH", gh.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        fs::read_to_string(c.root.join("CARD.md")).unwrap()
+    };
+
+    // The same memory limit must still allow a normal sample.
+    assert_eq!(
+        sync().lines().nth(1),
+        Some("GitHub REST core: 17/5000 used (reset 1792227600)")
+    );
+    fs::write(gh.fixture().join("large"), "").unwrap();
+    assert_eq!(sync().lines().nth(1), Some(""));
+    assert_eq!(
+        fs::read_to_string(gh.fixture().join("requests")).unwrap(),
+        "api rate_limit\napi rate_limit\n"
+    );
+}
+
+#[test]
 #[cfg(unix)]
 fn a_timed_out_quota_sample_closes_stdout_held_open_by_a_descendant() {
     use std::time::{Duration, Instant};

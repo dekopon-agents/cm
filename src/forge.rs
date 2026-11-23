@@ -756,6 +756,7 @@ fn run(
                 match stdout.read(&mut buffer) {
                     Ok(0) => eof = true,
                     Ok(n) => {
+                        body.try_reserve(n).map_err(|_| ForgeError::Json)?;
                         body.extend_from_slice(&buffer[..n]);
                         read = true;
                     }
