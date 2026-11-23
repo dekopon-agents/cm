@@ -1977,6 +1977,76 @@ esac
 
 #[test]
 #[cfg(unix)]
+fn an_in_flight_304_cannot_restore_a_pull_observation_removed_by_a_concurrent_sync() {
+    use std::time::{Duration, Instant};
+
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let target = "01-a/u/S1";
+    let pr = "https://github.com/o/r/pull/1";
+    assert!(declare(&host, &c, target, Lane::Pi, &[]).ok());
+    kickoff(&c, target);
+    open_pr(&host, &c, target, pr);
+
+    let gh = support::FakeGh::with_http(
+        r#"[ "$#" = 2 ] && [ "$2" = rate_limit ] && exit 1
+[ "$1" = api ] && [ "$2" = repos/o/r/pulls/1 ] && [ "$3" = --include ] || exit 90
+if [ "$#" = 3 ]; then
+    printf 'HTTP/2.0 200 OK\r\nETag: "open"\r\n\r\n'
+    echo '{"state":"open","merged":false,"mergeable_state":"dirty"}'
+elif [ "$#" = 5 ] && [ "$4" = -H ] && [ "$5" = 'If-None-Match: "open"' ]; then
+    if [ -f "$FAKE_GH/started" ]; then
+        printf 'HTTP/2.0 200 OK\r\n\r\n'
+        echo '{"state":"closed","merged":false}'
+    else
+        touch "$FAKE_GH/started"
+        while [ ! -f "$FAKE_GH/release" ]; do sleep 0.02; done
+        printf 'HTTP/2.0 304 Not Modified\r\n\r\n'
+        exit 1
+    fi
+else
+    exit 91
+fi
+"#,
+    );
+    let forge = Gh {
+        program: gh.program(),
+        timeout: Duration::from_secs(10),
+    };
+    let observe = || sync(&host, &forge, &c.root).unwrap();
+    let pulls = || {
+        store::read_json::<BTreeMap<String, plan::Observed>>(&plan::pulls_path(&c.root)).unwrap()
+    };
+    assert!(observe().ok());
+    assert_eq!(
+        pulls()[pr].mergeable_state,
+        Some(cm::forge::MergeableState::Dirty)
+    );
+
+    std::thread::scope(|scope| {
+        let waiting = scope.spawn(observe);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !gh.fixture().join("started").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "conditional request did not start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let closed = observe();
+        let after_close = pulls();
+        fs::write(gh.fixture().join("release"), "").unwrap();
+        let resumed = waiting.join().unwrap();
+
+        assert_eq!(rules(&closed), vec!["pr-closed"]);
+        assert!(after_close.is_empty());
+        assert!(resumed.ok(), "{:?}", resumed.violations);
+        assert!(pulls().is_empty(), "the closed PR returned to pulls.json");
+    });
+}
+
+#[test]
+#[cfg(unix)]
 fn a_stalled_gh_is_killed_at_its_timeout() {
     use std::time::{Duration, Instant};
 

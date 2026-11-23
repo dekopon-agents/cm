@@ -589,16 +589,19 @@ impl<'a> Run<'a> {
                     continue;
                 }
             };
-            if let Some(at) = &cached_at
-                && let Some(seen) = self.seen.get(&url).filter(|seen| seen.target == target)
-                && (seen.at != *at
+            if let Some(at) = &cached_at {
+                let Some(seen) = self.seen.get(&url).filter(|seen| seen.target == target) else {
+                    continue;
+                };
+                if seen.at != *at
                     || seen.head.as_deref() != pull.head.as_ref().map(CommitSha::as_str)
                     || seen.base.as_deref() != pull.base.as_ref().map(CommitSha::as_str)
-                    || seen.mergeable_state != pull.mergeable_state)
-            {
-                // Another sync published a full read while this read was in flight.
-                self.open.insert(url, seen.clone());
-                continue;
+                    || seen.mergeable_state != pull.mergeable_state
+                {
+                    // Another sync published a full read while this read was in flight.
+                    self.open.insert(url, seen.clone());
+                    continue;
+                }
             }
             if let Some(head) = &pull.head {
                 self.heads.insert(target.clone(), head.to_string());
