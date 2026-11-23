@@ -129,17 +129,59 @@ fn mac_lane_add_refuses_an_undeclared_step_without_writing() {
     assert!(cm(root, &["init"]).status.success());
     assert!(cm(root, &["init", "01-first/alpha"]).status.success());
     let journal = root.join("JOURNAL.md");
-    let before = fs::read(&journal).unwrap();
     let target = "01-first/alpha/undeclared";
-    let refused = cm(
-        root,
-        &["--json", "mac-lane", "add", "Mac work", "--step", target],
-    );
-    assert_eq!(refused.status.code(), Some(1));
-    assert_eq!(json(&refused)["violations"][0]["rule"], "step-unknown");
-    assert_eq!(json(&refused)["violations"][0]["path"], target);
+    let assert_refused = || {
+        let refused = cm(
+            root,
+            &["--json", "mac-lane", "add", "Mac work", "--step", target],
+        );
+        assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+        let violation = &json(&refused)["violations"][0];
+        assert_eq!(violation["rule"], "step-unknown");
+        assert_eq!(violation["path"], target);
+    };
+
+    let before = fs::read(&journal).unwrap();
+    assert_refused();
     assert!(!root.join("MAC-LANE.md").exists());
-    assert_eq!(fs::read(journal).unwrap(), before);
+    assert_eq!(fs::read(&journal).unwrap(), before);
+
+    let unit_dir = root.join("01-first/alpha");
+    let mut unit = cm::store::load_unit(&unit_dir).unwrap();
+    let mut step = cm::state::Step::new(&unit.track.since);
+    step.track.state = cm::state::Phase::Launched;
+    step.launches = 1;
+    unit.steps.insert("undeclared".to_owned(), step);
+    cm::commands::write_unit(&unit_dir, &unit).unwrap();
+    assert!(
+        cm(root, &["mac-lane", "add", "Existing request"])
+            .status
+            .success()
+    );
+    let paths = [
+        root.join("MAC-LANE.md"),
+        cm::store::state_path(&unit_dir),
+        cm::store::state_path(root),
+        journal,
+    ];
+    let snapshot = || paths.each_ref().map(|path| fs::read(path).unwrap());
+    let before = snapshot();
+    assert_refused();
+    assert_eq!(snapshot(), before);
+}
+
+#[test]
+fn init_help_advertises_all_supported_lanes() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = cm(temp.path(), &["init", "--help"]);
+    assert!(output.status.success(), "{output:?}");
+    let help = String::from_utf8(output.stdout).unwrap();
+    let lane_help = help
+        .lines()
+        .find(|line| line.contains("--lane <LANE>"))
+        .unwrap();
+    let lanes = cm::state::LANES.map(cm::state::Lane::name).join(", ");
+    assert!(lane_help.contains(&lanes), "{lane_help}");
 }
 
 #[test]

@@ -1068,7 +1068,7 @@ pub(crate) fn mac_lane_add_with_step(
             return Ok(unknown());
         }
         let mut unit = store::load_unit(&dir)?;
-        let Some(step) = unit.steps.get_mut(name) else {
+        let Some(step) = unit.steps.get_mut(name).filter(|step| step.lane.is_some()) else {
             return Ok(unknown());
         };
         step.mac_lane_items.push(number);

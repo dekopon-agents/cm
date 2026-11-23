@@ -12,7 +12,7 @@ use crate::host::{Host, System};
 use crate::idea::{self, Maturity, Word};
 use crate::lint;
 use crate::outcome::{Outcome, Violation};
-use crate::state::{Evidence, Lane, Phase, Work};
+use crate::state::{Evidence, LANES, Lane, Phase, Work};
 use crate::store::{self, Target, parse_target};
 
 #[derive(Parser)]
@@ -55,8 +55,7 @@ enum Commands {
         /// The folder to initialize.
         #[arg(default_value = ".")]
         dir: PathBuf,
-        /// The step's lane: pi, codex, claude-cloud, fable, owner or coordinator.
-        #[arg(long)]
+        #[arg(long, help = format!("The step's lane. Choose from {}.", LANES.map(Lane::name).join(", ")))]
         lane: Option<Lane>,
         /// The step is a study: it ships no PR and finishes with `cm advance <step> done --evidence <path>`.
         #[arg(long)]
