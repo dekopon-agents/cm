@@ -1021,6 +1021,7 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
         crate::ledger::unread_owner_queue(root)?,
     );
     read.walk();
+    let rate_limit = forge.rate_limit();
     let _lock = lock(root)?;
     let found = guard(root)?;
     if !found.is_empty() {
@@ -1111,7 +1112,15 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let card = render::card(root, run.now, &name, &run.units, &next, &run.moves);
+    let card = render::card_with_rate_limit(
+        root,
+        run.now,
+        &name,
+        &run.units,
+        &next,
+        &run.moves,
+        rate_limit.as_deref(),
+    );
     write_atomic(&root.join(CARD), card.as_bytes())?;
     render_resume(root, &run.units, false)?;
     for moved in &run.moves {

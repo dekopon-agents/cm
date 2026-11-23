@@ -374,10 +374,27 @@ pub fn card(
     next: &Next,
     moves: &[Moved],
 ) -> String {
+    card_with_rate_limit(root, now, name, units, next, moves, None)
+}
+
+pub(crate) fn card_with_rate_limit(
+    root: &std::path::Path,
+    now: Timestamp,
+    name: &str,
+    units: &Units,
+    next: &Next,
+    moves: &[Moved],
+    rate_limit: Option<&str>,
+) -> String {
     let at = crate::host::stamp(now);
-    let mut out = format!(
-        "Last run: {at}\n\n# {name} card\n\nRendered by `cm sync` from cm state after reading GitHub; the next sync overwrites it.\n\n"
-    );
+    let mut out = format!("Last run: {at}\n");
+    if let Some(line) = rate_limit {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "\n# {name} card\n\nRendered by `cm sync` from cm state after reading GitHub; the next sync overwrites it.\n\n"
+    ));
     if next.paused {
         out.push_str("**Paused:** LIMITS.toml has `paused = true`; nothing launches.\n\n");
     }

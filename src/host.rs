@@ -9,11 +9,19 @@ pub trait Host {
     fn now(&self) -> Timestamp;
     fn free_bytes(&self, volume: &Path) -> io::Result<u64>;
     fn heavy_builds(&self) -> io::Result<u32>;
+    fn github_rate_limit(&self) -> Option<String> {
+        None
+    }
 }
 
 pub struct System;
 
 impl Host for System {
+    fn github_rate_limit(&self) -> Option<String> {
+        use crate::forge::{Forge as _, Gh};
+        Gh::default().rate_limit()
+    }
+
     fn now(&self) -> Timestamp {
         Timestamp::now()
     }

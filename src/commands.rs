@@ -915,6 +915,7 @@ pub fn launch_remote(
         )]));
     };
     let full = format!("{}/{step_name}", target.unit);
+    let rate_limit = host.github_rate_limit();
     let _lock = lock(root)?;
     let campaign = store::load_campaign(root)?;
     let mut violations = journal::check(root, &campaign);
@@ -938,7 +939,7 @@ pub fn launch_remote(
     }
     let declared = plan::step(&units, &full).and_then(|step| step.lane);
     let local = declared.is_none_or(Lane::is_local);
-    let mut report = Vec::new();
+    let mut report: Vec<_> = rate_limit.into_iter().collect();
     let limits = match fs::read_to_string(root.join("LIMITS.toml")) {
         Err(_) => {
             violations.push(Violation::new(

@@ -4,10 +4,15 @@ use std::process::{Command, Output};
 
 use serde_json::Value;
 
+#[allow(dead_code)]
+mod support;
+
 fn cm(dir: &Path, args: &[&str]) -> Output {
+    let gh = support::FakeGh::new("exit 1\n");
     Command::new(env!("CARGO_BIN_EXE_cm"))
         .current_dir(dir)
         .args(args)
+        .env("PATH", gh.path())
         .output()
         .unwrap()
 }

@@ -255,7 +255,8 @@ fn every_next_command_parses_with_the_cli() {
     let c = campaign(&host);
     c.next_actions(&host);
     let next = plan::next_at(&c.root, None, None, at("2026-10-17T11:00:00Z").now).unwrap();
-    // Use an absent campaign so clap parses the command without applying it or reading GitHub.
+    let gh = support::FakeGh::new("exit 1\n");
+    // Use an absent campaign so clap parses the command without applying it.
     for field in [
         "steps",
         "waiting",
@@ -274,6 +275,7 @@ fn every_next_command_parses_with_the_cli() {
                 .args(["-c", &format!("set -- {command}; shift; exec \"$CM_TEST_BIN\" \"$@\" -C \"$CM_TEST_ROOT\" --json")])
                 .env("CM_TEST_BIN", env!("CARGO_BIN_EXE_cm"))
                 .env("CM_TEST_ROOT", c.root.parent().unwrap().join("absent"))
+                .env("PATH", gh.path())
                 .current_dir(&c.root)
                 .output().unwrap();
             assert_eq!(output.status.code(), Some(1), "{command}: {output:?}");
@@ -1789,7 +1791,8 @@ fn sync_reads_github_without_holding_the_lock() {
     let pr = "https://github.com/o/r/pull/1";
     open_pr(&host, &c, "01-a/u/S1", pr);
     let gh = support::FakeGh::new(
-        r#"touch "$FAKE_GH/started"
+        r#"if [ "$2" = rate_limit ]; then exit 1; fi
+touch "$FAKE_GH/started"
 while [ ! -f "$FAKE_GH/release" ]; do sleep 0.05; done
 echo '{"state":"closed","merged":true,"merge_commit_sha":"abc123"}'
 "#,
@@ -1847,7 +1850,8 @@ fn sync_reuses_validated_pull_and_pending_check_pages_until_a_full_read_is_due()
     open_pr(&host, &c, target, pr);
 
     let gh = support::FakeGh::with_http(
-        r#"printf '%s\n' "$*" >>"$FAKE_GH/args"
+        r#"if [ "$2" = rate_limit ]; then exit 1; fi
+printf '%s\n' "$*" >>"$FAKE_GH/args"
 [ "$1" = api ] && [ "$3" = --include ] || exit 90
 mode=$(cat "$FAKE_GH/mode")
 case "$2" in
@@ -2043,6 +2047,191 @@ fi
         assert!(resumed.ok(), "{:?}", resumed.violations);
         assert!(pulls().is_empty(), "the closed PR returned to pulls.json");
     });
+}
+
+#[test]
+#[cfg(unix)]
+fn quota_sampling_records_core_usage_and_leaves_events_successful_when_unavailable() {
+    use std::time::{Duration, Instant};
+
+    let host = at("2026-10-17T08:00:00Z");
+    let step = "01-a/u/S1";
+    let stamp = "GitHub REST core: 17/5000 used (reset 1792227600)";
+    let gh = support::FakeGh::new(
+        r#"printf '%s\n' "$*" >>"$FAKE_GH/args"
+[ "$#" = 2 ] && [ "$1" = api ] && [ "$2" = rate_limit ] || exit 90
+case "$(cat "$FAKE_GH/mode")" in
+valid)
+    echo '{"rate":{"used":99,"limit":60,"reset":0},"resources":{"core":{"used":17,"limit":5000,"reset":1792227600}}}' ;;
+absent)
+    exit 1 ;;
+malformed)
+    echo '{"resources":{"core":{"used":"seventeen","limit":5000,"reset":1792227600}}}' ;;
+slow)
+    sleep 9 &
+    exit 0 ;;
+esac
+"#,
+    );
+    let args_path = gh.fixture().join("args");
+    for mode in ["valid", "absent", "malformed", "slow"] {
+        let c = campaign(&host);
+        assert!(declare(&host, &c, step, Lane::ClaudeCloud, &[]).ok());
+        kickoff(&c, step);
+        fs::write(gh.fixture().join("mode"), mode).unwrap();
+        fs::write(&args_path, "").unwrap();
+        let cm = |args: &[&str]| {
+            let start = Instant::now();
+            let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+                .arg("-C")
+                .arg(&c.root)
+                .args(args)
+                .env("PATH", gh.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?} ({mode}): {output:?}");
+            if mode == "slow" {
+                assert!(
+                    (Duration::from_secs(4)..Duration::from_secs(8)).contains(&start.elapsed()),
+                    "{args:?} spent {:?} waiting for the quota sample",
+                    start.elapsed()
+                );
+            }
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let launch = cm(&["launch", step, "--coordinator", "session_quota_fixture"]);
+        let launched = store::load_unit(&c.root.join("01-a/u")).unwrap();
+        let claim = &launched.steps["S1"].attempt.as_ref().unwrap().claim;
+        let end = cm(&["attempt", step, "--claim", claim, "end", "complete"]);
+        cm(&["sync"]);
+
+        let ended = store::load_unit(&c.root.join("01-a/u")).unwrap();
+        let outcome = ended.steps["S1"]
+            .attempt
+            .as_ref()
+            .unwrap()
+            .ended
+            .as_ref()
+            .unwrap()
+            .outcome;
+        assert_eq!(outcome, cm::state::AttemptOutcome::Complete);
+
+        let expected = usize::from(mode == "valid");
+        for report in [&launch, &end] {
+            assert_eq!(
+                report.lines().filter(|line| *line == stamp).count(),
+                expected
+            );
+        }
+        let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+        let journal_stamp = format!("- {stamp}");
+        assert_eq!(
+            journal
+                .lines()
+                .filter(|line| *line == journal_stamp)
+                .count(),
+            2 * expected
+        );
+        let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+        assert_eq!(
+            card.lines().nth(1),
+            Some(if mode == "valid" { stamp } else { "" })
+        );
+        assert_eq!(
+            fs::read_to_string(&args_path).unwrap(),
+            "api rate_limit\napi rate_limit\napi rate_limit\n"
+        );
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn sync_omits_a_quota_sample_when_its_response_buffer_cannot_grow() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let gh = support::FakeGh::new(
+        r#"[ "$#" = 2 ] && [ "$1" = api ] && [ "$2" = rate_limit ] || exit 90
+printf '%s\n' "$*" >>"$FAKE_GH/requests"
+if [ -f "$FAKE_GH/large" ]; then
+    exec dd if=/dev/zero bs=65536 count=1024
+fi
+echo '{"resources":{"core":{"used":17,"limit":5000,"reset":1792227600}}}'
+"#,
+    );
+    let sync = || {
+        let output = Command::new("sh")
+            .args([
+                "-c",
+                r#"ulimit -c 0 && ulimit -v 32768 && exec "$@""#,
+                "sh",
+                env!("CARGO_BIN_EXE_cm"),
+                "-C",
+            ])
+            .arg(&c.root)
+            .arg("sync")
+            .env("PATH", gh.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        fs::read_to_string(c.root.join("CARD.md")).unwrap()
+    };
+
+    // The same memory limit must still allow a normal sample.
+    assert_eq!(
+        sync().lines().nth(1),
+        Some("GitHub REST core: 17/5000 used (reset 1792227600)")
+    );
+    fs::write(gh.fixture().join("large"), "").unwrap();
+    assert_eq!(sync().lines().nth(1), Some(""));
+    assert_eq!(
+        fs::read_to_string(gh.fixture().join("requests")).unwrap(),
+        "api rate_limit\napi rate_limit\n"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_timed_out_quota_sample_closes_stdout_held_open_by_a_descendant() {
+    use std::time::{Duration, Instant};
+
+    let gh = support::FakeGh::new(
+        r#"[ "$#" = 2 ] && [ "$1" = api ] && [ "$2" = rate_limit ] || exit 90
+(
+    remaining=200
+    while [ ! -f "$FAKE_GH/returned" ]; do
+        [ "$remaining" -gt 0 ] || exit 91
+        remaining=$((remaining - 1))
+        sleep 0.02
+    done
+    if (printf x) 2>/dev/null; then
+        echo open >"$FAKE_GH/probe.tmp"
+    else
+        echo closed >"$FAKE_GH/probe.tmp"
+    fi
+    mv "$FAKE_GH/probe.tmp" "$FAKE_GH/probe"
+) &
+exit 0
+"#,
+    );
+    let timeout = Duration::from_millis(250);
+    let forge = Gh {
+        program: gh.program(),
+        timeout,
+    };
+    let start = Instant::now();
+    let sample = forge.rate_limit();
+    let elapsed = start.elapsed();
+    fs::write(gh.fixture().join("returned"), "").unwrap();
+    assert_eq!(sample, None);
+    assert!((timeout..Duration::from_secs(2)).contains(&elapsed));
+
+    let probe = gh.fixture().join("probe");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !probe.exists() {
+        assert!(Instant::now() < deadline, "stdout probe did not finish");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(fs::read_to_string(probe).unwrap(), "closed\n");
 }
 
 #[test]
@@ -4730,7 +4919,9 @@ fn sync_completes_and_writes_card_with_an_invalid_mac_lane() {
         fs::write(c.root.join("CARD.md"), "Stale card.\n").unwrap();
         let before = fs::read(c.root.join("JOURNAL.md")).unwrap();
         let gh = support::FakeGh::new(
-            "echo '{\"state\":\"closed\",\"merged\":true,\"merge_commit_sha\":\"abc123\"}'\n",
+            r#"if [ "$2" = rate_limit ]; then exit 1; fi
+echo '{"state":"closed","merged":true,"merge_commit_sha":"abc123"}'
+"#,
         );
         let output = Command::new(env!("CARGO_BIN_EXE_cm"))
             .arg("-C")
