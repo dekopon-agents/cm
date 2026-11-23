@@ -85,12 +85,14 @@ impl Campaign {
 
     #[cfg(unix)]
     pub fn run_next_command(&self, command: &str) -> serde_json::Value {
+        let gh = super::support::FakeGh::new("exit 1\n");
         let output = std::process::Command::new("sh")
             .args([
                 "-c",
                 &format!("set -- {command}; shift; exec \"$CM_TEST_BIN\" \"$@\" --json"),
             ])
             .env("CM_TEST_BIN", env!("CARGO_BIN_EXE_cm"))
+            .env("PATH", gh.path())
             .current_dir(&self.root)
             .output()
             .unwrap();

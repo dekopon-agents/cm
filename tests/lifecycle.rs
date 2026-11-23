@@ -2297,9 +2297,11 @@ fn superseded_records_one_or_two_successors_in_state_journal_and_card() {
             )
         );
 
+        let gh = support::FakeGh::new("exit 1\n");
         let synced = Command::new(env!("CARGO_BIN_EXE_cm"))
             .current_dir(&c.root)
             .args(["--json", "sync"])
+            .env("PATH", gh.path())
             .output()
             .unwrap();
         assert!(synced.status.success(), "{synced:?}");

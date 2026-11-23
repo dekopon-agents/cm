@@ -11,6 +11,9 @@ use cm::state::{AttemptOutcome, Evidence, Lane, Phase};
 use cm::store::{self, parse_target};
 use jiff::Timestamp;
 
+#[allow(dead_code)]
+mod support;
+
 struct Fake {
     now: Timestamp,
 }
@@ -612,6 +615,12 @@ fn begin_and_record_each_journal_one_line_with_every_action_field() {
 #[test]
 fn launch_and_claim_default_to_the_remote_session_unless_a_label_is_given() {
     let host = at("2026-10-08T07:00:00Z");
+    let gh = support::FakeGh::new(
+        r#"printf '%s\n' "$*" >>"$FAKE_GH/requests"
+exit 1
+"#,
+    );
+    let requests = gh.fixture().join("requests");
     for (session, label, expected) in [
         (Some("session_cloud"), None, Some("session_cloud")),
         (Some("cse_cloud"), None, Some("session_cloud")),
@@ -634,6 +643,7 @@ fn launch_and_claim_default_to_the_remote_session_unless_a_label_is_given() {
             Some("explicit"),
         ),
     ] {
+        fs::write(&requests, "").unwrap();
         let c = campaign(&host);
         let step = "01-a/u/S1";
         assert!(declare(&host, &c, step, Lane::ClaudeCloud, &[]).ok());
@@ -647,6 +657,7 @@ fn launch_and_claim_default_to_the_remote_session_unless_a_label_is_given() {
                 .arg("-C")
                 .arg(&c.root)
                 .args(&args)
+                .env("PATH", gh.path())
                 .env_remove("CLAUDE_CODE_REMOTE_SESSION_ID")
                 .env("CLAUDE_CODE_SESSION_ID", "local_session");
             if let Some(session) = session {
@@ -671,12 +682,14 @@ fn launch_and_claim_default_to_the_remote_session_unless_a_label_is_given() {
                 expected.unwrap_or("—")
             );
         }
+        assert_eq!(fs::read_to_string(&requests).unwrap(), "api rate_limit\n");
     }
 }
 
 #[test]
 fn launch_refuses_invalid_coordinator_labels_without_changing_state_or_journal() {
     let host = at("2026-10-08T07:00:00Z");
+    let gh = support::FakeGh::new("exit 1\n");
     for (session, label) in [
         (Some("session_cloud\n## stray"), None),
         (Some("session_cloud\r## stray"), None),
@@ -696,6 +709,7 @@ fn launch_refuses_invalid_coordinator_labels_without_changing_state_or_journal()
             .arg("-C")
             .arg(&c.root)
             .args(["launch", step])
+            .env("PATH", gh.path())
             .env_remove("CLAUDE_CODE_REMOTE_SESSION_ID");
         if let Some(session) = session {
             command.env("CLAUDE_CODE_REMOTE_SESSION_ID", session);

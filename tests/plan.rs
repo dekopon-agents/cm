@@ -255,7 +255,8 @@ fn every_next_command_parses_with_the_cli() {
     let c = campaign(&host);
     c.next_actions(&host);
     let next = plan::next_at(&c.root, None, None, at("2026-10-17T11:00:00Z").now).unwrap();
-    // Use an absent campaign so clap parses the command without applying it or reading GitHub.
+    let gh = support::FakeGh::new("exit 1\n");
+    // Use an absent campaign so clap parses the command without applying it.
     for field in [
         "steps",
         "waiting",
@@ -274,6 +275,7 @@ fn every_next_command_parses_with_the_cli() {
                 .args(["-c", &format!("set -- {command}; shift; exec \"$CM_TEST_BIN\" \"$@\" -C \"$CM_TEST_ROOT\" --json")])
                 .env("CM_TEST_BIN", env!("CARGO_BIN_EXE_cm"))
                 .env("CM_TEST_ROOT", c.root.parent().unwrap().join("absent"))
+                .env("PATH", gh.path())
                 .current_dir(&c.root)
                 .output().unwrap();
             assert_eq!(output.status.code(), Some(1), "{command}: {output:?}");
@@ -1789,7 +1791,8 @@ fn sync_reads_github_without_holding_the_lock() {
     let pr = "https://github.com/o/r/pull/1";
     open_pr(&host, &c, "01-a/u/S1", pr);
     let gh = support::FakeGh::new(
-        r#"touch "$FAKE_GH/started"
+        r#"if [ "$2" = rate_limit ]; then exit 1; fi
+touch "$FAKE_GH/started"
 while [ ! -f "$FAKE_GH/release" ]; do sleep 0.05; done
 echo '{"state":"closed","merged":true,"merge_commit_sha":"abc123"}'
 "#,
@@ -2139,6 +2142,51 @@ esac
             "api rate_limit\napi rate_limit\napi rate_limit\n"
         );
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_timed_out_quota_sample_closes_stdout_held_open_by_a_descendant() {
+    use std::time::{Duration, Instant};
+
+    let gh = support::FakeGh::new(
+        r#"[ "$#" = 2 ] && [ "$1" = api ] && [ "$2" = rate_limit ] || exit 90
+(
+    remaining=200
+    while [ ! -f "$FAKE_GH/returned" ]; do
+        [ "$remaining" -gt 0 ] || exit 91
+        remaining=$((remaining - 1))
+        sleep 0.02
+    done
+    if (printf x) 2>/dev/null; then
+        echo open >"$FAKE_GH/probe.tmp"
+    else
+        echo closed >"$FAKE_GH/probe.tmp"
+    fi
+    mv "$FAKE_GH/probe.tmp" "$FAKE_GH/probe"
+) &
+exit 0
+"#,
+    );
+    let timeout = Duration::from_millis(250);
+    let forge = Gh {
+        program: gh.program(),
+        timeout,
+    };
+    let start = Instant::now();
+    let sample = forge.rate_limit();
+    let elapsed = start.elapsed();
+    fs::write(gh.fixture().join("returned"), "").unwrap();
+    assert_eq!(sample, None);
+    assert!((timeout..Duration::from_secs(2)).contains(&elapsed));
+
+    let probe = gh.fixture().join("probe");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !probe.exists() {
+        assert!(Instant::now() < deadline, "stdout probe did not finish");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(fs::read_to_string(probe).unwrap(), "closed\n");
 }
 
 #[test]
@@ -4826,7 +4874,9 @@ fn sync_completes_and_writes_card_with_an_invalid_mac_lane() {
         fs::write(c.root.join("CARD.md"), "Stale card.\n").unwrap();
         let before = fs::read(c.root.join("JOURNAL.md")).unwrap();
         let gh = support::FakeGh::new(
-            "echo '{\"state\":\"closed\",\"merged\":true,\"merge_commit_sha\":\"abc123\"}'\n",
+            r#"if [ "$2" = rate_limit ]; then exit 1; fi
+echo '{"state":"closed","merged":true,"merge_commit_sha":"abc123"}'
+"#,
         );
         let output = Command::new(env!("CARGO_BIN_EXE_cm"))
             .arg("-C")
