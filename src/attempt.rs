@@ -415,6 +415,9 @@ pub fn attempt(
             let step = unit.steps.get_mut(&step_name).expect("attempt has a step");
             step.attempt_history.push(attempt.clone());
             step.launches += 1;
+            if step.track.state == crate::state::Phase::Launched {
+                step.track.since.clone_from(&at);
+            }
             attempt.id = format!("{full}#{}", step.launches);
             attempt.lane = Some(*lane);
             attempt.actions.clear();

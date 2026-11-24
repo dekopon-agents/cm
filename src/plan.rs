@@ -425,11 +425,24 @@ pub(crate) fn stalls(units: &Units, inputs: &ActionInputs) -> Vec<Stall> {
             if active.is_none() && step.lane != Some(Lane::Codex) {
                 return None;
             }
+            // A step that finishes by evidence and waits on an open watch has declared its wait and
+            // its deadline: the watch holds its next move, `done`, so the watch's expiry, not the
+            // stall clock, calls for the coordinator. A code step's next move is `pr-open`, which no
+            // watch holds, so its worker still stalls.
+            let watching = step.finish(Release::of_target(&target).is_some()) == Finish::Evidence
+                && step.watches.iter().any(|watch| {
+                    watch.withdrawn.is_none()
+                        && watch.resolved.is_none()
+                        && instant(&watch.deadline).is_some_and(|deadline| deadline > inputs.now)
+                });
+            if watching {
+                return None;
+            }
             let lane = active.and_then(|attempt| attempt.lane).or(step.lane);
-            let mut since = step
-                .attempt
-                .as_ref()
-                .map_or(step.track.since.as_str(), |attempt| &attempt.claimed_at);
+            // The step's own clock: launch and unblock reset it, a re-claim by a successor
+            // coordinator does not, so an unblocked step never reads stalled from its first claim
+            // and a takeover never hides a stall.
+            let mut since = step.track.since.as_str();
             if let Some(attempt) = step.attempt.as_ref()
                 && let Some(lane) = lane
                 && inputs.turn_commands.for_lane(lane).is_some()
@@ -441,7 +454,11 @@ pub(crate) fn stalls(units: &Units, inputs: &ActionInputs) -> Vec<Stall> {
                 {
                     return None;
                 }
-                since = turn_began(attempt, lane).unwrap_or(since);
+                if let Some(began) = turn_began(attempt, lane)
+                    && instant(began) > instant(since)
+                {
+                    since = began;
+                }
             }
             let limit = inputs.stall_limits.hours(lane);
             let age = inputs.now.duration_since(instant(since)?).as_secs_f64() / 3600.0;
@@ -474,7 +491,7 @@ pub(crate) fn stall_line(stall: &Stall) -> String {
         format!("{} attempt", stall.lane.map_or("remote", Lane::name))
     };
     format!(
-        "stalled {}: {reason}, attempt since {} ({}h > {}h)",
+        "stalled {}: {reason}, since {} ({}h > {}h)",
         stall.target, stall.since, stall.hours, stall.limit
     )
 }

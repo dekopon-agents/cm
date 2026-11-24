@@ -5394,6 +5394,228 @@ fn attempt_stall_limits_default_to_two_hours_and_apply_to_the_configured_lane() 
 
 #[cfg(unix)]
 #[test]
+fn the_attempt_stall_clock_is_the_steps_own_since_so_unblock_resets_it_and_a_reclaim_does_not() {
+    use cm::attempt::Act;
+
+    const STEP: &str = "01-a/u/cloud";
+    let launched = at("2026-11-22T10:00:00Z");
+    let unblocked = at("2026-11-22T15:00:00Z");
+    let reclaimed = at("2026-11-22T16:30:00Z");
+    let c = campaign(&launched);
+    assert!(declare(&launched, &c, STEP, Lane::ClaudeCloud, &[]).ok());
+    launch_for(&launched, &c, STEP, "session_first");
+    let blocked = advance(
+        &launched,
+        &c,
+        STEP,
+        "blocked:waiting-on-a-person",
+        Evidence::default(),
+    );
+    assert!(blocked.ok(), "{:?}", blocked.violations);
+    let cleared = c.root.join("01-a/u/cloud/evidence/cleared.md");
+    fs::create_dir_all(cleared.parent().unwrap()).unwrap();
+    fs::write(&cleared, "the person answered\n").unwrap();
+    let back = commands::unblock(
+        &unblocked,
+        &c.root,
+        &parse_target(STEP, false).unwrap(),
+        Some(&cleared),
+    )
+    .unwrap();
+    assert!(back.ok(), "{:?}", back.violations);
+
+    // An hour after the unblock the step is inside its two hours, though its claim is six hours old.
+    let quiet = plan::next_at(&c.root, None, None, at("2026-11-22T16:00:00Z").now).unwrap();
+    assert!(
+        quiet.fields["stalled"].as_array().unwrap().is_empty(),
+        "{:?}",
+        quiet.fields["stalled"]
+    );
+
+    // A successor's re-claim does not restart the clock: it still runs from the unblock.
+    attempt_action(
+        &reclaimed,
+        &c,
+        STEP,
+        None,
+        Act::Claim {
+            coordinator: "session_second".into(),
+            expect: 1,
+        },
+    );
+    let stalled = plan::next_at(&c.root, None, None, at("2026-11-22T17:30:00Z").now).unwrap();
+    let stalled = stalled.fields["stalled"].as_array().unwrap();
+    assert_eq!(stalled.len(), 1, "{stalled:?}");
+    assert_eq!(stalled[0]["target"], STEP);
+    assert_eq!(stalled[0]["since"], "2026-11-22T15:00Z");
+}
+
+#[cfg(unix)]
+fn attempt_claim(
+    host: &Fake,
+    c: &Campaign,
+    step: &str,
+    claim: Option<&str>,
+    act: cm::attempt::Act,
+) -> String {
+    let outcome = cm::attempt::attempt(
+        host,
+        &c.root,
+        &parse_target(step, true).unwrap(),
+        claim,
+        &act,
+    )
+    .unwrap();
+    assert!(outcome.ok(), "{:?}", outcome.violations);
+    outcome.fields["attempt"]["claim"]
+        .as_str()
+        .or(outcome.fields["claim"].as_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_step_waiting_on_an_open_watch_is_not_stalled_until_the_deadline_passes() {
+    const PROBE: &str = "01-a/u/probe";
+    const CODE: &str = "01-a/u/code";
+    let launched = at("2026-11-22T10:00:00Z");
+    let c = campaign(&launched);
+    assert!(declare_work(&launched, &c, PROBE, Lane::Coordinator, &[], Work::Study).ok());
+    assert!(declare(&launched, &c, CODE, Lane::ClaudeCloud, &[]).ok());
+    for step in [PROBE, CODE] {
+        launch_for(&launched, &c, step, "session_first");
+        let added = cm::holds::watch_add(
+            &launched,
+            &c.root,
+            &parse_target(step, true).unwrap(),
+            "log:broker.decision",
+            "2026-11-23T10:00Z",
+        )
+        .unwrap();
+        assert!(added.ok(), "{:?}", added.violations);
+    }
+    let stalled_targets = |now: &str| {
+        let next = plan::next_at(&c.root, None, None, at(now).now).unwrap();
+        next.fields["stalled"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|stall| stall["target"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    // The study's next move is the done its watch holds; the code step's worker still owes a PR.
+    assert_eq!(stalled_targets("2026-11-22T20:00:00Z"), [CODE]);
+    assert_eq!(stalled_targets("2026-11-23T10:30:00Z"), [CODE, PROBE]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_restart_after_a_takeover_resets_the_attempt_stall_clock() {
+    use cm::attempt::Act;
+
+    const STEP: &str = "01-a/u/cloud";
+    let launched = at("2026-11-22T10:00:00Z");
+    let c = campaign(&launched);
+    assert!(declare(&launched, &c, STEP, Lane::ClaudeCloud, &[]).ok());
+    launch_for(&launched, &c, STEP, "session_first");
+    let claim = attempt_claim(
+        &at("2026-11-22T16:00:00Z"),
+        &c,
+        STEP,
+        None,
+        Act::Claim {
+            coordinator: "session_second".into(),
+            expect: 1,
+        },
+    );
+    attempt_action(
+        &at("2026-11-22T16:05:00Z"),
+        &c,
+        STEP,
+        Some(&claim),
+        Act::End {
+            outcome: cm::state::AttemptOutcome::Unknown,
+            file: None,
+        },
+    );
+    attempt_action(
+        &at("2026-11-22T16:10:00Z"),
+        &c,
+        STEP,
+        Some(&claim),
+        Act::Restart {
+            lane: Lane::Fable,
+            file: None,
+        },
+    );
+    let fresh = plan::next_at(&c.root, None, None, at("2026-11-22T16:11:00Z").now).unwrap();
+    assert!(
+        fresh.fields["stalled"].as_array().unwrap().is_empty(),
+        "{:?}",
+        fresh.fields["stalled"]
+    );
+    let later = plan::next_at(&c.root, None, None, at("2026-11-22T18:30:00Z").now).unwrap();
+    assert_eq!(later.fields["stalled"][0]["since"], "2026-11-22T16:10Z");
+}
+
+#[cfg(unix)]
+#[test]
+fn on_a_reader_lane_an_unblock_after_the_last_turn_resets_the_attempt_stall_clock() {
+    const STEP: &str = "01-a/u/cloud";
+    let launched = at("2026-11-22T10:00:00Z");
+    let c = campaign(&launched);
+    let limits = c.root.join("LIMITS.toml");
+    let original = fs::read_to_string(&limits).unwrap();
+    fs::write(
+        &limits,
+        format!(
+            "{original}\nclaude_cloud_turn_reader = [\"reader\", \"{{thread}}\", \"{{turn}}\"]\nclaude_cloud_turn_logs = [\"logs\", \"{{thread}}\", \"{{turn}}\"]\n"
+        ),
+    )
+    .unwrap();
+    assert!(declare(&launched, &c, STEP, Lane::ClaudeCloud, &[]).ok());
+    let claim = launch_for(&launched, &c, STEP, "session_first");
+    record_attempt_action(&launched, &c, STEP, &claim, "thread", "t1");
+    record_attempt_action(
+        &at("2026-11-22T10:05:00Z"),
+        &c,
+        STEP,
+        &claim,
+        "turn",
+        "turn-1",
+    );
+    let blocked = advance(
+        &at("2026-11-22T11:00:00Z"),
+        &c,
+        STEP,
+        "blocked:waiting-on-a-person",
+        Evidence::default(),
+    );
+    assert!(blocked.ok(), "{:?}", blocked.violations);
+    let cleared = c.root.join("01-a/u/cloud/evidence/cleared.md");
+    fs::create_dir_all(cleared.parent().unwrap()).unwrap();
+    fs::write(&cleared, "the person answered\n").unwrap();
+    let back = commands::unblock(
+        &at("2026-11-23T15:00:00Z"),
+        &c.root,
+        &parse_target(STEP, false).unwrap(),
+        Some(&cleared),
+    )
+    .unwrap();
+    assert!(back.ok(), "{:?}", back.violations);
+    let quiet = plan::next_at(&c.root, None, None, at("2026-11-23T16:00:00Z").now).unwrap();
+    assert!(
+        quiet.fields["stalled"].as_array().unwrap().is_empty(),
+        "{:?}",
+        quiet.fields["stalled"]
+    );
+    let later = plan::next_at(&c.root, None, None, at("2026-11-23T17:30:00Z").now).unwrap();
+    assert_eq!(later.fields["stalled"][0]["since"], "2026-11-23T15:00Z");
+}
+
+#[cfg(unix)]
+#[test]
 fn pauses_explain_dispatch_holds_without_becoming_actions() {
     let host = at("2026-11-22T18:00:00Z");
     let c = campaign(&host);
