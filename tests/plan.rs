@@ -5476,6 +5476,33 @@ fn attempt_claim(
 
 #[cfg(unix)]
 #[test]
+fn a_step_waiting_on_an_open_watch_is_not_stalled_until_the_deadline_passes() {
+    const STEP: &str = "01-a/u/probe";
+    let launched = at("2026-11-22T10:00:00Z");
+    let c = campaign(&launched);
+    assert!(declare(&launched, &c, STEP, Lane::ClaudeCloud, &[]).ok());
+    launch_for(&launched, &c, STEP, "session_first");
+    let added = cm::holds::watch_add(
+        &launched,
+        &c.root,
+        &parse_target(STEP, true).unwrap(),
+        "log:broker.decision",
+        "2026-11-23T10:00Z",
+    )
+    .unwrap();
+    assert!(added.ok(), "{:?}", added.violations);
+    let waiting = plan::next_at(&c.root, None, None, at("2026-11-22T20:00:00Z").now).unwrap();
+    assert!(
+        waiting.fields["stalled"].as_array().unwrap().is_empty(),
+        "{:?}",
+        waiting.fields["stalled"]
+    );
+    let lapsed = plan::next_at(&c.root, None, None, at("2026-11-23T10:30:00Z").now).unwrap();
+    assert_eq!(lapsed.fields["stalled"][0]["target"], STEP);
+}
+
+#[cfg(unix)]
+#[test]
 fn a_restart_after_a_takeover_resets_the_attempt_stall_clock() {
     use cm::attempt::Act;
 

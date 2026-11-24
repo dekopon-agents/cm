@@ -425,6 +425,17 @@ pub(crate) fn stalls(units: &Units, inputs: &ActionInputs) -> Vec<Stall> {
             if active.is_none() && step.lane != Some(Lane::Codex) {
                 return None;
             }
+            // A step waiting on an open watch has declared its wait and its deadline; the watch's
+            // expiry, not the stall clock, is what calls for the coordinator.
+            let watching = step.watches.iter().any(|watch| {
+                watch.withdrawn.is_none()
+                    && watch.resolved.is_none()
+                    && watch.expired.is_none()
+                    && instant(&watch.deadline).is_some_and(|deadline| deadline > inputs.now)
+            });
+            if watching {
+                return None;
+            }
             let lane = active.and_then(|attempt| attempt.lane).or(step.lane);
             // The step's own clock: launch and unblock reset it, a re-claim by a successor
             // coordinator does not, so an unblocked step never reads stalled from its first claim
