@@ -425,14 +425,16 @@ pub(crate) fn stalls(units: &Units, inputs: &ActionInputs) -> Vec<Stall> {
             if active.is_none() && step.lane != Some(Lane::Codex) {
                 return None;
             }
-            // A step waiting on an open watch has declared its wait and its deadline; the watch's
-            // expiry, not the stall clock, is what calls for the coordinator.
-            let watching = step.watches.iter().any(|watch| {
-                watch.withdrawn.is_none()
-                    && watch.resolved.is_none()
-                    && watch.expired.is_none()
-                    && instant(&watch.deadline).is_some_and(|deadline| deadline > inputs.now)
-            });
+            // A step that finishes by evidence and waits on an open watch has declared its wait and
+            // its deadline: the watch holds its next move, `done`, so the watch's expiry, not the
+            // stall clock, calls for the coordinator. A code step's next move is `pr-open`, which no
+            // watch holds, so its worker still stalls.
+            let watching = step.finish(Release::of_target(&target).is_some()) == Finish::Evidence
+                && step.watches.iter().any(|watch| {
+                    watch.withdrawn.is_none()
+                        && watch.resolved.is_none()
+                        && instant(&watch.deadline).is_some_and(|deadline| deadline > inputs.now)
+                });
             if watching {
                 return None;
             }

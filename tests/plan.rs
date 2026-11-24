@@ -5477,28 +5477,36 @@ fn attempt_claim(
 #[cfg(unix)]
 #[test]
 fn a_step_waiting_on_an_open_watch_is_not_stalled_until_the_deadline_passes() {
-    const STEP: &str = "01-a/u/probe";
+    const PROBE: &str = "01-a/u/probe";
+    const CODE: &str = "01-a/u/code";
     let launched = at("2026-11-22T10:00:00Z");
     let c = campaign(&launched);
-    assert!(declare(&launched, &c, STEP, Lane::ClaudeCloud, &[]).ok());
-    launch_for(&launched, &c, STEP, "session_first");
-    let added = cm::holds::watch_add(
-        &launched,
-        &c.root,
-        &parse_target(STEP, true).unwrap(),
-        "log:broker.decision",
-        "2026-11-23T10:00Z",
-    )
-    .unwrap();
-    assert!(added.ok(), "{:?}", added.violations);
-    let waiting = plan::next_at(&c.root, None, None, at("2026-11-22T20:00:00Z").now).unwrap();
-    assert!(
-        waiting.fields["stalled"].as_array().unwrap().is_empty(),
-        "{:?}",
-        waiting.fields["stalled"]
-    );
-    let lapsed = plan::next_at(&c.root, None, None, at("2026-11-23T10:30:00Z").now).unwrap();
-    assert_eq!(lapsed.fields["stalled"][0]["target"], STEP);
+    assert!(declare_work(&launched, &c, PROBE, Lane::Coordinator, &[], Work::Study).ok());
+    assert!(declare(&launched, &c, CODE, Lane::ClaudeCloud, &[]).ok());
+    for step in [PROBE, CODE] {
+        launch_for(&launched, &c, step, "session_first");
+        let added = cm::holds::watch_add(
+            &launched,
+            &c.root,
+            &parse_target(step, true).unwrap(),
+            "log:broker.decision",
+            "2026-11-23T10:00Z",
+        )
+        .unwrap();
+        assert!(added.ok(), "{:?}", added.violations);
+    }
+    let stalled_targets = |now: &str| {
+        let next = plan::next_at(&c.root, None, None, at(now).now).unwrap();
+        next.fields["stalled"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|stall| stall["target"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    // The study's next move is the done its watch holds; the code step's worker still owes a PR.
+    assert_eq!(stalled_targets("2026-11-22T20:00:00Z"), [CODE]);
+    assert_eq!(stalled_targets("2026-11-23T10:30:00Z"), [CODE, PROBE]);
 }
 
 #[cfg(unix)]

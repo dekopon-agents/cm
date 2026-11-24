@@ -408,8 +408,8 @@ hold appears in regular `cm next` and CARD dispatch guidance.
 ### Remote turns
 
 An attempt's stall clock runs from the step's own stamp: a launch, a restart or an unblock
-resets it, and a successor coordinator's re-claim does not. A step with an open watch whose
-deadline is still ahead is not stalled: the watch is its declared wait. For a lane with a configured
+resets it, and a successor coordinator's re-claim does not. A step that finishes by evidence,
+with an open watch whose deadline is still ahead, is not stalled: the watch holds its next move. For a lane with a configured
 reader, a later recorded turn `began` time moves it forward, including when the reader fails.
 Set a lane's optional `<lane>_stall_hours` key in LIMITS.toml to override the two-hour default.
 Use underscores in lane names, as in `claude_cloud_stall_hours`.
