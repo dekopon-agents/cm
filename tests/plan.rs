@@ -5394,6 +5394,64 @@ fn attempt_stall_limits_default_to_two_hours_and_apply_to_the_configured_lane() 
 
 #[cfg(unix)]
 #[test]
+fn the_attempt_stall_clock_is_the_steps_own_since_so_unblock_resets_it_and_a_reclaim_does_not() {
+    use cm::attempt::Act;
+
+    const STEP: &str = "01-a/u/cloud";
+    let launched = at("2026-11-22T10:00:00Z");
+    let unblocked = at("2026-11-22T15:00:00Z");
+    let reclaimed = at("2026-11-22T16:30:00Z");
+    let c = campaign(&launched);
+    assert!(declare(&launched, &c, STEP, Lane::ClaudeCloud, &[]).ok());
+    launch_for(&launched, &c, STEP, "session_first");
+    let blocked = advance(
+        &launched,
+        &c,
+        STEP,
+        "blocked:waiting-on-a-person",
+        Evidence::default(),
+    );
+    assert!(blocked.ok(), "{:?}", blocked.violations);
+    let cleared = c.root.join("01-a/u/cloud/evidence/cleared.md");
+    fs::create_dir_all(cleared.parent().unwrap()).unwrap();
+    fs::write(&cleared, "the person answered\n").unwrap();
+    let back = commands::unblock(
+        &unblocked,
+        &c.root,
+        &parse_target(STEP, false).unwrap(),
+        Some(&cleared),
+    )
+    .unwrap();
+    assert!(back.ok(), "{:?}", back.violations);
+
+    // An hour after the unblock the step is inside its two hours, though its claim is six hours old.
+    let quiet = plan::next_at(&c.root, None, None, at("2026-11-22T16:00:00Z").now).unwrap();
+    assert!(
+        quiet.fields["stalled"].as_array().unwrap().is_empty(),
+        "{:?}",
+        quiet.fields["stalled"]
+    );
+
+    // A successor's re-claim does not restart the clock: it still runs from the unblock.
+    attempt_action(
+        &reclaimed,
+        &c,
+        STEP,
+        None,
+        Act::Claim {
+            coordinator: "session_second".into(),
+            expect: 1,
+        },
+    );
+    let stalled = plan::next_at(&c.root, None, None, at("2026-11-22T17:30:00Z").now).unwrap();
+    let stalled = stalled.fields["stalled"].as_array().unwrap();
+    assert_eq!(stalled.len(), 1, "{stalled:?}");
+    assert_eq!(stalled[0]["target"], STEP);
+    assert_eq!(stalled[0]["since"], "2026-11-22T15:00Z");
+}
+
+#[cfg(unix)]
+#[test]
 fn pauses_explain_dispatch_holds_without_becoming_actions() {
     let host = at("2026-11-22T18:00:00Z");
     let c = campaign(&host);

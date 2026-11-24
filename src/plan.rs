@@ -426,10 +426,10 @@ pub(crate) fn stalls(units: &Units, inputs: &ActionInputs) -> Vec<Stall> {
                 return None;
             }
             let lane = active.and_then(|attempt| attempt.lane).or(step.lane);
-            let mut since = step
-                .attempt
-                .as_ref()
-                .map_or(step.track.since.as_str(), |attempt| &attempt.claimed_at);
+            // The step's own clock: launch and unblock reset it, a re-claim by a successor
+            // coordinator does not, so an unblocked step never reads stalled from its first claim
+            // and a takeover never hides a stall.
+            let mut since = step.track.since.as_str();
             if let Some(attempt) = step.attempt.as_ref()
                 && let Some(lane) = lane
                 && inputs.turn_commands.for_lane(lane).is_some()
