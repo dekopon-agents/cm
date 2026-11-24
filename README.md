@@ -407,10 +407,9 @@ hold appears in regular `cm next` and CARD dispatch guidance.
 
 ### Remote turns
 
-For a lane with a configured reader, a launch's stall clock starts at the latest turn's
-recorded `began` time, including when the reader fails. When a reader is unconfigured
-or a launch has no recorded turn, cm measures from the step's own stamp: a launch or an
-unblock resets it, and a successor coordinator's re-claim does not.
+An attempt's stall clock runs from the step's own stamp: a launch, a restart or an unblock
+resets it, and a successor coordinator's re-claim does not. For a lane with a configured
+reader, a later recorded turn `began` time moves it forward, including when the reader fails.
 Set a lane's optional `<lane>_stall_hours` key in LIMITS.toml to override the two-hour default.
 Use underscores in lane names, as in `claude_cloud_stall_hours`.
 

@@ -441,7 +441,11 @@ pub(crate) fn stalls(units: &Units, inputs: &ActionInputs) -> Vec<Stall> {
                 {
                     return None;
                 }
-                since = turn_began(attempt, lane).unwrap_or(since);
+                if let Some(began) = turn_began(attempt, lane)
+                    && instant(began) > instant(since)
+                {
+                    since = began;
+                }
             }
             let limit = inputs.stall_limits.hours(lane);
             let age = inputs.now.duration_since(instant(since)?).as_secs_f64() / 3600.0;
@@ -474,7 +478,7 @@ pub(crate) fn stall_line(stall: &Stall) -> String {
         format!("{} attempt", stall.lane.map_or("remote", Lane::name))
     };
     format!(
-        "stalled {}: {reason}, attempt since {} ({}h > {}h)",
+        "stalled {}: {reason}, since {} ({}h > {}h)",
         stall.target, stall.since, stall.hours, stall.limit
     )
 }
