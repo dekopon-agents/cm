@@ -2744,3 +2744,76 @@ fn the_built_cm_tick_resolves_its_cm_where_it_was_given() {
         "{json}"
     );
 }
+
+fn tick_json(harness: &Harness, dir: &Path, path: &str) -> Value {
+    let output = harness
+        .command("cse_01abc")
+        .current_dir(dir)
+        .env("PATH", path)
+        .args(["--json", "tick", "--checkout"])
+        .arg(harness.ct.path())
+        .args(["--cm", "cm"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{path}: {output:?}");
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn the_built_cm_tick_takes_the_first_cm_on_path_its_user_may_run() {
+    let harness = Harness::new(1, &act(lines()), PICK_OK);
+    let working = fs::read_to_string(harness.bin.join("cm")).unwrap();
+    let entries = harness.ct.path().join("entries");
+    let entry = |name: &str| {
+        let dir = entries.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    };
+    fs::create_dir_all(entry("folder").join("cm")).unwrap();
+    std::os::unix::fs::symlink(entries.join("nowhere"), entry("dangling").join("cm")).unwrap();
+    for (name, mode) in [("plain", 0o644), ("others", 0o641)] {
+        let cm = script(&entry(name).join("cm"), &working);
+        fs::set_permissions(&cm, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let path = ["folder", "dangling", "plain", "others"]
+        .map(|name| entries.join(name).display().to_string())
+        .join(":");
+    let json = tick_json(
+        &harness,
+        harness.ct.path(),
+        &format!("{path}:{}:/usr/bin:/bin", harness.bin.display()),
+    );
+    // A directory, a dangling symlink and a file with no execute bit are skipped by everyone.
+    // Execute for others only is not the owner's to run, but is root's (any execute bit will
+    // do for root), so the first entry this user may run is decided by who runs the suite.
+    let runs = if rustix::process::geteuid().is_root() {
+        entries.join("others/cm")
+    } else {
+        harness.bin.join("cm")
+    };
+    assert_eq!(json["cm"], runs.display().to_string(), "{json}");
+    assert_eq!(json["lines"], json!(PRINTED), "{json}");
+}
+
+#[test]
+fn the_built_cm_tick_reads_empty_and_relative_path_entries_from_where_it_started() {
+    let harness = Harness::new(1, &act(lines()), PICK_OK);
+    let working = fs::read_to_string(harness.bin.join("cm")).unwrap();
+    let started = harness.ct.path().join("started");
+    script(&started.join("cm"), &working);
+    script(&started.join("relative/cm"), &working);
+    let bin = harness.bin.display();
+    for (path, runs) in [
+        (format!(":{bin}:/usr/bin:/bin"), started.join("cm")),
+        (
+            format!("relative:{bin}:/usr/bin:/bin"),
+            started.join("relative/cm"),
+        ),
+    ] {
+        let json = tick_json(&harness, &started, &path);
+        let used = Path::new(json["cm"].as_str().unwrap());
+        assert!(used.is_absolute(), "{path}: {json}");
+        assert_eq!(fs::canonicalize(used).unwrap(), runs, "{path}");
+        assert_eq!(json["lines"], json!(PRINTED), "{path}: {json}");
+    }
+}

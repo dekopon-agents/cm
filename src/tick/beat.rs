@@ -87,16 +87,24 @@ pub fn this_cm() -> OsString {
 }
 
 // Children run in the checkout, so `--cm` is resolved where it was given: a path made absolute,
-// a bare name looked up on PATH. A name PATH does not hold stays bare, to fail as one line.
+// a bare name looked up on PATH as a shell would, an empty or relative entry taken from the
+// directory cm tick started in. A name PATH does not hold stays bare, to fail as one line.
 pub fn resolve(cm: &OsStr) -> OsString {
-    use std::os::unix::fs::PermissionsExt;
     let named = Path::new(cm);
     if cm.as_encoded_bytes().contains(&b'/') {
         return std::path::absolute(named).map_or_else(|_| cm.to_owned(), PathBuf::into_os_string);
     }
+    // The effective user's own execute permission, not the mode's bits: a file whose only
+    // execute bit is another class's is skipped, as execvp would fail on it and move on.
     let runnable = |path: &Path| {
-        path.metadata()
-            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        path.metadata().is_ok_and(|meta| meta.is_file())
+            && rustix::fs::accessat(
+                rustix::fs::CWD,
+                path,
+                rustix::fs::Access::EXEC_OK,
+                rustix::fs::AtFlags::EACCESS,
+            )
+            .is_ok()
     };
     std::env::var_os("PATH")
         .and_then(|paths| {
