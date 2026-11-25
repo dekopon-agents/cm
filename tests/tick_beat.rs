@@ -1566,6 +1566,7 @@ impl Harness {
         let log = ct.path().join("calls.log");
         fs::write(ct.path().join("next.json"), next).unwrap();
         fs::write(ct.path().join("pick"), pick).unwrap();
+        fs::create_dir(ct.path().join("tmp")).unwrap();
         script(
             &bin.join("cm"),
             &format!(
@@ -1592,12 +1593,18 @@ impl Harness {
         Harness { ct, bin }
     }
 
+    // The runner's /tmp can be too small for a 64 MiB spill, and the built cm sees no TMPDIR.
+    fn tmpdir(&self) -> PathBuf {
+        self.ct.path().join("tmp")
+    }
+
     fn command(&self, session: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cm"));
         command
             .env_clear()
             .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
             .env("HOME", self.ct.path())
+            .env("TMPDIR", self.tmpdir())
             .env("CLAUDE_CODE_REMOTE_SESSION_ID", session)
             .current_dir(self.ct.path());
         command
@@ -2415,11 +2422,9 @@ fn peak_kib(pid: u32) -> Option<u64> {
 fn the_built_cm_tick_spills_a_list_above_64_mib_and_prints_every_line_in_bounded_memory() {
     let harness = Harness::new(1, "", PICK_OK);
     harness.big();
-    let tmpdir = harness.ct.path().join("tmp");
-    fs::create_dir(&tmpdir).unwrap();
+    let tmpdir = harness.tmpdir();
     let mut child = harness
         .command("cse_01abc")
-        .env("TMPDIR", &tmpdir)
         .args(["tick", "--cm", "cm"])
         .stdout(std::process::Stdio::piped())
         .spawn()
@@ -2469,11 +2474,9 @@ fn the_built_cm_tick_names_a_spill_that_could_not_be_stored() {
 fn a_killed_cm_tick_leaves_no_spilled_list_behind() {
     let harness = Harness::new(1, "", PICK_OK);
     harness.big();
-    let tmpdir = harness.ct.path().join("tmp");
-    fs::create_dir(&tmpdir).unwrap();
+    let tmpdir = harness.tmpdir();
     let mut child = harness
         .command("cse_01abc")
-        .env("TMPDIR", &tmpdir)
         .args(["tick", "--cm", "cm"])
         .stdout(std::process::Stdio::piped())
         .spawn()
@@ -2528,6 +2531,7 @@ impl Harness {
             .env_clear()
             .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
             .env("HOME", self.ct.path())
+            .env("TMPDIR", self.tmpdir())
             .env("CLAUDE_CODE_REMOTE_SESSION_ID", session)
             .current_dir(self.ct.path())
             .arg("-c")
@@ -2549,16 +2553,13 @@ fn the_built_cm_tick_names_a_spill_that_would_pass_the_file_size_limit() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert_eq!(stdout.lines().count(), 1, "{stdout}");
-    assert!(
-        stdout.starts_with(
-            "heartbeat: cm --json next --act's list was too large to keep in memory and could not be stored in "
-        ),
-        "{stdout}"
-    );
     let efbig = std::io::Error::from_raw_os_error(27);
-    assert!(
-        stdout.ends_with(&format!(": {efbig}; no act line was read\n")),
-        "{stdout}"
+    assert_eq!(
+        stdout,
+        format!(
+            "heartbeat: cm --json next --act's list was too large to keep in memory and could not be stored in {}: {efbig}; no act line was read\n",
+            harness.tmpdir().display()
+        )
     );
 }
 
@@ -2895,11 +2896,8 @@ fn the_built_cm_tick_checks_every_spill_write_against_the_file_size_limit() {
     write_big_list(&harness.ct.path().join("next.json"));
     // Room for the first write, the 64 MiB held so far, but not for the rest of the list.
     let limit_kib = (WHOLE_CAP >> 10) + 1_024;
-    let tmpdir = harness.ct.path().join("spill");
-    fs::create_dir(&tmpdir).unwrap();
     let output = harness
         .limited("cse_01abc", &format!("ulimit -f {limit_kib}"))
-        .env("TMPDIR", &tmpdir)
         .args(["tick", "--cm", "cm"])
         .output()
         .unwrap();
@@ -2909,7 +2907,7 @@ fn the_built_cm_tick_checks_every_spill_write_against_the_file_size_limit() {
         String::from_utf8(output.stdout).unwrap(),
         format!(
             "heartbeat: cm --json next --act's list was too large to keep in memory and could not be stored in {}: {efbig}; no act line was read\n",
-            tmpdir.display()
+            harness.tmpdir().display()
         )
     );
 }
