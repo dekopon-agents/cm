@@ -1451,7 +1451,8 @@ impl<'a> Run<'a> {
     }
 }
 
-// EPOCH.md's `epoch` slug, so a checkout under another folder name renders the same card.
+// EPOCH.md's `epoch` slug, else a fixed name: a checkout under another folder name renders the
+// same card.
 fn card_name(root: &Path) -> String {
     let declared = std::fs::read_to_string(root.join(crate::epoch::EPOCH))
         .ok()
@@ -1462,11 +1463,7 @@ fn card_name(root: &Path) -> String {
                 .filter(|slug| !slug.is_empty())
                 .map(str::to_owned)
         });
-    declared.unwrap_or_else(|| {
-        root.file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    })
+    declared.unwrap_or_else(|| "campaign".to_owned())
 }
 
 fn last_sync_entry(root: &Path) -> BTreeSet<String> {

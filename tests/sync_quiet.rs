@@ -989,3 +989,40 @@ echo '{{"done":false,"successful":false,"turn_status":"inProgress"}}'
     let overlap = fs::read_to_string(scratch.path().join("overlap")).unwrap();
     assert_eq!(overlap, "1\n1\n1\n");
 }
+
+#[test]
+fn a_card_without_an_epoch_slug_keeps_its_title_under_another_folder_name() {
+    let gh = support::FakeGh::new("exit 1\n");
+    let synced_card = |root: &Path| {
+        let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("-C")
+            .arg(root)
+            .arg("sync")
+            .env("PATH", gh.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        fs::read_to_string(root.join("CARD.md")).unwrap()
+    };
+    for epoch in [
+        None,
+        Some("---\nstatus: WORKING\n---\n"),
+        Some("---\nepoch:\nstatus: WORKING\n---\n"),
+    ] {
+        let c = campaign(&at("2026-10-17T08:00:00Z"));
+        if let Some(text) = epoch {
+            fs::write(c.root.join("EPOCH.md"), text).unwrap();
+        }
+        let card = synced_card(&c.root);
+        let moved = c.root.with_file_name("moved");
+        let copied = Command::new("cp")
+            .arg("-a")
+            .arg(&c.root)
+            .arg(&moved)
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        assert_eq!(synced_card(&moved), card, "{epoch:?}");
+        assert!(card.starts_with("# campaign card\n"), "{card}");
+    }
+}
