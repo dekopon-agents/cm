@@ -14,7 +14,7 @@ use cm::tick::act::{ActLine, Ctx, Env, Executor, Outcome, Registry, Report};
 use cm::tick::beat::{self, Beat, Phases};
 use cm::tick::gitsync::Mode;
 use cm::tick::proc::{
-    Cmd, Exit, FakeProc, Keep, OUTPUT_CAP, Proc, Ran, Spilled, SystemProc, WHOLE_CAP,
+    Cmd, Exit, FakeProc, Keep, OUTPUT_CAP, Proc, Ran, Spilled, StdoutKeep, SystemProc, WHOLE_CAP,
 };
 use serde_json::{Value, json};
 
@@ -975,18 +975,18 @@ fn more_than_one_live_epoch_stops_before_any_effect() {
 #[test]
 fn the_live_epoch_is_one_with_a_line_starting_status_planning_or_working() {
     let ct = Ct::new();
-    assert_eq!(beat::live_epochs(ct.path()), [Path::new(EPOCH)]);
+    assert_eq!(beat::live_epochs(ct.path()).unwrap(), [Path::new(EPOCH)]);
     ct.write("store/epochs/.hidden/EPOCH.md", "status: WORKING\n");
     ct.write("store/epochs/indented/EPOCH.md", "  status: WORKING\n");
     ct.write("store/epochs/other/EPOCH.md", "status: OPEN\n");
     fs::create_dir_all(ct.path().join("store/epochs/folder/EPOCH.md")).unwrap();
-    assert_eq!(beat::live_epochs(ct.path()), [Path::new(EPOCH)]);
+    assert_eq!(beat::live_epochs(ct.path()).unwrap(), [Path::new(EPOCH)]);
     ct.write(
         "store/epochs/later/EPOCH.md",
         "---\ntitle: x\n---\nstatus: PLANNING-ish\r\n",
     );
     assert_eq!(
-        beat::live_epochs(ct.path()),
+        beat::live_epochs(ct.path()).unwrap(),
         [Path::new(EPOCH), Path::new("store/epochs/later")]
     );
 
@@ -1000,7 +1000,7 @@ fn the_live_epoch_is_one_with_a_line_starting_status_planning_or_working() {
         ]
     );
     let empty = tempfile::tempdir().unwrap();
-    assert!(beat::live_epochs(empty.path()).is_empty());
+    assert!(beat::live_epochs(empty.path()).unwrap().is_empty());
 }
 
 struct Bin(PathBuf);
@@ -1275,7 +1275,7 @@ fn the_act_list_spills_past_64_mib_and_the_frame_children_keep_their_heads() {
         .unwrap();
     assert_eq!(
         (next.keep_stdout, next.keep_stderr),
-        (Keep::Spill, Keep::Head)
+        (StdoutKeep::Spill, Keep::Head)
     );
     for frame in proc.calls().iter().filter(|cmd| cmd.program_name() != "cm") {
         assert_eq!(frame.keep_stdout, Keep::Head, "{}", frame.line());
@@ -1515,7 +1515,7 @@ fn a_spilling_capture_times_out_and_kills_a_descendant_that_outlives_the_leader(
         let started = Instant::now();
         let ran = spawn(
             &Cmd::new(&leaves)
-                .keep(Keep::Spill, Keep::Head)
+                .keep(StdoutKeep::Spill, Keep::Head)
                 .timeout(timeout),
         )
         .unwrap();
@@ -2503,4 +2503,152 @@ fn the_built_cm_tick_exits_0_on_a_closed_stdout_with_act_lines_to_print() {
             "{args:?}: {output:?}"
         );
     }
+}
+
+impl Harness {
+    // The built cm under a shell resource limit, e.g. `ulimit -f 1024`.
+    fn limited(&self, session: &str, limit: &str) -> Command {
+        let mut command = Command::new("bash");
+        command
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
+            .env("HOME", self.ct.path())
+            .env("CLAUDE_CODE_REMOTE_SESSION_ID", session)
+            .current_dir(self.ct.path())
+            .arg("-c")
+            .arg(format!("{limit}; exec \"$0\" \"$@\""))
+            .arg(env!("CARGO_BIN_EXE_cm"));
+        command
+    }
+}
+
+#[test]
+fn the_built_cm_tick_names_a_spill_that_would_pass_the_file_size_limit() {
+    let harness = Harness::new(1, "", PICK_OK);
+    write_big_list(&harness.ct.path().join("next.json"));
+    let output = harness
+        .limited("cse_01abc", "ulimit -f 1024")
+        .args(["tick", "--cm", "cm"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(
+        stdout.starts_with(
+            "heartbeat: cm --json next --act printed more than 64 MiB, which could not be stored in "
+        ),
+        "{stdout}"
+    );
+    let efbig = std::io::Error::from_raw_os_error(27);
+    assert!(
+        stdout.ends_with(&format!(": {efbig}; no act line was read\n")),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn the_built_cm_tick_stops_writing_a_stdout_file_at_the_file_size_limit() {
+    let wide = |target| {
+        line(
+            "stale-block",
+            target,
+            &format!("cm sync {}", "0".repeat(1200)),
+        )
+    };
+    let harness = Harness::new(
+        1,
+        &act(vec![wide("01-a/u/a"), wide("01-a/u/b"), wide("01-a/u/c")]),
+        PICK_OK,
+    );
+    let all = harness
+        .command("cse_01abc")
+        .args(["tick", "--cm", "cm"])
+        .output()
+        .unwrap();
+    let all = String::from_utf8(all.stdout).unwrap();
+    let first = all.lines().next().unwrap();
+    assert_eq!(all.lines().count(), 3, "{all}");
+    assert!(first.len() < 2048 && 2 * (first.len() + 1) > 2048);
+    let file = harness.ct.path().join("out");
+    for (args, kept) in [
+        (&["tick", "--cm", "cm"][..], format!("{first}\n")),
+        (&["--json", "tick", "--cm", "cm"][..], String::new()),
+    ] {
+        let output = harness
+            .limited(
+                "cse_01abc",
+                &format!("ulimit -f 2; exec > '{}'", file.display()),
+            )
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), kept, "{args:?}");
+    }
+}
+
+#[test]
+fn the_built_cm_tick_moves_the_list_to_its_file_when_memory_for_it_runs_out() {
+    let harness = Harness::new(1, "", PICK_OK);
+    write_big_list(&harness.ct.path().join("next.json"));
+    let output = harness
+        .limited("cse_01abc", "ulimit -v 60000")
+        .args(["tick", "--cm", "cm"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), BIG_LIST);
+    for (n, line) in stdout.lines().enumerate() {
+        assert_eq!(line, big_line(n));
+    }
+}
+
+#[test]
+fn an_epoch_store_that_cannot_be_read_is_named_not_counted_as_none() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("store")).unwrap();
+    std::os::unix::fs::symlink("epochs", dir.path().join("store/epochs")).unwrap();
+    let error = beat::live_epochs(dir.path()).unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(40), "ELOOP: {error}");
+    let proc = Answers::new(1, act(lines())).proc();
+    let mut out = Vec::new();
+    beat::run(
+        &Beat {
+            checkout: dir.path(),
+            proc: &proc,
+            env: &bound_env(),
+            registry: &Registry::new(),
+            phases: &QUIET,
+            cm: OsStr::new("cm"),
+            started: Instant::now(),
+        },
+        &mut |line| out.push(line),
+    );
+    assert_eq!(
+        out,
+        [format!(
+            "heartbeat: store/epochs could not be read: {error}"
+        )]
+    );
+    assert!(proc.calls().is_empty());
+    let shapes = tempfile::tempdir().unwrap();
+    assert!(beat::live_epochs(shapes.path()).unwrap().is_empty());
+    write(
+        &shapes.path().join("store/epochs"),
+        "a file, not a folder\n",
+    );
+    assert!(beat::live_epochs(shapes.path()).unwrap().is_empty());
+    fs::remove_file(shapes.path().join("store/epochs")).unwrap();
+    write(
+        &shapes.path().join("store/epochs/README"),
+        "a file among epochs\n",
+    );
+    assert!(beat::live_epochs(shapes.path()).unwrap().is_empty());
 }

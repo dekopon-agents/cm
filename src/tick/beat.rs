@@ -10,7 +10,9 @@ use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 use crate::tick::act::{ActLine, Ctx, Env, Outcome, Registry, Report, clip};
-use crate::tick::proc::{Cmd, Exit, KILL_AFTER, Keep, Proc, Ran, Spilled, SystemProc, WHOLE_CAP};
+use crate::tick::proc::{
+    Cmd, Exit, KILL_AFTER, Keep, Proc, Ran, Spilled, StdoutKeep, SystemProc, WHOLE_CAP,
+};
 use crate::tick::{claude_md, collect, directive, exec, gitsync, pin};
 
 pub const DEADLINE_SECS: i64 = 230;
@@ -87,7 +89,15 @@ pub fn this_cm() -> OsString {
 }
 
 pub fn run(beat: &Beat, out: &mut dyn FnMut(String)) {
-    let epochs = live_epochs(beat.checkout);
+    let epochs = match live_epochs(beat.checkout) {
+        Ok(epochs) => epochs,
+        Err(error) => {
+            out(format!(
+                "heartbeat: store/epochs could not be read: {error}"
+            ));
+            return;
+        }
+    };
     let [epoch] = epochs.as_slice() else {
         out(format!(
             "heartbeat: {} PLANNING or WORKING epochs, not one; stay read-only until cm, PR and journal state are reconciled",
@@ -139,24 +149,39 @@ pub fn run(beat: &Beat, out: &mut dyn FnMut(String)) {
     );
 }
 
-pub fn live_epochs(checkout: &Path) -> Vec<PathBuf> {
+// A store or EPOCH.md that is missing or not the kind of file it should be is no epoch, as
+// heartbeat.sh's glob matched none; a read that fails (EMFILE, EACCES, ELOOP) is returned, not
+// counted as no epoch.
+pub fn live_epochs(checkout: &Path) -> std::io::Result<Vec<PathBuf>> {
+    use std::io::ErrorKind::{IsADirectory, NotADirectory, NotFound};
     let epochs = Path::new("store/epochs");
-    let Ok(entries) = std::fs::read_dir(checkout.join(epochs)) else {
-        return Vec::new();
+    let missing =
+        |error: &std::io::Error| matches!(error.kind(), NotFound | NotADirectory | IsADirectory);
+    let entries = match std::fs::read_dir(checkout.join(epochs)) {
+        Err(error) if missing(&error) => return Ok(Vec::new()),
+        entries => entries?,
     };
-    let live = |bytes: Vec<u8>| {
+    let live = |bytes: &[u8]| {
         bytes.split(|byte| *byte == b'\n').any(|line| {
             line.starts_with(b"status: PLANNING") || line.starts_with(b"status: WORKING")
         })
     };
-    let mut found: Vec<PathBuf> = entries
-        .filter_map(|entry| Some(entry.ok()?.file_name()))
-        .filter(|name| !name.as_encoded_bytes().starts_with(b"."))
-        .map(|name| epochs.join(name))
-        .filter(|epoch| std::fs::read(checkout.join(epoch).join("EPOCH.md")).is_ok_and(live))
-        .collect();
+    let mut found = Vec::new();
+    for entry in entries {
+        let name = entry?.file_name();
+        if name.as_encoded_bytes().starts_with(b".") {
+            continue;
+        }
+        let epoch = epochs.join(name);
+        match std::fs::read(checkout.join(&epoch).join("EPOCH.md")) {
+            Ok(bytes) if live(&bytes) => found.push(epoch),
+            Ok(_) => {}
+            Err(error) if missing(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
     found.sort();
-    found
+    Ok(found)
 }
 
 fn deadline(env: &Env) -> Result<i64, String> {
@@ -237,7 +262,7 @@ fn act(
         .arg("--act")
         .cwd(beat.checkout)
         .timeout(FRAME_CAP)
-        .keep(Keep::Spill, Keep::Head);
+        .keep(StdoutKeep::Spill, Keep::Head);
     let next = match beat.proc.run(&next) {
         Ok(ran) if ran.exit == Exit::TimedOut => {
             out(format!(

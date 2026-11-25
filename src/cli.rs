@@ -15,6 +15,7 @@ use crate::lint;
 use crate::outcome::{Outcome, Violation};
 use crate::state::{Evidence, LANES, Lane, Phase, Work};
 use crate::store::{self, Target, parse_target};
+use crate::tick::proc::FileSizeLimit;
 
 #[derive(Parser)]
 #[command(
@@ -1348,11 +1349,19 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
         Commands::Tick { checkout, cm } => {
             let mut lines = Vec::new();
             let mut stdout = std::io::stdout().lock();
+            let limit = FileSizeLimit::of(&stdout);
+            let mut full = false;
             let used =
                 crate::tick::beat::cli(checkout, cm.as_deref().map(Path::as_os_str), &mut |line| {
                     if cli.json {
                         lines.push(line);
-                    } else {
+                        return;
+                    }
+                    full = full
+                        || limit
+                            .as_ref()
+                            .is_some_and(|limit| !limit.fits(&stdout, line.len() + 1));
+                    if !full {
                         // A closed stdout (`cm tick | true`) must not end the tick: its moves still run.
                         let _ = writeln!(stdout, "{line}");
                     }
@@ -1453,7 +1462,13 @@ pub fn main() -> ExitCode {
         Ok((outcome, exit)) => {
             if cli.json && matches!(cli.command, Commands::Tick { .. }) {
                 // A closed stdout must not turn a tick whose moves ran into a panic.
-                let _ = writeln!(std::io::stdout(), "{}", outcome.to_json(command));
+                let text = outcome.to_json(command).to_string();
+                let mut stdout = std::io::stdout().lock();
+                if FileSizeLimit::of(&stdout)
+                    .is_none_or(|limit| limit.fits(&stdout, text.len() + 1))
+                {
+                    let _ = writeln!(stdout, "{text}");
+                }
             } else if cli.json {
                 println!("{}", outcome.to_json(command));
             } else {

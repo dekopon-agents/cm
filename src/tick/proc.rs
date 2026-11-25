@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::TryReserveError;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
@@ -9,7 +10,8 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
+use rustix::fs::{FileType, OFlags, SeekFrom};
+use rustix::process::{Pid, Resource, Signal, WaitId, WaitIdOptions};
 
 use crate::tick::{Result, TickError};
 
@@ -34,16 +36,33 @@ pub struct Cmd {
     pub stdin: Option<Vec<u8>>,
     pub timeout: Duration,
     pub merge_stderr: bool,
-    pub keep_stdout: Keep,
+    pub keep_stdout: StdoutKeep,
     pub keep_stderr: Keep,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keep {
     Whole,
-    Spill,
     Head,
     Tail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdoutKeep {
+    Keep(Keep),
+    Spill,
+}
+
+impl From<Keep> for StdoutKeep {
+    fn from(keep: Keep) -> Self {
+        StdoutKeep::Keep(keep)
+    }
+}
+
+impl PartialEq<Keep> for StdoutKeep {
+    fn eq(&self, keep: &Keep) -> bool {
+        *self == StdoutKeep::Keep(*keep)
+    }
 }
 
 impl Cmd {
@@ -58,7 +77,7 @@ impl Cmd {
             stdin: None,
             timeout: Self::DEFAULT_TIMEOUT,
             merge_stderr: false,
-            keep_stdout: Keep::Whole,
+            keep_stdout: StdoutKeep::Keep(Keep::Whole),
             keep_stderr: Keep::Tail,
         }
     }
@@ -105,8 +124,8 @@ impl Cmd {
         self
     }
 
-    pub fn keep(mut self, stdout: Keep, stderr: Keep) -> Self {
-        self.keep_stdout = stdout;
+    pub fn keep(mut self, stdout: impl Into<StdoutKeep>, stderr: Keep) -> Self {
+        self.keep_stdout = stdout.into();
         self.keep_stderr = stderr;
         self
     }
@@ -280,7 +299,7 @@ impl Proc for SystemProc {
             let err = child.stderr.take().map(|s| Box::new(s) as Box<dyn Stream>);
             Ok((
                 Drain::new(out, cmd.keep_stdout)?,
-                Drain::new(err, cmd.keep_stderr)?,
+                Drain::new(err, StdoutKeep::Keep(cmd.keep_stderr))?,
                 Feed::new(child.stdin.take(), cmd.stdin.as_deref())?,
             ))
         })();
@@ -409,16 +428,17 @@ fn nonblocking(fd: impl AsFd) -> std::io::Result<()> {
 
 struct Drain {
     reader: Option<Box<dyn Stream>>,
-    keep: Keep,
+    keep: StdoutKeep,
     bytes: Vec<u8>,
     overflowed: bool,
     truncated: bool,
-    spill: Option<std::io::Result<File>>,
+    spill: Option<std::io::Result<SpillFile>>,
     open_spill: fn() -> std::io::Result<File>,
+    reserve: fn(&mut Vec<u8>, usize) -> std::result::Result<(), TryReserveError>,
 }
 
 impl Drain {
-    fn new(reader: Option<Box<dyn Stream>>, keep: Keep) -> std::io::Result<Self> {
+    fn new(reader: Option<Box<dyn Stream>>, keep: StdoutKeep) -> std::io::Result<Self> {
         if let Some(reader) = &reader {
             nonblocking(reader.as_fd())?;
         }
@@ -431,6 +451,7 @@ impl Drain {
             spill: None,
             // Unlinked from the start, so a killed tick leaves nothing behind.
             open_spill: tempfile::tempfile,
+            reserve: Vec::try_reserve,
         })
     }
 
@@ -465,14 +486,27 @@ impl Drain {
         moved
     }
 
+    // Memory that cannot be had is output not kept, never an abort.
+    fn hold(&mut self, bytes: &[u8]) -> bool {
+        let held = (self.reserve)(&mut self.bytes, bytes.len()).is_ok();
+        if held {
+            self.bytes.extend_from_slice(bytes);
+        }
+        held
+    }
+
     fn take(&mut self, chunk: &[u8]) {
-        let cap = match self.keep {
-            Keep::Spill => return self.spill(chunk),
+        let keep = match self.keep {
+            StdoutKeep::Spill => return self.spill(chunk),
+            StdoutKeep::Keep(keep) => keep,
+        };
+        let cap = match keep {
             Keep::Whole => WHOLE_CAP,
             Keep::Head => OUTPUT_CAP,
             Keep::Tail => {
-                self.bytes.extend_from_slice(chunk);
-                if self.bytes.len() > 2 * OUTPUT_CAP {
+                if !self.hold(chunk) {
+                    self.truncated = true;
+                } else if self.bytes.len() > 2 * OUTPUT_CAP {
                     self.bytes.drain(..self.bytes.len() - OUTPUT_CAP);
                     self.truncated = true;
                 }
@@ -480,27 +514,26 @@ impl Drain {
             }
         };
         let room = cap.saturating_sub(self.bytes.len());
-        self.bytes
-            .extend_from_slice(&chunk[..chunk.len().min(room)]);
-        if chunk.len() > room {
+        let held = self.hold(&chunk[..chunk.len().min(room)]);
+        if chunk.len() > room || !held {
             self.truncated = true;
-            self.overflowed |= self.keep == Keep::Whole;
+            self.overflowed |= keep == Keep::Whole;
         }
     }
 
     fn spill(&mut self, chunk: &[u8]) {
+        if self.spill.is_none() && self.bytes.len() + chunk.len() <= WHOLE_CAP && self.hold(chunk) {
+            return;
+        }
         let written = match &mut self.spill {
             Some(Err(_)) => return,
-            Some(Ok(file)) => file.write_all(chunk),
-            None if self.bytes.len() + chunk.len() <= WHOLE_CAP => {
-                self.bytes.extend_from_slice(chunk);
-                return;
-            }
+            Some(Ok(file)) => file.write(chunk),
             None => {
                 let held = std::mem::take(&mut self.bytes);
-                let stored = (self.open_spill)().and_then(|mut file| {
-                    file.write_all(&held)?;
-                    file.write_all(chunk)?;
+                let stored = (self.open_spill)().and_then(|file| {
+                    let mut file = SpillFile::new(file);
+                    file.write(&held)?;
+                    file.write(chunk)?;
                     Ok(file)
                 });
                 match stored {
@@ -524,10 +557,60 @@ impl Drain {
             self.truncated = true;
         }
         let spill = self.spill.map(|spill| match spill {
-            Ok(file) => Spilled::Stored(Arc::new(file)),
+            Ok(file) => Spilled::Stored(Arc::new(file.file)),
             Err(error) => Spilled::Failed(Arc::new(error)),
         });
         (self.bytes, self.truncated, spill)
+    }
+}
+
+struct SpillFile {
+    file: File,
+    len: u64,
+    limit: Option<u64>,
+}
+
+impl SpillFile {
+    fn new(file: File) -> Self {
+        SpillFile {
+            file,
+            len: 0,
+            limit: rustix::process::getrlimit(Resource::Fsize).current,
+        }
+    }
+
+    // A write past RLIMIT_FSIZE would raise SIGXFSZ, which kills the tick before the write can
+    // fail, so it fails here instead.
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let len = self.len + bytes.len() as u64;
+        if self.limit.is_some_and(|limit| len > limit) {
+            return Err(rustix::io::Errno::FBIG.into());
+        }
+        self.file.write_all(bytes)?;
+        self.len = len;
+        Ok(())
+    }
+}
+
+// RLIMIT_FSIZE for a write to a regular file the tick did not open, such as its stdout.
+pub struct FileSizeLimit(u64);
+
+impl FileSizeLimit {
+    pub fn of(fd: impl AsFd) -> Option<Self> {
+        let limit = rustix::process::getrlimit(Resource::Fsize).current?;
+        let stat = rustix::fs::fstat(fd).ok()?;
+        (FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile)
+            .then_some(FileSizeLimit(limit))
+    }
+
+    pub fn fits(&self, fd: impl AsFd, len: usize) -> bool {
+        let fd = fd.as_fd();
+        let at = if rustix::fs::fcntl_getfl(fd).is_ok_and(|flags| flags.contains(OFlags::APPEND)) {
+            rustix::fs::fstat(fd).map(|stat| stat.st_size.unsigned_abs())
+        } else {
+            rustix::fs::seek(fd, SeekFrom::Current(0))
+        };
+        at.is_ok_and(|at| at.saturating_add(len as u64) <= self.0)
     }
 }
 
@@ -615,6 +698,7 @@ impl Proc for FakeProc {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::write as fs_write;
     use std::io::{Seek, SeekFrom};
 
     use super::*;
@@ -622,7 +706,7 @@ mod tests {
     fn spilling(open_spill: fn() -> std::io::Result<File>) -> Drain {
         Drain {
             open_spill,
-            ..Drain::new(None, Keep::Spill).unwrap()
+            ..Drain::new(None, StdoutKeep::Spill).unwrap()
         }
     }
 
@@ -657,6 +741,70 @@ mod tests {
         let mut tail = Vec::new();
         file.read_to_end(&mut tail).unwrap();
         assert_eq!(tail, b"xyz");
+    }
+
+    #[test]
+    fn a_hold_that_cannot_get_memory_spills_or_stops_keeping_instead_of_aborting() {
+        fn no_memory(_: &mut Vec<u8>, _: usize) -> std::result::Result<(), TryReserveError> {
+            Vec::<u8>::new().try_reserve(usize::MAX)
+        }
+        let starved = |keep: StdoutKeep| Drain {
+            reserve: no_memory,
+            ..Drain::new(None, keep).unwrap()
+        };
+        let mut spill = starved(StdoutKeep::Spill);
+        spill.take(b"abc");
+        assert!(!spill.overflowed);
+        let (bytes, _, stored) = spill.finish();
+        assert!(bytes.is_empty());
+        let Some(Spilled::Stored(file)) = stored else {
+            panic!("{stored:?}");
+        };
+        let mut file = &*file;
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut kept = Vec::new();
+        file.read_to_end(&mut kept).unwrap();
+        assert_eq!(kept, b"abc");
+        for (keep, overflowed) in [
+            (Keep::Whole, true),
+            (Keep::Head, false),
+            (Keep::Tail, false),
+        ] {
+            let mut drain = starved(keep.into());
+            drain.take(b"abc");
+            assert_eq!(
+                (drain.overflowed, drain.truncated),
+                (overflowed, true),
+                "{keep:?}"
+            );
+            assert!(drain.finish().0.is_empty(), "{keep:?}");
+        }
+    }
+
+    #[test]
+    fn a_write_past_the_file_size_limit_fails_before_it_is_made() {
+        let mut spill = SpillFile {
+            limit: Some(10),
+            ..SpillFile::new(tempfile::tempfile().unwrap())
+        };
+        spill.write(b"123456").unwrap();
+        let error = spill.write(b"78901").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::FileTooLarge);
+        assert_eq!(spill.len, 6);
+        assert_eq!(spill.file.metadata().unwrap().len(), 6);
+        spill.write(b"7890").unwrap();
+
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"12345").unwrap();
+        let limit = FileSizeLimit(10);
+        assert!(limit.fits(&file, 5));
+        assert!(!limit.fits(&file, 6));
+        file.seek(SeekFrom::Start(0)).unwrap();
+        assert!(limit.fits(&file, 10));
+        let appending = tempfile::NamedTempFile::new().unwrap();
+        fs_write(appending.path(), b"12345").unwrap();
+        let appending = File::options().append(true).open(appending.path()).unwrap();
+        assert!(!limit.fits(&appending, 6), "an append lands at the end");
     }
 
     #[test]
