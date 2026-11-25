@@ -1260,34 +1260,81 @@ fn head_keeps_the_first_bytes_and_tail_the_last() {
 }
 
 #[test]
-fn an_act_list_too_large_to_keep_is_one_named_line() {
+fn the_act_list_is_read_from_a_file_and_the_frame_children_keep_their_heads() {
     let ct = Ct::new();
-    let proc = Answers {
-        next: Ran {
-            exit: Exit::TooLarge,
-            ..Ran::code(0, "{\"actionable\": [")
-        },
-        ..Answers::new(0, "")
-    }
-    .proc();
-    let out = tick(&ct, &proc, &bound_env(), &Registry::new());
-    assert_eq!(
-        out,
-        [
-            "heartbeat: cm --json next --act printed more than 64 MiB and was killed; no act line was read"
-        ]
-    );
+    let proc = Answers::new(1, act(lines())).proc();
+    assert_eq!(tick(&ct, &proc, &bound_env(), &Registry::new()), PRINTED);
     let next = proc
         .calls()
         .into_iter()
         .find(|cmd| cmd.program_name() == "cm")
         .unwrap();
-    assert_eq!(
-        (next.keep_stdout, next.keep_stderr),
-        (Keep::Whole, Keep::Head)
+    assert!(next.stdout_file.is_some(), "{next:?}");
+    assert_eq!(next.keep_stderr, Keep::Head);
+    assert!(
+        !next.stdout_file.unwrap().exists(),
+        "the list's file is gone once the tick is done"
     );
     for frame in proc.calls().iter().filter(|cmd| cmd.program_name() != "cm") {
         assert_eq!(frame.keep_stdout, Keep::Head, "{}", frame.line());
+    }
+}
+
+#[test]
+fn a_list_cut_short_prints_no_act_line() {
+    let ct = Ct::new();
+    let whole = act(lines());
+    let proc = Answers::new(1, &whole.as_bytes()[..whole.len() - 3]).proc();
+    let (executor, seen) = Record::new(done());
+    let registry = Registry::new().with("launchable-not-launched", executor);
+    assert_eq!(
+        tick(&ct, &proc, &bound_env(), &registry),
+        ["heartbeat: cm --json next --act exited 1 without an actionable list: "]
+    );
+    assert!(
+        seen.calls().is_empty(),
+        "nothing ran before the list was whole"
+    );
+}
+
+#[test]
+fn a_valid_act_list_above_64_mib_prints_every_line() {
+    let ct = Ct::new();
+    let bin = ct.path().join("bin");
+    let count = 70_000;
+    let cm = script(
+        &bin.join("cm"),
+        &format!(
+            "awk 'BEGIN {{ printf \"{{\\\"ok\\\":true,\\\"actionable\\\":[\"; for (i = 0; i < {count}; i++) {{ if (i) printf \",\"; printf \"{{\\\"kind\\\":\\\"stale-block\\\",\\\"target\\\":\\\"01-a/u/s%07d\\\",\\\"command\\\":\\\"cm sync %01000d\\\"}}\", i, i }} printf \"]}}\" }}'\nexit 1\n"
+        ),
+    );
+    script(&bin.join("git"), "echo main\n");
+    let probe = Command::new(&cm).output().unwrap();
+    assert!(probe.stdout.len() > 64 << 20, "{}", probe.stdout.len());
+    drop(probe);
+    let mut out = Vec::new();
+    beat::run(
+        &Beat {
+            checkout: ct.path(),
+            proc: &Bin(bin.clone()),
+            env: &Env::default(),
+            registry: &Registry::new(),
+            phases: &QUIET,
+            cm: cm.as_os_str(),
+            started: Instant::now(),
+        },
+        &mut |line| out.push(line),
+    );
+    assert_eq!(out.len(), 1 + count, "{:?}", out.first());
+    assert_eq!(
+        out[0],
+        "heartbeat: executors off (no CLAUDE_CODE_REMOTE_SESSION_ID, so no lineage); every act line below is yours"
+    );
+    for (n, line) in out[1..].iter().enumerate() {
+        assert_eq!(
+            *line,
+            format!("stale-block 01-a/u/s{n:07}: cm sync {n:01000}")
+        );
     }
 }
 
@@ -2123,4 +2170,45 @@ fn a_list_read_past_the_act_budget_still_prints_the_wall_time() {
     let out = tick(&ct, &proc, &env, &Registry::new());
     assert_eq!(out.len(), 1, "{out:?}");
     assert!(is_wall_line(&out[0], "act"), "{out:?}");
+}
+
+#[test]
+fn the_built_cm_tick_without_a_place_for_the_list_is_one_line() {
+    let harness = Harness::new(1, &act(lines()), PICK_OK);
+    let output = harness
+        .command("cse_01abc")
+        .env("TMPDIR", harness.ct.path().join("no-such-dir"))
+        .args(["tick", "--cm", "cm"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(
+        stdout.starts_with("heartbeat: cm --json next --act could not run: "),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn the_built_cm_tick_exits_0_on_a_closed_stdout_with_act_lines_to_print() {
+    let harness = Harness::new(1, &act(lines()), PICK_OK);
+    for args in [
+        &["--json", "tick", "--cm", "cm"][..],
+        &["tick", "--cm", "cm"][..],
+    ] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let output = harness
+            .command("cse_01abc")
+            .args(args)
+            .stdout(writer)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("panicked"),
+            "{args:?}: {output:?}"
+        );
+    }
 }

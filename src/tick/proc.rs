@@ -34,6 +34,7 @@ pub struct Cmd {
     pub merge_stderr: bool,
     pub keep_stdout: Keep,
     pub keep_stderr: Keep,
+    pub stdout_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +58,7 @@ impl Cmd {
             merge_stderr: false,
             keep_stdout: Keep::Whole,
             keep_stderr: Keep::Tail,
+            stdout_file: None,
         }
     }
 
@@ -99,6 +101,11 @@ impl Cmd {
 
     pub fn merge_stderr(mut self) -> Self {
         self.merge_stderr = true;
+        self
+    }
+
+    pub fn stdout_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.stdout_file = Some(path.into());
         self
     }
 
@@ -235,7 +242,17 @@ impl Proc for SystemProc {
         if let Some(dir) = &cmd.cwd {
             command.current_dir(dir);
         }
-        let merged = if cmd.merge_stderr {
+        let merged = if let Some(path) = &cmd.stdout_file {
+            // Straight to disk: output of any size, never held in memory.
+            let file = std::fs::File::create(path).map_err(fail)?;
+            if cmd.merge_stderr {
+                command.stderr(file.try_clone().map_err(fail)?);
+            } else {
+                command.stderr(Stdio::piped());
+            }
+            command.stdout(file);
+            None
+        } else if cmd.merge_stderr {
             let (reader, writer) = std::io::pipe().map_err(fail)?;
             command
                 .stdout(writer.try_clone().map_err(fail)?)
@@ -541,7 +558,16 @@ impl FakeProc {
 impl Proc for FakeProc {
     fn run(&self, cmd: &Cmd) -> Result<Ran> {
         self.calls.borrow_mut().push(cmd.clone());
-        (self.answer)(cmd)
+        let mut ran = (self.answer)(cmd)?;
+        if let Some(path) = &cmd.stdout_file {
+            std::fs::write(path, std::mem::take(&mut ran.stdout)).map_err(|source| {
+                TickError::Io {
+                    path: path.clone(),
+                    source,
+                }
+            })?;
+        }
+        Ok(ran)
     }
 
     fn pause(&self, pause: Duration) {

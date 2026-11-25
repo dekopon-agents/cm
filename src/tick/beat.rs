@@ -1,11 +1,16 @@
 use std::ffi::{OsStr, OsString};
+use std::fmt;
+use std::fs::File;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use serde::Deserializer as _;
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 use crate::tick::act::{ActLine, Ctx, Env, Outcome, Registry, Report, clip};
-use crate::tick::proc::{Cmd, Exit, KILL_AFTER, Keep, Proc, SystemProc, WHOLE_CAP};
+use crate::tick::proc::{Cmd, Exit, KILL_AFTER, Keep, Proc, SystemProc};
 use crate::tick::{claude_md, collect, directive, exec, gitsync, pin};
 
 pub const DEADLINE_SECS: i64 = 230;
@@ -224,25 +229,30 @@ fn act(
     deadline: i64,
     out: &mut dyn FnMut(String),
 ) -> Act {
+    // The list goes to a file and is read from it twice, whole and then line by line, so a list
+    // of any size prints every line in bounded memory.
+    let stdout = match tempfile::NamedTempFile::new() {
+        Ok(file) => file,
+        Err(error) => {
+            out(format!(
+                "heartbeat: cm --json next --act could not run: {error}"
+            ));
+            return READ_FAILED;
+        }
+    };
     let next = Cmd::new(beat.cm)
         .args(["--json", "next", "-C"])
         .arg(epoch)
         .arg("--act")
         .cwd(beat.checkout)
         .timeout(FRAME_CAP)
-        .keep(Keep::Whole, Keep::Head);
+        .keep(Keep::Whole, Keep::Head)
+        .stdout_file(stdout.path());
     let next = match beat.proc.run(&next) {
         Ok(ran) if ran.exit == Exit::TimedOut => {
             out(format!(
                 "heartbeat: cm --json next --act ran past {} s and was killed",
                 FRAME_CAP.as_secs()
-            ));
-            return READ_FAILED;
-        }
-        Ok(ran) if ran.exit == Exit::TooLarge => {
-            out(format!(
-                "heartbeat: cm --json next --act printed more than {} MiB and was killed; no act line was read",
-                WHOLE_CAP >> 20
             ));
             return READ_FAILED;
         }
@@ -255,11 +265,12 @@ fn act(
         }
     };
     let status = next.exit.shell_status();
-    let list = serde_json::from_slice::<Value>(&next.stdout)
-        .ok()
-        .filter(|act| act.get("actionable").is_some_and(Value::is_array) && status <= 1);
-    let Some(list) = list else {
-        if status == 0 && next.stdout.iter().all(|byte| *byte == b'\n') {
+    let list = stdout.as_file();
+    let shape = (status <= 1)
+        .then(|| read_list(BufReader::new(list), None).ok())
+        .flatten();
+    let Some(shape) = shape else {
+        if status == 0 && only_newlines(list) {
             return Act {
                 ran: false,
                 failed: false,
@@ -271,68 +282,193 @@ fn act(
         ));
         return READ_FAILED;
     };
-    // The list can be tens of MiB: free the raw output and move the lines out, never copy them.
-    drop(next);
-    let mut list = list;
-    let unread = list
-        .get("owner_queue_unread")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-    if unread != 0 {
+    if shape.unread != 0 {
         out(format!(
-            "owner-queue: {unread} unread item(s); read OWNER-QUEUE.md and run cm owner-queue read before any merge or review"
+            "owner-queue: {} unread item(s); read OWNER-QUEUE.md and run cm owner-queue read before any merge or review",
+            shape.unread
         ));
     }
-    let lines = match list.get_mut("actionable").map(Value::take) {
-        Some(Value::Array(lines)) => lines,
-        _ => Vec::new(),
-    };
-    drop(list);
-    let mut act = Act {
-        ran: false,
-        failed: false,
-    };
-    if lines.is_empty() {
-        return act;
+    if shape.lines == 0 {
+        return Act {
+            ran: false,
+            failed: false,
+        };
     }
     if let Err(why) = bound {
         out(format!(
             "heartbeat: executors off ({why}); every act line below is yours"
         ));
     }
-    let epoch_dir = beat.checkout.join(epoch);
-    for json in lines {
-        let line = ActLine::read(json, &epoch_dir);
+    let lines = Lines {
+        beat,
+        epoch,
+        epoch_dir: beat.checkout.join(epoch),
+        bound,
+        unread: shape.unread,
+        deadline,
+    };
+    let mut ran = false;
+    let read = rewind(list).and_then(|()| {
+        read_list(
+            BufReader::new(list),
+            Some(&mut |json| ran |= lines.act(json, out)),
+        )
+    });
+    if let Err(error) = read {
+        out(format!(
+            "heartbeat: cm --json next --act's list could not be read again: {error}"
+        ));
+        return Act { ran, failed: true };
+    }
+    Act { ran, failed: false }
+}
+
+fn rewind(mut file: &File) -> serde_json::Result<()> {
+    file.seek(SeekFrom::Start(0))
+        .map(drop)
+        .map_err(serde_json::Error::io)
+}
+
+// heartbeat.sh's `[ -z "$act" ]`: nothing but newlines.
+fn only_newlines(file: &File) -> bool {
+    rewind(file).is_ok()
+        && BufReader::new(file)
+            .bytes()
+            .all(|byte| matches!(byte, Ok(b'\n')))
+}
+
+struct Shape {
+    lines: usize,
+    unread: usize,
+}
+
+// Without `each` this only checks the whole document, keeping none of its lines.
+fn read_list(source: impl Read, each: Option<&mut dyn FnMut(Value)>) -> serde_json::Result<Shape> {
+    let mut parser = serde_json::Deserializer::from_reader(source);
+    let shape = parser.deserialize_map(Document { each })?;
+    parser.end()?;
+    Ok(shape)
+}
+
+struct Document<'a> {
+    each: Option<&'a mut dyn FnMut(Value)>,
+}
+
+impl<'de> Visitor<'de> for Document<'_> {
+    type Value = Shape;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("an object with an `actionable` array")
+    }
+
+    fn visit_map<M: MapAccess<'de>>(mut self, mut map: M) -> Result<Shape, M::Error> {
+        let mut lines = None;
+        let mut unread = 0;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "actionable" if lines.is_some() => {
+                    return Err(de::Error::duplicate_field("actionable"));
+                }
+                "actionable" => {
+                    lines = Some(map.next_value_seed(Elements {
+                        each: self.each.take(),
+                    })?);
+                }
+                "owner_queue_unread" => {
+                    unread = map.next_value::<Value>()?.as_array().map_or(0, Vec::len);
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        let lines = lines.ok_or_else(|| de::Error::missing_field("actionable"))?;
+        Ok(Shape { lines, unread })
+    }
+}
+
+struct Elements<'a> {
+    each: Option<&'a mut dyn FnMut(Value)>,
+}
+
+impl<'de> DeserializeSeed<'de> for Elements<'_> {
+    type Value = usize;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<usize, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Elements<'_> {
+    type Value = usize;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("an array of act lines")
+    }
+
+    fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<usize, S::Error> {
+        let mut count = 0;
+        match self.each {
+            Some(each) => {
+                while let Some(line) = seq.next_element::<Value>()? {
+                    each(line);
+                    count += 1;
+                }
+            }
+            None => {
+                while seq.next_element::<IgnoredAny>()?.is_some() {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+}
+
+struct Lines<'a> {
+    beat: &'a Beat<'a>,
+    epoch: &'a Path,
+    epoch_dir: PathBuf,
+    bound: &'a Result<(), String>,
+    unread: usize,
+    deadline: i64,
+}
+
+impl Lines<'_> {
+    fn act(&self, json: Value, out: &mut dyn FnMut(String)) -> bool {
+        let beat = self.beat;
+        let line = ActLine::read(json, &self.epoch_dir);
         let text = line.text();
         let kind = line.kind();
-        let found = bound
+        let found = self
+            .bound
             .as_ref()
             .ok()
             .and_then(|()| beat.registry.lookup(&kind, line.lane.as_deref()));
         let Some((name, executor)) = found else {
             out(text);
-            continue;
+            return false;
         };
-        if unread != 0 && QUEUE_HELD.contains(&kind.as_str()) {
+        if self.unread != 0 && QUEUE_HELD.contains(&kind.as_str()) {
             out(text);
-            continue;
+            return false;
         }
-        let cap = deadline
+        let cap = self
+            .deadline
             .saturating_sub(beat.elapsed_secs())
             .min(EXECUTOR_CAP_SECS);
         if cap < 1 {
             out(format!("{text} [not run: heartbeat time budget spent]"));
-            continue;
+            return false;
         }
-        act.ran = true;
-        let ctx = beat.ctx(epoch, Duration::from_secs(cap.unsigned_abs()));
+        let ctx = beat.ctx(self.epoch, Duration::from_secs(cap.unsigned_abs()));
         let outcome = contained(|| executor.run(&line, &ctx))
             .unwrap_or_else(|panic| Outcome::Failed(format!("panicked: {panic}")));
         if ctx.timed_out() {
             out(format!(
                 "{text} [tick/{name} timed out after {cap} s and was killed; check what it started]"
             ));
-            continue;
+            return true;
         }
         match outcome {
             Outcome::Done(lines) => {
@@ -353,8 +489,8 @@ fn act(
                 )
             )),
         }
+        true
     }
-    act
 }
 
 fn bound(beat: &Beat, epoch: &Path, out: &mut dyn FnMut(String)) -> Result<(), String> {
@@ -528,6 +664,59 @@ mod tests {
         ] {
             assert_eq!(malformed(&other), None, "{other}");
         }
+    }
+
+    #[test]
+    fn read_list_checks_the_whole_document_then_hands_lines_one_at_a_time() {
+        let shape = |text: &str| {
+            read_list(text.as_bytes(), None)
+                .map(|shape| (shape.lines, shape.unread))
+                .ok()
+        };
+        assert_eq!(
+            shape(r#"{"actionable": [1, {"a": 2}], "owner_queue_unread": ["x", "y"]}"#),
+            Some((2, 2))
+        );
+        assert_eq!(
+            shape(r#"{"owner_queue_unread": "x", "ok": true, "actionable": []}"#),
+            Some((0, 0))
+        );
+        for bad in [
+            "",
+            "{}",
+            r#"{"actionable": {}}"#,
+            r#"{"actionable": null}"#,
+            "[[]]",
+            r#"{"actionable": []} x"#,
+            r#"{"actionable": [], "actionable": []}"#,
+            r#"{"actionable": [1,"#,
+        ] {
+            assert_eq!(shape(bad), None, "{bad}");
+        }
+        let mut seen = Vec::new();
+        let shape = read_list(
+            r#"{"actionable": [{"k": 1}, {"k": 2}], "ok": true}"#.as_bytes(),
+            Some(&mut |line| seen.push(line)),
+        )
+        .unwrap();
+        assert_eq!(shape.lines, 2);
+        assert_eq!(
+            seen,
+            [serde_json::json!({"k": 1}), serde_json::json!({"k": 2})]
+        );
+    }
+
+    #[test]
+    fn only_newlines_is_an_empty_capture() {
+        let check = |bytes: &[u8]| {
+            let file = tempfile::tempfile().unwrap();
+            std::io::Write::write_all(&mut &file, bytes).unwrap();
+            only_newlines(&file)
+        };
+        assert!(check(b""));
+        assert!(check(b"\n\n"));
+        assert!(!check(b" \n"));
+        assert!(!check(b"{}"));
     }
 
     #[test]
