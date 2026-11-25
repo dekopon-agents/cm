@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -101,7 +101,12 @@ pub struct Env(BTreeMap<String, String>);
 
 impl Env {
     pub fn system() -> Self {
-        Env(std::env::vars_os()
+        Env::from_os(std::env::vars_os())
+    }
+
+    pub(crate) fn from_os(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
+        Env(vars
+            .into_iter()
             .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
             .collect())
     }
@@ -598,6 +603,36 @@ mod tests {
             "three 30 s checks spend none of it"
         );
         assert_eq!(ctx.checking(), Duration::from_secs(90));
+    }
+
+    // cm#132's fresh reader: an IfDirty gitsync 31 s into its 60 s, past the heartbeat's own
+    // deadline, re-checks for 30 s; capping the check's move there timed its push out.
+    #[test]
+    fn a_check_late_in_a_phase_leaves_the_push_after_it_its_budget() {
+        let clock = Rc::new(Cell::new(Instant::now()));
+        let proc = bound_children(&clock, |word, clock| {
+            (word == "fetch").then(|| {
+                later(clock, 30);
+                Ran::code(0, "")
+            })
+        });
+        let (env, ticking) = (session(), Ticking(clock.clone()));
+        let ctx = Ctx::new(
+            Path::new("."),
+            Path::new("store/epochs/e"),
+            &proc,
+            &env,
+            OsStr::new("cm"),
+            Duration::ZERO,
+        )
+        .clocked(&ticking, Duration::from_secs(60));
+        later(&clock, 31);
+        assert!(ctx.still_bound());
+        let push = ctx
+            .run(Cmd::new("git").args(["push", "-q", "origin", "main"]))
+            .unwrap();
+        assert_eq!((push.exit, ctx.timed_out()), (Exit::Code(0), false));
+        assert_eq!(ctx.remaining(), Duration::from_secs(29));
     }
 
     #[test]

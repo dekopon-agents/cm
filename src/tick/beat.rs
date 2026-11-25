@@ -180,7 +180,7 @@ pub fn run(beat: &Beat, out: &mut dyn FnMut(String)) {
 }
 
 pub fn check(checkout: &Path, proc: &dyn Proc, env: &Env) -> bool {
-    matches!(live_epochs(checkout).as_deref(), Ok([epoch]) if bound(checkout, epoch, proc, env))
+    matches!(epochs(checkout, false).as_deref(), Ok([epoch]) if bound(checkout, epoch, proc, env))
 }
 
 pub fn cli_check(checkout: &Path) -> bool {
@@ -269,7 +269,8 @@ pub(crate) fn bound(checkout: &Path, epoch: &Path, proc: &dyn Proc, env: &Env) -
     };
     let dir = tmp.path();
     let tar = dir.join("h.tar");
-    // Only origin's own attributes may change the copy, never this checkout's eol settings.
+    // Neither this checkout's eol settings nor its core.attributesFile may change the copy. Its
+    // .git/info/attributes still can, as origin's .gitattributes can, and no flag turns it off.
     let archived = succeeded(
         Cmd::new("git")
             .args([
@@ -277,6 +278,8 @@ pub(crate) fn bound(checkout: &Path, epoch: &Path, proc: &dyn Proc, env: &Env) -
                 "core.autocrlf=false",
                 "-c",
                 "core.eol=lf",
+                "-c",
+                "core.attributesFile=/dev/null",
                 "archive",
                 "-o",
             ])
@@ -294,8 +297,8 @@ pub(crate) fn bound(checkout: &Path, epoch: &Path, proc: &dyn Proc, env: &Env) -
                 .arg(&tar),
         )
         .is_some();
-    // git archive applies origin's export-ignore, export-subst and eol attributes, and a changed
-    // copy is not origin's folder: every file its tree lists must be in the extract, byte for byte.
+    // A copy those attributes changed (export-ignore, export-subst, eol, ident) is not origin's
+    // folder: every file its tree lists must be in the extract, byte for byte.
     let listed = archived
         .then(|| {
             succeeded(
@@ -437,6 +440,12 @@ fn one_line(line: String) -> String {
 // heartbeat.sh's glob matched none; a read that fails (EMFILE, EACCES, ELOOP) is returned, not
 // counted as no epoch.
 pub fn live_epochs(checkout: &Path) -> std::result::Result<Vec<PathBuf>, TickError> {
+    epochs(checkout, true)
+}
+
+// heartbeat.sh's grep skips an EPOCH.md it cannot read, and so does `--check-bound`; a tick
+// names it and stops instead.
+fn epochs(checkout: &Path, name_unreadable: bool) -> std::result::Result<Vec<PathBuf>, TickError> {
     use std::io::ErrorKind::{IsADirectory, NotADirectory, NotFound};
     let epochs = Path::new("store/epochs");
     let missing =
@@ -465,7 +474,7 @@ pub fn live_epochs(checkout: &Path) -> std::result::Result<Vec<PathBuf>, TickErr
         match std::fs::read(checkout.join(&file)) {
             Ok(bytes) if live(&bytes) => found.push(epoch),
             Ok(_) => {}
-            Err(error) if missing(&error) => {}
+            Err(error) if missing(&error) || !name_unreadable => {}
             Err(error) => return Err(failed(&file)(error)),
         }
     }
@@ -854,6 +863,17 @@ mod tests {
         for relative in ["tmp", ".", "../tmp", " /tmp"] {
             assert_eq!(extract_root(Some(relative)), None, "{relative:?}");
         }
+    }
+
+    #[test]
+    fn a_tmpdir_that_is_not_utf8_is_read_as_unset_so_the_extract_goes_to_tmp() {
+        use std::os::unix::ffi::OsStringExt;
+        let env = Env::from_os([(
+            "TMPDIR".into(),
+            std::ffi::OsString::from_vec(b"/var/tmp/\xff".to_vec()),
+        )]);
+        assert_eq!(env.get("TMPDIR"), None);
+        assert_eq!(extract_root(env.get("TMPDIR")), Some(Path::new("/tmp")));
     }
 
     #[test]

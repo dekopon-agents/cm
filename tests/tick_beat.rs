@@ -2588,6 +2588,16 @@ impl Harness {
     fn big(&self) {
         script(&self.bin.join("cm"), &big_list());
     }
+
+    // A fake that logs dies at a file-size limit, and one that quotes a path breaks on a
+    // folder name holding a quote; these fakes do neither.
+    fn unlogged(&self) {
+        script(
+            &self.bin.join("git"),
+            "case $1 in rev-parse|symbolic-ref|branch) echo main ;; esac\n",
+        );
+        script(&self.ct.path().join(beat::HANDOFF_PICK), "cat pick\n");
+    }
 }
 
 fn peak_kib(pid: u32) -> Option<u64> {
@@ -2675,6 +2685,7 @@ fn the_built_cm_tick_spills_a_list_above_64_mib_and_prints_every_line_in_bounded
 fn the_built_cm_tick_names_a_spill_that_could_not_be_stored() {
     let harness = Harness::new(1, "", PICK_OK);
     harness.big();
+    harness.unlogged();
     let tmpdir = harness.ct.path().join("no-such-dir");
     let output = harness
         .command("cse_01abc")
@@ -2842,19 +2853,9 @@ fn the_built_cm_tick_writes_a_json_object_ending_at_the_file_size_limit_and_none
     let harness = Harness::new(0, &act(Vec::new()), PICK_OK);
     script(
         &harness.bin.join("cm"),
-        &format!(
-            "if [ \"$1 $2\" = '--json next' ]; then cat '{}'; fi\n",
-            harness.ct.path().join("next.json").display()
-        ),
+        "if [ \"$1 $2\" = '--json next' ]; then cat \"${0%/*}/../next.json\"; fi\n",
     );
-    script(
-        &harness.bin.join("git"),
-        "case $1 in rev-parse|symbolic-ref|branch) echo main ;; esac\n",
-    );
-    script(
-        &harness.ct.path().join(beat::HANDOFF_PICK),
-        &format!("cat '{}'\n", harness.ct.path().join("pick").display()),
-    );
+    harness.unlogged();
     let bound = harness
         .limited("cse_01abc", "ulimit -f 2")
         .args(["tick", "--check-bound"])
@@ -3253,9 +3254,13 @@ fn main_repository(dir: &Path) -> PathBuf {
 fn the_built_cm_tick_leaves_a_bare_cm_to_the_default_search_path_when_path_is_unset() {
     let harness = Harness::new(1, &act(lines()), PICK_OK);
     // With PATH unset the tick's git is the system one, which reads only this repository, so the
-    // tick is bound and reaches the act loop. Of the harness's fakes only handoff-pick.sh runs:
-    // once for `--check-bound`, and twice a tick, at the frame's check and its re-check.
+    // tick is bound and reaches the act loop. Only the fake handoff-pick.sh logs: once for
+    // `--check-bound`, and twice a tick, at the frame's check and its re-check.
     let git_dir = main_repository(&harness.ct.path().join("git"));
+    script(
+        &harness.ct.path().join(beat::HANDOFF_PICK),
+        "echo \"handoff-pick.sh $*\" >> calls.log\ncat pick\n",
+    );
     let tick = |args: &[&str]| {
         harness
             .command("cse_01abc")
@@ -3427,7 +3432,7 @@ fn an_unbound_session_prints_nothing_and_runs_only_the_bound_check() {
     };
     let [rev, pick, fetch, diff] = BOUND_CHECK;
     let archive = format!(
-        "git -c core.autocrlf=false -c core.eol=lf archive -o <tmp>/h.tar origin/main {handoff}"
+        "git -c core.autocrlf=false -c core.eol=lf -c core.attributesFile=/dev/null archive -o <tmp>/h.tar origin/main {handoff}"
     );
     let tar = "tar -x -C <tmp> -f <tmp>/h.tar";
     let origin_pick = format!(
@@ -3719,7 +3724,10 @@ fn an_unbound_session_prints_nothing_and_runs_only_the_bound_check() {
         let tmp = calls
             .iter()
             .find(|call| call.program_name() == "git" && sub(call) == Some("archive"))
-            .map(|call| Path::new(&call.argv[7]).parent().unwrap().to_owned());
+            .and_then(|call| {
+                let tar = call.argv.iter().skip_while(|arg| *arg != "-o").nth(1)?;
+                Some(Path::new(tar).parent()?.to_owned())
+            });
         if let Some(tmp) = &tmp {
             assert!(
                 tmp.starts_with(ct.path().join("tick-tmp")),
@@ -3904,6 +3912,39 @@ fn check_bound_answers_for_the_one_live_epoch_only() {
     }
 }
 
+#[test]
+fn check_bound_skips_an_epoch_md_it_cannot_read_as_heartbeat_sh_does() {
+    let looped = |checkout: &Path| {
+        let dir = checkout.join("store/epochs/looped");
+        fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink("EPOCH.md", dir.join("EPOCH.md")).unwrap();
+    };
+    let ct = Ct::new();
+    looped(ct.path());
+    let proc = Answers::new(0, "").proc();
+    assert!(beat::check(
+        ct.path(),
+        &proc,
+        &in_fixture(ct.path(), &bound_env())
+    ));
+    assert_eq!(proc.log(), BOUND_CHECK);
+    let proc = Answers::new(1, act(lines())).proc();
+    let out = tick(&ct, &proc, &bound_env(), &Registry::new());
+    assert_eq!(
+        out,
+        [format!(
+            "heartbeat: could not read store/epochs/looped/EPOCH.md: {}; stay read-only until cm, PR and journal state are reconciled",
+            std::io::Error::from_raw_os_error(40)
+        )],
+        "a tick still names it"
+    );
+    assert!(proc.calls().is_empty());
+
+    let origin = Origin::real();
+    looped(&origin.ct());
+    assert_eq!(origin.check_bound(Some("cse_01abc")), Some(0));
+}
+
 const OURS: &str = "coordinator-2026-11-24T2030Z.md";
 const NEXT: &str = "coordinator-2026-11-26T0100Z.md";
 
@@ -3931,11 +3972,7 @@ impl Origin {
         fs::write(origin.path("next.json"), act(lines())).unwrap();
         script(
             &origin.cm(),
-            &format!(
-                "echo \"cm $*\" >> '{}'\nif [ \"$1 $2\" = '--json next' ]; then cat '{}'; exit 1; fi\n",
-                origin.path("cm.log").display(),
-                origin.path("next.json").display()
-            ),
+            "echo \"cm $*\" >> \"$TICK_FIXTURE/cm.log\"\nif [ \"$1 $2\" = '--json next' ]; then cat \"$TICK_FIXTURE/next.json\"; exit 1; fi\n",
         );
         let root = origin.0.path();
         origin.git(root, &["init", "-q", "--bare", "-b", "main", "origin.git"]);
@@ -3958,13 +3995,12 @@ impl Origin {
         // a line `stale`), else the other heads are another lineage's.
         write(
             &ct.join(beat::HANDOFF_PICK),
-            &format!(
-                r#"echo "handoff-pick.sh $*" >> '{}'
+            r#"echo "handoff-pick.sh $*" >> "$TICK_FIXTURE/pick.log"
 dir=$1/handoff
 other=
 for f in "$dir"/coordinator-*.md; do
   [ -f "$f" ] || continue
-  name=${{f##*/}}
+  name=${f##*/}
   if grep -q "^Handoff: .* supersedes=$name\$" "$dir"/coordinator-*.md; then continue; fi
   if grep -q "^Handoff: .* lineage=$4 " "$f"; then
     if grep -qx stale "$f"; then echo "stale $1/handoff/$name"; exit 6; fi
@@ -3976,8 +4012,6 @@ done
 if [ -n "$other" ]; then echo "missing other-lineage$other"; else echo missing; fi
 exit 3
 "#,
-                origin.path("pick.log").display()
-            ),
         );
         origin.git(&ct, &["add", "-A"]);
         origin.git(&ct, &["commit", "-qm", "epoch"]);
@@ -4014,6 +4048,7 @@ exit 3
             ("GIT_CONFIG_GLOBAL", self.path("gitconfig")),
             ("GIT_CONFIG_NOSYSTEM", "1".into()),
             ("TMPDIR", self.tmpdir()),
+            ("TICK_FIXTURE", self.0.path().to_owned()),
         ]
     }
 
@@ -4247,7 +4282,7 @@ fn handoff_line(lineage: &str, supersedes: &str) -> String {
     )
 }
 
-// tools/cloud-env/handoff-pick.sh at campaign-trail a799a866 (the steering SHA), unchanged.
+// campaign-trail's tools/cloud-env/handoff-pick.sh, unchanged: git blob 3d9376d2d58eed9ac45f5d10973a904dd350250f.
 const REAL_HANDOFF_PICK: &str = r#"#!/bin/sh
 # handoff-pick.sh EPOCH_DIR ROLE (--lineage SESSION | --path FILE) [--max-age-hours H] [--now ISO]
 # Read-only. Names the one handoff a resuming session may start from; never the newest file in the folder
@@ -4984,29 +5019,34 @@ fn a_successor_on_origin_after_gitsync_stops_the_tick_at_the_re_check() {
 
 #[test]
 fn the_built_cm_tick_reads_a_non_ascii_coordinator_handoff_name_on_origin() {
-    // Without -z, git quotes this name ("...coordinator-\303\251.md") and heartbeat.sh's
-    // `\.md$` never matched it.
-    let origin = Origin::new();
-    origin.push_handoff(
-        "coordinator-2026-11-26T0100Z-\u{e9}.md",
-        "session_02next",
-        Some(OURS),
-    );
-    origin.git(&origin.ct(), &["fetch", "-q", "origin", "main"]);
-    let quoted = origin.git(
-        &origin.ct(),
-        &[
-            "diff",
-            "--name-only",
-            "--diff-filter=A",
-            "HEAD",
-            "origin/main",
-        ],
-    );
-    assert!(quoted.ends_with(".md\"\n"), "{quoted}");
-    origin.silent(Some("cse_01abc"), &[]);
-    assert!(origin_pick(&origin.tmpdir(), &origin.log("pick.log")[1]));
-    assert_eq!(origin.check_bound(Some("cse_01abc")), Some(1));
+    // Without -z, git quotes these names ("...coordinator-\303\251.md") and heartbeat.sh's
+    // `\.md$` never matched them.
+    for odd in ["\u{e9}", "\u{fc}", "\"", "\\", "\t", "\n"] {
+        let origin = Origin::new();
+        origin.push_handoff(
+            &format!("coordinator-2026-11-26T0100Z-{odd}.md"),
+            "session_02next",
+            Some(OURS),
+        );
+        origin.git(&origin.ct(), &["fetch", "-q", "origin", "main"]);
+        let quoted = origin.git(
+            &origin.ct(),
+            &[
+                "diff",
+                "--name-only",
+                "--diff-filter=A",
+                "HEAD",
+                "origin/main",
+            ],
+        );
+        assert!(quoted.ends_with(".md\"\n"), "{odd:?}: {quoted}");
+        origin.silent(Some("cse_01abc"), &[]);
+        assert!(
+            origin_pick(&origin.tmpdir(), &origin.log("pick.log")[1]),
+            "{odd:?}"
+        );
+        assert_eq!(origin.check_bound(Some("cse_01abc")), Some(1), "{odd:?}");
+    }
 }
 
 #[test]
@@ -5180,6 +5220,48 @@ fn the_built_cm_tick_with_the_real_handoff_pick_judges_origins_untransformed_fol
     assert!(bystander.binds(&bystander.archived()));
     bystander.silent(Some("cse_01abc"), &[]);
     assert_eq!(bystander.check_bound(Some("cse_01abc")), Some(1));
+}
+
+#[test]
+fn the_built_cm_tick_fails_closed_when_export_subst_or_ident_rewrites_a_bystander_on_origin() {
+    for (attribute, text) in [
+        ("export-subst", "built from $Format:%H$\n"),
+        ("ident", "$Id$\n"),
+    ] {
+        let origin = Origin::real();
+        origin.push(
+            &[
+                (
+                    ".gitattributes",
+                    &format!("{EPOCH}/handoff/notes.txt {attribute}\n"),
+                ),
+                (&format!("{EPOCH}/handoff/notes.txt"), text),
+                (
+                    &format!("{EPOCH}/handoff/{NEXT}"),
+                    &handoff("session_01abc", Some(OURS)),
+                ),
+            ],
+            "a bystander the archive rewrites, beside this lineage's newer handoff",
+        );
+        origin.git(&origin.ct(), &["fetch", "-q", "origin", "main"]);
+        let archived = origin.archived();
+        assert_ne!(
+            fs::read(archived.join("handoff/notes.txt")).unwrap(),
+            text.as_bytes(),
+            "{attribute}: the archive rewrites it"
+        );
+        assert!(
+            origin.binds(&archived),
+            "{attribute}: handoff-pick.sh binds the copy"
+        );
+        origin.silent(Some("cse_01abc"), &[]);
+        assert_eq!(
+            origin.check_bound(Some("cse_01abc")),
+            Some(1),
+            "{attribute}"
+        );
+        origin.tmp_is_empty();
+    }
 }
 
 #[test]
@@ -5402,6 +5484,65 @@ fn the_built_cm_tick_reads_origin_whole_whatever_the_checkouts_eol_config() {
     origin.acts(Some("cse_01abc"));
     assert_eq!(origin.check_bound(Some("cse_01abc")), Some(0));
     origin.tmp_is_empty();
+}
+
+#[test]
+fn the_built_cm_tick_reads_origin_whole_whatever_the_checkouts_core_attributes_file_says() {
+    for configured in [true, false] {
+        let origin = Origin::real();
+        origin.push_handoff(NEXT, "session_01abc", Some(OURS));
+        let ct = origin.ct();
+        let crlf = "*.md text eol=crlf\n";
+        if configured {
+            let file = origin.path("attributes");
+            write(&file, crlf);
+            origin.git(
+                &ct,
+                &["config", "core.attributesFile", file.to_str().unwrap()],
+            );
+        } else {
+            write(&origin.home().join(".config/git/attributes"), crlf);
+        }
+        origin.git(&ct, &["fetch", "-q", "origin", "main"]);
+        assert!(
+            fs::read(origin.archived().join("handoff").join(NEXT))
+                .unwrap()
+                .contains(&b'\r'),
+            "{configured}: a plain git archive in this checkout converts to CRLF"
+        );
+        origin.acts(Some("cse_01abc"));
+        assert_eq!(
+            origin.check_bound(Some("cse_01abc")),
+            Some(0),
+            "{configured}"
+        );
+        origin.tmp_is_empty();
+    }
+}
+
+#[test]
+fn the_built_cm_tick_fails_closed_when_the_checkouts_info_attributes_change_the_archive() {
+    for attributes in [
+        "*.md text eol=crlf\n".to_owned(),
+        format!("{NEXT} export-ignore\n"),
+    ] {
+        let origin = Origin::real();
+        origin.push_handoff(NEXT, "session_01abc", Some(OURS));
+        write(&origin.ct().join(".git/info/attributes"), &attributes);
+        origin.git(&origin.ct(), &["fetch", "-q", "origin", "main"]);
+        assert!(
+            origin.binds(&origin.archived()),
+            "{attributes}: heartbeat.sh's archive in this checkout binds"
+        );
+        origin.silent(Some("cse_01abc"), &[]);
+        assert!(origin.log("cm.log").is_empty());
+        assert_eq!(
+            origin.check_bound(Some("cse_01abc")),
+            Some(1),
+            "{attributes}"
+        );
+        origin.tmp_is_empty();
+    }
 }
 
 #[test]
