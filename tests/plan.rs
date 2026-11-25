@@ -6176,6 +6176,15 @@ fn a_registered_drivers_claim_under_its_units_is_live_while_unregistered_and_out
     let (code, before) = earlier_coordinators(&c);
     assert_eq!(code, Some(1));
     assert_eq!(sorted(before), sorted(all.to_vec()));
+    let synced_card = || {
+        let synced = coordinator_cm(&c, &["sync"])
+            .env("PATH", support::FakeGh::new("exit 1").path())
+            .output()
+            .unwrap();
+        assert!(synced.status.code().is_some(), "{synced:?}");
+        fs::read_to_string(c.root.join("CARD.md")).unwrap()
+    };
+    let unregistered = synced_card();
 
     let (code, added) = current_json(
         &c,
@@ -6217,19 +6226,14 @@ fn a_registered_drivers_claim_under_its_units_is_live_while_unregistered_and_out
     assert_eq!(code, Some(1));
     assert_eq!(after, [STRANGER]);
 
-    let card = {
-        let synced = coordinator_cm(&c, &["sync"])
-            .env("PATH", support::FakeGh::new("exit 1").path())
-            .output()
-            .unwrap();
-        assert!(synced.status.code().is_some(), "{synced:?}");
-        fs::read_to_string(c.root.join("CARD.md")).unwrap()
-    };
-    // The card counts no caller-relative item: an earlier coordinator depends on who asks.
+    // The card counts no caller-relative item, registry or not: an earlier coordinator depends
+    // on who asks.
+    let card = synced_card();
     assert!(
         card.lines().any(|line| line == "Actionable: 0 (oldest: —)"),
         "{card}"
     );
+    assert_eq!(card, unregistered);
 }
 
 #[test]

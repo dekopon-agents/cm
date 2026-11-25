@@ -576,9 +576,10 @@ cm lane driver remove tooling
 
 A unit is `<NN-name>`, `<NN-name>/<unit>` or `<NN-name>/<unit>/<step>`, and covers the steps under
 it whole path segments at a time (`07-tick/mvp` covers `07-tick/mvp/core`, not
-`07-tick/mvp2/core`). cm reads the registry, never a lane brief. `cm next --act` and CARD's
-`Actionable` count do not list `earlier-coordinator` for a live attempt whose `coordinator` is a
-registered driver with a unit covering the step; `cm next` notes it instead, one unnumbered line
+`07-tick/mvp2/core`). cm reads the registry, never a lane brief. `cm next --act` does not list
+`earlier-coordinator` for a live attempt whose `coordinator` is a registered driver with a unit
+covering the step (CARD's `Actionable` count lists no `earlier-coordinator` at all, registry or
+not); `cm next` notes it instead, one unnumbered line
 and one `driver_held` item (`target`, `driver`, `driver_lane`, `generation`, `since`, `note`) with
 no `command`. `driver_held` is absent while no driver holds a step:
 
