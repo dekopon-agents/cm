@@ -429,7 +429,8 @@ LIMITS.toml, invalid command pairs, and reader failures in `turn_reader_warnings
 behind them. JSON carries `kind`, `since`, `waiting_count` and `command` in the `actionable`
 list and, where they apply, the step's `lane` and its PR's `pr`, `head` (sync's last observation,
 else the recorded one), `base` and `ci_green` (only when CI completed at that head). Plain
-`cm next --json` carries the same list.
+`cm next --json` carries the same list. Exit 1 means actions remain. Exit 0 means the list is
+empty.
 
 | Kind | Fires when | Command |
 |---|---|---|
