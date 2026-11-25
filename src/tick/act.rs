@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value};
 
 use crate::tick::Result;
-use crate::tick::proc::{Cmd, Exit, Proc, Ran};
+use crate::tick::proc::{Cmd, Exit, Proc, Ran, WHOLE_CAP};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActLine {
@@ -212,6 +212,10 @@ impl<'a> Ctx<'a> {
     pub fn cm_run(&self, sub: &str, cmd: Cmd) -> std::result::Result<Ran, String> {
         match self.run(cmd) {
             Ok(ran) if ran.exit.success() => Ok(ran),
+            Ok(ran) if ran.exit == Exit::TooLarge => Err(format!(
+                "cm {sub} printed more than {} MiB and was killed",
+                WHOLE_CAP >> 20
+            )),
             Ok(ran) => Err(format!("cm {sub} failed: {}", last_line(&ran))),
             Err(error) => Err(format!("cm {sub} failed: {error}")),
         }
@@ -369,6 +373,37 @@ pub struct Report {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_cm_cut_at_the_whole_cap_is_named_not_by_its_cut_last_line() {
+        let proc = crate::tick::proc::FakeProc::new(|cmd| {
+            Ok(match cmd.argv.get(1).and_then(|sub| sub.to_str()) {
+                Some("brief") => Ran {
+                    exit: Exit::TooLarge,
+                    stdout_truncated: true,
+                    ..Ran::code(0, "{\"cut")
+                },
+                _ => Ran::code(1, "").with_stderr("no thread recorded"),
+            })
+        });
+        let env = Env::default();
+        let ctx = Ctx::new(
+            Path::new("."),
+            Path::new("store/epochs/e"),
+            &proc,
+            &env,
+            OsStr::new("cm"),
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            ctx.cm("brief", &[]).unwrap_err(),
+            "cm brief printed more than 64 MiB and was killed"
+        );
+        assert_eq!(
+            ctx.cm("review", &[]).unwrap_err(),
+            "cm review failed: no thread recorded"
+        );
+    }
 
     #[test]
     fn text_matches_jq_for_parts_and_missing_fields() {

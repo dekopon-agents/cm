@@ -129,7 +129,7 @@ Executors:
 - `ActLine` holds the line's JSON and its lane (the line's, else the step's state). `text()` gives heartbeat.sh's `<kind> <target>[#<part>]: <command>`.
 - `Ctx` holds the checkout, the epoch (relative, `store/epochs/<slug>`), `proc`, `env` and `cm` (the program cm calls go to). It offers:
   - `run(Cmd)`: in the checkout, at most what is left of the budget;
-  - `cm(sub, args)`, `cm_cmd`/`cm_run` (stdin, `--json`), `step_state(target)` and `pull(line, step)`, plus `last_line(&Ran)`, all with act_lib.py's messages;
+  - `cm(sub, args)`, `cm_cmd`/`cm_run` (stdin, `--json`), `step_state(target)` and `pull(line, step)`, plus `last_line(&Ran)`, all with act_lib.py's messages (a cm cut at the `Whole` cap fails as `cm <sub> printed more than 64 MiB and was killed`);
   - `pause(d)`, which a fake records without waiting.
 - Executor code itself must not block: only its children are bounded. Only a child the budget cut short makes the loop print the timeout line.
 
