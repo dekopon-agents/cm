@@ -407,6 +407,13 @@ fn record(host: &Fake, c: &Campaign, report: &Path, reviewer: &str) -> Outcome {
 }
 
 #[test]
+#[should_panic(expected = "no lock file to watch at")]
+fn the_lock_probe_has_no_answer_for_a_campaign_without_a_lock_file() {
+    let dir = tempfile::tempdir().unwrap();
+    forge_fixture::lock_holder(&dir.path().join("typo"));
+}
+
+#[test]
 fn released_without_a_checkout_reads_tag_containment_from_the_forge() {
     let host = at("2026-10-25T06:00:00Z");
     let c = campaign(&host, true);

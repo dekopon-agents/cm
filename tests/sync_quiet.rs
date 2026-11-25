@@ -1265,11 +1265,19 @@ fn a_release_that_leaves_merged_drops_its_unreadable_note() {
 #[test]
 fn an_unreadable_notified_marker_cm_cannot_parse_refuses_the_sync_naming_it() {
     use publication_fixture as p;
-    for text in ["", "[\"- unknown", "{\"schema\":2,\"notes\":[]}", "[1]"] {
+    let texts = ["", "[\"- unknown", "{\"schema\":2,\"notes\":[]}", "[1]"];
+    for (text, locked) in texts
+        .into_iter()
+        .flat_map(|text| [(text, true), (text, false)])
+    {
         let c = p::campaign(&at("2026-10-17T08:00:00Z"), Phase::Merged, &p::ARTIFACTS);
         let marker = c.root.join(".cm/unreadable-notified.json");
         fs::write(&marker, text).unwrap();
-        let before = c.files();
+        let lock = c.root.join(".cm/lock");
+        if !locked {
+            fs::remove_file(&lock).unwrap();
+        }
+        let mut before = c.files();
         let mut forge = p::present();
         forge.broken.insert("crate:acme-sdk".into());
         let error = readers::both(&at("2026-10-17T08:05:00Z"), &forge, &c.root).unwrap_err();
@@ -1278,6 +1286,13 @@ fn an_unreadable_notified_marker_cm_cannot_parse_refuses_the_sync_naming_it() {
             message.starts_with(&format!("parsing {}: ", marker.display())),
             "{text:?}: {message}"
         );
-        assert_eq!(c.files(), before, "{text:?}");
+        before
+            .entry(lock.strip_prefix(&c.root).unwrap().to_owned())
+            .or_default();
+        assert_eq!(
+            c.files(),
+            before,
+            "{text:?}, lock file there before: {locked}"
+        );
     }
 }

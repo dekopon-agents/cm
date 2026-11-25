@@ -25,14 +25,18 @@ pub struct FakeForge {
 // holds the lock, so a descriptor of this process open on that file is.
 pub fn lock_holder(root: &Path) -> Option<std::path::PathBuf> {
     use std::os::unix::fs::MetadataExt;
-    let lock = std::fs::metadata(root.join(cm::store::CM_DIR).join(cm::store::LOCK)).ok()?;
+    let path = root.join(cm::store::CM_DIR).join(cm::store::LOCK);
+    let lock = std::fs::metadata(&path)
+        .unwrap_or_else(|error| panic!("no lock file to watch at {}: {error}", path.display()));
+    // A descriptor closed between the listing and its stat is gone; a holder blocked on this
+    // read cannot close its own.
     std::fs::read_dir("/dev/fd")
         .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|fd| {
-            std::fs::metadata(fd)
-                .is_ok_and(|open| (open.dev(), open.ino()) == (lock.dev(), lock.ino()))
+        .map(|entry| entry.unwrap().path())
+        .find(|fd| match std::fs::metadata(fd) {
+            Ok(open) => (open.dev(), open.ino()) == (lock.dev(), lock.ino()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => panic!("{}: {error}", fd.display()),
         })
 }
 

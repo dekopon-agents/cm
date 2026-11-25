@@ -19,6 +19,9 @@ use cm::tick::proc::{
 };
 use serde_json::{Value, json};
 
+#[allow(dead_code)]
+mod support;
+
 const EPOCH: &str = "store/epochs/eleemosynary-mnemosyne";
 const PICK_OK: &str =
     "ok store/epochs/eleemosynary-mnemosyne/handoff/coordinator-2026-11-24T2030Z.md\n";
@@ -54,8 +57,8 @@ fn write(path: &Path, text: &str) {
 }
 
 fn script(path: &Path, body: &str) -> PathBuf {
-    write(path, &format!("#!/bin/sh\n{body}"));
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    support::write_executable(path, &format!("#!/bin/sh\n{body}"));
     path.to_owned()
 }
 
@@ -2192,7 +2195,14 @@ fn the_built_cm_tick_run_through_a_symlink_reads_from_the_resolved_binary() {
     let harness = Harness::new(0, &act(Vec::new()), PICK_OK);
     let real = harness.ct.path().join("real");
     fs::create_dir_all(&real).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_cm"), real.join("cm")).unwrap();
+    // A copy this process wrote could still be open for writing in a sibling test's fork that
+    // has not exec'd yet, and running it would fail with ETXTBSY; `cp` writes it instead.
+    let copied = Command::new("cp")
+        .arg(env!("CARGO_BIN_EXE_cm"))
+        .arg(real.join("cm"))
+        .status()
+        .unwrap();
+    assert!(copied.success());
     let link = harness.ct.path().join("linked");
     fs::create_dir_all(&link).unwrap();
     std::os::unix::fs::symlink(real.join("cm"), link.join("cm")).unwrap();
@@ -2482,7 +2492,11 @@ fn peak_kib(pid: u32) -> Option<u64> {
 fn spills(pid: u32) -> Vec<PathBuf> {
     fs::read_dir(format!("/proc/{pid}/fd"))
         .unwrap()
-        .filter_map(|fd| fs::read_link(fd.unwrap().path()).ok())
+        .filter_map(|fd| match fs::read_link(fd.unwrap().path()) {
+            Ok(target) => Some(target),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("/proc/{pid}/fd: {error}"),
+        })
         .filter(|target| target.to_string_lossy().ends_with(" (deleted)"))
         .collect()
 }
@@ -2504,6 +2518,7 @@ fn the_built_cm_tick_spills_a_list_above_64_mib_and_prints_every_line_in_bounded
     let mut child = harness
         .command("cse_01abc")
         .args(["tick", "--cm", "cm"])
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -2559,6 +2574,7 @@ fn a_killed_cm_tick_leaves_no_spilled_list_behind() {
     let mut child = harness
         .command("cse_01abc")
         .args(["tick", "--cm", "cm"])
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -2693,7 +2709,9 @@ fn the_built_cm_tick_stops_writing_a_stdout_file_at_the_file_size_limit() {
 
 #[test]
 fn the_built_cm_tick_writes_a_json_object_ending_at_the_file_size_limit_and_none_past_it() {
-    let harness = Harness::new(1, &act(lines()), PICK_OK);
+    // With no act line the object is the same bound or not, so no fake that dies at the limit
+    // while logging can change its length between runs.
+    let harness = Harness::new(0, &act(Vec::new()), PICK_OK);
     let whole = harness
         .command("cse_01abc")
         .args(["--json", "tick", "--cm", "cm"])
@@ -2710,12 +2728,14 @@ fn the_built_cm_tick_writes_a_json_object_ending_at_the_file_size_limit_and_none
         for append in [false, true] {
             let open = if append {
                 fs::write(&file, &pad).unwrap();
-                format!("exec >> '{}'", file.display())
+                r#"exec >>"$OUT""#
             } else {
-                format!("exec > '{}'; printf '%s' '{pad}'", file.display())
+                r#"exec >"$OUT"; printf '%s' "$PAD""#
             };
             let output = harness
-                .limited("cse_01abc", &format!("ulimit -f 2; {open}"))
+                .limited("cse_01abc", &format!("ulimit -f 2; {open}; unset OUT PAD"))
+                .env("OUT", &file)
+                .env("PAD", &pad)
                 .args(["--json", "tick", "--cm", "cm"])
                 .output()
                 .unwrap();
@@ -2980,16 +3000,15 @@ fn the_built_cm_tick_takes_the_first_cm_on_path_its_user_may_run() {
     // Execute for others only is not the owner's to run, but is a user's with CAP_DAC_OVERRIDE
     // (any execute bit will do), so the kernel says whether this process may run that entry.
     let others = entries.join("others/cm");
-    let runnable = rustix::fs::accessat(
+    let runs = match rustix::fs::accessat(
         rustix::fs::CWD,
         &others,
         rustix::fs::Access::EXEC_OK,
         rustix::fs::AtFlags::EACCESS,
-    );
-    let runs = if runnable.is_ok() {
-        others
-    } else {
-        harness.bin.join("cm")
+    ) {
+        Ok(()) => others,
+        Err(rustix::io::Errno::ACCESS) => harness.bin.join("cm"),
+        Err(error) => panic!("{}: {error}", others.display()),
     };
     assert_eq!(json["cm"], runs.display().to_string(), "{json}");
     assert_eq!(json["lines"], json!(PRINTED), "{json}");
@@ -3025,30 +3044,36 @@ fn the_built_cm_tick_leaves_a_bare_cm_to_the_default_search_path_when_path_is_un
         let output = harness
             .command("cse_01abc")
             .env_remove("PATH")
+            .env("GIT_DIR", "/nonexistent")
             .args(["--json", "tick", "--cm", cm])
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(0), "{cm}: {output:?}");
         let json: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(json["cm"], cm, "{json}");
-        let lines = json["lines"].as_array().unwrap();
+        let lines: Vec<&str> = json["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|line| line.as_str().unwrap())
+            .collect();
         let could_not_run = format!("heartbeat: cm --json next --act could not run: {cm}: ");
-        assert_eq!(
-            !lines
-                .iter()
-                .any(|line| line.as_str().unwrap().starts_with(&could_not_run)),
-            ran,
-            "{json}"
-        );
+        if ran {
+            assert_eq!(lines, Vec::<&str>::new(), "{json}");
+        } else {
+            assert!(
+                matches!(lines.as_slice(), [line] if line.starts_with(&could_not_run)),
+                "{json}"
+            );
+        }
     }
 }
 
 #[test]
 fn the_built_cm_tick_started_in_a_deleted_folder_runs_a_relative_cm_from_the_checkout() {
     let harness = Harness::new(1, &act(lines()), PICK_OK);
-    let own = harness.ct.path().join("own-next.json");
     fs::write(
-        &own,
+        harness.ct.path().join("own-next.json"),
         act(vec![line(
             "missing-kickoff",
             "01-a/u/b",
@@ -3058,11 +3083,10 @@ fn the_built_cm_tick_started_in_a_deleted_folder_runs_a_relative_cm_from_the_che
     .unwrap();
     script(
         &harness.ct.path().join("cm"),
-        &format!(
-            "if [ \"$1 $2\" = '--json next' ]; then cat '{}'; exit 1; fi\n",
-            own.display()
-        ),
+        "if [ \"$1 $2\" = '--json next' ]; then cat \"${0%/*}/own-next.json\"; exit 1; fi\n",
     );
+    script(&harness.bin.join("git"), "echo main\n");
+    script(&harness.ct.path().join(beat::HANDOFF_PICK), "cat pick\n");
     fs::create_dir(harness.ct.path().join("gone")).unwrap();
     let output = harness
         .limited("cse_01abc", "cd gone && rmdir \"$PWD\"")
