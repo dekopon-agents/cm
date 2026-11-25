@@ -6682,3 +6682,56 @@ fn stale_blocks_held_unblocks_and_expired_watches_owe_their_moves() {
     assert!(resolved.ok(), "{:?}", resolved.violations);
     assert!(actions_of(&c, now, "expired-watch").is_empty());
 }
+
+#[cfg(unix)]
+#[test]
+fn the_deploy_executors_evidence_and_deployed_digest_clear_released_undeployed() {
+    let old = at("2026-11-22T08:00:00Z");
+    let now = at("2026-11-22T16:00:00Z");
+    let c = campaign(&old);
+    const RELEASE: &str = "00-release/widget/1.0.0";
+    assert!(declare_release(&old, &c, RELEASE, "o/widget", "v{version}").ok());
+    set_track(
+        &old,
+        &c,
+        RELEASE,
+        Phase::Released,
+        Evidence {
+            tag: Some("v1.0.0".into()),
+            ..Evidence::default()
+        },
+    );
+    assert!(
+        declare_work(
+            &old,
+            &c,
+            "01-a/u/widget-pin",
+            Lane::Coordinator,
+            &["tag:widget@1.0.0"],
+            Work::Rollout
+        )
+        .ok()
+    );
+    add_limit(&c, "deploy_after_hours = 4");
+    assert_eq!(
+        actions_of(&c, now.now, "released-undeployed")[0].0,
+        "01-a/u/widget-pin"
+    );
+    let target = parse_target(RELEASE, true).unwrap();
+    let recorded =
+        cm::ledger::evidence(&now, &c.root, &target, "deploy", "Argo synced v1.0.0.\n").unwrap();
+    assert!(recorded.ok(), "{:?}", recorded.violations);
+    let deployed = advance(
+        &now,
+        &c,
+        RELEASE,
+        "deployed",
+        Evidence {
+            digest: Some(format!("sha256:{}", "a".repeat(64))),
+            ..Evidence::default()
+        },
+    );
+    assert!(deployed.ok(), "{:?}", deployed.violations);
+    assert_eq!(state(&c, RELEASE), Phase::Deployed);
+    assert!(actions_of(&c, now.now, "released-undeployed").is_empty());
+}
