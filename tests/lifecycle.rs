@@ -27,6 +27,15 @@ mod lifecycle_fixture;
 
 #[path = "support/forge.rs"]
 mod forge_fixture;
+
+#[path = "support/readers.rs"]
+mod readers;
+
+impl readers::Twin for forge_fixture::FakeForge {
+    fn twin(&self, root: &Path) -> Self {
+        forge_fixture::FakeForge::twin(self, root)
+    }
+}
 #[path = "support/resume.rs"]
 mod resume_fixture;
 
@@ -2081,13 +2090,13 @@ fn sync_rewrites_only_resume_status_and_is_idempotent() {
     let path = c.root.join("RESUME.md");
     fs::write(&path, resume_fixture::resume_text("Stale status.\r\n")).unwrap();
 
-    let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    let out = readers::both(&host, &forge, &c.root).unwrap();
     assert!(out.ok(), "{:?}", out.violations);
     let status = "| State | Steps |\n|---|---|\n| drafted | 2 |\n| released | 2 |\n| deployed | 1 |\n| done | 1 |\n| superseded | 1 |\n| blocked | 1 |\n\n| Release line | Released | Deployed |\n|---|---|---|\n| alpha | 2.0.0 | — |\n| gizmo | 3.0.0 | 3.0.0 |\n| widget | 1.10.0 | 1.9.0 |\n\nEpoch status: working.\n";
     let expected = resume_fixture::resume_text(status).into_bytes();
     assert_eq!(fs::read(&path).unwrap(), expected);
     let later = Fake::at("2026-10-08T08:00:00Z");
-    let out = cm::sync::sync(&later, &forge, &c.root).unwrap();
+    let out = readers::both(&later, &forge, &c.root).unwrap();
     assert!(out.ok(), "{:?}", out.violations);
     assert_eq!(fs::read(&path).unwrap(), expected);
 }
@@ -2101,7 +2110,7 @@ fn sync_leaves_resume_without_markers_unchanged() {
         .replace("<!-- cm:status-end -->\r\n", "");
     let path = c.root.join("RESUME.md");
     fs::write(&path, &text).unwrap();
-    let out = cm::sync::sync(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
+    let out = readers::both(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
     assert!(out.ok(), "{:?}", out.violations);
     assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
     assert_clean(&c.root);
@@ -2127,7 +2136,7 @@ fn sync_renders_empty_state_and_current_epoch_status() {
             )
             .unwrap();
         }
-        let out = cm::sync::sync(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
+        let out = readers::both(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
         assert!(out.ok(), "{:?}", out.violations);
         let epoch = epoch.unwrap_or("unknown").to_lowercase();
         let status = format!(
@@ -2166,7 +2175,7 @@ fn lint_reports_malformed_resume_status_markers_and_sync_preserves_them() {
         let out = lint(&c.root).unwrap();
         assert_eq!(rules(&out), vec!["resume-status"], "{:?}", out.violations);
         assert_eq!(out.violations[0].path, "RESUME.md");
-        let out = cm::sync::sync(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
+        let out = readers::both(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
         assert!(out.ok(), "{:?}", out.violations);
         assert_eq!(fs::read(c.root.join("RESUME.md")).unwrap(), text.as_bytes());
     }
@@ -2179,7 +2188,7 @@ fn close_and_epoch_closed_refresh_resume_without_sync() {
     c.resume_working_epoch();
     let path = c.root.join("RESUME.md");
     fs::write(&path, resume_fixture::resume_text("Stale status.\n")).unwrap();
-    let out = cm::sync::sync(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
+    let out = readers::both(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
     assert!(out.ok(), "{:?}", out.violations);
     let working = fs::read_to_string(&path).unwrap();
     assert!(working.contains("Epoch status: working.\n"));
@@ -2207,7 +2216,7 @@ fn sync_and_lint_ignore_fenced_marker_examples() {
             let path = c.root.join("RESUME.md");
             fs::write(&path, &text).unwrap();
             assert_clean(&c.root);
-            let out = cm::sync::sync(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
+            let out = readers::both(&host, &forge_fixture::FakeForge::default(), &c.root).unwrap();
             assert!(out.ok(), "{:?}", out.violations);
             let expected = if real_span {
                 resume_fixture::resume_with_marker_example(
@@ -2547,7 +2556,7 @@ fn sync_leaves_rollouts_merged_even_when_a_containing_release_is_deployed() {
     forge
         .tags
         .insert(("o/cm".into(), "v1.0.0".into()), [sha].into());
-    let synced = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    let synced = readers::both(&host, &forge, &c.root).unwrap();
     assert!(synced.ok(), "{:?}", synced.violations);
     let state = store::load_unit(&c.root.join("01-first/alpha")).unwrap();
     assert_eq!(state.steps["ROLLOUT"].track.state, Phase::Merged);
@@ -2655,7 +2664,7 @@ fn release_sync_records_every_publication_in_one_move() {
     let c = p::campaign(&host, Phase::Merged, &p::ARTIFACTS);
     let mut forge = p::present();
     forge.root = Some(c.root.clone());
-    let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    let out = readers::both(&host, &forge, &c.root).unwrap();
     assert!(out.ok(), "{:?}", out.violations);
     let step = p::step(&c);
     assert_eq!(step.track.state, Phase::Released);
@@ -2672,7 +2681,7 @@ fn release_sync_records_every_publication_in_one_move() {
         serde_json::json!(expected)
     );
     assert_eq!(
-        *forge.artifact_queries.borrow(),
+        *forge.artifact_queries.lock().unwrap(),
         [
             "crate:acme-sdk",
             "tap:o/homebrew-tap/widget",
@@ -2714,12 +2723,12 @@ fn missing_yanked_or_stale_publications_stay_merged_and_are_retried() {
             }
         }
         let before = p::step(&c);
-        let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+        let out = readers::both(&host, &forge, &c.root).unwrap();
         assert_eq!(rules(&out), ["release-unpublished"]);
         assert_eq!(p::step(&c), before);
         assert_eq!(out.fields["moves"], serde_json::json!([]));
         let forge = p::present();
-        let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+        let out = readers::both(&host, &forge, &c.root).unwrap();
         assert!(out.ok(), "{:?}", out.violations);
         assert_eq!(p::step(&c).track.state, Phase::Released);
     }
@@ -2733,7 +2742,7 @@ fn unread_publication_journals_unknown_without_partial_evidence() {
     let before = p::unit(&c);
     let mut forge = p::present();
     forge.broken.insert("image:ghcr.io/acme/widget".into());
-    let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    let out = readers::both(&host, &forge, &c.root).unwrap();
     assert_eq!(rules(&out), ["sync-unknown"]);
     assert_eq!(p::unit(&c), before);
     assert!(out.fields.contains_key("journal"));
@@ -2749,9 +2758,9 @@ fn tag_containment_is_checked_before_publication() {
     forge
         .tags
         .insert(("o/widget".into(), p::TAG.into()), Default::default());
-    let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    let out = readers::both(&host, &forge, &c.root).unwrap();
     assert_eq!(rules(&out), ["release-tag"]);
-    assert!(forge.artifact_queries.borrow().is_empty());
+    assert!(forge.artifact_queries.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -2764,10 +2773,10 @@ fn undeclared_artifacts_warn_early_and_keep_the_existing_release_behavior() {
     assert!(out.fields["warnings"].as_array().unwrap().contains(&serde_json::json!(format!("release-artifacts-undeclared: {} declares no artifacts; cm amend {} --artifact <spec>", p::STEP, p::STEP))));
     let c = p::campaign(&host, Phase::Merged, &[]);
     let forge = p::present();
-    let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    let out = readers::both(&host, &forge, &c.root).unwrap();
     assert!(out.ok(), "{:?}", out.violations);
     assert_eq!(p::step(&c).track.state, Phase::Released);
-    assert!(forge.artifact_queries.borrow().is_empty());
+    assert!(forge.artifact_queries.lock().unwrap().is_empty());
     assert!(p::step(&c).track.evidence.published.is_empty());
 }
 
@@ -2848,7 +2857,7 @@ fn artifacts_persist_in_order_and_can_only_be_removed_by_amend_before_released()
         ("acme/custom-tap".into(), "widget".into()),
         p::formula(p::TAG),
     );
-    assert!(cm::sync::sync(&host, &forge, &c.root).unwrap().ok());
+    assert!(readers::both(&host, &forge, &c.root).unwrap().ok());
     let before = c.files();
     let refused = commands::amend(
         &host,
@@ -2872,7 +2881,7 @@ fn an_unpublished_release_ships_no_other_merged_steps() {
     c.publication_consumer(&host);
     let mut forge = p::present();
     forge.images.clear();
-    let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    let out = readers::both(&host, &forge, &c.root).unwrap();
     assert_eq!(rules(&out), ["release-unpublished"]);
     let code = || {
         store::load_unit(&c.root.join("01-build/widget"))
@@ -2885,7 +2894,7 @@ fn an_unpublished_release_ships_no_other_merged_steps() {
     };
     assert_eq!(code(), Phase::Merged);
     assert_eq!(out.fields["moves"], serde_json::json!([]));
-    let out = cm::sync::sync(&host, &p::present(), &c.root).unwrap();
+    let out = readers::both(&host, &p::present(), &c.root).unwrap();
     assert!(out.ok(), "{:?}", out.violations);
     assert_eq!(code(), Phase::Released);
 }
@@ -2895,7 +2904,7 @@ fn publication_cache_never_satisfies_another_version_at_the_same_tag() {
     use publication_fixture as p;
     let host = Fake::at("2026-10-08T07:00:00Z");
     let (c, forge) = p::colliding_versions(&host);
-    let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+    let out = readers::both(&host, &forge, &c.root).unwrap();
     assert_eq!(rules(&out), ["release-unpublished"]);
     assert_eq!(out.violations[0].path, "00-release/widget/4.0.0");
     let unit = p::unit(&c);
@@ -2906,7 +2915,7 @@ fn publication_cache_never_satisfies_another_version_at_the_same_tag() {
     );
     assert_eq!(unit.steps["4.0.0"].track.state, Phase::Merged);
     assert!(unit.steps["4.0.0"].track.evidence.published.is_empty());
-    assert_eq!(forge.artifact_queries.borrow().len(), 2);
+    assert_eq!(forge.artifact_queries.lock().unwrap().len(), 2);
 }
 
 #[test]
@@ -2925,7 +2934,7 @@ fn unread_pr_or_tag_without_artifacts_does_not_journal() {
             .into(),
         );
         let before = fs::read(c.root.join("JOURNAL.md")).unwrap();
-        let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+        let out = readers::both(&host, &forge, &c.root).unwrap();
         assert_eq!(rules(&out), ["sync-unknown"]);
         assert!(!out.fields.contains_key("journal"));
         assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), before);
@@ -2993,7 +3002,7 @@ fn unsupported_formula_arguments_journal_unknown_and_leave_the_release_merged() 
             forge
                 .formulas
                 .insert(("o/homebrew-tap".into(), "widget".into()), body);
-            let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
+            let out = readers::both(&host, &forge, &c.root).unwrap();
             assert_eq!(rules(&out), ["sync-unknown"], "{key}: {name}");
             // Journaled by this sync, or by an earlier one while it stays unreadable.
             let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();

@@ -14,7 +14,6 @@ use cm::outcome::Outcome;
 use cm::plan;
 use cm::state::{Evidence, Lane, Phase, Work};
 use cm::store::{self, parse_target};
-use cm::sync::sync;
 use jiff::Timestamp;
 
 struct Fake {
@@ -66,6 +65,26 @@ use campaign_fixture::{Campaign, campaign};
 #[path = "support/forge.rs"]
 mod forge_fixture;
 use forge_fixture::FakeForge;
+
+#[path = "support/readers.rs"]
+mod readers;
+use readers::both as sync;
+
+impl readers::Twin for FakeForge {
+    fn twin(&self, root: &Path) -> Self {
+        FakeForge::twin(self, root)
+    }
+}
+
+// For a `gh` script that keeps no state between calls.
+impl readers::Twin for Gh {
+    fn twin(&self, _: &Path) -> Self {
+        Gh {
+            program: self.program.clone(),
+            timeout: self.timeout,
+        }
+    }
+}
 
 #[path = "support/watch.rs"]
 mod watch_fixture;
@@ -1343,9 +1362,13 @@ fn sync_moves_steps_from_github_state_and_renders_the_card() {
         },
     );
     assert!(deployed.ok(), "{:?}", deployed.violations);
-    let calls = *forge.calls.borrow();
+    let calls = *forge.calls.lock().unwrap();
     sync(&later, &forge, &c.root).unwrap();
-    assert_eq!(*forge.calls.borrow(), calls + 2, "one read per open PR");
+    assert_eq!(
+        *forge.calls.lock().unwrap(),
+        calls + 2,
+        "one read per open PR"
+    );
     assert_eq!(state(&c, "01-a/u/S1"), Phase::Deployed);
     let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
     assert_eq!(
@@ -1916,7 +1939,7 @@ esac
     let observe = |mode, now| {
         fs::write(gh.fixture().join("mode"), mode).unwrap();
         fs::write(&args_path, "").unwrap();
-        let outcome = sync(&at(now), &forge, &c.root).unwrap();
+        let outcome = cm::sync::sync(&at(now), &forge, &c.root).unwrap();
         let pulls = store::read_json::<BTreeMap<String, plan::Observed>>(&pulls_path).unwrap();
         (
             outcome,
@@ -2026,7 +2049,7 @@ fi
         program: gh.program(),
         timeout: Duration::from_secs(10),
     };
-    let observe = || sync(&host, &forge, &c.root).unwrap();
+    let observe = || cm::sync::sync(&host, &forge, &c.root).unwrap();
     let pulls = || {
         store::read_json::<BTreeMap<String, plan::Observed>>(&plan::pulls_path(&c.root)).unwrap()
     };
@@ -2902,7 +2925,7 @@ fn a_tag_only_release_does_not_release_a_member_it_does_not_contain() {
     sync(&host, &forge, &c.root).unwrap();
     assert_eq!(state(&c, "01-a/u/S1"), Phase::Merged);
     assert_eq!(
-        *forge.containment_queries.borrow(),
+        *forge.containment_queries.lock().unwrap(),
         vec![("o/cm".into(), "v0.7.0".into(), "s1".into())]
     );
 }
@@ -2916,7 +2939,7 @@ fn a_tag_only_release_without_a_declared_repository_is_skipped() {
         .insert(("o/cm".into(), "v0.7.0".into()), ["s1".to_owned()].into());
     sync(&host, &forge, &c.root).unwrap();
     assert_eq!(state(&c, "01-a/u/S1"), Phase::Merged);
-    assert!(forge.containment_queries.borrow().is_empty());
+    assert!(forge.containment_queries.lock().unwrap().is_empty());
 }
 
 #[test]

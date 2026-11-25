@@ -14,7 +14,6 @@ use cm::outcome::Outcome;
 use cm::plan;
 use cm::state::{Evidence, Lane, Phase};
 use cm::store::{self, parse_target};
-use cm::sync::sync;
 use cm::verdict::{self, CleanUpdateError, Lineage};
 use jiff::Timestamp;
 use sha2::{Digest, Sha256};
@@ -24,6 +23,35 @@ mod support;
 
 #[path = "support/verdict.rs"]
 mod review_fixture;
+
+#[path = "support/readers.rs"]
+mod readers;
+use readers::both as sync;
+
+impl readers::Twin for FakeForge {
+    fn twin(&self, root: &Path) -> Self {
+        FakeForge {
+            campaign: self.campaign.as_ref().map(|_| root.to_path_buf()),
+            ..self.clone()
+        }
+    }
+}
+
+impl readers::Twin for forge_fixture::FakeForge {
+    fn twin(&self, root: &Path) -> Self {
+        forge_fixture::FakeForge::twin(self, root)
+    }
+}
+
+// For a `gh` script that keeps no state between calls.
+impl readers::Twin for Gh {
+    fn twin(&self, _: &Path) -> Self {
+        Gh {
+            program: self.program.clone(),
+            timeout: self.timeout,
+        }
+    }
+}
 
 struct Fake {
     now: Timestamp,
@@ -50,6 +78,7 @@ fn at(now: &str) -> Fake {
 }
 
 /// GitHub as one PR at `head` with `mergeable_state` and these checks on it; `down` fails every read.
+#[derive(Clone)]
 struct FakeForge {
     head: String,
     state: PullState,

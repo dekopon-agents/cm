@@ -1,5 +1,6 @@
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::sync::Mutex;
 
 use cm::forge::{
     CheckState, CommitSha, Forge, ForgeError, GithubRepo, ImageRef, Pull, Read, TagName,
@@ -11,15 +12,32 @@ pub struct FakeForge {
     pub crates: BTreeMap<(String, String), Read>,
     pub formulas: BTreeMap<(String, String), String>,
     pub images: BTreeMap<(String, String), Read>,
-    pub artifact_queries: RefCell<Vec<String>>,
+    pub artifact_queries: Mutex<Vec<String>>,
     pub pulls: BTreeMap<String, Pull>,
     pub tags: BTreeMap<(String, String), BTreeSet<String>>,
     pub broken: BTreeSet<String>,
-    pub calls: RefCell<usize>,
-    pub containment_queries: RefCell<Vec<(String, String, String)>>,
+    pub calls: Mutex<usize>,
+    pub containment_queries: Mutex<Vec<(String, String, String)>>,
 }
 
 impl FakeForge {
+    // The same answers, with fresh logs, for a copy of the campaign at `root`.
+    #[allow(dead_code)]
+    pub fn twin(&self, root: &Path) -> Self {
+        FakeForge {
+            root: self.root.as_ref().map(|_| root.to_path_buf()),
+            crates: self.crates.clone(),
+            formulas: self.formulas.clone(),
+            images: self.images.clone(),
+            artifact_queries: Mutex::default(),
+            pulls: self.pulls.clone(),
+            tags: self.tags.clone(),
+            broken: self.broken.clone(),
+            calls: Mutex::default(),
+            containment_queries: Mutex::default(),
+        }
+    }
+
     fn artifact_query(&self, key: &str) {
         if let Some(root) = &self.root {
             let lock = std::fs::OpenOptions::new()
@@ -32,7 +50,7 @@ impl FakeForge {
                 "publication read held the campaign lock"
             );
         }
-        self.artifact_queries.borrow_mut().push(key.to_owned());
+        self.artifact_queries.lock().unwrap().push(key.to_owned());
     }
 }
 
@@ -83,7 +101,7 @@ impl Forge for FakeForge {
     }
 
     fn pull(&self, url: &str) -> Result<Pull, ForgeError> {
-        *self.calls.borrow_mut() += 1;
+        *self.calls.lock().unwrap() += 1;
         if self.broken.contains(url) {
             return Err(ForgeError::Exit(Some(1)));
         }
@@ -100,7 +118,7 @@ impl Forge for FakeForge {
         tag: &TagName,
         sha: &CommitSha,
     ) -> Result<bool, ForgeError> {
-        self.containment_queries.borrow_mut().push((
+        self.containment_queries.lock().unwrap().push((
             repo.to_string(),
             tag.to_string(),
             sha.to_string(),
