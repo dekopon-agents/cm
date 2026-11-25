@@ -624,8 +624,8 @@ remains required. Superseding meets no gate; amend consumers to name the replace
 
 cm 0.13 raises SCHEMA from 6 to 7 for additive PR base/CI observations and an optional owner-queue read acknowledgement.
 New fields default to absent and are omitted when absent; old state remains readable.
-Sync stamps campaign state with schema 7 before writing observations so an older reader
-cannot erase them. A first nonempty, fully completed check read records head/base;
+Sync stamps campaign state with at least schema 7 before writing observations so an older reader
+cannot erase them, and never lowers it: a campaign holding a resolution review stays at schema 8. A first nonempty, fully completed check read records head/base;
 pending or unreadable checks do not. The baseline changes with a new tested head,
 not a same-head rerun. A changed base is a warning and never a lifecycle gate.
 Upgrade every reader before writing shared state with cm 0.13.

@@ -599,6 +599,13 @@ impl Recorded {
     pub fn at_head(&self, head: &str) -> bool {
         same_commit(&self.head, head)
     }
+
+    fn binds(&self, at: &str) -> bool {
+        match self.kind {
+            ReviewKind::Head => self.at_head(at),
+            ReviewKind::Resolution => self.head.eq_ignore_ascii_case(at),
+        }
+    }
 }
 
 fn verdicts_path(root: &Path) -> PathBuf {
@@ -785,16 +792,26 @@ fn resolution_parent(
             repo.display()
         ));
     }
+    let named = merge;
     let Some(merge) = git_out(
         &repo,
-        &["rev-parse", "--verify", &format!("{merge}^{{commit}}")],
+        &["rev-parse", "--verify", &format!("{named}^{{commit}}")],
     ) else {
         return Err(CleanUpdateError::Unreadable {
-            commit: merge.to_owned(),
+            commit: named.to_owned(),
             repo,
         }
         .to_string());
     };
+    if !merge
+        .to_ascii_lowercase()
+        .starts_with(&named.to_ascii_lowercase())
+    {
+        return Err(format!(
+            "{named} resolves to {merge} in {}, a commit it does not name: a ref of that name shadows it",
+            repo.display()
+        ));
+    }
     let merged = merge_from_base(&repo, &merge, base).map_err(|why| why.to_string())?;
     if merged.clean {
         return Err(format!(
@@ -1655,7 +1672,7 @@ fn finished_receipt_at(root: &Path, target: &Target, verdicts: &Verdicts, head: 
                                         .iter()
                                         .filter(|review| {
                                             review.step == step
-                                                && review.at_head(head)
+                                                && review.binds(head)
                                                 && review.kind == ReviewKind::Resolution
                                         })
                                         .filter_map(|review| report_sha256(root, review))
@@ -1744,7 +1761,7 @@ fn astra_gap(
                         // Bound to this PR and part, as every review the gate reads.
                         .filter(|review| {
                             review.step == step
-                                && review.at_head(head)
+                                && review.binds(head)
                                 && review.reviewer.as_deref() == Some(ASTRA_REVIEWER)
                                 && review.part.as_deref() == scope
                                 && review
@@ -1868,7 +1885,7 @@ fn reviews_at<'a>(
         .iter()
         .filter(|review| {
             review.step == step
-                && review.at_head(head)
+                && review.binds(head)
                 && review.kind == kind
                 && review.part.as_deref() == part
                 && review
@@ -2144,8 +2161,21 @@ fn merge_from_base(repo: &Path, commit: &str, base: &str) -> Result<Merge, Clean
     }
 }
 
-fn nul_list(text: &str) -> Vec<&str> {
-    text.split('\0').filter(|item| !item.is_empty()).collect()
+fn git_bytes(repo: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+fn nul_paths(listed: &[u8]) -> Vec<&[u8]> {
+    listed
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .collect()
 }
 
 // A resolution review covers a conflict resolution only: a merge whose parents conflict and whose
@@ -2172,9 +2202,7 @@ fn beyond_resolution(repo: &Path, commit: &str, merge: &Merge) -> Option<String>
         ])
         .output();
     let listed = match merged {
-        Ok(output) if output.status.code() == Some(1) => {
-            String::from_utf8_lossy(&output.stdout).into_owned()
-        }
+        Ok(output) if output.status.code() == Some(1) => output.stdout,
         Ok(output) if output.status.code() == Some(0) => {
             return Some(
                 "its parents merge without a conflict, so its remerge diff resolves none"
@@ -2183,23 +2211,26 @@ fn beyond_resolution(repo: &Path, commit: &str, merge: &Merge) -> Option<String>
         }
         _ => return Some(unreadable()),
     };
-    let conflicted: Vec<&str> = nul_list(&listed).into_iter().skip(1).collect();
-    let Some(changed) = git_out(
+    let conflicted: Vec<&[u8]> = nul_paths(&listed).into_iter().skip(1).collect();
+    // Rename detection would fold a rename's source into its target and hide it from the check.
+    let Some(changed) = git_bytes(
         repo,
         &[
             "show",
             "--remerge-diff",
             "--format=",
             "--name-only",
+            "--no-renames",
             "-z",
             commit,
         ],
     ) else {
         return Some(unreadable());
     };
-    let beyond: Vec<&str> = nul_list(&changed)
+    let beyond: Vec<String> = nul_paths(&changed)
         .into_iter()
         .filter(|path| !conflicted.contains(path))
+        .map(|path| format!("\"{}\"", path.escape_ascii()))
         .collect();
     (!beyond.is_empty()).then(|| {
         format!(
@@ -2283,7 +2314,7 @@ fn gate(
     };
     let resolution_at = |at: &str| {
         verdicts.reviews.iter().any(|review| {
-            review.step == step && review.at_head(at) && review.kind == ReviewKind::Resolution
+            review.step == step && review.binds(at) && review.kind == ReviewKind::Resolution
         })
     };
     let resolution_gaps = |at: &str| -> Vec<String> {

@@ -5567,8 +5567,9 @@ fn a_ledger_cm_0_17_1_wrote_round_trips_byte_for_byte_and_keeps_its_records_on_a
     claude_accept(&host, &c, &c.head());
     let after = fs::read_to_string(&ledger).unwrap();
     let kept = written.strip_suffix("\n  ]\n}\n").unwrap();
+    let next = verdict::load(&c.root).unwrap().reviews.len();
     assert!(
-        after.starts_with(&format!("{kept},\n    {{\n      \"number\": 4,")),
+        after.starts_with(&format!("{kept},\n    {{\n      \"number\": {next},")),
         "{after}"
     );
     assert!(!after.contains("\"kind\""), "{after}");
@@ -5779,14 +5780,14 @@ fn a_conflict_resolution_that_also_changes_other_files_is_refused() {
     assert_eq!(
         refused.violations[0].message,
         format!(
-            "{} is no conflict resolution a resolution review can cover: it changes other.txt beyond the files its parents conflict in; it needs a review of its own",
+            "{} is no conflict resolution a resolution review can cover: it changes \"other.txt\" beyond the files its parents conflict in; it needs a review of its own",
             &merge[..12]
         )
     );
     s.edit_ledger(|ledger| as_resolutions(ledger, &s.h1, &merge));
     assert_eq!(
         walk_gaps(&s.cleared()),
-        ["it changes other.txt beyond the files its parents conflict in"]
+        ["it changes \"other.txt\" beyond the files its parents conflict in"]
     );
 }
 
@@ -6000,4 +6001,209 @@ fn resolution_reviews_recorded_for_another_pr_cover_nothing() {
         gaps.contains(&"no astra or claude resolution ACCEPT".to_owned()),
         "{gaps:?}"
     );
+}
+
+impl Scratch {
+    fn conflicted_with(&self, extra: impl FnOnce(&Scratch)) -> String {
+        self.on_main("shared.txt", "main\n");
+        let main = format!("origin/{}", self.base);
+        let merged = scratch_git(
+            &self.home,
+            &self.c.repo,
+            &["merge", "-q", "--no-edit", &main],
+        );
+        assert!(!merged.status.success(), "the merge conflicts: {merged:?}");
+        fs::write(self.c.repo.join("shared.txt"), "feature and main\n").unwrap();
+        extra(self);
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-q", "--no-edit"]);
+        self.head()
+    }
+
+    fn reviewed(&self, host: &Fake, name: &str) -> String {
+        let head = self.head();
+        self.astra(host, &head, name, "ACCEPT");
+        claude_accept(host, &self.c, &head);
+        head
+    }
+
+    fn on_main_with(&self, change: impl FnOnce(&Scratch)) {
+        self.git(&["checkout", "-q", &self.base]);
+        change(self);
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-q", "-m", "main"]);
+        self.git(&["push", "-q", "origin", &self.base]);
+        self.git(&["checkout", "-q", "feature"]);
+    }
+}
+
+fn beyond_the_conflict(s: &Scratch, host: &Fake, merge: &str, parent: &str, shown: &str) {
+    let gap = format!("it changes {shown} beyond the files its parents conflict in");
+    let refused = s.resolution(host, Some("claude"), merge, "claude-beyond", &[]);
+    assert_eq!(
+        rules(&refused),
+        ["review-resolution"],
+        "{:?}",
+        refused.violations
+    );
+    assert_eq!(
+        refused.violations[0].message,
+        format!(
+            "{} is no conflict resolution a resolution review can cover: {gap}; it needs a review of its own",
+            &merge[..12]
+        )
+    );
+    s.edit_ledger(|ledger| as_resolutions(ledger, parent, merge));
+    assert_eq!(walk_gaps(&s.cleared()), [gap]);
+}
+
+#[test]
+fn a_change_beyond_the_conflict_is_seen_by_its_exact_name() {
+    let host = at("2026-11-25T06:00:00Z");
+    for (name, shown) in [
+        (" shared.txt", "\" shared.txt\""),
+        ("shared.txt\n", "\"shared.txt\\n\""),
+        ("-shared.txt", "\"-shared.txt\""),
+    ] {
+        let s = Scratch::new(&host);
+        let merge = s.conflicted_with(|s| {
+            fs::write(s.c.repo.join(name), "unreviewed\n").unwrap();
+        });
+        beyond_the_conflict(&s, &host, &merge, &s.h1, shown);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn file_names_that_are_not_utf_8_are_compared_byte_for_byte() {
+    use std::os::unix::ffi::OsStrExt;
+    let named = |bytes: &[u8]| PathBuf::from(std::ffi::OsStr::from_bytes(bytes));
+    let (conflicted, colliding) = (named(b"caf\xe9.txt"), named(b"caf\xe8.txt"));
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main_with(|s| fs::write(s.c.repo.join(&conflicted), "base\n").unwrap());
+    s.merge_main(None);
+    fs::write(s.c.repo.join(&conflicted), "feature\n").unwrap();
+    s.git(&["commit", "-q", "-a", "-m", "feature edit"]);
+    let h2 = s.reviewed(&host, "h2");
+    s.on_main_with(|s| fs::write(s.c.repo.join(&conflicted), "main\n").unwrap());
+    let main = format!("origin/{}", s.base);
+    let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", &main]);
+    assert!(!merged.status.success(), "the merge conflicts: {merged:?}");
+    fs::write(s.c.repo.join(&conflicted), "feature and main\n").unwrap();
+    fs::write(s.c.repo.join(&colliding), "unreviewed\n").unwrap();
+    s.git(&["add", "-A"]);
+    s.git(&["commit", "-q", "--no-edit"]);
+    let merge = s.head();
+    beyond_the_conflict(&s, &host, &merge, &h2, "\"caf\\xe8.txt\"");
+}
+
+#[test]
+fn a_rename_never_hides_a_change_beyond_the_conflict() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("a.txt", "a line one\na line two\n");
+    s.on_main("u.txt", "u content\nmore u\n");
+    s.merge_main(None);
+    s.git(&["mv", "a.txt", "b.txt"]);
+    s.git(&["commit", "-q", "-m", "rename a to b"]);
+    let h2 = s.reviewed(&host, "h2");
+    s.on_main_with(|s| {
+        s.git(&["mv", "a.txt", "c.txt"]);
+    });
+    let main = format!("origin/{}", s.base);
+    let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", &main]);
+    assert!(!merged.status.success(), "the renames conflict: {merged:?}");
+    s.git(&["rm", "-q", "c.txt"]);
+    s.git(&["mv", "u.txt", "a.txt"]);
+    s.git(&["add", "-A"]);
+    s.git(&["commit", "-q", "--no-edit"]);
+    let merge = s.head();
+    beyond_the_conflict(&s, &host, &merge, &h2, "\"u.txt\"");
+}
+
+#[test]
+fn add_add_and_modify_delete_conflicts_stay_coverable() {
+    let host = at("2026-11-25T06:00:00Z");
+    let resolve_and_cover = |s: &Scratch, resolve: &dyn Fn(&Scratch)| {
+        let main = format!("origin/{}", s.base);
+        let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", &main]);
+        assert!(!merged.status.success(), "the merge conflicts: {merged:?}");
+        resolve(s);
+        s.git(&["add", "-A"]);
+        s.git(&["commit", "-q", "--no-edit"]);
+        let merge = s.head();
+        s.accepted_resolution(&host, &merge, "resolution");
+        let cleared = s.cleared();
+        assert!(cleared.gaps.is_empty(), "{:?}", cleared.gaps);
+        assert_eq!(cleared.resolved, [merge]);
+    };
+
+    let s = Scratch::new(&host);
+    fs::write(s.c.repo.join("new.txt"), "feature new\n").unwrap();
+    s.git(&["add", "new.txt"]);
+    s.git(&["commit", "-q", "-m", "add new"]);
+    s.reviewed(&host, "h2");
+    s.on_main_with(|s| fs::write(s.c.repo.join("new.txt"), "main new\n").unwrap());
+    resolve_and_cover(&s, &|s| {
+        fs::write(s.c.repo.join("new.txt"), "feature and main new\n").unwrap();
+    });
+
+    let s = Scratch::new(&host);
+    s.on_main("m.txt", "base\n");
+    s.merge_main(None);
+    fs::write(s.c.repo.join("m.txt"), "feature\n").unwrap();
+    s.git(&["commit", "-q", "-a", "-m", "modify m"]);
+    s.reviewed(&host, "h2");
+    s.on_main_with(|s| {
+        s.git(&["rm", "-q", "m.txt"]);
+    });
+    resolve_and_cover(&s, &|s| {
+        s.git(&["rm", "-q", "m.txt"]);
+    });
+}
+
+#[test]
+fn a_ref_named_like_the_reports_head_never_redirects_the_record() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    s.git(&["commit", "-q", "--amend", "-m", "Merge main, amended"]);
+    let amended = s.head();
+    s.git(&["tag", &merge[..12], &amended]);
+    let refused = s.resolution(&host, Some("claude"), &merge[..12], "claude-tag", &[]);
+    assert_eq!(
+        rules(&refused),
+        ["review-resolution"],
+        "{:?}",
+        refused.violations
+    );
+    assert_eq!(
+        refused.violations[0].message,
+        format!(
+            "{} resolves to {amended} in {}, a commit it does not name: a ref of that name shadows it",
+            &merge[..12],
+            s.c.repo.display()
+        )
+    );
+}
+
+#[test]
+fn a_resolution_record_binds_only_its_full_merge_sha() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    s.accepted_resolution(&host, &merge, "resolution");
+    assert!(s.cleared().gaps.is_empty());
+    s.edit_ledger(|ledger| {
+        for review in &mut ledger.reviews[2..] {
+            review.head = merge[..8].to_owned();
+        }
+    });
+    let prefixed = s.cleared();
+    assert!(prefixed.resolved.is_empty());
+    assert!(!prefixed.gaps.is_empty());
+    assert!(rules(&s.merge(&host)).contains(&"merge-gate"));
 }
