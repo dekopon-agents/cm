@@ -94,8 +94,12 @@ enum Commands {
     },
     /// Read PR state and release tags from GitHub (read-only `gh`), move steps pr-open → merged → released (→ deployed after their release's receipt), and render CARD.md.
     Sync {
-        /// Print each phase's wall time when the sync takes longer than this many seconds (it always does when the sync fails).
-        #[arg(long, value_name = "SECONDS", default_value_t = crate::sync::BUDGET.as_secs())]
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            default_value_t = crate::sync::BUDGET.as_secs(),
+            help = "Print each phase's wall time when the sync takes longer than this many seconds (it always does when the sync fails)"
+        )]
         budget_secs: u64,
     },
     /// Move EPOCH.md along OPEN → PLANNING → WORKING → CLOSED, stamping the date. Refuses a null pin.
