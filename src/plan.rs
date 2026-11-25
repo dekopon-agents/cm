@@ -7,7 +7,7 @@ use anyhow::Result;
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
-use crate::attempt::{remote_turn, turn_began};
+use crate::attempt::{Drivers, remote_turn, turn_began};
 use crate::commands::shell_word;
 use crate::forge::{GithubRepo, MergeableState, TagName};
 use crate::limits;
@@ -368,15 +368,27 @@ pub(crate) struct ActionInputs {
     coordinator: Option<String>,
     stall_limits: limits::StallLimits,
     turn_commands: limits::TurnCommands,
+    drivers: Drivers,
 }
 
 impl ActionInputs {
+    // Sync does not refuse an unreadable registry, as it does not refuse an unreadable review
+    // ledger: it registers no driver, so every claim reads as it would without one.
     pub(crate) fn read(root: &Path, now: Timestamp) -> Self {
+        Self::with_drivers(root, now, Drivers::read(root).unwrap_or_default())
+    }
+
+    pub(crate) fn load(root: &Path, now: Timestamp) -> Result<Self, Violation> {
+        Ok(Self::with_drivers(root, now, Drivers::read(root)?))
+    }
+
+    fn with_drivers(root: &Path, now: Timestamp, drivers: Drivers) -> Self {
         Self {
             now,
             coordinator: crate::attempt::coordinator_label(&None),
             stall_limits: limits::StallLimits::read(root),
             turn_commands: limits::TurnCommands::read(root),
+            drivers,
         }
     }
 }
@@ -641,6 +653,10 @@ fn actionable(
                 .coordinator
                 .as_deref()
                 .is_some_and(|label| label != attempt.coordinator)
+            && inputs
+                .drivers
+                .driving(&attempt.coordinator, &target)
+                .is_none()
         {
             actions.push(Action::new(
                 ActionKind::EarlierCoordinator,
@@ -767,6 +783,52 @@ fn append_actions(outcome: &mut Outcome, number: &mut usize, actions: &[Action])
     outcome.field("actionable", json!(actions));
 }
 
+fn driver_held(
+    units: &Units,
+    inputs: &ActionInputs,
+    target: Option<&Target>,
+    lane: Option<Lane>,
+) -> Vec<Value> {
+    steps(units)
+        .filter(|(full, step)| {
+            target.is_none_or(|target| {
+                split(full).is_some_and(|(unit, name)| {
+                    unit == target.unit && Some(name) == target.step.as_deref()
+                })
+            }) && lane.is_none_or(|lane| step.lane == Some(lane))
+        })
+        .filter_map(|(full, step)| {
+            let attempt = active_attempt(step)?;
+            if inputs.coordinator.as_deref() == Some(attempt.coordinator.as_str()) {
+                return None;
+            }
+            let driven = inputs.drivers.driving(&attempt.coordinator, &full)?;
+            let note = format!(
+                "note: {full} is held by {}, driver of lane {driven} (generation {}, claimed {})",
+                attempt.coordinator, attempt.generation, attempt.claimed_at
+            );
+            Some(json!({
+                "target": full,
+                "driver": attempt.coordinator,
+                "driver_lane": driven,
+                "generation": attempt.generation,
+                "since": attempt.claimed_at,
+                "note": note,
+            }))
+        })
+        .collect()
+}
+
+// Absent while empty, so `cm next` output is unchanged where no driver holds a step.
+fn append_held(outcome: &mut Outcome, held: &[Value]) {
+    for item in held {
+        outcome.line(item["note"].as_str().unwrap_or_default());
+    }
+    if !held.is_empty() {
+        outcome.field("driver_held", held);
+    }
+}
+
 pub(crate) fn action_summary(
     root: &Path,
     units: &Units,
@@ -796,7 +858,10 @@ pub(crate) fn next_act(
         Vec::new()
     } else {
         let units = load_units(root)?;
-        let inputs = ActionInputs::read(root, now);
+        let inputs = match ActionInputs::load(root, now) {
+            Ok(inputs) => inputs,
+            Err(violation) => return Ok((Outcome::refused(vec![violation]), true)),
+        };
         let stalled = stalls(&units, &inputs);
         let verdicts = crate::verdict::load(root)?;
         action_scope(
@@ -1068,6 +1133,10 @@ pub fn next_at(
         Ok(paused) => paused,
         Err(violations) => return Ok(Outcome::refused(violations)),
     };
+    let inputs = match ActionInputs::load(root, now) {
+        Ok(inputs) => inputs,
+        Err(violation) => return Ok(Outcome::refused(vec![violation])),
+    };
     let units = load_units(root)?;
     let all = candidates(root, &units);
     let mut outcome = Outcome::default();
@@ -1102,7 +1171,6 @@ pub fn next_at(
     }
     outcome.field("review_waits", review_waits);
     let verdicts = crate::verdict::load(root)?;
-    let inputs = ActionInputs::read(root, now);
     let stalled = stalls(&units, &inputs);
     let actions = action_scope(
         actionable(root, &units, &inputs, &stalled, &verdicts),
@@ -1110,6 +1178,7 @@ pub fn next_at(
         target,
         lane,
     );
+    let driven = driver_held(&units, &inputs, target, lane);
     let quota = limits::codex_pause();
     let quota = (!paused).then_some(quota.as_deref()).flatten();
     let fresh_readers: Vec<Value> = crate::verdict::fresh_readers(&verdicts)
@@ -1184,6 +1253,7 @@ pub fn next_at(
             outcome.field("steps", Vec::<Value>::new());
             outcome.field("waiting", Vec::<Value>::new());
             append_actions(&mut outcome, &mut number, &actions);
+            append_held(&mut outcome, &driven);
             return Ok(outcome);
         }
         let Some(candidate) = candidate else {
@@ -1208,6 +1278,7 @@ pub fn next_at(
                 .violations
                 .push(Violation::new(&full, "next-state", message));
             append_actions(&mut outcome, &mut number, &actions);
+            append_held(&mut outcome, &driven);
             return Ok(outcome);
         };
         if lane.is_some_and(|lane| candidate.lane() != Some(lane)) {
@@ -1266,6 +1337,7 @@ pub fn next_at(
             outcome.field("waiting", vec![candidate.waiting_json(root, quota)]);
         }
         append_actions(&mut outcome, &mut number, &actions);
+        append_held(&mut outcome, &driven);
         return Ok(outcome);
     }
     let in_lane = |candidate: &&Candidate| lane.is_none_or(|lane| candidate.lane() == Some(lane));
@@ -1402,6 +1474,7 @@ pub fn next_at(
             .collect::<Vec<_>>(),
     );
     append_actions(&mut outcome, &mut number, &actions);
+    append_held(&mut outcome, &driven);
     Ok(outcome)
 }
 
