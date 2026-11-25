@@ -1727,7 +1727,7 @@ fn run_sync(
             ));
         }
     }
-    // An unreadable publication the journal already published, unread since, is not news.
+    // A publication already journaled as unreadable, and unreadable since, is not news.
     let unreadable_path = root.join(store::CM_DIR).join(UNREADABLE_NOTIFIED);
     let published: BTreeSet<String> = store::read_json(&unreadable_path).unwrap_or_default();
     let news = run

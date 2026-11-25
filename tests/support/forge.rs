@@ -21,7 +21,6 @@ pub struct FakeForge {
 }
 
 impl FakeForge {
-    // The same answers, with fresh logs, for a copy of the campaign at `root`.
     #[allow(dead_code)]
     pub fn twin(&self, root: &Path) -> Self {
         FakeForge {

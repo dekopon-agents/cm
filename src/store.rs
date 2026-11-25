@@ -144,7 +144,6 @@ pub fn load_unit(dir: &Path) -> Result<UnitState> {
     Ok(state)
 }
 
-// An unchanged render leaves the file, its mtime and git alone.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     write_changed(path, bytes).map(drop)
 }
@@ -232,7 +231,6 @@ pub fn lock(root: &Path) -> Result<Lock> {
     Ok(Lock { _file: file })
 }
 
-// A campaign whose ignore file predates `name` gains the line once.
 pub fn ignore(root: &Path, name: &str) -> Result<()> {
     let path = root.join(CM_DIR).join(".gitignore");
     let mut text = match fs::read_to_string(&path) {
@@ -344,7 +342,6 @@ mod tests {
         assert!(write_changed(&path, b"Card!\n").unwrap());
         assert_eq!(fs::read(&path).unwrap(), b"Card!\n");
 
-        // A symlink is replaced by the file, as before, even when it reads the same.
         #[cfg(unix)]
         {
             let target = path.with_file_name("target");

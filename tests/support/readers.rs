@@ -12,9 +12,7 @@ pub trait Twin: Forge + Sync + Sized {
     fn twin(&self, root: &Path) -> Self;
 }
 
-// `cm::sync::sync`, which reads one call at a time, checked against the concurrent reads
-// `cm sync` ships, run on a copy of the campaign with a twin of the forge: the two must report
-// and write the same.
+// The concurrent reads `cm sync` ships must report and write what the serial sync does.
 pub fn both<F: Twin>(host: &dyn Host, forge: &F, root: &Path) -> anyhow::Result<Outcome> {
     let copy = tempfile::tempdir().unwrap();
     let twin = copy.path().join(root.file_name().unwrap());
