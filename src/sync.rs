@@ -47,6 +47,8 @@ const PULL_MAX_AGE: jiff::SignedDuration = jiff::SignedDuration::from_mins(30);
 // Ignored by git, so a quiet sync's reads change no tracked file.
 pub const PULLS_READ: &str = "pulls-read.json";
 
+const UNREADABLE_NOTIFIED: &str = "unreadable-notified.json";
+
 // A 304 restores the stored observation, so ETags go out only while `.cm/pulls.json` holds the
 // one they validated.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -1469,25 +1471,6 @@ fn card_name(root: &Path) -> String {
     declared.unwrap_or_else(|| "campaign".to_owned())
 }
 
-fn last_sync_entry(root: &Path) -> BTreeSet<String> {
-    let mut entry = BTreeSet::new();
-    let Ok(text) = std::fs::read_to_string(root.join(store::JOURNAL)) else {
-        return entry;
-    };
-    let mut in_sync = false;
-    for line in text.lines() {
-        if line.starts_with("## ") {
-            in_sync = journal::is_stamped(line) && line.contains(" — cm sync: ");
-            if in_sync {
-                entry.clear();
-            }
-        } else if in_sync {
-            entry.insert(line.to_owned());
-        }
-    }
-    entry
-}
-
 fn guard(root: &Path) -> Result<Vec<Violation>> {
     let campaign = store::load_campaign(root)?;
     let mut guard = journal::check(root, &campaign);
@@ -1744,12 +1727,16 @@ fn run_sync(
             ));
         }
     }
-    // A publication still unreadable since the last sync entry journaled it is not news.
-    let journaled = last_sync_entry(root);
+    // An unreadable publication the journal already published, unread since, is not news.
+    let unreadable_path = root.join(store::CM_DIR).join(UNREADABLE_NOTIFIED);
+    let published: BTreeSet<String> = store::read_json(&unreadable_path).unwrap_or_default();
     let news = run
         .notes
         .iter()
-        .any(|(_, note)| !run.unreadable.contains(note) || !journaled.contains(note.as_str()));
+        .any(|(_, note)| !run.unreadable.contains(note) || !published.contains(note));
+    for (_, note) in &run.notes {
+        outcome.line(note.trim_start_matches("- ").to_owned());
+    }
     if !run.moves.is_empty() || news {
         let mut body: String = run
             .moves
@@ -1767,7 +1754,6 @@ fn run_sync(
         for (_, note) in &run.notes {
             body.push_str(note);
             body.push('\n');
-            outcome.line(note.trim_start_matches("- ").to_owned());
         }
         let title = format!("cm sync: {} move(s) from GitHub", run.moves.len());
         journal::append(root, &journal::entry(&run.at, &title, Some(&body)))?;
@@ -1775,6 +1761,9 @@ fn run_sync(
     }
     if changed {
         store::write_json(&marker_path, &notified)?;
+    }
+    if run.unreadable != published && (!run.unreadable.is_empty() || unreadable_path.exists()) {
+        store::write_json(&unreadable_path, &run.unreadable)?;
     }
     phases.enter("render");
     let next = plan::summary(root, &run.units);

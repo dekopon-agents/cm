@@ -855,6 +855,13 @@ fn an_unreadable_publication_is_journaled_once_while_it_stays_unreadable() {
         let out = sync(&at(now), &forge, &c.root).unwrap();
         let rules: Vec<_> = out.violations.iter().map(|v| v.rule).collect();
         assert_eq!(rules, ["sync-unknown"], "the violation stands at {now}");
+        assert!(
+            out.lines
+                .iter()
+                .any(|line| line.starts_with("unknown 00-release/widget/1.4.0: ")),
+            "{now}: {:?}",
+            out.lines
+        );
         entries.push(out.fields.contains_key("journal"));
     }
     assert_eq!(entries, [true, false, false]);
@@ -1025,4 +1032,69 @@ fn a_card_without_an_epoch_slug_keeps_its_title_under_another_folder_name() {
         assert_eq!(synced_card(&moved), card, "{epoch:?}");
         assert!(card.starts_with("# campaign card\n"), "{card}");
     }
+}
+
+#[test]
+fn an_unreadable_publication_is_journaled_again_when_it_returns() {
+    use publication_fixture as p;
+    let host = at("2026-10-17T08:00:00Z");
+    let c = p::campaign(&host, Phase::Merged, &p::ARTIFACTS);
+    let (crate_key, image_key) = ("crate:acme-sdk", "image:ghcr.io/acme/widget");
+    let unreadable = |keys: &[&str]| {
+        let mut forge = p::present();
+        forge
+            .broken
+            .extend(keys.iter().map(|key| (*key).to_owned()));
+        forge
+    };
+    let mut readable = p::present();
+    readable.crates.clear();
+    let entries = |steps: Vec<(&str, forge_fixture::FakeForge)>| {
+        steps
+            .into_iter()
+            .map(|(now, forge)| {
+                // An unrelated entry between syncs changes nothing.
+                let noted = commands::journal(&at(now), &c.root, "operator note", None).unwrap();
+                assert!(noted.ok(), "{:?}", noted.violations);
+                let out = sync(&at(now), &forge, &c.root).unwrap();
+                out.fields
+                    .get("journal")
+                    .map(|_| journal_tail(&c.root))
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+    };
+    // Unreadable, read again, unreadable: published twice.
+    let first = entries(vec![
+        ("2026-10-17T08:00:00Z", unreadable(&[crate_key])),
+        ("2026-10-17T08:05:00Z", readable),
+        ("2026-10-17T08:10:00Z", unreadable(&[crate_key])),
+    ]);
+    assert!(
+        first[0].contains("- unknown 00-release/widget/1.4.0: crate"),
+        "{first:?}"
+    );
+    assert!(first[1].is_empty(), "{first:?}");
+    assert!(
+        first[2].contains("- unknown 00-release/widget/1.4.0: crate"),
+        "{first:?}"
+    );
+    // Another one returning while the first stays is news; the first is listed with it.
+    let second = entries(vec![
+        ("2026-10-17T08:15:00Z", unreadable(&[crate_key, image_key])),
+        ("2026-10-17T08:20:00Z", unreadable(&[crate_key])),
+        ("2026-10-17T08:25:00Z", unreadable(&[crate_key, image_key])),
+    ]);
+    assert!(second[0].contains(": image"), "{second:?}");
+    assert!(second[1].is_empty(), "{second:?}");
+    assert!(
+        second[2].contains(": image") && second[2].contains(": crate"),
+        "{second:?}"
+    );
+}
+
+fn journal_tail(root: &Path) -> String {
+    let journal = fs::read_to_string(root.join("JOURNAL.md")).unwrap();
+    let last = journal.rfind("\n## ").unwrap();
+    journal[last..].to_owned()
 }
