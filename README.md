@@ -491,7 +491,8 @@ Launchable at sync: <count> (oldest: <stamp>)
 
 `Actionable` counts every `--act` kind. `Deployed in 24 h` counts the deploy steps that reached
 `merged` or `deployed` in the last 24 hours, a multipart step once: a rollout, or a `tag:`-gated
-step whose PR is in a repository no release line ships, the set `released-undeployed` reads. Its
+pin (`…/pin`, `…/deploy`) or step whose PR is in a repository no release line ships, the set
+`released-undeployed` reads. Its
 `last` is the newest such move ever, inside the window or not. `Launchable at sync`'s
 `oldest` is the earliest `since` of its `launchable-not-launched` lines. An open code card is a step that ships a PR, launched or
 `pr-open`, measured from its first launch; the campaign's target is under 24 h. The unreleased
