@@ -771,12 +771,15 @@ fn the_card_does_not_depend_on_who_runs_sync_or_where() {
         card(&c.root, &[("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_other")]),
         alone
     );
-    let held = card(&c.root, &[("CM_CODEX_WEEKLY_PCT", "86")]);
-    assert!(
-        held.contains("Codex dispatch held: weekly usage reached the 85% pause"),
-        "{held}"
-    );
-    assert_eq!(card(&c.root, &[("CM_CODEX_WEEKLY_PCT", "87")]), held);
+    // The Codex weekly hold is the caller's environment too; `cm next` and `cm launch` apply it.
+    for used in ["0", "86", "87"] {
+        assert_eq!(
+            card(&c.root, &[("CM_CODEX_WEEKLY_PCT", used)]),
+            alone,
+            "{used}%"
+        );
+    }
+    assert!(!alone.contains("held"), "{alone}");
     assert_eq!(card(&c.root, &[]), alone);
 
     assert!(alone.starts_with("# trail-slug card\n"), "{alone}");

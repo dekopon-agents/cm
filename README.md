@@ -405,8 +405,8 @@ blocks offer `cm unblock`.
 When `CM_CODEX_WEEKLY_PCT` contains a valid percentage at or above 85, `cm next`
 lists ready Codex steps as waiting and shows the reason. Named `cm next <step>` and
 `cm launch <step>` refuse the held dispatch with exit 1 and `codex-paused`. The
-hold appears in regular `cm next` and CARD dispatch guidance; CARD shows it without the usage
-percent, which changes with every sample.
+hold appears in regular `cm next`. CARD.md shows no hold: the usage percent is the caller's
+environment, not a campaign fact, so the card lists a held step as next.
 
 ### Remote turns
 

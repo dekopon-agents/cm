@@ -1087,23 +1087,20 @@ pub(crate) fn unblock_command(target: &str, condition_met: bool) -> String {
     }
 }
 
+// CARD.md, its only caller, shows no Codex hold: CM_CODEX_WEEKLY_PCT is the caller's environment.
 pub fn summary(root: &Path, units: &Units) -> Next {
     let paused = paused(root).unwrap_or(true);
-    let quota = limits::codex_pause_held();
     let mut ready = Vec::new();
     let mut waiting = Vec::new();
     for candidate in candidates(root, units) {
-        let quota_hold = candidate.dispatch_hold(quota.as_deref());
-        if !paused && candidate.ready() && quota_hold.is_none() {
+        if !paused && candidate.ready() {
             ready.push((
                 candidate.target.clone(),
                 candidate.lane(),
                 candidate.finish(),
             ));
         } else {
-            let mut on = candidate.waits_on();
-            on.extend(quota_hold.map(str::to_owned));
-            waiting.push((candidate.target.clone(), on));
+            waiting.push((candidate.target.clone(), candidate.waits_on()));
         }
     }
     Next {
