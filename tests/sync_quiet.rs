@@ -683,7 +683,7 @@ fn gh_reads_run_at_once() {
     }
     // Each PR read waits, up to five seconds, until another read is in flight beside it.
     let gh = support::FakeGh::new(
-        r#"[ "$2" = rate_limit ] && exit 1
+        r#"if [ "$2" = rate_limit ]; then echo rate_limit >>"$FAKE_GH/calls"; exit 1; fi
 touch "$FAKE_GH/in.$$"
 tries=100
 while :; do
@@ -693,6 +693,7 @@ while :; do
     sleep 0.05
 done
 echo "$seen" >>"$FAKE_GH/overlap"
+echo pull >>"$FAKE_GH/calls"
 rm "$FAKE_GH/in.$$"
 echo '{"state":"open","merged":false,"head":{"sha":"0000000000000000000000000000000000000000"}}'
 "#,
@@ -711,6 +712,9 @@ echo '{"state":"open","merged":false,"head":{"sha":"0000000000000000000000000000
             .all(|seen| seen.parse::<usize>().unwrap() >= 2),
         "a read ran alone: {overlap}"
     );
+    // The quota sample follows the reads, so its `used` counts them.
+    let calls = fs::read_to_string(gh.fixture().join("calls")).unwrap();
+    assert_eq!(calls, "pull\npull\npull\npull\nrate_limit\n");
 }
 
 #[test]

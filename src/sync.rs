@@ -100,8 +100,6 @@ struct Reads {
     publications:
         BTreeMap<(Vec<String>, GithubRepo, TagName, Version), Read<crate::forge::Publication>>,
     completed_checks: BTreeMap<(GithubRepo, CommitSha, Vec<String>), Read<Vec<CheckState>>>,
-    /// The quota sample, when a concurrent sync took it beside its first reads.
-    rate_limit: Option<Option<String>>,
     /// Reads made, by kind, for the phase report.
     made: BTreeMap<&'static str, usize>,
 }
@@ -1568,10 +1566,6 @@ fn prefetch(
     owner_unread: &[String],
 ) -> Reads {
     let mut reads = Reads::default();
-    let mut jobs: Vec<Job> = vec![Box::new(|forge: &dyn Forge| -> Store {
-        let sample = forge.rate_limit();
-        Box::new(move |reads: &mut Reads| reads.rate_limit = Some(sample))
-    })];
     for _ in 0..PLAN_ROUNDS {
         let mut plan = Run::new(
             root,
@@ -1583,11 +1577,11 @@ fn prefetch(
         );
         plan.walk();
         reads = std::mem::take(&mut plan.reads);
-        jobs.append(&mut plan.wanted);
+        let jobs = std::mem::take(&mut plan.wanted);
         if jobs.is_empty() {
             break;
         }
-        for store in perform(std::mem::take(&mut jobs), forge) {
+        for store in perform(jobs, forge) {
             store(&mut reads);
         }
     }
@@ -1679,10 +1673,8 @@ fn run_sync(
     };
     let mut read = Run::new(root, Access::Read(forge), reads, now, units, owner_unread);
     read.walk();
-    let rate_limit = match read.reads.rate_limit.take() {
-        Some(sample) => sample,
-        None => forge.rate_limit(),
-    };
+    // Sampled after the reads, so `used` counts this sync's own.
+    let rate_limit = forge.rate_limit();
     let summary = read.reads.summary();
     phases.note(format!("{summary}; up to {at_once} at once"));
     phases.enter("lock");
