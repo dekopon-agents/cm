@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
 
 use crate::commands::{closed, write_unit};
 use crate::evidence::CampaignFile;
@@ -9,7 +11,7 @@ use crate::host::{Host, stamp};
 use crate::journal;
 use crate::outcome::{Outcome, Violation};
 use crate::state::{Attempt, AttemptOutcome, Ended, External, Lane, ObservedTurn};
-use crate::store::{self, Target, is_name, lock};
+use crate::store::{self, CM_DIR, Target, is_name, is_subcampaign_name, lock};
 
 #[derive(Debug, Clone)]
 pub enum Act {
@@ -493,5 +495,317 @@ pub fn attempt(
     outcome.field("plan", code);
     outcome.field("next", next);
     outcome.field("attempt", serde_json::to_value(&attempt)?);
+    Ok(outcome)
+}
+
+pub const LANE_DRIVERS: &str = "lane-drivers.json";
+
+/// The sessions the coordinator registered as lane drivers, by lane name, in
+/// `.cm/lane-drivers.json`. A live attempt a registered driver claimed, on a step under one of its
+/// units, is the driver's own, not an earlier coordinator's. cm trusts the labels it is given: the
+/// journal names who registered whom.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Drivers {
+    #[serde(default)]
+    pub drivers: BTreeMap<String, Driver>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Driver {
+    /// The driver's session label, as its claims record it.
+    pub session: String,
+    /// `<NN-name>[/<unit>[/<step>]]` prefixes, sorted: the steps under them are the driver's.
+    pub units: Vec<String>,
+    /// When the driver was registered, and the label of the session that registered it.
+    pub at: String,
+    pub by: String,
+}
+
+fn drivers_path(root: &Path) -> PathBuf {
+    root.join(CM_DIR).join(LANE_DRIVERS)
+}
+
+/// A unit prefix covers the steps under it, whole path segments at a time.
+pub fn covers(prefix: &str, target: &str) -> bool {
+    target
+        .strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+impl Drivers {
+    /// No file registers no driver; a file cm cannot parse is an error.
+    pub fn load(root: &Path) -> Result<Self> {
+        let path = drivers_path(root);
+        if path.exists() {
+            store::read_json(&path)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    /// The lane whose registered driver is `session` with a unit covering `target`.
+    pub fn driving(&self, session: &str, target: &str) -> Option<&str> {
+        self.drivers
+            .iter()
+            .find(|(_, driver)| {
+                driver.session == session && driver.units.iter().any(|unit| covers(unit, target))
+            })
+            .map(|(lane, _)| lane.as_str())
+    }
+
+    fn lane_of(&self, session: &str) -> Option<&str> {
+        self.drivers
+            .iter()
+            .find(|(_, driver)| driver.session == session)
+            .map(|(lane, _)| lane.as_str())
+    }
+}
+
+fn unit_prefix(text: &str) -> Option<String> {
+    let parts: Vec<&str> = text.trim_matches('/').split('/').collect();
+    (parts.len() <= 3
+        && is_subcampaign_name(parts[0])
+        && parts[1..].iter().all(|part| is_name(part)))
+    .then(|| parts.join("/"))
+}
+
+fn registry_path() -> String {
+    format!("{CM_DIR}/{LANE_DRIVERS}")
+}
+
+fn check_lane(lane: &str, out: &mut Vec<Violation>) {
+    if !is_name(lane) {
+        out.push(Violation::new(
+            registry_path(),
+            "lane-driver-lane",
+            format!(
+                "`{lane}` is not a lane name: pass the <name> of LANE-<name>.md, in letters, digits, `.`, `_` and `-`"
+            ),
+        ));
+    }
+}
+
+fn check_registrar(by: &str, out: &mut Vec<Violation>) {
+    if by.trim().is_empty() || by.contains(['\n', '\r']) {
+        out.push(Violation::new(
+            registry_path(),
+            "lane-driver-registrar",
+            "--coordinator is one non-empty line: pass the label of the coordinator's session",
+        ));
+    }
+}
+
+fn units_line(units: &[String]) -> String {
+    units.join(", ")
+}
+
+/// `cm lane driver add`: register `session` as the driver of `lane` for the steps under `units`,
+/// replacing the lane's earlier driver.
+pub fn driver_add(
+    host: &dyn Host,
+    root: &Path,
+    lane: &str,
+    session: &str,
+    units: &[String],
+    by: &str,
+) -> Result<Outcome> {
+    let path = registry_path();
+    let mut violations = Vec::new();
+    check_lane(lane, &mut violations);
+    if !is_name(session) {
+        violations.push(Violation::new(
+            &path,
+            "lane-driver-session",
+            format!(
+                "`{session}` is not a session label: pass --session <label>, the driver's session as its claims record it (such as session_01…), in letters, digits, `.`, `_` and `-`"
+            ),
+        ));
+    }
+    if units.is_empty() {
+        violations.push(Violation::new(
+            &path,
+            "lane-driver-units",
+            "no unit is given: pass --unit <NN-name>[/<unit>[/<step>]] once for each unit the driver claims",
+        ));
+    }
+    let mut prefixes = Vec::new();
+    for unit in units {
+        match unit_prefix(unit) {
+            Some(prefix) => prefixes.push(prefix),
+            None => violations.push(Violation::new(
+                &path,
+                "lane-driver-units",
+                format!(
+                    "`{unit}` is not <NN-name>[/<unit>[/<step>]]: pass --unit with a subcampaign, unit or step the driver claims"
+                ),
+            )),
+        }
+    }
+    prefixes.sort();
+    prefixes.dedup();
+    check_registrar(by, &mut violations);
+    if by == session {
+        violations.push(Violation::new(
+            &path,
+            "lane-driver-registrar",
+            format!(
+                "`{session}` is the session registering it: a driver never registers itself; the coordinator runs `cm lane driver add`"
+            ),
+        ));
+    }
+    if !violations.is_empty() {
+        return Ok(Outcome::refused(violations));
+    }
+    let (_lock, mut violations) = crate::ledger::guard(root)?;
+    let mut drivers = Drivers::load(root)?;
+    if let Some(driven) = drivers.lane_of(by) {
+        violations.push(Violation::new(
+            &path,
+            "lane-driver-registrar",
+            format!(
+                "`{by}` drives lane `{driven}`: only the coordinator registers a driver; run `cm lane driver add` from the coordinator's session"
+            ),
+        ));
+    }
+    let replaced = drivers.drivers.get(lane).cloned();
+    if replaced
+        .as_ref()
+        .is_some_and(|driver| driver.session == session && driver.units == prefixes)
+    {
+        violations.push(Violation::new(
+            &path,
+            "lane-driver-unchanged",
+            format!(
+                "lane `{lane}` already has driver `{session}` for {}; `cm lane driver list` shows it",
+                units_line(&prefixes)
+            ),
+        ));
+    }
+    if !violations.is_empty() {
+        return Ok(Outcome::refused(violations));
+    }
+    let at = stamp(host.now());
+    let driver = Driver {
+        session: session.to_owned(),
+        units: prefixes,
+        at: at.clone(),
+        by: by.to_owned(),
+    };
+    drivers.drivers.insert(lane.to_owned(), driver.clone());
+    std::fs::create_dir_all(root.join(CM_DIR))?;
+    store::write_json(&drivers_path(root), &drivers)?;
+    let mut body = format!(
+        "- session: {session}\n- units: {}\n- registered by: {by}\n",
+        units_line(&driver.units)
+    );
+    let mut line = format!(
+        "lane {lane}: driver {session} for {}",
+        units_line(&driver.units)
+    );
+    if let Some(old) = &replaced {
+        body.push_str(&format!(
+            "- replaces: {} for {}\n",
+            old.session,
+            units_line(&old.units)
+        ));
+        line.push_str(&format!("; replaces {}", old.session));
+    }
+    let journal = crate::ledger::journal_line(
+        root,
+        &at,
+        &format!("lane driver add {lane}: {session}"),
+        &body,
+    )?;
+    let mut outcome = Outcome::default();
+    outcome.line(line);
+    outcome.field("lane", lane);
+    outcome.field("driver", serde_json::to_value(&driver)?);
+    outcome.field("replaced", serde_json::to_value(&replaced)?);
+    outcome.field("journal", journal);
+    Ok(outcome)
+}
+
+/// `cm lane driver remove`: drop `lane`'s driver, whose claims read as an earlier coordinator's
+/// again.
+pub fn driver_remove(host: &dyn Host, root: &Path, lane: &str, by: &str) -> Result<Outcome> {
+    let path = registry_path();
+    let mut violations = Vec::new();
+    check_lane(lane, &mut violations);
+    check_registrar(by, &mut violations);
+    if !violations.is_empty() {
+        return Ok(Outcome::refused(violations));
+    }
+    let (_lock, mut violations) = crate::ledger::guard(root)?;
+    let mut drivers = Drivers::load(root)?;
+    let Some(driver) = drivers.drivers.remove(lane) else {
+        let registered = if drivers.drivers.is_empty() {
+            "none is registered".to_owned()
+        } else {
+            format!(
+                "registered: {}",
+                drivers
+                    .drivers
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        violations.push(Violation::new(
+            &path,
+            "lane-driver-unknown",
+            format!(
+                "lane `{lane}` has no registered driver ({registered}); `cm lane driver list` shows them"
+            ),
+        ));
+        return Ok(Outcome::refused(violations));
+    };
+    if !violations.is_empty() {
+        return Ok(Outcome::refused(violations));
+    }
+    let at = stamp(host.now());
+    store::write_json(&drivers_path(root), &drivers)?;
+    let journal = crate::ledger::journal_line(
+        root,
+        &at,
+        &format!("lane driver remove {lane}: {}", driver.session),
+        &format!(
+            "- units: {}\n- removed by: {by}\n",
+            units_line(&driver.units)
+        ),
+    )?;
+    let mut outcome = Outcome::default();
+    outcome.line(format!(
+        "lane {lane}: removed driver {} for {}",
+        driver.session,
+        units_line(&driver.units)
+    ));
+    outcome.field("lane", lane);
+    outcome.field("driver", serde_json::to_value(&driver)?);
+    outcome.field("journal", journal);
+    Ok(outcome)
+}
+
+/// `cm lane driver list`: the registered drivers, by lane name.
+pub fn driver_list(root: &Path) -> Result<Outcome> {
+    let drivers = Drivers::load(root)?;
+    let mut outcome = Outcome::default();
+    let mut items = Vec::new();
+    for (lane, driver) in &drivers.drivers {
+        outcome.line(format!(
+            "{lane}: {} for {} (registered {} by {})",
+            driver.session,
+            units_line(&driver.units),
+            driver.at,
+            driver.by
+        ));
+        let mut item = serde_json::to_value(driver)?;
+        item["lane"] = lane.as_str().into();
+        items.push(item);
+    }
+    if items.is_empty() {
+        outcome.line("no lane driver is registered");
+    }
+    outcome.field("drivers", items);
     Ok(outcome)
 }

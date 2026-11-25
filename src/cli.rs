@@ -207,6 +207,11 @@ enum Commands {
         #[command(subcommand)]
         act: Option<AttemptAct>,
     },
+    /// Register the session that drives a campaign lane (LANE-<name>.md) for its units, list the registered drivers, or remove one. A live attempt a registered driver claimed on a step under its units is not `earlier-coordinator`.
+    Lane {
+        #[command(subcommand)]
+        act: LaneAct,
+    },
     /// Move a unit or step to its next state with that state's evidence.
     Advance {
         /// <NN-name>/<unit> or <NN-name>/<unit>/<step>
@@ -516,6 +521,43 @@ enum AttemptAct {
         outcome: crate::state::AttemptOutcome,
         #[arg(long, value_name = "PATH")]
         evidence: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LaneAct {
+    /// The sessions the coordinator registered to drive campaign lanes, recorded in `.cm/lane-drivers.json` and journaled.
+    Driver {
+        #[command(subcommand)]
+        act: DriverAct,
+    },
+}
+
+#[derive(Subcommand)]
+enum DriverAct {
+    /// Record that --session drives lane <NAME> for the steps under each --unit, replacing the lane's earlier driver.
+    Add {
+        /// The lane's name, as in LANE-<name>.md.
+        name: String,
+        /// The driver's session label, as its claims record it (e.g. session_01…).
+        #[arg(long, value_name = "LABEL")]
+        session: String,
+        /// <NN-name>[/<unit>[/<step>]]: the driver's steps are those under it. Repeat for each.
+        #[arg(long, value_name = "PREFIX")]
+        unit: Vec<String>,
+        /// The coordinator registering the driver. Defaults to trimmed CLAUDE_CODE_REMOTE_SESSION_ID (cse_ becomes session_); otherwise required.
+        #[arg(long, value_name = "LABEL", required = coordinator_label(&None).is_none())]
+        coordinator: Option<String>,
+    },
+    /// List the registered drivers by lane.
+    List,
+    /// Remove lane <NAME>'s driver; its claims read as `earlier-coordinator` again.
+    Remove {
+        /// The lane's name, as in LANE-<name>.md.
+        name: String,
+        /// The coordinator removing the driver. Defaults to trimmed CLAUDE_CODE_REMOTE_SESSION_ID (cse_ becomes session_); otherwise required.
+        #[arg(long, value_name = "LABEL", required = coordinator_label(&None).is_none())]
+        coordinator: Option<String>,
     },
 }
 
@@ -929,6 +971,43 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             };
             crate::attempt::attempt(host, &root()?, target, claim.as_deref(), &act)
         }
+        Commands::Lane {
+            act:
+                LaneAct::Driver {
+                    act:
+                        DriverAct::Add {
+                            name,
+                            session,
+                            unit,
+                            coordinator,
+                        },
+                },
+        } => crate::attempt::driver_add(
+            host,
+            &root()?,
+            name,
+            session,
+            unit,
+            &coordinator_label(coordinator)
+                .expect("clap requires --coordinator without a session default"),
+        ),
+        Commands::Lane {
+            act: LaneAct::Driver {
+                act: DriverAct::List,
+            },
+        } => crate::attempt::driver_list(&root()?),
+        Commands::Lane {
+            act:
+                LaneAct::Driver {
+                    act: DriverAct::Remove { name, coordinator },
+                },
+        } => crate::attempt::driver_remove(
+            host,
+            &root()?,
+            name,
+            &coordinator_label(coordinator)
+                .expect("clap requires --coordinator without a session default"),
+        ),
         Commands::Advance {
             target,
             state,
@@ -1245,6 +1324,7 @@ fn name(command: &Commands) -> &'static str {
         Commands::Unblock { .. } => "unblock",
         Commands::Amend { .. } => "amend",
         Commands::Attempt { .. } => "attempt",
+        Commands::Lane { .. } => "lane",
         Commands::Advance { .. } => "advance",
         Commands::KnownRed { .. } => "known-red",
         Commands::Watch { .. } => "watch",
