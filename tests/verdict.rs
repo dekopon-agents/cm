@@ -717,13 +717,15 @@ fn merge_gate_needs_astra_a_cleared_review_and_green_ci_at_the_head() {
     )
     .unwrap();
     assert_eq!(rules(&again), vec!["resolve-done"]);
-    // Astra is the author's family: the Codex-built PR also needs a Claude reviewer's ACCEPT.
+    // Resolved findings are no ACCEPT, and a model lane's head needs Astra's and a Claude
+    // reviewer's.
     assert!(
         c.merge(&host, &gate).violations[0]
             .message
-            .contains("no Claude review")
+            .contains("no astra or claude ACCEPT")
     );
     claude_accept(&host, &c, &head);
+    astra_accept(&host, &c, &head);
 
     let red = FakeForge::open(&head, &[("fmt, clippy, test", "failure")]);
     let refused = c.merge(
@@ -2214,6 +2216,14 @@ fn a_receipt_counts_only_for_a_review_that_happened_and_was_recorded() {
             .unwrap()
             .ok()
     );
+    // A resolved FIX REQUIRED is no ACCEPT: the model lane's head still needs Astra's.
+    let unaccepted = c.merge(&host, &gate);
+    assert!(
+        unaccepted.violations[0].message.contains("no astra ACCEPT"),
+        "{:?}",
+        unaccepted.violations
+    );
+    astra_accept(&host, &c, &head);
     assert!(c.merge(&host, &gate).ok());
 }
 
@@ -2836,6 +2846,16 @@ fn known_red(
 }
 
 /// A Claude reviewer's ACCEPT at `head`: the family that did not write a Codex-built PR.
+/// A second Astra report at `head`, an explicit ACCEPT after a FIX REQUIRED was resolved.
+fn astra_accept(host: &Fake, c: &Campaign, head: &str) {
+    let astra = c.write(
+        &format!("drafts/astra-accept-{head}.md"),
+        &format!("# Astra re-review\n\nFixed.\n\n```cm-review\nhead: {head}\n```\n\nACCEPT\n"),
+    );
+    let recorded = record(host, c, &astra, "astra");
+    assert!(recorded.ok(), "{:?}", recorded.violations);
+}
+
 fn claude_accept(host: &Fake, c: &Campaign, head: &str) {
     let claude = c.write(
         &format!("drafts/claude-{head}.md"),
@@ -3638,10 +3658,13 @@ fn sync_surfaces_a_moved_base_since_ci_and_refreshes_only_at_a_tested_new_head()
             .iter()
             .any(|line| line.as_str().unwrap().starts_with("stale-base "))
     );
-    let before: serde_json::Value = store::read_json(&plan::pulls_path(&c.root)).unwrap();
+    let mut before: serde_json::Value = store::read_json(&plan::pulls_path(&c.root)).unwrap();
     forge.down = true;
     assert!(!sync(&host, &forge, &c.root).unwrap().ok());
     let after: serde_json::Value = store::read_json(&plan::pulls_path(&c.root)).unwrap();
+    // An unread PR keeps its observation, but its CI is unknown now, never the last green.
+    assert_eq!(before[PR]["ci_green"], true);
+    before[PR].as_object_mut().unwrap().remove("ci_green");
     assert_eq!(before, after);
     forge.down = false;
     forge.head = "d".repeat(40);
@@ -4314,6 +4337,24 @@ fn each_part_of_a_multipart_step_is_merge_ready_on_its_own_pr() {
     forge.parts.insert(second_pr.into(), second);
     sync(&host, &forge, &c.root).unwrap();
     let one = format!("cm advance {STEP} merged --pr {PR} --sha '<merge-sha>' --part one");
+    // Reviews bind to their part: the step's reviews from before it had parts clear neither.
+    assert!(merge_ready(&c, host.now()).is_empty());
+    for (reviewer, name) in [("astra", "astra-one"), ("claude", "claude-one")] {
+        let report = c.write(
+            &format!("drafts/{name}.md"),
+            &format!("# {name}\n\nRead in full.\n\n```cm-review\nhead: {head}\n```\n\nACCEPT\n"),
+        );
+        let recorded = verdict::record(
+            &host,
+            &c.root,
+            &target(),
+            &report,
+            Some(reviewer),
+            Some("one"),
+        )
+        .unwrap();
+        assert!(recorded.ok(), "{:?}", recorded.violations);
+    }
     assert_eq!(merge_ready(&c, host.now()), std::slice::from_ref(&one));
     let report = c.report("astra-review-8", &second_head, &[], "ACCEPT");
     c.receipt_with(
@@ -4358,6 +4399,31 @@ fn each_part_of_a_multipart_step_is_merge_ready_on_its_own_pr() {
             format!("cm advance {STEP} merged --pr {second_pr} --sha '<merge-sha>' --part two")
         ]
     );
+    // Each action carries its own part, so the JSON names that part's PR, head and CI.
+    let next = plan::next_at(&c.root, None, None, host.now()).unwrap();
+    let two = next.fields["actionable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["kind"] == "merge-ready" && action["part"] == "two")
+        .unwrap()
+        .clone();
+    assert_eq!(two["pr"], second_pr);
+    assert_eq!(two["head"], second_head);
+    assert_eq!(two["ci_green"], true);
+    // A blocked step merges none of its parts.
+    let blocked = commands::advance(
+        &host,
+        &c.root,
+        &target(),
+        &Phase::Blocked("waiting-on-the-owner".into()),
+        &Evidence::default(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(blocked.ok(), "{:?}", blocked.violations);
+    assert!(merge_ready(&c, host.now()).is_empty());
 }
 
 #[test]
@@ -4385,6 +4451,8 @@ fn every_model_lane_needs_astra_and_a_claude_verdict_at_the_head() {
                 &verdict::load(&c.root).unwrap(),
                 STEP,
                 &head,
+                Some(PR),
+                None,
                 verdict::model_lane(Some(lane)),
             )
         };
@@ -4395,7 +4463,7 @@ fn every_model_lane_needs_astra_and_a_claude_verdict_at_the_head() {
         assert_eq!(missing(), ["claude"], "{lane:?}");
         let gaps_now = gaps();
         assert_eq!(gaps_now.len(), 1, "{lane:?} {gaps_now:?}");
-        assert!(gaps_now[0].contains("no Claude review"), "{gaps_now:?}");
+        assert!(gaps_now[0].contains("no claude ACCEPT"), "{gaps_now:?}");
         claude_accept(&host, &c, &head);
         assert!(missing().is_empty(), "{lane:?}");
         assert!(gaps().is_empty(), "{lane:?} {:?}", gaps());
@@ -4431,7 +4499,7 @@ fn every_model_lane_refuses_a_merge_without_astra_and_claude_at_the_head() {
         let refused = c.merge(&host, &gate);
         assert_eq!(rules(&refused), ["merge-gate"], "{lane:?}");
         assert!(
-            refused.violations[0].message.contains("no Claude review"),
+            refused.violations[0].message.contains("no claude ACCEPT"),
             "{lane:?}: {:?}",
             refused.violations
         );

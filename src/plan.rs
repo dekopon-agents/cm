@@ -762,7 +762,7 @@ fn merge_ready(
     let part_flag = part
         .map(|part| format!(" --part {}", shell_word(part)))
         .unwrap_or_default();
-    Some(Action::new(
+    let mut action = Action::new(
         ActionKind::MergeReady,
         target,
         since,
@@ -775,7 +775,9 @@ fn merge_ready(
             "merge {pr} at {}: the gate holds and CI is green, then record the merge",
             head.chars().take(12).collect::<String>()
         ),
-    ))
+    );
+    action.part = part.map(str::to_owned);
+    Some(action)
 }
 
 /// A free-text block older than 24 hours: lint's `block-stale`, without its journal-mention
@@ -1153,7 +1155,6 @@ fn actionable(
     stalled: &[Stall],
     verdicts: &crate::verdict::Verdicts,
 ) -> Vec<Action> {
-    let reviews = crate::review::reviews(root);
     let verdict_prs: BTreeSet<_> = verdicts
         .reviews
         .iter()
@@ -1282,7 +1283,11 @@ fn actionable(
             let on_step: Vec<&crate::verdict::Recorded> = verdicts
                 .reviews
                 .iter()
-                .filter(|review| review.step == target && review.part.as_deref() == part)
+                .filter(|review| {
+                    review.step == target
+                        && review.part.as_deref() == part
+                        && review.pr.as_deref().is_none_or(|recorded| recorded == pr)
+                })
                 .collect();
             let at_head: Vec<&&crate::verdict::Recorded> = on_step
                 .iter()
@@ -1295,7 +1300,9 @@ fn actionable(
                 .max_by_key(|at| instant(at))
                 .unwrap_or_default();
             // `paused = true` is the owner's stop, merges included; the Codex quota hold is not.
+            // A blocked step merges none of its parts until it is unblocked.
             if !inputs.paused
+                && !matches!(step.track.state, Phase::Blocked(_))
                 && let Some(action) = merge_ready(root, &target, part, pr, observed, reviewed_since)
             {
                 actions.push(action);
@@ -1331,17 +1338,16 @@ fn actionable(
                         verdicts,
                         &target,
                         head,
+                        Some(pr),
+                        part,
                         crate::verdict::model_lane(step.lane),
                     ),
                     None if verdict_prs.contains(pr) => Vec::new(),
                     None => vec!["any"],
                 };
+                // A review ledger row names no head, so it cannot stand for a verdict here.
                 if missing.is_empty()
                     || crate::review::wait_marker(root, pr).is_some_and(|mark| mark.is_file())
-                    || (at_head.is_empty()
-                        && reviews
-                            .as_ref()
-                            .is_some_and(|rows| crate::review::reviewed(rows, pr, &target)))
                 {
                     return;
                 }

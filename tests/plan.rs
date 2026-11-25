@@ -2004,7 +2004,14 @@ esac
     for mode in ["broken", "slow"] {
         let (outcome, observed, args) = observe(mode, "2026-10-17T08:31:00Z");
         assert_eq!(rules(&outcome), vec!["sync-unknown"]);
-        assert_eq!(observed, aged);
+        // The unread PR keeps its observation; its CI is unknown now, never the last green.
+        assert_eq!(
+            observed,
+            plan::Observed {
+                ci_green: None,
+                ..aged.clone()
+            }
+        );
         assert_eq!(
             args,
             format!("api {pull} --include -H If-None-Match: \"new-pull\"\n")
@@ -5754,7 +5761,7 @@ fn pauses_explain_dispatch_holds_without_becoming_actions() {
 }
 
 #[test]
-fn a_review_ledger_row_clears_only_its_pr() {
+fn a_review_ledger_row_names_no_head_so_it_never_silences_review_owed() {
     let host = at("2026-11-22T18:00:00Z");
     let c = campaign(&host);
     let reviewed = "01-a/u/reviewed";
@@ -5781,8 +5788,15 @@ fn a_review_ledger_row_clears_only_its_pr() {
         .unwrap();
     assert_eq!(outcome.status.code(), Some(1), "{outcome:?}");
     let outcome: serde_json::Value = serde_json::from_slice(&outcome.stdout).unwrap();
-    assert_eq!(outcome["actionable"].as_array().unwrap().len(), 1);
-    assert_eq!(outcome["actionable"][0]["target"], other);
+    // The merge gate counts only verdicts at the head, so a ledger row clears nothing here.
+    let owed: Vec<&str> = outcome["actionable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|action| action["kind"] == "review-owed")
+        .map(|action| action["target"].as_str().unwrap())
+        .collect();
+    assert_eq!(owed, [other, reviewed]);
 }
 
 #[cfg(unix)]
@@ -6777,4 +6791,85 @@ fn a_pin_declared_as_code_is_the_deploy_released_undeployed_names() {
             "cm amend 01-a/u/pin --kickoff-file '<kickoff-file>'".to_owned()
         )]
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn only_a_deploy_scripts_pin_merges_past_the_gate_and_a_direct_commit_finishes_by_evidence() {
+    let host = at("2026-11-25T08:00:00Z");
+    let c = campaign(&host);
+    for (step, pr) in [
+        ("01-a/u/pin", "https://github.com/xrl/rpi-homelab/pull/1"),
+        (
+            "01-a/u/publish",
+            "https://github.com/xrl/rpi-homelab/pull/2",
+        ),
+    ] {
+        assert!(declare_work(&host, &c, step, Lane::Coordinator, &[], Work::Rollout).ok());
+        kickoff(&c, step);
+        open_pr(&host, &c, step, pr);
+    }
+    let merge = |step: &str| {
+        let sha = plan::track(&plan::load_units(&c.root).unwrap(), step)
+            .unwrap()
+            .evidence
+            .sha
+            .clone();
+        advance(
+            &host,
+            &c,
+            step,
+            "merged",
+            Evidence {
+                sha,
+                ..Evidence::default()
+            },
+        )
+    };
+    // A config rollout is model-written: it takes the gate. A script's pin does not.
+    assert!(rules(&merge("01-a/u/publish")).contains(&"merge-gate"));
+    let pinned = merge("01-a/u/pin");
+    assert!(pinned.ok(), "{:?}", pinned.violations);
+
+    // A model-lane step whose work lands as a direct commit to campaign-trail main, with no
+    // PR, finishes as evidence-only steps do and never meets the merge refusal.
+    for (step, lane) in [
+        ("01-a/u/rules", Lane::Coordinator),
+        ("01-a/u/tooling", Lane::ClaudeCloud),
+    ] {
+        assert!(declare(&host, &c, step, lane, &[]).ok());
+        kickoff(&c, step);
+        if lane != Lane::Coordinator {
+            let study = commands::amend(
+                &host,
+                &c.root,
+                &parse_target(step, true).unwrap(),
+                &commands::Amendment {
+                    study: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(study.ok(), "{:?}", study.violations);
+        }
+        let record = c.root.join(step).join("evidence/commit.md");
+        fs::create_dir_all(record.parent().unwrap()).unwrap();
+        fs::write(
+            &record,
+            "campaign-trail main 1234567: the rule, reviewed.\n",
+        )
+        .unwrap();
+        let done = commands::advance(
+            &host,
+            &c.root,
+            &parse_target(step, true).unwrap(),
+            &Phase::Done,
+            &Evidence::default(),
+            Some(&record),
+            None,
+        )
+        .unwrap();
+        assert!(done.ok(), "{step}: {:?}", done.violations);
+        assert_eq!(state(&c, step), Phase::Done);
+    }
 }

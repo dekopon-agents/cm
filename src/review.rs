@@ -576,35 +576,6 @@ pub(crate) fn wait_marker(root: &Path, pr: &str) -> Option<PathBuf> {
     )
 }
 
-pub(crate) fn reviews(root: &Path) -> Option<Reviews> {
-    read_json(&reviews_path(root)).ok()
-}
-
-pub(crate) fn reviewed(rows: &Reviews, pr: &str, target: &str) -> bool {
-    rows.rows.iter().any(|row| match row {
-        Row::Review(review) => review.pr.eq_ignore_ascii_case(pr),
-        Row::Imported { cells } => {
-            let Some(id) = cells.get(1).and_then(|cell| cell.split_whitespace().next()) else {
-                return false;
-            };
-            if id.eq_ignore_ascii_case(pr) {
-                return true;
-            }
-            let Some((repo, number)) = pr
-                .strip_prefix("https://github.com/")
-                .and_then(|url| url.split_once("/pull/"))
-            else {
-                return false;
-            };
-            id.eq_ignore_ascii_case(&format!("{repo}#{number}"))
-                || (cells.get(2).and_then(|kind| kind.split_whitespace().next()) == Some(target)
-                    && repo.rsplit_once('/').is_some_and(|(_, name)| {
-                        id.eq_ignore_ascii_case(&format!("{name}#{number}"))
-                    }))
-        }
-    })
-}
-
 /// Wait for a recorded round without preventing the recording process from taking the lock.
 pub(crate) fn wait(
     root: &Path,

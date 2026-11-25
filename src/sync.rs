@@ -516,7 +516,7 @@ impl<'a> Run<'a> {
         head: Option<&CommitSha>,
         base: Option<&CommitSha>,
     ) -> Option<Vec<String>> {
-        if !crate::commands::merge_gated(step) {
+        if !crate::commands::merge_gated(target.split('#').next().unwrap_or(target), step) {
             return Some(Vec::new());
         }
         let Some(head) = head else {
@@ -889,7 +889,12 @@ impl<'a> Run<'a> {
                             .filter(|seen| seen.head.as_deref() == Some(head.as_str()))
                             .map(|seen| seen.etags.clone())
                             .unwrap_or_default();
-                        if let Some(Ok(checks)) = self.open_checks(&repo, head, &validators) {
+                        let read = self.open_checks(&repo, head, &validators);
+                        if !matches!(read, Some(Ok(_))) {
+                            // An unread CI is unknown, never the last green.
+                            ci_green = None;
+                        }
+                        if let Some(Ok(checks)) = read {
                             if checks.unchanged {
                                 for (page, tag) in validators {
                                     etags.entry(page).or_insert(tag);
@@ -1279,7 +1284,11 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
             track.state == Phase::PrOpen && track.evidence.pr.as_deref() == Some(url.as_str())
         });
         if failed && current {
-            open.entry(url).or_insert(observed);
+            // The PR went unread, so its CI is unknown now: keep the rest, never the green.
+            open.entry(url).or_insert(plan::Observed {
+                ci_green: None,
+                ..observed
+            });
         }
     }
     let mut campaign = store::load_campaign(root)?;

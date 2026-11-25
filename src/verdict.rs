@@ -1592,57 +1592,80 @@ pub fn model_lane(lane: Option<crate::state::Lane>) -> bool {
     )
 }
 
-/// The reviews a step's head still needs a verdict from: on a model lane, Astra (whose receipt
-/// (a) binds) and a Claude reviewer; on any other lane, any one review.
+/// The reviews recorded for this PR of this step or part at `head`: a review binds to the part
+/// it was recorded for and, when it names one, its PR, so two parts never share a verdict.
+fn reviews_at<'a>(
+    verdicts: &'a Verdicts,
+    step: &str,
+    head: &str,
+    pr: Option<&str>,
+    part: Option<&str>,
+) -> Vec<&'a Recorded> {
+    verdicts
+        .reviews
+        .iter()
+        .filter(|review| {
+            review.step == step
+                && review.at_head(head)
+                && review.part.as_deref() == part
+                && review
+                    .pr
+                    .as_deref()
+                    .is_none_or(|recorded| pr.is_none_or(|pr| recorded == pr))
+        })
+        .collect()
+}
+
+/// The verdicts a model lane's head needs (owner, 2026-11-25): an explicit ACCEPT from Astra
+/// and one from a Claude reviewer. A FIX REQUIRED whose findings were resolved is no ACCEPT.
+fn missing_accepts(at_head: &[&Recorded]) -> Vec<&'static str> {
+    let accepted = |family: &dyn Fn(&Recorded) -> bool| {
+        at_head
+            .iter()
+            .any(|review| review.verdict == Verdict::Accept && family(review))
+    };
+    let mut missing = Vec::new();
+    if !accepted(&|review| review.reviewer.as_deref() == Some(ASTRA_REVIEWER)) {
+        missing.push(ASTRA_REVIEWER);
+    }
+    if !accepted(&|review| Family::reviewer(review.reviewer.as_deref()) == Some(Family::Claude)) {
+        missing.push("claude");
+    }
+    missing
+}
+
+/// The verdicts a head still needs: on a model lane, Astra's and a Claude reviewer's ACCEPT; on
+/// any other lane, any one review.
 pub fn missing_reviews(
     verdicts: &Verdicts,
     step: &str,
     head: &str,
+    pr: Option<&str>,
+    part: Option<&str>,
     model: bool,
 ) -> Vec<&'static str> {
-    let at_head: Vec<&Recorded> = verdicts
-        .reviews
-        .iter()
-        .filter(|review| review.step == step && review.at_head(head))
-        .collect();
-    if !model {
-        return if at_head.is_empty() {
-            vec!["any"]
-        } else {
-            Vec::new()
-        };
+    let at_head = reviews_at(verdicts, step, head, pr, part);
+    if model {
+        missing_accepts(&at_head)
+    } else if at_head.is_empty() {
+        vec!["any"]
+    } else {
+        Vec::new()
     }
-    let mut missing = Vec::new();
-    if !at_head
-        .iter()
-        .any(|review| review.reviewer.as_deref() == Some(ASTRA_REVIEWER))
-    {
-        missing.push(ASTRA_REVIEWER);
-    }
-    if !at_head
-        .iter()
-        .any(|review| Family::reviewer(review.reviewer.as_deref()) == Some(Family::Claude))
-    {
-        missing.push("claude");
-    }
-    missing
 }
 
 fn review_gap(
     verdicts: &Verdicts,
     step: &str,
     head: &str,
+    pr: Option<&str>,
     part: Option<&str>,
     model: bool,
 ) -> Option<String> {
+    let at_head = reviews_at(verdicts, step, head, pr, part);
     let part = part
         .map(|part| format!(" --part={}", crate::commands::shell_word(part)))
         .unwrap_or_default();
-    let at_head: Vec<&Recorded> = verdicts
-        .reviews
-        .iter()
-        .filter(|review| review.step == step && review.at_head(head))
-        .collect();
     if at_head.is_empty() {
         return Some(format!(
             "no review of {head} is recorded; `cm review record {step} <report>{part}`"
@@ -1663,17 +1686,26 @@ fn review_gap(
             open.join(", ")
         ));
     }
-    // On a model lane both families clear the head: Astra's verdict (a) and a Claude reviewer's.
-    if model
-        && !at_head
-            .iter()
-            .any(|review| Family::reviewer(review.reviewer.as_deref()) == Some(Family::Claude))
-    {
-        return Some(format!(
-            "no Claude review of {head} is recorded; a model lane's head needs both Astra's and a Claude reviewer's verdict; `cm review record {step} <report> --reviewer claude{part}`"
-        ));
-    }
-    None
+    // On a model lane both families accept the head explicitly: Astra and a Claude reviewer.
+    // A head with no Astra review at all is (a)'s gap already.
+    let astra_reviewed = at_head
+        .iter()
+        .any(|review| review.reviewer.as_deref() == Some(ASTRA_REVIEWER));
+    let missing: Vec<&str> = if model {
+        missing_accepts(&at_head)
+            .into_iter()
+            .filter(|reviewer| *reviewer != ASTRA_REVIEWER || astra_reviewed)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (!missing.is_empty()).then(|| {
+        format!(
+            "no {} ACCEPT of {head} is recorded; a model lane's head needs an ACCEPT from Astra and from a Claude reviewer, and a resolved FIX REQUIRED is not one; `cm review record {step} <report> --reviewer <{}>{part}`",
+            missing.join(" or "),
+            missing.join("|")
+        )
+    })
 }
 
 /// Where the gate may walk a PR's history: a checkout holding its commits, and the base branch's
@@ -1845,7 +1877,14 @@ pub fn merge_gaps(
     let gaps_at = |at: &str| -> Vec<String> {
         astra_gap(root, target, &verdicts, pr, at, part)
             .into_iter()
-            .chain(review_gap(&verdicts, &full_name(target), at, part, model))
+            .chain(review_gap(
+                &verdicts,
+                &full_name(target),
+                at,
+                pr,
+                part,
+                model,
+            ))
             .collect()
     };
     let gaps = gaps_at(head);
