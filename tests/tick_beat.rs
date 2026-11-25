@@ -2691,7 +2691,9 @@ fn text_from_a_path_the_act_list_or_a_child_stays_one_escaped_line() {
         line("missing-kickoff", "01-a/u/c", "cm amend 01-a/u/c"),
     ]);
     let (failing, _) = Record::new(Outcome::Failed(format!("boom\u{1b}[2K\t{obey}")));
-    let (leaving, _) = Record::new(Outcome::Done(vec![format!("left\r{obey}\u{7f}\u{2028}")]));
+    let (leaving, _) = Record::new(Outcome::Done(vec![format!(
+        "left\r{obey}\u{7f}\u{2028}\u{85}\u{9b}\u{2029}"
+    )]));
     let registry = Registry::new()
         .with("launchable-not-launched", failing)
         .with("missing-kickoff", leaving);
@@ -2704,7 +2706,7 @@ fn text_from_a_path_the_act_list_or_a_child_stays_one_escaped_line() {
             format!(
                 "launchable-not-launched 01-a/u/b: cm launch 01-a/u/b [tick/launchable-not-launched failed: boom\\u{{1b}}[2K\\t{obey}]"
             ),
-            format!("left\\r{obey}\\u{{7f}}\\u{{2028}}"),
+            format!("left\\r{obey}\\u{{7f}}\\u{{2028}}\\u{{85}}\\u{{9b}}\\u{{2029}}"),
         ]
     );
 
