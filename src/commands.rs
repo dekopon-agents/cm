@@ -141,14 +141,20 @@ fn parse_artifacts(full: &str, specs: &[String], violations: &mut Vec<Violation>
     artifacts
 }
 
-fn check_kickoff(full: &str, text: Option<&str>) -> Option<Violation> {
-    text.filter(|text| text.trim().is_empty()).map(|_| {
-        Violation::new(
+/// A `--kickoff-file` must hold text, and its `Weight:` line must parse and not contradict
+/// its own checklist (`weight-malformed`, `weight-contradiction`).
+fn check_kickoff(full: &str, text: Option<&str>) -> Vec<Violation> {
+    let Some(text) = text else {
+        return Vec::new();
+    };
+    if text.trim().is_empty() {
+        return vec![Violation::new(
             full,
             "kickoff-file",
             "--kickoff-file must hold non-empty text",
-        )
-    })
+        )];
+    }
+    plan::weight_violation(full, text).into_iter().collect()
 }
 
 fn kickoff_outcome(outcome: &mut Outcome, full: &str, written: bool) {
@@ -2673,6 +2679,21 @@ pub struct Amendment {
     pub priority: Option<crate::state::Priority>,
 }
 
+impl Amendment {
+    /// Whether any flag that changes a step is given (everything but `--priority`).
+    fn changes_step(&self) -> bool {
+        self.study
+            || self.lane.is_some()
+            || !self.after.is_empty()
+            || !self.drop_after.is_empty()
+            || !self.artifacts.is_empty()
+            || !self.drop_artifacts.is_empty()
+            || !self.parts.is_empty()
+            || self.kickoff.is_some()
+            || self.ships.given()
+    }
+}
+
 fn add_parts(
     full: &str,
     names: &[String],
@@ -2776,46 +2797,60 @@ pub fn amend(
     let Some((mut unit, full)) = unit_of(root, target, &mut violations)? else {
         return Ok(Outcome::refused(violations));
     };
-    let Some(step_name) = target.step.as_deref() else {
-        let Some(priority) = amendment.priority else {
-            violations.push(Violation::new(
-                &full,
-                "amend-target",
-                "`cm amend` takes a step, or a unit with --priority",
-            ));
-            return Ok(Outcome::refused(violations));
-        };
-        if unit.priority == priority {
-            violations.push(Violation::new(
-                &full,
-                "amend-empty",
-                format!("{full} already has priority {}", priority.name()),
-            ));
-        }
-        if !violations.is_empty() {
-            return Ok(Outcome::refused(violations));
-        }
-        let change = format!("priority {} → {}", unit.priority.name(), priority.name());
-        unit.priority = priority;
-        write_unit(&root.join(&target.unit), &unit)?;
-        let at = stamp(host.now());
-        let heading = record(root, &at, &format!("amend {full}"), &format!("{change}\n"))?;
-        let mut outcome = Outcome::default();
-        outcome.line(format!("amended {full}"));
-        outcome.line(change.clone());
-        outcome.field("target", full);
-        outcome.field("changes", vec![change]);
-        outcome.field("journal", heading);
-        return Ok(outcome);
+    // `--priority` belongs to the unit: alone, it amends the target's unit; beside step flags,
+    // it rides along with the step's amendment.
+    let priority_change = |unit: &crate::state::UnitState| {
+        amendment
+            .priority
+            .filter(|priority| *priority != unit.priority)
+            .map(|priority| {
+                (
+                    priority,
+                    format!("priority {} → {}", unit.priority.name(), priority.name()),
+                )
+            })
     };
-    if amendment.priority.is_some() {
-        violations.push(Violation::new(
-            &full,
-            "amend-target",
-            "--priority amends a unit, not a step",
-        ));
-        return Ok(Outcome::refused(violations));
-    }
+    let step_name = match target.step.as_deref() {
+        Some(step) if amendment.changes_step() || amendment.priority.is_none() => step,
+        _ => {
+            let unit_name = target.unit.clone();
+            if amendment.priority.is_none() || amendment.changes_step() {
+                violations.push(Violation::new(
+                    &full,
+                    "amend-target",
+                    "`cm amend` takes a step for its step flags, or a unit with --priority alone",
+                ));
+                return Ok(Outcome::refused(violations));
+            }
+            let Some((priority, change)) = priority_change(&unit) else {
+                violations.push(Violation::new(
+                    &unit_name,
+                    "amend-empty",
+                    format!("{unit_name} already has priority {}", unit.priority.name()),
+                ));
+                return Ok(Outcome::refused(violations));
+            };
+            if !violations.is_empty() {
+                return Ok(Outcome::refused(violations));
+            }
+            unit.priority = priority;
+            write_unit(&root.join(&target.unit), &unit)?;
+            let at = stamp(host.now());
+            let heading = record(
+                root,
+                &at,
+                &format!("amend {unit_name}"),
+                &format!("{change}\n"),
+            )?;
+            let mut outcome = Outcome::default();
+            outcome.line(format!("amended {unit_name}"));
+            outcome.line(change.clone());
+            outcome.field("target", unit_name);
+            outcome.field("changes", vec![change]);
+            outcome.field("journal", heading);
+            return Ok(outcome);
+        }
+    };
     let units = plan::load_units(root)?;
     let Some(step) = unit.steps.get(step_name).cloned() else {
         violations.push(step_unknown(&full));
@@ -3024,7 +3059,8 @@ pub fn amend(
         }
     }
     violations.extend(check_work_lane(&full, next.work, next.lane));
-    if next == step && amendment.kickoff.is_none() && violations.is_empty() {
+    let priority = priority_change(&unit);
+    if next == step && amendment.kickoff.is_none() && priority.is_none() && violations.is_empty() {
         violations.push(Violation::new(
             &full,
             "amend-empty",
@@ -3057,6 +3093,10 @@ pub fn amend(
         write_atomic(&root.join(&full).join("kickoff.md"), kickoff.as_bytes())?;
     }
     unit.steps.insert(step_name.to_owned(), next);
+    if let Some((priority, change)) = priority {
+        unit.priority = priority;
+        changes.push(change);
+    }
     write_unit(&root.join(&target.unit), &unit)?;
     let body: String = changes.iter().map(|line| format!("{line}\n")).collect();
     let heading = record(root, &at, &format!("amend {full}"), &body)?;

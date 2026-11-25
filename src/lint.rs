@@ -439,6 +439,11 @@ fn lint_holds(root: &Path, unit: &UnitState, seen: &mut Seen, out: &mut Vec<Viol
                 seen.warnings.push(format!("block-stale: {target} has been blocked:{reason} for more than 24 h with no later journal title naming it"));
             }
         }
+        if !step.track.state.is_final()
+            && let Ok(kickoff) = fs::read_to_string(root.join(&target).join("kickoff.md"))
+        {
+            out.extend(crate::plan::weight_violation(&target, &kickoff));
+        }
         match undeclared_parts(root, &target, step) {
             Ok(found) => seen.warnings.extend(
                 found

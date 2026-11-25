@@ -8009,10 +8009,40 @@ fn a_now_unit_sorts_first_in_next_act_and_the_card() {
         rules(&amend("01-b/v", cm::state::Priority::Now)),
         ["amend-empty"]
     );
+    // Beside step flags, --priority rides along with the step's amendment; a unit takes no
+    // step flags.
+    let both = commands::amend(
+        &host,
+        &c.root,
+        &parse_target("01-a/u/first", true).unwrap(),
+        &commands::Amendment {
+            lane: Some(Lane::Codex),
+            priority: Some(cm::state::Priority::Now),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(both.ok(), "{:?}", both.violations);
     assert_eq!(
-        rules(&amend("01-a/u/first", cm::state::Priority::Now)),
-        ["amend-target"]
+        both.fields["changes"].as_array().unwrap().last().unwrap(),
+        "priority whenever → now"
     );
+    let unit_flags = commands::amend(
+        &host,
+        &c.root,
+        &parse_target("01-b/v", false).unwrap(),
+        &commands::Amendment {
+            lane: Some(Lane::Codex),
+            priority: Some(cm::state::Priority::Whenever),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(rules(&unit_flags), ["amend-target"]);
+    // --priority alone on a step amends its unit.
+    let alone = amend("01-a/u/first", cm::state::Priority::Whenever);
+    assert!(alone.ok(), "{:?}", alone.violations);
+    assert_eq!(alone.fields["target"], "01-a/u");
     let act = coordinator_cm(&c, &["next", "--act"]).output().unwrap();
     let act = String::from_utf8(act.stdout).unwrap();
     assert!(
@@ -8094,29 +8124,109 @@ fn card_guarantee_lines_name_the_oldest_of_each_wait() {
         ],
         "{card}"
     );
+    // `last` is the newest deploy ever, not the newest inside the window.
+    sync(&at("2026-11-25T16:00:00Z"), &FakeForge::default(), &c.root).unwrap();
+    let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+    assert!(
+        card.lines()
+            .any(|line| line == "Deployed in 24 h: 0 (last: 2026-11-22T08:00Z)"),
+        "{card}"
+    );
 }
 
 #[test]
 fn weight_is_simple_only_when_the_checklist_holds() {
-    use cm::plan::{Weight, weight_of};
-    let line = |text: &str| weight_of(&format!("# Kickoff\n\n{text}\n\nGo.\n"));
-    assert_eq!(
-        line("Weight: simple — repos: dekopon; files: 3; surface: none"),
-        Weight::Simple
-    );
-    assert_eq!(
-        line("Weight: simple — repos: dekopon; files: src/a.rs, src/b.rs; surface: none"),
-        Weight::Simple
-    );
+    use cm::plan::{Weight, weight_check};
+    let line = |text: &str| weight_check(&format!("# Kickoff\n\n{text}\n\nGo.\n"));
+    for simple in [
+        "Weight: simple — repos: dekopon; files: 3; surface: none",
+        "- weight: Simple - repos: `dekopon`; files: src/a.rs, src/b.rs; surface: `none`",
+        "WEIGHT: simple: repos: dekopon; files: 2 files; surface: None",
+    ] {
+        assert_eq!(line(simple), Ok(Weight::Simple), "{simple}");
+    }
     for complex in [
-        "Weight: simple — repos: dekopon, cm; files: 1; surface: none",
-        "Weight: simple — repos: dekopon; files: 4; surface: none",
-        "Weight: simple — repos: dekopon; files: 1; surface: auth",
-        "Weight: simple — repos: dekopon; files: 1",
         "Weight: complex — repos: dekopon; files: 1; surface: none",
-        "Weight: simple",
+        "Weight: complex — repos: dekopon, cm; files: 12 files; surface: auth",
         "No weight line.",
     ] {
-        assert_eq!(line(complex), Weight::Complex, "{complex}");
+        assert_eq!(line(complex), Ok(Weight::Complex), "{complex}");
     }
+    for (contradicted, why) in [
+        (
+            "Weight: simple — repos: dekopon, cm; files: 1; surface: none",
+            "2 repo(s)",
+        ),
+        (
+            "Weight: simple — repos: dekopon; files: 12; surface: none",
+            "12 file(s)",
+        ),
+        (
+            "Weight: simple — repos: dekopon; files: 4 files; surface: none",
+            "4 file(s)",
+        ),
+        (
+            "Weight: simple — repos: dekopon; files: ; surface: none",
+            "no file(s)",
+        ),
+        (
+            "Weight: simple — repos: dekopon; files: 1; surface: auth",
+            "surface auth",
+        ),
+    ] {
+        let refused = line(contradicted).unwrap_err();
+        assert_eq!(refused.rule, "weight-contradiction", "{contradicted}");
+        assert!(refused.message.contains(why), "{}", refused.message);
+    }
+    for malformed in [
+        "Weight: simple",
+        "Weight: easy — repos: dekopon; files: 1; surface: none",
+        "Weight: simple — repos: dekopon; files: 1",
+        "Weight: simple repos: dekopon; files: 1; surface: none",
+    ] {
+        assert_eq!(
+            line(malformed).unwrap_err().rule,
+            "weight-malformed",
+            "{malformed}"
+        );
+    }
+}
+
+#[test]
+fn kickoff_files_and_lint_refuse_a_weight_line_by_code() {
+    let host = at("2026-11-22T10:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/card", Lane::Codex, &[]).ok());
+    let amend = |kickoff: &str| {
+        commands::amend(
+            &host,
+            &c.root,
+            &parse_target("01-a/u/card", true).unwrap(),
+            &commands::Amendment {
+                kickoff: Some(kickoff.to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let contradicted = "Go.\n\nWeight: simple — repos: dekopon, cm; files: 1; surface: none\n";
+    assert_eq!(rules(&amend(contradicted)), ["weight-contradiction"]);
+    assert!(amend("Go.\n\nWeight: simple — repos: dekopon; files: 1; surface: none\n").ok());
+    let next = plan::next_at(&c.root, None, None, host.now).unwrap();
+    assert_eq!(next.fields["steps"][0]["weight"], "simple");
+    // A hand edit is caught by lint, by the same code.
+    fs::write(
+        c.root.join("01-a/u/card/kickoff.md"),
+        "Go.\n\nWeight: simple — repos: dekopon\n",
+    )
+    .unwrap();
+    let linted = lint(&c.root).unwrap();
+    assert!(
+        linted
+            .violations
+            .iter()
+            .any(|v| v.rule == "weight-malformed" && v.path == "01-a/u/card"),
+        "{:?}",
+        linted.violations
+    );
 }

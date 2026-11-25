@@ -67,7 +67,7 @@ error. `review wait` additionally uses 3 for its deadline and 4 for unreadable c
 | `cm attempt <NN-name>/<unit>/<step> [--claim TOKEN] [claim [--coordinator L] --expect G \| begin KIND \| record KIND ID \| restart --lane L [--evidence PATH] \| end complete\|partial\|unknown [--evidence PATH]]` | Shows a remote attempt and what to do next from committed state, or extends it; each change is journaled. `end` includes the sampled GitHub REST core usage in its journal and text output when available. Launch and attempt quota reads time out after five seconds. See [Attempts](#attempts). |
 | `cm lane driver add <NAME> --session LABEL --unit PREFIX… [--coordinator L]`, `cm lane driver list`, `cm lane driver remove <NAME> [--coordinator L]` | The registry of lane drivers in `.cm/lane-drivers.json`: `add` records that session `LABEL` drives lane `NAME` (the `<name>` of `LANE-<name>.md`, not a step's `--lane`) for the steps under each `--unit <NN-name>[/<unit>[/<step>]]`, replacing the lane's earlier driver; `remove` drops it; both are journaled with the registering or removing label. `list` prints `<name>: <session> for <units> (registered <stamp> by <label>)` per lane and journals nothing. See [Lane drivers](#lane-drivers). |
 | `cm unblock <NN-name>/<unit>[/<step>] [--evidence PATH]` | Releases a `blocked:<reason>` track to the state it was blocked from. Omit `--evidence` only for a step whose `blocked:until:<condition>` holds; the condition is journaled. Other blocks require a campaign evidence file, as for `done`. A step that rests at `drafted` or `launched` still waits on every `--after`: `cm next` and `cm launch` check them again, and the move lists what is still unmet. |
-| `cm amend <NN-name>/<unit> --priority now\|whenever` | Sets a unit's priority, journaled: lines of `now` units sort first in `cm next`, `--act` and CARD, ahead of their waiting counts. The default is `whenever`; the same priority again is `amend-empty`, and `--priority` on a step is `amend-target`. |
+| `cm amend <NN-name>/<unit> --priority now\|whenever` | Sets a unit's priority, journaled: lines of `now` units sort first in `cm next`, `--act` and CARD, ahead of their waiting counts. The default is `whenever`; the same priority again is `amend-empty`. Given a step with no step flags, it amends the step's unit; beside step flags it changes the unit in the same amendment and journal entry. A unit given step flags is `amend-target`. |
 | `cm amend <NN-name>/<unit>/<step> [--study] [--lane L] [--after A]… [--drop-after A]… [--part NAME]… [--kickoff-file F] [--github OWNER/NAME] [--tag PATTERN] [--artifact SPEC] [--drop-artifact SPEC]` | Changes a declared step that rests at `drafted` or `launched`: marks it a study, moves its lane, or removes gates with `--drop-after` before adding gates with `--after` (each declared, never closing a cycle: `after-cycle`). Removing a gate it lacks is `after-absent`. Moving a rollout to `mac` is `mac-lane-rollout`. `--kickoff-file F` replaces `kickoff.md` from a non-empty file of at most 1 MiB (`-` reads stdin) and journals one line; it refuses a step past launched. `--github` and `--tag` change a release step's repository and tag pattern through `pr-open` and `merged`, refusing once released; its prep PR must be in that repository. `--part` declares required parts (see [Parts](#parts)); given alone it also amends a step that has moved on, short of final. Journals the change; a change that changes nothing is `amend-empty`. |
 | `cm advance <NN-name>/<unit>[/<step>] <state> [--sha S] [--pr URL] [--tag T] [--digest D] [--evidence PATH] [--by STEP[,STEP…]] [--repo PATH] [--head SHA] [--ci-verified PATH] [--override PATH] [--part NAME]` | Refuses merged moves in every lane/part and all release-step lifecycle moves with `owner-queue-unread` until explicit `owner-queue read`; no override. Moves one state along `drafted → launched → pr-open → merged → released → deployed → done`, or to `blocked:<reason>`; a `mac`-lane step, a non-rollout `owner`-lane step, a study, or a non-release `coordinator`-lane step without a rollout, recorded PR, SHA or declared parts moves to `done` with `--evidence` (see [Finishing](#finishing)). `superseded --evidence PATH [--by STEP[,STEP…]]` retires a step replaced by other work from any state short of final, recording its declared successors in state and the journal and showing them in `STATE.md` and `CARD.md`; it meets no gate, so its consumers are amended. A release step moves to `released --tag T --sha S` from `drafted` or `launched` when the tag was cut without a prep PR (tag-only); T must contain S. Other releases require T to contain the recorded merge SHA (`tag-lineage`). A step declared with `--kind rollout` moves `merged → deployed --sha S --evidence PATH` without a release or digest; PATH names the Argo sync revision (see [Finishing](#finishing)). Refuses any other skipped state and a state without its evidence, journals the move and re-renders `STATE.md`. A model-lane step other than a script pin moves to `merged` only through its merge gate (see [Merge gate](#merge-gate)). An already `merged` release step accepts `merged --sha S` again when S descends from its recorded merge, updating only its evidence SHA and journaling both SHAs; otherwise it refuses (`merge-lineage`). `--part NAME` moves one part of a multipart step (see [Parts](#parts)). A step with an unresolved watch does not move to `deployed` or `done` (`watch-open`, see [Watches](#watches)), and `done --evidence` refuses a stale pinned file (`evidence-stale`). |
 | `cm known-red <step> --commit SHA --check NAME --reason T --owner WHO --until A` | Records a known-red exception for the step's merge gate (see [Known-red exceptions](#known-red-exceptions)) and journals it. |
@@ -438,11 +438,14 @@ else the recorded one), `base` and `ci_green` (only when CI completed at that he
 an executor can hold `merge-ready` while merges refuse with `owner-queue-unread`. Exit 1 means actions remain. Exit 0 means the list is
 empty.
 
-A step's `weight`, on act lines and on `cm next --json` steps, is derived from one kickoff line,
-`Weight: simple|complex — repos: <list>; files: <n or list>; surface: none|<what>`. It is
-`simple` only when the line says simple, names one repository, at most three footprint files and
-surface `none`; anything else, a missing line included, is `complex`. Exit 1 means actions remain. Exit 0 means the list is
-empty.
+A step's `weight`, on act lines and on every `cm next --json` step, is derived from one kickoff
+line, `Weight: simple|complex — repos: <list>; files: <n or list>; surface: none|<what>`: an
+optional `- ` bullet, any case, `—`, `-` or `:` before the checklist, backticked values, and
+`files: 12` or `12 files` for twelve. It is `simple` only when the line says simple, names one
+repository, at most three footprint files and surface `none`; anything else, a missing line
+included, is `complex`. `cm init --kickoff-file`, `cm amend --kickoff-file` and `cm lint` (on
+steps short of final) refuse a line that does not parse as `weight-malformed`, and a `simple`
+its own checklist contradicts (an empty `files:` included) as `weight-contradiction`.
 
 | Kind | Fires when | Command |
 |---|---|---|
@@ -484,8 +487,10 @@ Oldest undeployed tag: <line>@<version> since <stamp>
 Launchable at sync: <count> (oldest: <stamp>)
 ```
 
-`Actionable` counts every `--act` kind. `Deployed in 24 h` counts non-release steps moved to
-`deployed` in the last 24 hours, `last` the newest of those moves. `Launchable at sync`'s
+`Actionable` counts every `--act` kind. `Deployed in 24 h` counts the deploy steps that reached
+`merged` or `deployed` in the last 24 hours, a multipart step once: a rollout, or a `tag:`-gated
+step whose PR is in a repository no release line ships, the set `released-undeployed` reads. Its
+`last` is the newest such move ever, inside the window or not. `Launchable at sync`'s
 `oldest` is the earliest `since` of its `launchable-not-launched` lines. An open code card is a step that ships a PR, launched or
 `pr-open`, measured from its first launch; the campaign's target is under 24 h. The unreleased
 merge and the undeployed tag use the `merged-unreleased` and `released-undeployed` scans

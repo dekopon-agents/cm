@@ -212,7 +212,8 @@ pub fn unmet(target: &str, gates: &[Gate]) -> Vec<Violation> {
 /// How much review a card needs, derived by rule from its kickoff's checklist line
 /// `Weight: simple|complex — repos: <list>; files: <n or list>; surface: none|<what>`: simple only
 /// for one repository, at most three footprint files and no contract, auth or secret surface.
-/// A missing or unreadable line is complex.
+/// A missing line is complex. kickoff-lint's grammar: an optional `- ` bullet, any case, `—`, `-`
+/// or `:` before the checklist, a backticked value, and `files: 12` or `12 files` as twelve.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Weight {
@@ -220,44 +221,111 @@ pub enum Weight {
     Complex,
 }
 
-pub fn weight_of(kickoff: &str) -> Weight {
-    let Some(line) = kickoff
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("Weight:"))
-    else {
-        return Weight::Complex;
+/// Why a kickoff's `Weight:` line is refused, with its fixed violation code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WeightRefusal {
+    pub rule: &'static str,
+    pub message: String,
+}
+
+const SIMPLE_MAX_FILES: usize = 3;
+
+/// The weight a kickoff states and derives, or why its `Weight:` line is refused: the line does
+/// not parse (`weight-malformed`), or it says simple while its checklist derives complex
+/// (`weight-contradiction`). No line is complex.
+pub fn weight_check(kickoff: &str) -> Result<Weight, WeightRefusal> {
+    let Some(line) = kickoff.lines().find_map(|line| {
+        let line = line.trim_start();
+        let line = line.strip_prefix("- ").unwrap_or(line);
+        line.get(..7)
+            .filter(|head| head.eq_ignore_ascii_case("weight:"))
+            .map(|_| &line[7..])
+    }) else {
+        return Ok(Weight::Complex);
     };
-    let Some((word, checklist)) = line.split_once('—') else {
-        return Weight::Complex;
+    let malformed = || WeightRefusal {
+        rule: "weight-malformed",
+        message: format!(
+            "the kickoff's `Weight:{line}` is not `Weight: simple|complex — repos: <list>; files: <n or list>; surface: none|<what>`"
+        ),
+    };
+    let rest = line.trim_start();
+    let word_end = rest
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(rest.len());
+    let stated = match rest[..word_end].to_ascii_lowercase().as_str() {
+        "simple" => Weight::Simple,
+        "complex" => Weight::Complex,
+        _ => return Err(malformed()),
+    };
+    let after = rest[word_end..].trim_start();
+    let checklist = after.trim_start_matches(['—', ':', '-']);
+    if checklist.len() == after.len() {
+        return Err(malformed());
+    }
+    let fields: Vec<&str> = checklist.split(';').collect();
+    let [repos, files, surface] = fields.as_slice() else {
+        return Err(malformed());
+    };
+    fn value<'a>(field: &'a str, key: &str) -> Option<&'a str> {
+        let (name, value) = field.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case(key)
+            .then(|| value.trim().trim_matches('`').trim())
+    }
+    let (Some(repos), Some(files), Some(surface)) = (
+        value(repos, "repos"),
+        value(files, "files"),
+        value(surface, "surface"),
+    ) else {
+        return Err(malformed());
     };
     let items = |text: &str| {
         text.split(',')
-            .map(str::trim)
+            .map(|item| item.trim().trim_matches('`').trim())
             .filter(|item| !item.is_empty())
             .count()
     };
-    let (mut repos, mut files, mut surface) = (None, None, None);
-    for field in checklist.split(';') {
-        let Some((key, value)) = field.split_once(':') else {
-            continue;
-        };
-        let value = value.trim();
-        match key.trim() {
-            "repos" => repos = Some(items(value)),
-            "files" => files = Some(value.parse::<usize>().unwrap_or_else(|_| items(value))),
-            "surface" => surface = Some(value.eq_ignore_ascii_case("none")),
-            _ => {}
-        }
-    }
-    if word.trim() == "simple"
-        && repos == Some(1)
-        && files.is_some_and(|files| files <= 3)
-        && surface == Some(true)
+    let lower = files.to_ascii_lowercase();
+    let counted = lower
+        .strip_suffix("files")
+        .or_else(|| lower.strip_suffix("file"))
+        .unwrap_or(&lower)
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .or_else(|| (items(files) > 0).then(|| items(files)));
+    let derived = if items(repos) == 1
+        && counted.is_some_and(|files| files <= SIMPLE_MAX_FILES)
+        && surface.eq_ignore_ascii_case("none")
     {
         Weight::Simple
     } else {
         Weight::Complex
+    };
+    if stated == Weight::Simple && derived == Weight::Complex {
+        return Err(WeightRefusal {
+            rule: "weight-contradiction",
+            message: format!(
+                "the kickoff says simple, but its checklist derives complex ({} repo(s), {} file(s), surface {surface}); simple is one repository, at most {SIMPLE_MAX_FILES} files and surface none",
+                items(repos),
+                counted.map_or_else(|| "no".to_owned(), |files| files.to_string())
+            ),
+        });
     }
+    Ok(stated)
+}
+
+/// The weight a kickoff derives; a refused line is complex.
+pub fn weight_of(kickoff: &str) -> Weight {
+    weight_check(kickoff).unwrap_or(Weight::Complex)
+}
+
+/// The weight refusal of a kickoff, as a violation on its step.
+pub(crate) fn weight_violation(target: &str, kickoff: &str) -> Option<Violation> {
+    weight_check(kickoff)
+        .err()
+        .map(|refusal| Violation::new(target, refusal.rule, refusal.message))
 }
 
 pub(crate) fn weight(root: &Path, target: &str) -> Weight {
@@ -911,15 +979,14 @@ struct Undeployed<'a> {
 }
 
 /// Each line's newest release that no step gated on its tag, or a later one, has merged.
-fn undeployed_releases(units: &Units) -> Vec<Undeployed<'_>> {
+/// A deploy is a rollout, or a PR in a repository no release line ships (a homelab pin). A code
+/// PR in a released repository that waits on a tag consumes the release; it deploys nothing.
+fn deploy_predicate(units: &Units) -> impl Fn(&str, &Step) -> bool + '_ {
     let releases: Vec<(Release, &Step)> = steps(units)
         .filter_map(|(target, step)| Some((Release::of_target(&target)?, step)))
         .collect();
-    // A deploy is a rollout, or a PR in a repository no release line ships (a homelab pin). A
-    // code PR in a released repository that waits on a tag consumes the release; it deploys
-    // nothing.
     // A pin or deploy step deploys by its name, as a rollout does, even when declared as code.
-    let deploys = |target: &str, step: &Step| {
+    move |target: &str, step: &Step| {
         step.work == Work::Rollout
             || target.ends_with("/pin")
             || target.ends_with("/deploy")
@@ -934,7 +1001,11 @@ fn undeployed_releases(units: &Units) -> Vec<Undeployed<'_>> {
                         .iter()
                         .any(|(release, step)| step.ships_from(release, &repo))
                 })
-    };
+    }
+}
+
+fn undeployed_releases(units: &Units) -> Vec<Undeployed<'_>> {
+    let deploys = deploy_predicate(units);
     let mut deployers: BTreeMap<String, Vec<(Release, String, &Step)>> = BTreeMap::new();
     let mut newest: BTreeMap<String, (Release, String, &Step)> = BTreeMap::new();
     for (target, step) in steps(units) {
@@ -1678,21 +1749,43 @@ pub(crate) fn card_lines(
         .min()
         .map_or("—", |(_, since)| since.as_str());
     let day_ago = now - jiff::SignedDuration::from_hours(24);
-    let deploys: Vec<&crate::state::Move> = units
+    // A deploy is a deploy step (a rollout, a pin, or a tag-gated PR in a repository no release
+    // line ships) reaching merged: the pin ends at its merge. Parts count once, as their step.
+    let deploys_step = deploy_predicate(units);
+    let deploy_steps: BTreeSet<String> = steps(units)
+        .filter(|(target, step)| {
+            deploys_step(target, step)
+                && (step.work == Work::Rollout
+                    || step
+                        .after
+                        .iter()
+                        .any(|after| matches!(after, After::Tag(_))))
+        })
+        .map(|(target, _)| target)
+        .collect();
+    let deploys: Vec<(&str, Timestamp, &str)> = units
         .values()
         .flat_map(|unit| &unit.history)
-        .filter(|moved| {
-            moved.to == Phase::Deployed
-                && Release::of_target(&moved.target).is_none()
-                && instant(&moved.at).is_some_and(|at| at >= day_ago)
+        .filter(|moved| matches!(moved.to, Phase::Merged | Phase::Deployed))
+        .filter_map(|moved| {
+            let target = moved.target.split('#').next().unwrap_or(&moved.target);
+            deploy_steps.contains(target).then_some((
+                target,
+                instant(&moved.at)?,
+                moved.at.as_str(),
+            ))
         })
         .collect();
-    let deployed: BTreeSet<&str> = deploys.iter().map(|moved| moved.target.as_str()).collect();
+    let deployed: BTreeSet<&str> = deploys
+        .iter()
+        .filter(|(_, at, _)| *at >= day_ago)
+        .map(|(target, _, _)| *target)
+        .collect();
     let last_deploy = deploys
         .iter()
-        .filter_map(|moved| Some((instant(&moved.at)?, moved.at.as_str())))
+        .map(|(_, at, stamp)| (*at, *stamp))
         .max()
-        .map_or("—", |(_, at)| at);
+        .map_or("—", |(_, stamp)| stamp);
     let first_launchable = actions
         .iter()
         .filter(|action| action.kind == ActionKind::LaunchableNotLaunched)
