@@ -525,6 +525,12 @@ fn card_rechecks_unmet_until_blocks_and_unblocks_satisfied_or_free_text_blocks()
     ] {
         let c = campaign(&host);
         assert!(declare(&host, &c, "01-a/u/park", Lane::Codex, &[]).ok());
+        // A block names an open item; the case's queue then shows it open or answered.
+        fs::write(
+            c.root.join("OWNER-QUEUE.md"),
+            "# Owner queue\n\n## 1. Decision\n",
+        )
+        .unwrap();
         assert!(
             advance(
                 &host,
@@ -4711,6 +4717,11 @@ fn blocked_until_epoch_reads_crlf_and_requires_an_exact_closing_delimiter() {
 fn blocked_until_epoch_and_removed_owner_heading_use_current_files() {
     let host = at("2026-10-17T08:00:00Z");
     let c = campaign(&host);
+    fs::write(
+        c.root.join("OWNER-QUEUE.md"),
+        "# Owner queue\n\n## 2. Decision\n",
+    )
+    .unwrap();
     for (target, condition) in [
         ("01-a/u/epoch", "epoch:WORKING"),
         ("01-a/u/owner", "owner-queue:2"),
@@ -8228,5 +8239,97 @@ fn kickoff_files_and_lint_refuse_a_weight_line_by_code() {
             .any(|v| v.rule == "weight-malformed" && v.path == "01-a/u/card"),
         "{:?}",
         linted.violations
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_owner_queue_block_names_an_open_item_and_add_block_files_and_blocks_in_one_write() {
+    let host = at("2026-11-25T02:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/park", Lane::Codex, &[]).ok());
+    let queue = c.root.join("OWNER-QUEUE.md");
+    // A number guessed from the journal names no open item.
+    assert_eq!(
+        rules(&advance(
+            &host,
+            &c,
+            "01-a/u/park",
+            "blocked:until:owner-queue:31",
+            Evidence::default()
+        )),
+        ["owner-queue-not-open"]
+    );
+    let item = cm::ledger::QueueItem {
+        title: "Chart termination",
+        context: "the broker quotes a token on a parse error",
+        question: "Redact it in the chart?",
+        recommendation: "yes",
+    };
+    // A step that cannot block refuses the whole command: no item is filed.
+    let before = fs::read_to_string(&queue).unwrap();
+    let refused = cm::ledger::owner_queue_add_blocking(
+        &host,
+        &c.root,
+        &item,
+        Some(&parse_target("01-a/u/missing", true).unwrap()),
+    )
+    .unwrap();
+    assert!(!refused.ok());
+    assert_eq!(fs::read_to_string(&queue).unwrap(), before);
+    let filed = cm::ledger::owner_queue_add_blocking(
+        &host,
+        &c.root,
+        &item,
+        Some(&parse_target("01-a/u/park", true).unwrap()),
+    )
+    .unwrap();
+    assert!(filed.ok(), "{:?}", filed.violations);
+    assert_eq!(filed.fields["item"], 1);
+    assert!(
+        fs::read_to_string(&queue)
+            .unwrap()
+            .contains("## 1. Chart termination\n")
+    );
+    assert_eq!(
+        state(&c, "01-a/u/park"),
+        Phase::Blocked("until:owner-queue:1".into())
+    );
+    let linted = |c: &Campaign| {
+        lint(&c.root)
+            .unwrap()
+            .violations
+            .into_iter()
+            .filter(|v| v.rule.starts_with("owner-queue-"))
+            .map(|v| (v.rule, v.path))
+            .collect::<Vec<_>>()
+    };
+    assert!(linted(&c).is_empty());
+    // The answer arrives after the block: the block holds and is met, not dangling.
+    let answered =
+        cm::ledger::owner_queue_answer(&at("2026-11-25T03:00:00Z"), &c.root, 1, "Redact it.")
+            .unwrap();
+    assert!(answered.ok(), "{:?}", answered.violations);
+    assert!(linted(&c).is_empty());
+    // A block written after its item closed holds nothing; a hand-written heading is not cm's.
+    set_track(
+        &at("2026-11-25T04:00:00Z"),
+        &c,
+        "01-a/u/park",
+        Phase::Blocked("until:owner-queue:1".into()),
+        Evidence::default(),
+    );
+    let text = fs::read_to_string(&queue).unwrap();
+    fs::write(
+        &queue,
+        format!("{text}\n## Chart termination (item 1)\n\nContext: x\nQuestion?\nRecommendation: y\nAnswer:\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        linted(&c),
+        [
+            ("owner-queue-heading", "OWNER-QUEUE.md".to_owned()),
+            ("owner-queue-dangling", "01-a/u/park".to_owned()),
+        ]
     );
 }

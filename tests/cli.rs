@@ -382,7 +382,7 @@ fn a_queue_item_without_context_is_reported_and_left_as_written() {
     let root = temp.path();
     assert!(cm(root, &["init"]).status.success());
     let queue =
-        "# Owner queue\n\n## Pick one\n\nWhich path?\n\nRecommendation: the first\n\nAnswer:\n";
+        "# Owner queue\n\n## 1. Pick one\n\nWhich path?\n\nRecommendation: the first\n\nAnswer:\n";
     fs::write(root.join("OWNER-QUEUE.md"), queue).unwrap();
     let resume = fs::read_to_string(root.join("RESUME.md")).unwrap();
     let start = resume.find("> ```").unwrap();
@@ -402,7 +402,7 @@ fn a_queue_item_without_context_is_reported_and_left_as_written() {
     assert_eq!(violations[0]["rule"], "owner-queue-field");
     assert_eq!(
         violations[0]["message"],
-        "item `Pick one` has no line starting `Context:`"
+        "item `1. Pick one` has no line starting `Context:`"
     );
     assert!(cm(root, &["init"]).status.success());
     assert_eq!(

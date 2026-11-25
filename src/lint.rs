@@ -869,6 +869,7 @@ pub fn lint_at(start: &Path, now: jiff::Timestamp) -> Result<Outcome> {
     for dir in &units {
         violations.extend(lint_unit(&root, dir, &mut seen));
     }
+    violations.extend(crate::ledger::lint_owner_queue_items(&root, &seen.units));
     for item in crate::plan::stale_bases(&root, &seen.units) {
         seen.warnings.push(crate::plan::stale_base_line(&item));
     }

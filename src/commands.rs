@@ -1667,6 +1667,23 @@ pub fn advance_gated(
     advance: Advance,
     gate: &MergeGate,
 ) -> Result<Outcome> {
+    advance_held(host, root, target, advance, gate, None)
+}
+
+/// A caller that already holds the campaign lock: `cm owner-queue add --block`, which blocks the
+/// step on the item it is about to file as `pending`.
+pub(crate) struct Held {
+    pub pending: u32,
+}
+
+pub(crate) fn advance_held(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    advance: Advance,
+    gate: &MergeGate,
+    held: Option<&Held>,
+) -> Result<Outcome> {
     let Advance {
         to,
         given,
@@ -1821,10 +1838,29 @@ pub fn advance_gated(
     } else {
         None
     };
-    let _lock = lock(root)?;
+    let _lock = match held {
+        Some(_) => None,
+        None => Some(lock(root)?),
+    };
     let campaign = store::load_campaign(root)?;
     let mut violations = journal::check(root, &campaign);
     violations.extend(closed(root, &campaign));
+    // A block on an owner-queue item names one that is open now, or the one being filed.
+    if let Phase::Blocked(reason) = to
+        && let Some(number) = reason
+            .strip_prefix("until:owner-queue:")
+            .and_then(|number| number.parse::<u32>().ok())
+        && held.is_none_or(|held| held.pending != number)
+        && !crate::ledger::open_items(root).contains(&number)
+    {
+        violations.push(Violation::new(
+            &full,
+            "owner-queue-not-open",
+            format!(
+                "OWNER-QUEUE.md has no open item {number}; file the question with `cm owner-queue add <title> … --block {full}`"
+            ),
+        ));
+    }
     if *to == Phase::Merged || Release::of_target(&step_full).is_some() {
         violations.extend(crate::ledger::owner_queue_refusal(root, &full)?);
     }

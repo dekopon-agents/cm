@@ -661,6 +661,9 @@ enum QueueAct {
         question: String,
         #[arg(long)]
         recommendation: String,
+        /// Also block this step on the new item (`blocked:until:owner-queue:N`), in the same write.
+        #[arg(long, value_name = "STEP", value_parser = step_target)]
+        block: Option<Target>,
     },
     /// Journal the answer and remove the numbered item.
     Answer {
@@ -1172,8 +1175,9 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                     context,
                     question,
                     recommendation,
+                    block,
                 },
-        } => crate::ledger::owner_queue_add(
+        } => crate::ledger::owner_queue_add_blocking(
             host,
             &root()?,
             &crate::ledger::QueueItem {
@@ -1182,6 +1186,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                 question,
                 recommendation,
             },
+            block.as_ref(),
         ),
         Commands::OwnerQueue {
             act: QueueAct::Answer { number, body_file },
