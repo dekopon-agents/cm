@@ -148,28 +148,44 @@ pub enum Reader<'a> {
 /// Wall time per sync phase, printed when a sync fails or runs past its budget.
 struct Phases {
     start: Instant,
-    last: Instant,
+    current: Option<(&'static str, Instant, String)>,
     spent: Vec<(&'static str, Duration, String)>,
 }
 
 impl Phases {
     fn new() -> Self {
-        let start = Instant::now();
         Phases {
-            start,
-            last: start,
+            start: Instant::now(),
+            current: None,
             spent: Vec::new(),
         }
     }
 
-    fn mark(&mut self, phase: &'static str) {
-        self.note(phase, String::new());
+    fn enter(&mut self, phase: &'static str) {
+        self.close();
+        self.current = Some((phase, Instant::now(), String::new()));
     }
 
-    fn note(&mut self, phase: &'static str, note: String) {
-        let now = Instant::now();
-        self.spent.push((phase, now - self.last, note));
-        self.last = now;
+    fn note(&mut self, note: String) {
+        if let Some((_, _, current)) = &mut self.current {
+            *current = note;
+        }
+    }
+
+    fn fail(&mut self) {
+        if let Some((_, _, note)) = &mut self.current {
+            if !note.is_empty() {
+                note.push_str("; ");
+            }
+            note.push_str("failed");
+        }
+        self.close();
+    }
+
+    fn close(&mut self) {
+        if let Some((phase, began, note)) = self.current.take() {
+            self.spent.push((phase, began.elapsed(), note));
+        }
     }
 
     fn lines(&self, total: Duration, budget: Duration) -> Vec<String> {
@@ -1588,6 +1604,10 @@ pub fn sync_with(
 ) -> Result<Outcome> {
     let mut phases = Phases::new();
     let result = run_sync(host, reader, root, &mut phases);
+    if result.is_err() {
+        phases.fail();
+    }
+    phases.close();
     let total = phases.start.elapsed();
     match result {
         Ok(mut outcome) => {
@@ -1614,15 +1634,16 @@ fn run_sync(
     root: &Path,
     phases: &mut Phases,
 ) -> Result<Outcome> {
+    phases.enter("guard");
     let found = guard(root)?;
-    phases.mark("guard");
     if !found.is_empty() {
         return Ok(Outcome::refused(found));
     }
+    phases.enter("load");
     let now = host.now();
     let units = plan::load_units(root)?;
     let owner_unread = crate::ledger::unread_owner_queue(root)?;
-    phases.mark("load");
+    phases.enter("read");
     let (forge, reads, at_once): (&dyn Forge, _, _) = match reader {
         Reader::Serial(forge) => (forge, Reads::default(), 1),
         Reader::Concurrent(forge) => (
@@ -1638,9 +1659,10 @@ fn run_sync(
         None => forge.rate_limit(),
     };
     let summary = read.reads.summary();
-    phases.note("read", format!("{summary}; up to {at_once} at once"));
+    phases.note(format!("{summary}; up to {at_once} at once"));
+    phases.enter("lock");
     let _lock = lock(root)?;
-    phases.mark("lock");
+    phases.enter("apply");
     let found = guard(root)?;
     if !found.is_empty() {
         return Ok(Outcome::refused(found));
@@ -1654,7 +1676,7 @@ fn run_sync(
         crate::ledger::unread_owner_queue(root)?,
     );
     run.walk();
-    phases.mark("apply");
+    phases.enter("write");
     for name in &run.dirty {
         write_unit(&root.join(name), &run.units[name])?;
     }
@@ -1691,7 +1713,7 @@ fn run_sync(
         store::ignore(root, PULLS_READ)?;
         store::write_json(&last_read_path, &last_read)?;
     }
-    phases.mark("write");
+    phases.enter("journal");
     let mut outcome = Outcome::refused(std::mem::take(&mut run.violations));
     crate::ledger::owner_queue_banner(root, &mut outcome)?;
     if !run.turn_warnings.is_empty() {
@@ -1757,12 +1779,12 @@ fn run_sync(
     if changed {
         store::write_json(&marker_path, &notified)?;
     }
-    phases.mark("journal");
+    phases.enter("render");
     let next = plan::summary(root, &run.units);
     let card = render::card(root, run.now, &card_name(root), &run.units, &next);
     let wrote_card = store::write_changed(&root.join(CARD), card.as_bytes())?;
     render_resume(root, &run.units, false)?;
-    phases.mark("render");
+    phases.enter("report");
     for moved in &run.moves {
         outcome.line(format!(
             "{}: {} → {} ({})",
@@ -1822,6 +1844,5 @@ fn run_sync(
         })
         .collect::<Result<Vec<_>, serde_json::Error>>()?;
     outcome.field("moves", moves);
-    phases.mark("report");
     Ok(outcome)
 }

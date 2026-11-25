@@ -799,3 +799,29 @@ fn the_card_does_not_depend_on_who_runs_sync_or_where() {
         assert_eq!(card(&copy, &[]), alone, "{}", copy.display());
     }
 }
+
+#[test]
+fn a_sync_that_stops_with_an_error_times_the_phase_that_failed() {
+    let gh = support::FakeGh::new("exit 1\n");
+    for (path, phase) in [("CARD.md", "render"), (".cm/pulls.json", "write")] {
+        let c = campaign(&at("2026-10-17T08:00:00Z"));
+        fs::create_dir_all(c.root.join(path).join("blocker")).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("-C")
+            .arg(&c.root)
+            .args(["sync", "--budget-secs", "600"])
+            .env("PATH", gh.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let last = stderr
+            .lines()
+            .rfind(|line| line.starts_with("phase "))
+            .unwrap_or_default();
+        assert!(
+            last.starts_with(&format!("phase {phase}: ")) && last.ends_with(" (failed)"),
+            "{path}: {stderr}"
+        );
+    }
+}
