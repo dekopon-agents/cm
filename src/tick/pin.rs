@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::tick::act::{Ctx, Report};
 use crate::tick::beat::FRAME_CAP;
 use crate::tick::claude_md::within_size_limit;
+use crate::tick::directive::examined;
 use crate::tick::proc::{Cmd, Keep};
 
 pub const BUDGET: Duration = Duration::from_secs(60);
@@ -49,10 +50,16 @@ fn pinned(ctx: &Ctx) -> Option<Pin> {
                 .keep(Keep::Head, Keep::Tail),
         )
         .ok()?;
-    let rows = ran.stdout_text();
+    pin_of(&ran.stdout_text())
+}
+
+fn pin_of(rows: &str) -> Option<Pin> {
     let mut cm_rows = rows
         .split('\n')
-        .map(|row| row.split('|'))
+        .map(|row| {
+            examined(row.len() + 1);
+            row.split('|')
+        })
         .filter_map(|mut fields| (fields.next() == Some("cm")).then_some(fields));
     let mut fields = cm_rows.next()?;
     let version = fields.next().unwrap_or_default().to_owned();
@@ -79,6 +86,7 @@ fn running(ctx: &Ctx) -> String {
 fn second_words(text: &str) -> String {
     let mut words = String::new();
     for line in text.split('\n') {
+        examined(line.len() + 1);
         let word = line
             .split([' ', '\t'])
             .filter(|word| !word.is_empty())
@@ -177,7 +185,8 @@ mod tests {
 
     use super::*;
     use crate::tick::act::Env;
-    use crate::tick::proc::{FakeProc, Ran};
+    use crate::tick::directive::{examining, grows_with_its_input};
+    use crate::tick::proc::{FakeProc, KILL_AFTER, OUTPUT_CAP, Ran};
 
     fn ctx_run<T>(proc: &FakeProc, cm: &str, body: impl FnOnce(&Ctx) -> T) -> T {
         let env = Env::default();
@@ -325,6 +334,11 @@ mod tests {
         assert_eq!(check.line(), ".cm-pin-x --version");
         assert_eq!(check.timeout, Duration::from_secs(30));
         assert_eq!(check.cwd.as_deref(), Some(Path::new("/ct")));
+        assert_eq!(
+            check.timeout + KILL_AFTER,
+            Duration::from_secs(35),
+            "README's bound past pin's budget"
+        );
     }
 
     #[test]
@@ -342,5 +356,63 @@ mod tests {
                 .iter()
                 .any(|call| call.contains("--fetch-pinned"))
         );
+    }
+
+    const SIZES: [usize; 3] = [1 << 18, 1 << 19, 1 << 20];
+
+    type Output = (&'static str, fn(usize) -> String);
+
+    const LIST_PINS: [Output; 5] = [
+        ("one cm row as long as the output", |size| {
+            format!("cm|0.17.1|{}\n", "a".repeat(size))
+        }),
+        ("a cm row on every line", |size| {
+            "cm|0.17.1|a.tar.gz\n".repeat(size / 19)
+        }),
+        ("other rows before the cm row", |size| {
+            "uv|1|a|b|c\n".repeat(size / 11) + "cm|0.17.1|a.tar.gz\n"
+        }),
+        ("a cm row of many fields", |size| {
+            format!("cm|0.17.1{}\n", "|f".repeat(size / 2))
+        }),
+        ("CRLF line ends and NUL bytes", |size| {
+            "x|\0|y\r\n".repeat(size / 7) + "cm|0.17.1|a\0.tar.gz\r\n"
+        }),
+    ];
+
+    const VERSIONS: [Output; 4] = [
+        ("a version line on every line", |size| {
+            "cm 0.17.1\n".repeat(size / 10)
+        }),
+        ("one line of many words", |size| "cm ".repeat(size / 3)),
+        ("blanks and tabs only", |size| " \t".repeat(size / 2)),
+        ("CRLF line ends and NUL bytes", |size| {
+            "cm 0.17\0.1\r\n".repeat(size / 11)
+        }),
+    ];
+
+    #[test]
+    fn every_shape_of_pin_and_version_output_costs_work_in_proportion_to_its_bytes() {
+        for (shapes, read) in [
+            (&LIST_PINS[..], (|text| drop(pin_of(text))) as fn(&str)),
+            (&VERSIONS[..], |text| drop(second_words(text))),
+        ] {
+            for (shape, output) in shapes {
+                let texts: Vec<String> = SIZES.iter().map(|&size| output(size)).collect();
+                assert!(texts.iter().all(|text| text.len() <= OUTPUT_CAP));
+                let work: Vec<usize> = texts.iter().map(|text| examining(|| read(text))).collect();
+                let sizes: Vec<usize> = texts.iter().map(String::len).collect();
+                grows_with_its_input(shape, &sizes, &work, 4);
+            }
+        }
+    }
+
+    #[test]
+    fn the_pin_reader_is_handed_at_most_the_first_4_mib_of_each_child_s_output() {
+        let proc = answering(PINS, "cm 0.17.1\n");
+        ctx_run(&proc, "/bin/cm", run);
+        let calls = proc.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|cmd| cmd.keep_stdout == Keep::Head));
     }
 }

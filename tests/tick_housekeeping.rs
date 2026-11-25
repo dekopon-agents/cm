@@ -732,7 +732,7 @@ fn unpicked_owner_directives_below_the_stamp_entry_are_listed_one_line_each() {
 }
 
 #[test]
-fn a_folder_or_fifo_named_like_a_handoff_is_skipped_as_grep_skipped_it() {
+fn a_folder_or_fifo_named_like_a_handoff_is_skipped_though_heartbeat_sh_blocked_on_the_fifo() {
     let directives = Directives::new();
     directives.append(&format!("\n{OPEN}"));
     let handoff = directives.epoch().join("handoff");

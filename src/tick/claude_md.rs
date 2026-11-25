@@ -45,13 +45,14 @@ fn claude_md(env: &Env) -> Option<PathBuf> {
 }
 
 fn boot_time(path: &Path) -> bool {
-    let Ok(file) = File::open(path) else {
-        return false;
-    };
+    File::open(path).is_ok_and(begins_with_boot_time)
+}
+
+// Only a first line's worth is read, however large the file.
+fn begins_with_boot_time(file: impl Read) -> bool {
     let mut first = Vec::new();
     let limit = BOOT_TIME.len() as u64 + 2;
-    if BufReader::new(file)
-        .take(limit)
+    if BufReader::new(file.take(limit))
         .read_until(b'\n', &mut first)
         .is_err()
     {
@@ -334,5 +335,64 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(left, ["CLAUDE.md"]);
+    }
+
+    struct Counted<'a, R>(R, &'a std::cell::Cell<u64>);
+
+    impl<R: Read> Read for Counted<'_, R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.0.read(buf)?;
+            self.1.set(self.1.get() + read as u64);
+            Ok(read)
+        }
+    }
+
+    type Shape = (&'static str, bool, fn(u64) -> Box<dyn Read>);
+
+    const FILES: [Shape; 5] = [
+        ("one line with no line end", false, |size| {
+            Box::new(std::io::repeat(b'x').take(size))
+        }),
+        ("the boot-time line, then the rest", true, |size| {
+            Box::new(
+                std::io::Cursor::new(format!("{BOOT_TIME}\n"))
+                    .chain(std::io::repeat(b'x').take(size)),
+            )
+        }),
+        (
+            "the boot-time line ended by CRLF, then the rest",
+            false,
+            |size| {
+                Box::new(
+                    std::io::Cursor::new(format!("{BOOT_TIME}\r\n"))
+                        .chain(std::io::repeat(b'x').take(size)),
+                )
+            },
+        ),
+        ("the boot-time words running on", false, |size| {
+            Box::new(BOOT_TIME.as_bytes().chain(std::io::repeat(b' ').take(size)))
+        }),
+        ("NUL bytes", false, |size| {
+            Box::new(std::io::repeat(0).take(size))
+        }),
+    ];
+
+    #[test]
+    fn a_claude_md_of_any_size_and_shape_is_read_no_further_than_one_boot_time_line() {
+        for (shape, boot_time, file) in FILES {
+            for size in [1 << 20, 10 << 20, 50 << 20] {
+                let read = std::cell::Cell::new(0);
+                assert_eq!(
+                    begins_with_boot_time(Counted(file(size), &read)),
+                    boot_time,
+                    "{shape}"
+                );
+                assert!(
+                    read.get() <= BOOT_TIME.len() as u64 + 2,
+                    "{shape}: {} bytes read of {size}",
+                    read.get()
+                );
+            }
+        }
     }
 }

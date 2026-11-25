@@ -111,7 +111,7 @@ mod tests {
 
     use super::*;
     use crate::tick::act::Env;
-    use crate::tick::proc::{FakeProc, Ran};
+    use crate::tick::proc::{FakeProc, KILL_AFTER, Ran};
 
     const PULL: &str = "git pull -q --rebase --autostash origin main";
     const PUSH: &str = "git push -q origin main";
@@ -305,6 +305,34 @@ mod tests {
         assert_eq!(abort.cwd.as_deref(), Some(Path::new("/ct")));
         assert_eq!(abort.timeout, Duration::from_secs(30));
         assert!(proc.pauses().is_empty());
+    }
+
+    // README's bound: a try the deadline cuts ends within its grace, and past the deadline only
+    // the abort starts, with a timeout and a grace of its own.
+    #[test]
+    fn gitsync_ends_at_most_40_s_past_its_budget() {
+        let proc = Git {
+            failing: &[PULL],
+            ..CLEAN
+        }
+        .proc();
+        let env = Env::default();
+        let spent = Ctx::new(
+            Path::new("/ct"),
+            Path::new("store/epochs/eleemosynary-mnemosyne"),
+            &proc,
+            &env,
+            OsStr::new("cm"),
+            Duration::ZERO,
+        );
+        push(&spent, &mut Report::default());
+        let past: Duration = KILL_AFTER
+            + proc
+                .calls()
+                .iter()
+                .map(|cmd| cmd.timeout + KILL_AFTER)
+                .sum::<Duration>();
+        assert_eq!(past, Duration::from_secs(40));
     }
 
     #[test]

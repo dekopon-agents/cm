@@ -1,5 +1,6 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
+use std::hash::{BuildHasher, RandomState};
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::Path;
 use std::time::Duration;
@@ -11,6 +12,12 @@ pub const BUDGET: Duration = Duration::from_secs(10);
 const STAMP_FIELD: &[u8] = b" stamp_entry=";
 
 const PICKED_UP: &[u8] = "— Directive picked up: ".as_bytes();
+
+const MODULUS: u64 = (1 << 61) - 1;
+
+const BLOCKS: usize = 64;
+
+const MIN_BLOCK: usize = 1 << 12;
 
 pub fn run(ctx: &Ctx) -> Report {
     let epoch = ctx.epoch_dir();
@@ -71,7 +78,8 @@ fn could_not_read(path: &Path, error: &std::io::Error) -> String {
     )
 }
 
-// A handoff that is gone or not a file is skipped, as heartbeat.sh's grep skipped it.
+// A handoff that is gone or not a file is skipped. heartbeat.sh's grep skipped a folder too, but
+// blocked on a FIFO until something wrote to it.
 fn stamps(handoff: &Path) -> Result<Vec<Vec<u8>>, String> {
     let entries = match std::fs::read_dir(handoff) {
         Ok(entries) => entries,
@@ -80,7 +88,7 @@ fn stamps(handoff: &Path) -> Result<Vec<Vec<u8>>, String> {
         }
         Err(error) => return Err(could_not_read(handoff, &error)),
     };
-    let mut found = BTreeSet::new();
+    let mut found = HashSet::new();
     for entry in entries {
         let entry = entry.map_err(|error| could_not_read(handoff, &error))?;
         let name = entry.file_name();
@@ -97,18 +105,33 @@ fn stamps(handoff: &Path) -> Result<Vec<Vec<u8>>, String> {
             Err(error) if error.kind() == ErrorKind::NotFound => continue,
             Err(error) => return Err(could_not_read(&path, &error)),
         };
-        each_line(BufReader::new(file), |line| {
-            if line.starts_with(b"Handoff: ") {
-                for stamp in stamp_fields(line) {
-                    if !stamp.is_empty() && stamp != b"none" && !found.contains(stamp) {
-                        found.insert(stamp.to_vec());
-                    }
+        stamps_in(BufReader::new(file), &mut found)
+            .map_err(|error| could_not_read(&path, &error))?;
+    }
+    Ok(sorted(found))
+}
+
+fn stamps_in(handoff: impl BufRead, found: &mut HashSet<Vec<u8>>) -> std::io::Result<()> {
+    each_line(handoff, |line| {
+        if line.starts_with(b"Handoff: ") {
+            for stamp in stamp_fields(line) {
+                examined(stamp.len());
+                if !stamp.is_empty() && stamp != b"none" && !found.contains(stamp) {
+                    found.insert(stamp.to_vec());
                 }
             }
-        })
-        .map_err(|error| could_not_read(&path, &error))?;
-    }
-    Ok(found.into_iter().collect())
+        }
+    })
+}
+
+// As `sort -u` ordered them, by bytes.
+fn sorted(found: HashSet<Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut found: Vec<Vec<u8>> = found.into_iter().collect();
+    found.sort_unstable_by(|one, other| {
+        examined(one.len().min(other.len()) + 1);
+        one.cmp(other)
+    });
+    found
 }
 
 // Lines are bytes, as grep compared them; text is decoded only to be printed.
@@ -119,6 +142,7 @@ fn each_line(mut text: impl BufRead, mut each: impl FnMut(&[u8])) -> std::io::Re
         if text.read_until(b'\n', &mut bytes)? == 0 {
             return Ok(());
         }
+        examined(bytes.len());
         each(bytes.strip_suffix(b"\n").unwrap_or(&bytes));
     }
 }
@@ -127,9 +151,10 @@ fn after_each<'a>(text: &'a [u8], marker: &'a [u8]) -> impl Iterator<Item = &'a 
     let mut from = 0;
     std::iter::from_fn(move || {
         let at = from
-            + text[from..]
-                .windows(marker.len())
-                .position(|window| window == marker)?;
+            + text[from..].windows(marker.len()).position(|window| {
+                examined(1);
+                window == marker
+            })?;
         from = at + marker.len();
         Some(&text[from..])
     })
@@ -143,14 +168,22 @@ fn stamp_fields(line: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 // A pickup anywhere in the journal counts, as heartbeat.sh's `grep -cF` over the whole file did.
-// A line holding pickups is kept once, and the text after each is a slice of it.
 fn unpicked(journal: impl BufRead, stamp: &[u8]) -> std::io::Result<Option<Vec<String>>> {
+    unpicked_by(journal, stamp, random_base())
+}
+
+fn unpicked_by(
+    journal: impl BufRead,
+    stamp: &[u8],
+    base: u64,
+) -> std::io::Result<Option<Vec<String>>> {
     let heading = [b"## ", stamp, b" "].concat();
     let mut below = false;
     let mut directives = Vec::new();
     let mut pickups = Vec::new();
     each_line(journal, |line| {
         if !below {
+            examined(heading.len().min(line.len()));
             below = line.starts_with(&heading);
         } else if is_directive(line) {
             directives.push(line[b"## ".len()..].to_vec());
@@ -162,67 +195,197 @@ fn unpicked(journal: impl BufRead, stamp: &[u8]) -> std::io::Result<Option<Vec<S
     if !below {
         return Ok(None);
     }
-    let index = Prefixes::of(&directives);
-    let mut picked: HashSet<&[u8]> = HashSet::new();
+    let mut index = Pickups::of(&directives, base);
     for line in &pickups {
-        for rest in after_each(line, PICKED_UP) {
-            index.starting(rest, |directive| {
-                picked.insert(directive);
-            });
-        }
+        index.scan(line);
     }
     Ok(Some(
         directives
             .iter()
-            .filter(|directive| !picked.contains(directive.as_slice()))
+            .filter(|directive| !index.picked(directive))
             .map(|directive| format!("owner-directive: {}", String::from_utf8_lossy(directive)))
             .collect(),
     ))
 }
 
-// Sorted by bytes, the directives starting with some text are one run, and within it those whose
-// next byte is a given one are a run again: each byte of a pickup's text narrows the run by two
-// binary searches, and the walk ends at the first byte no directive has there.
-struct Prefixes<'a> {
-    sorted: Vec<&'a [u8]>,
+// heartbeat.sh ran one `grep -F` per directive. Here every heading is hashed once and filed by
+// its length; the text after each pickup is hashed, for each length a heading has, in O(1) from
+// rolling hashes of its line's prefixes, and a heading's bytes are compared only when its hash
+// matches and only until it is picked up. No pickup is walked for as long as it agrees with a
+// heading, so the work is the bytes read plus the pickups times the distinct heading lengths.
+struct Pickups<'a> {
+    base: u64,
+    ids: HashMap<&'a [u8], usize>,
+    headings: Vec<&'a [u8]>,
+    picked: Vec<bool>,
+    lengths: Vec<Length>,
 }
 
-impl<'a> Prefixes<'a> {
-    fn of(directives: &'a [Vec<u8>]) -> Self {
-        let mut sorted: Vec<&[u8]> = directives.iter().map(Vec::as_slice).collect();
-        sorted.sort_unstable();
-        sorted.dedup();
-        Prefixes { sorted }
+struct Length {
+    len: usize,
+    power: u64,
+    hashes: Vec<(u64, usize)>,
+}
+
+impl<'a> Pickups<'a> {
+    fn of(directives: &'a [Vec<u8>], base: u64) -> Self {
+        let mut ids = HashMap::new();
+        let mut headings = Vec::new();
+        for directive in directives {
+            examined(directive.len());
+            ids.entry(directive.as_slice()).or_insert_with(|| {
+                headings.push(directive.as_slice());
+                headings.len() - 1
+            });
+        }
+        let mut by_len: BTreeMap<usize, Vec<(u64, usize)>> = BTreeMap::new();
+        for (id, heading) in headings.iter().enumerate() {
+            examined(heading.len());
+            let hash = heading.iter().fold(0, |hash, &byte| roll(hash, base, byte));
+            by_len.entry(heading.len()).or_default().push((hash, id));
+        }
+        let lengths = by_len
+            .into_iter()
+            .map(|(len, mut hashes)| {
+                hashes.sort_unstable();
+                Length {
+                    len,
+                    power: power(base, len),
+                    hashes,
+                }
+            })
+            .collect();
+        Pickups {
+            base,
+            ids,
+            picked: vec![false; headings.len()],
+            headings,
+            lengths,
+        }
     }
 
-    fn starting(&self, text: &[u8], mut found: impl FnMut(&'a [u8])) -> usize {
-        let (mut from, mut to) = (0, self.sorted.len());
-        let mut looked = 0;
-        for (at, byte) in text.iter().enumerate() {
-            let run = &self.sorted[from..to];
-            let mut next = |directive: &&[u8]| {
-                looked += 1;
-                directive.get(at).copied()
-            };
-            let start = run.partition_point(|directive| next(directive) < Some(*byte));
-            let end =
-                start + run[start..].partition_point(|directive| next(directive) == Some(*byte));
-            (from, to) = (from + start, from + end);
-            if from == to {
-                break;
-            }
-            if self.sorted[from].len() == at + 1 {
-                found(self.sorted[from]);
-            }
-        }
-        looked
+    fn picked(&self, directive: &[u8]) -> bool {
+        examined(directive.len());
+        self.ids.get(directive).is_some_and(|&id| self.picked[id])
     }
+
+    // A line's prefix hashes are made a block at a time, at most 1/64 of the line, and each
+    // pickup whose text would end in the block is checked against each length then, so a line
+    // costs an eighth of its size in hashes rather than eight times it.
+    fn scan(&mut self, line: &[u8]) {
+        let Pickups {
+            base,
+            headings,
+            picked,
+            lengths,
+            ..
+        } = self;
+        let starts: Vec<usize> = after_each(line, PICKED_UP)
+            .map(|rest| line.len() - rest.len())
+            .collect();
+        let fits = &lengths[..lengths.partition_point(|length| length.len <= line.len())];
+        let block = (line.len() / BLOCKS).max(MIN_BLOCK);
+        let mut next = vec![0; fits.len()];
+        let mut at_start = Vec::with_capacity(starts.len());
+        let mut prefix = Vec::with_capacity(block);
+        let mut hash = 0;
+        let mut first = 0;
+        while first <= line.len() {
+            let end = (first + block).min(line.len() + 1);
+            prefix.clear();
+            for &byte in &line[first..end.min(line.len())] {
+                prefix.push(hash);
+                hash = roll(hash, *base, byte);
+            }
+            if end > line.len() {
+                prefix.push(hash);
+            }
+            examined(end - first);
+            while let Some(&start) = starts.get(at_start.len()).filter(|&&start| start < end) {
+                at_start.push(prefix[start - first]);
+            }
+            for (length, next) in fits.iter().zip(&mut next) {
+                examined(1);
+                while let Some(&start) =
+                    starts.get(*next).filter(|&&start| start + length.len < end)
+                {
+                    let text = minus(
+                        prefix[start + length.len - first],
+                        times(at_start[*next], length.power),
+                    );
+                    pick(
+                        length,
+                        text,
+                        &line[start..start + length.len],
+                        headings,
+                        picked,
+                    );
+                    *next += 1;
+                }
+            }
+            first = end;
+        }
+    }
+}
+
+fn pick(length: &Length, hash: u64, text: &[u8], headings: &[&[u8]], picked: &mut [bool]) {
+    let from = length.hashes.partition_point(|&(other, _)| {
+        examined(1);
+        other < hash
+    });
+    for &(_, id) in length.hashes[from..].iter().take_while(|&&(other, _)| {
+        examined(1);
+        other == hash
+    }) {
+        if !picked[id] {
+            examined(text.len());
+            picked[id] = headings[id] == text;
+        }
+    }
+}
+
+// Drawn afresh by each tick, so no journal can be written to make two texts' hashes agree: two
+// different texts of length n agree for at most n of the 2^61 - 1 bases.
+fn random_base() -> u64 {
+    2 + RandomState::new().hash_one(()) % (MODULUS - 2)
+}
+
+fn reduce(sum: u64) -> u64 {
+    if sum >= MODULUS { sum - MODULUS } else { sum }
+}
+
+fn times(one: u64, other: u64) -> u64 {
+    let product = u128::from(one) * u128::from(other);
+    reduce((product as u64 & MODULUS) + (product >> 61) as u64)
+}
+
+fn minus(one: u64, other: u64) -> u64 {
+    reduce(one + MODULUS - other)
+}
+
+fn roll(hash: u64, base: u64, byte: u8) -> u64 {
+    reduce(times(hash, base) + u64::from(byte))
+}
+
+fn power(base: u64, mut exponent: usize) -> u64 {
+    let (mut power, mut square) = (1, base);
+    while exponent > 0 {
+        if exponent & 1 == 1 {
+            power = times(power, square);
+        }
+        square = times(square, square);
+        exponent >>= 1;
+    }
+    power
 }
 
 fn stamp_len(text: &[u8]) -> usize {
-    text.iter()
+    let len = text
+        .iter()
         .take_while(|byte| byte.is_ascii_digit() || b"TZ:-".contains(byte))
-        .count()
+        .count();
+    examined(len + 1);
+    len
 }
 
 fn is_directive(line: &[u8]) -> bool {
@@ -231,6 +394,48 @@ fn is_directive(line: &[u8]) -> bool {
     };
     let stamp = stamp_len(rest);
     stamp > 0 && rest[stamp..].starts_with(" — Owner directive:".as_bytes())
+}
+
+// What the readers looked at: bytes read, windows and stamps compared, hashes made and probed.
+// Tests bound it by the input's size, so work that grows faster than the input fails without a
+// clock.
+pub(crate) fn examined(count: usize) {
+    #[cfg(test)]
+    EXAMINED.with(|examined| examined.set(examined.get() + count));
+    #[cfg(not(test))]
+    let _ = count;
+}
+
+#[cfg(test)]
+thread_local! {
+    static EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn examining(body: impl FnOnce()) -> usize {
+    EXAMINED.with(|examined| examined.set(0));
+    body();
+    EXAMINED.with(std::cell::Cell::get)
+}
+
+// Each input at most `per_byte` times its size, and twice the input never more than 2.25 times
+// the work.
+#[cfg(test)]
+pub(crate) fn grows_with_its_input(shape: &str, sizes: &[usize], work: &[usize], per_byte: usize) {
+    for (size, work) in sizes.iter().zip(work) {
+        assert!(
+            *work <= per_byte * size,
+            "{shape}: {work} examined for {size} bytes"
+        );
+    }
+    for pair in work.windows(2) {
+        assert!(
+            4 * pair[1] <= 9 * pair[0],
+            "{shape}: twice the input took {} then {}",
+            pair[0],
+            pair[1]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -342,45 +547,6 @@ mod tests {
     }
 
     #[test]
-    fn directives_sharing_one_stamp_are_found_by_bytes_walked_not_by_their_number() {
-        for count in [1_000, 2_000, 4_000] {
-            let heading = |n: usize| format!("2026-11-25T04:05Z — Owner directive: item {n}");
-            let mut text = format!("## {STAMP} — s\n");
-            for n in 0..count {
-                text.push_str(&format!("## {}\n", heading(n)));
-            }
-            for n in 1..count {
-                text.push_str(&format!("{MARKER}{}\n", heading(n)));
-            }
-            assert_eq!(
-                listed(&text, STAMP),
-                Some(vec![format!("owner-directive: {}", heading(0))]),
-                "{count}"
-            );
-            let directives: Vec<Vec<u8>> = (0..count).map(|n| heading(n).into_bytes()).collect();
-            let index = Prefixes::of(&directives);
-            let bits = (usize::BITS - count.leading_zeros()) as usize;
-            for n in 1..count {
-                let pickup = heading(n);
-                let mut found = Vec::new();
-                let looked = index.starting(pickup.as_bytes(), |directive| found.push(directive));
-                let mut starts: Vec<&[u8]> = directives
-                    .iter()
-                    .map(Vec::as_slice)
-                    .filter(|directive| pickup.as_bytes().starts_with(directive))
-                    .collect();
-                starts.sort_unstable();
-                found.sort_unstable();
-                assert_eq!(found, starts, "{count}: {pickup}");
-                assert!(
-                    looked <= 2 * pickup.len() * (bits + 1),
-                    "{count}: {pickup} looked at {looked} directives"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn a_directive_heading_is_a_stamp_of_digits_t_z_colons_and_hyphens() {
         for yes in [
             "## 2026-11-25T04:05Z — Owner directive: x",
@@ -417,5 +583,376 @@ mod tests {
             ["a", "", "c\tz"]
         );
         assert_eq!(fields("Handoff: xstamp_entry=a"), Vec::<String>::new());
+    }
+
+    const BASE: u64 = 0x0123_4567_89ab_cdef % MODULUS;
+
+    const SIZES: [usize; 3] = [1 << 14, 1 << 15, 1 << 16];
+
+    fn repeated(unit: &str, size: usize) -> String {
+        unit.repeat(size / unit.len() + 1)
+    }
+
+    fn below_stamp(body: impl AsRef<[u8]>) -> Vec<u8> {
+        [format!("## {STAMP} — s\n").as_bytes(), body.as_ref()].concat()
+    }
+
+    fn numbered(count: usize, line: impl Fn(usize) -> String) -> String {
+        (0..count).map(line).collect()
+    }
+
+    const UNIT: &str = "— Directive picked up: 1 — Owner directive: x ";
+
+    const OVERLAP: &str = "— Directive picked up: 1 — Owner directive: ";
+
+    type Shape = (&'static str, fn(usize) -> Vec<u8>);
+
+    const JOURNALS: [Shape; 12] = [
+        (
+            "a heading that is its whole line, picked up again and again inside itself",
+            |size| {
+                below_stamp(format!(
+                    "## 1 — Owner directive: x {}\n",
+                    repeated(UNIT, size)
+                ))
+            },
+        ),
+        (
+            "two such headings, the shorter of which fits after each pickup",
+            |size| {
+                below_stamp(format!(
+                    "## 1 — Owner directive: x {}\n## 1 — Owner directive: x {}y\n",
+                    repeated(UNIT, size / 2),
+                    repeated(UNIT, size / 4)
+                ))
+            },
+        ),
+        (
+            "many short directives sharing one stamp, each but the first picked up",
+            |size| {
+                let count = size / 100;
+                let heading = |n| format!("2026-11-25T04:05Z — Owner directive: item {n}");
+                below_stamp(
+                    numbered(count, |n| format!("## {}\n", heading(n)))
+                        + &numbered(count, |n| format!("{MARKER}{}\n", heading(n + 1))),
+                )
+            },
+        ),
+        (
+            "a heading that fits after each of the pickups that overlap it",
+            |size| {
+                below_stamp(format!(
+                    "## 1 — Owner directive: x {}\n## 1 — Owner directive: x {}\n",
+                    repeated(UNIT, size / 2),
+                    repeated(UNIT, size / 4)
+                ))
+            },
+        ),
+        (
+            "eight headings, each a prefix of the next, under pickups of the fourth",
+            |size| {
+                let heading =
+                    |n: usize| format!("1 — Owner directive: {}", "x".repeat(n * size / 32));
+                below_stamp(
+                    numbered(8, |n| format!("## {}\n", heading(n + 1)))
+                        + &numbered(4, |_| format!("{MARKER}{}\n", heading(4))),
+                )
+            },
+        ),
+        ("headings that hold a pickup of a shorter heading", |size| {
+            below_stamp(numbered(size / 120, |n| {
+                format!(
+                    "## 1 — Owner directive: a{n}\n## 1 — Owner directive: b{n} {MARKER}1 — Owner directive: a{}\n",
+                    n / 2 * 2
+                )
+            }))
+        }),
+        (
+            "pickups that overlap a heading they agree with to its last byte",
+            |size| {
+                below_stamp(format!(
+                    "## 1 — Owner directive: {}z\n{}\n",
+                    repeated(OVERLAP, size / 2),
+                    repeated(OVERLAP, size / 2)
+                ))
+            },
+        ),
+        ("a heading the size of the journal and no pickup", |size| {
+            below_stamp(format!("## 1 — Owner directive: {}\n", "x".repeat(size)))
+        }),
+        (
+            "CRLF line ends and NUL bytes in headings and pickups",
+            |size| {
+                below_stamp(numbered(size / 70, |n| {
+                    format!(
+                        "## 1 — Owner directive: a\0{n}\r\n{MARKER}1 — Owner directive: a\0{}\r\n",
+                        n / 2 * 2
+                    )
+                }))
+            },
+        ),
+        ("pickups under headings of thirty-two lengths", |size| {
+            let heading = |n: usize| format!("1 — Owner directive: {}", "y".repeat(n));
+            below_stamp(
+                numbered(32, |n| format!("## {}\n", heading(n)))
+                    + &repeated(&format!("{MARKER}{} ", heading(16)), size)
+                    + "\n",
+            )
+        }),
+        ("a line of nothing but pickup markers", |size| {
+            below_stamp(format!(
+                "## 1 — Owner directive: q\n{}\n",
+                repeated(MARKER, size)
+            ))
+        }),
+        ("a line of near misses of the marker", |size| {
+            below_stamp(format!(
+                "## 1 — Owner directive: q\n{}\n",
+                repeated("— Directive picked up:", size)
+            ))
+        }),
+    ];
+
+    #[test]
+    fn every_journal_shape_costs_work_in_proportion_to_its_bytes() {
+        for (shape, journal) in JOURNALS {
+            let texts: Vec<Vec<u8>> = SIZES.iter().map(|&size| journal(size)).collect();
+            let work: Vec<usize> = texts
+                .iter()
+                .map(|text| {
+                    examining(|| {
+                        unpicked_by(text.as_slice(), STAMP.as_bytes(), BASE).unwrap();
+                    })
+                })
+                .collect();
+            let sizes: Vec<usize> = texts.iter().map(Vec::len).collect();
+            grows_with_its_input(shape, &sizes, &work, 16);
+            assert_eq!(
+                unpicked_by(texts[0].as_slice(), STAMP.as_bytes(), BASE).unwrap(),
+                grep_f_per_directive(&texts[0], STAMP.as_bytes()),
+                "{shape}"
+            );
+        }
+    }
+
+    type Handoff = (&'static str, fn(usize) -> String);
+
+    const HANDOFFS: [Handoff; 7] = [
+        ("Handoff lines naming one stamp", |size| {
+            repeated(
+                "Handoff: epoch=e role=coordinator stamp_entry=2026-11-19T17:38Z\n",
+                size,
+            )
+        }),
+        ("Handoff lines naming a different stamp each", |size| {
+            numbered(size / 40, |n| {
+                format!("Handoff: stamp_entry=2026-11-19T17:38Z-{n}\n")
+            })
+        }),
+        ("one Handoff line of many stamp fields", |size| {
+            format!("Handoff:{}\n", repeated(" stamp_entry=a", size))
+        }),
+        ("a stamp field as long as the handoff", |size| {
+            format!("Handoff: stamp_entry={}\n", "x".repeat(size))
+        }),
+        ("stamp fields outside Handoff lines", |size| {
+            repeated(" stamp_entry=2026-11-19T17:38Z\n", size)
+        }),
+        ("a Handoff line of near misses of the stamp field", |size| {
+            format!("Handoff: {}\n", repeated(" stamp_entr", size))
+        }),
+        ("CRLF line ends and NUL bytes", |size| {
+            repeated("Handoff: stamp_entry=a\0b\r\n", size)
+        }),
+    ];
+
+    // Reading is linear; ordering the distinct stamps, as `sort -u` did, takes up to about
+    // log2 of their number comparisons each, each comparing at most the shorter stamp.
+    #[test]
+    fn every_handoff_shape_is_read_in_proportion_to_its_bytes_and_sorted_as_sort_u_sorts() {
+        for (shape, handoff) in HANDOFFS {
+            let texts: Vec<String> = SIZES.iter().map(|&size| handoff(size)).collect();
+            let mut found = Vec::new();
+            let work: Vec<usize> = texts
+                .iter()
+                .map(|text| {
+                    let mut stamps = HashSet::new();
+                    let work = examining(|| stamps_in(text.as_bytes(), &mut stamps).unwrap());
+                    found.push(stamps);
+                    work
+                })
+                .collect();
+            let sizes: Vec<usize> = texts.iter().map(String::len).collect();
+            grows_with_its_input(shape, &sizes, &work, 4);
+            for stamps in found {
+                let count = stamps.len();
+                let bytes: usize = stamps.iter().map(|stamp| stamp.len() + 1).sum();
+                let log = (usize::BITS - count.leading_zeros()) as usize;
+                let work = examining(|| drop(sorted(stamps)));
+                assert!(
+                    work <= 4 * bytes * (log + 1),
+                    "{shape}: {work} examined to sort {count} stamps of {bytes} bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stamps_are_listed_once_each_in_byte_order() {
+        let mut found = HashSet::new();
+        stamps_in(
+            "Handoff: stamp_entry=b\nHandoff: stamp_entry=a stamp_entry=b\nHandoff: stamp_entry=none stamp_entry= x\nHandoff: stamp_entry=é\nHandoff: stamp_entry=B\n"
+                .as_bytes(),
+            &mut found,
+        )
+        .unwrap();
+        assert_eq!(sorted(found), [&b"B"[..], b"a", b"b", "\u{e9}".as_bytes()]);
+    }
+
+    #[test]
+    fn a_hash_match_counts_only_when_the_bytes_agree_and_every_heading_with_that_hash_is_tried() {
+        let one = "1 — Owner directive: ";
+        for (base, first, second) in [(1, "ab", "ba"), (0, "xa", "ya")] {
+            let text = below_stamp(format!(
+                "## {one}{first}\n## {one}{second}\n{MARKER}{one}{second}\n"
+            ));
+            assert_eq!(
+                unpicked_by(text.as_slice(), STAMP.as_bytes(), base).unwrap(),
+                Some(vec![format!("owner-directive: {one}{first}")]),
+                "base {base}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pickup_is_matched_whether_its_text_ends_inside_a_block_on_its_edge_or_at_its_line_s_end() {
+        let heading = "1 — Owner directive: h";
+        let reach = MARKER.len() + heading.len();
+        for line in [3 * MIN_BLOCK, BLOCKS * MIN_BLOCK + 7 * BLOCKS] {
+            let block = (line / BLOCKS).max(MIN_BLOCK);
+            let edges = [block, 2 * block, line];
+            for end in edges.into_iter().flat_map(|edge| edge - 5..=edge + 2) {
+                if end > line {
+                    continue;
+                }
+                let pad = "p".repeat(end - reach);
+                let tail = "q".repeat(line - end);
+                let text = below_stamp(format!(
+                    "## {heading}\n## {heading}z\n{pad}{MARKER}{heading}{tail}\n{pad}{MARKER}{}{tail}\n",
+                    &heading[..heading.len() - 1]
+                ));
+                assert_eq!(
+                    unpicked_by(text.as_slice(), STAMP.as_bytes(), BASE).unwrap(),
+                    Some(vec![format!("owner-directive: {heading}z")]),
+                    "a pickup ending at {end} of a {line}-byte line, in blocks of {block}"
+                );
+            }
+        }
+    }
+
+    // Each owner directive below the first stamp heading is listed unless some line holds the
+    // marker followed by its heading: heartbeat.sh's grep pipeline, one `grep -cF` per directive.
+    fn grep_f_per_directive<'a>(journal: &'a [u8], stamp: &[u8]) -> Option<Vec<String>> {
+        let lines: Vec<&[u8]> = journal.split(|byte| *byte == b'\n').collect();
+        let heading = [b"## ", stamp, b" "].concat();
+        let at = lines.iter().position(|line| line.starts_with(&heading))?;
+        let stamped = |line: &&'a [u8]| -> Option<&'a [u8]> {
+            let rest = line.strip_prefix(b"## ")?;
+            let stamp = rest
+                .iter()
+                .position(|byte| !(byte.is_ascii_digit() || b"TZ:-".contains(byte)))
+                .unwrap_or(rest.len());
+            (stamp > 0 && rest[stamp..].starts_with(" — Owner directive:".as_bytes()))
+                .then_some(rest)
+        };
+        let unpicked = |heading: &&[u8]| {
+            let pattern = [MARKER.as_bytes(), heading].concat();
+            !lines
+                .iter()
+                .any(|line| line.windows(pattern.len()).any(|window| window == pattern))
+        };
+        Some(
+            lines[at + 1..]
+                .iter()
+                .filter_map(stamped)
+                .filter(unpicked)
+                .map(|heading| format!("owner-directive: {}", String::from_utf8_lossy(heading)))
+                .collect(),
+        )
+    }
+
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound as u64) as usize
+        }
+    }
+
+    const TOKENS: [&str; 18] = [
+        "## ",
+        "1",
+        "1 ",
+        "12",
+        " — Owner directive:",
+        " — Owner directive: ",
+        "x",
+        "y",
+        MARKER,
+        MARKER,
+        "— Directive picked up:",
+        "\n",
+        "\n",
+        "\n## 1 — Owner directive: x",
+        "\r",
+        "\0",
+        "—",
+        " ",
+    ];
+
+    // Two million journals in all, a quarter per test so they run side by side: under a fresh
+    // random base, and under bases 0, 1 and 2, whose hashes agree for many different texts.
+    fn random_journals_match_one_grep_f_per_directive(seed: u64, base: impl Fn() -> u64) {
+        let mut random = Xorshift(seed);
+        for _ in 0..500_000 {
+            let mut text = String::new();
+            if random.below(4) > 0 {
+                text.push_str("## 1 \n");
+            }
+            for _ in 0..random.below(28) {
+                text.push_str(TOKENS[random.below(TOKENS.len())]);
+            }
+            let base = base();
+            assert_eq!(
+                unpicked_by(text.as_bytes(), b"1", base).unwrap(),
+                grep_f_per_directive(text.as_bytes(), b"1"),
+                "base {base}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn random_journals_list_what_one_grep_f_per_directive_lists_under_a_random_base() {
+        random_journals_match_one_grep_f_per_directive(0x9e37_79b9_7f4a_7c15, random_base);
+    }
+
+    #[test]
+    fn random_journals_list_what_one_grep_f_per_directive_lists_under_base_0_which_hashes_the_last_byte()
+     {
+        random_journals_match_one_grep_f_per_directive(0x2545_f491_4f6c_dd1d, || 0);
+    }
+
+    #[test]
+    fn random_journals_list_what_one_grep_f_per_directive_lists_under_base_1_which_sums_the_bytes()
+    {
+        random_journals_match_one_grep_f_per_directive(0xd1b5_4a32_d192_ed03, || 1);
+    }
+
+    #[test]
+    fn random_journals_list_what_one_grep_f_per_directive_lists_under_base_2() {
+        random_journals_match_one_grep_f_per_directive(0x8cb9_2ba7_2f3d_8dd7, || 2);
     }
 }
