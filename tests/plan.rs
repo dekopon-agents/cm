@@ -525,6 +525,12 @@ fn card_rechecks_unmet_until_blocks_and_unblocks_satisfied_or_free_text_blocks()
     ] {
         let c = campaign(&host);
         assert!(declare(&host, &c, "01-a/u/park", Lane::Codex, &[]).ok());
+        // A block names an open item; the case's queue then shows it open or answered.
+        fs::write(
+            c.root.join("OWNER-QUEUE.md"),
+            "# Owner queue\n\n## 1. Decision\n",
+        )
+        .unwrap();
         assert!(
             advance(
                 &host,
@@ -4711,6 +4717,11 @@ fn blocked_until_epoch_reads_crlf_and_requires_an_exact_closing_delimiter() {
 fn blocked_until_epoch_and_removed_owner_heading_use_current_files() {
     let host = at("2026-10-17T08:00:00Z");
     let c = campaign(&host);
+    fs::write(
+        c.root.join("OWNER-QUEUE.md"),
+        "# Owner queue\n\n## 2. Decision\n",
+    )
+    .unwrap();
     for (target, condition) in [
         ("01-a/u/epoch", "epoch:WORKING"),
         ("01-a/u/owner", "owner-queue:2"),
@@ -7959,4 +7970,450 @@ fn a_pi_or_undeclared_lane_pr_is_merge_ready_after_one_verdict() {
         assert!(recorded.ok(), "{step}: {:?}", recorded.violations);
     }
     assert_eq!(kinds(), [ready("01-a/u/local"), ready("01-a/u/loose")]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_now_unit_sorts_first_in_next_act_and_the_card() {
+    let host = at("2026-11-22T10:00:00Z");
+    let c = campaign(&host);
+    for step in ["01-a/u/first", "01-b/v/second"] {
+        assert!(declare(&host, &c, step, Lane::ClaudeCloud, &[]).ok());
+        kickoff(&c, step);
+    }
+    let order = |c: &Campaign| {
+        let next = plan::next_at(&c.root, None, None, host.now).unwrap();
+        let steps: Vec<String> = next.fields["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["target"].as_str().unwrap().to_owned())
+            .collect();
+        let actions: Vec<String> = next.fields["actionable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|action| action["target"].as_str().unwrap().to_owned())
+            .collect();
+        (steps, actions)
+    };
+    let amend = |target: &str, priority: cm::state::Priority| {
+        commands::amend(
+            &host,
+            &c.root,
+            &parse_target(target, false).unwrap(),
+            &commands::Amendment {
+                priority: Some(priority),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let alphabetical = vec!["01-a/u/first".to_owned(), "01-b/v/second".to_owned()];
+    assert_eq!(order(&c), (alphabetical.clone(), alphabetical.clone()));
+    let amended = amend("01-b/v", cm::state::Priority::Now);
+    assert!(amended.ok(), "{:?}", amended.violations);
+    assert_eq!(amended.fields["changes"][0], "priority whenever → now");
+    let now_first = vec!["01-b/v/second".to_owned(), "01-a/u/first".to_owned()];
+    assert_eq!(order(&c), (now_first.clone(), now_first));
+    assert_eq!(
+        rules(&amend("01-b/v", cm::state::Priority::Now)),
+        ["amend-empty"]
+    );
+    // Beside step flags, --priority rides along with the step's amendment; a unit takes no
+    // step flags.
+    let both = commands::amend(
+        &host,
+        &c.root,
+        &parse_target("01-a/u/first", true).unwrap(),
+        &commands::Amendment {
+            lane: Some(Lane::Codex),
+            priority: Some(cm::state::Priority::Now),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(both.ok(), "{:?}", both.violations);
+    assert_eq!(
+        both.fields["changes"].as_array().unwrap().last().unwrap(),
+        "priority whenever → now"
+    );
+    let unit_flags = commands::amend(
+        &host,
+        &c.root,
+        &parse_target("01-b/v", false).unwrap(),
+        &commands::Amendment {
+            lane: Some(Lane::Codex),
+            priority: Some(cm::state::Priority::Whenever),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(rules(&unit_flags), ["amend-target"]);
+    // --priority alone on a step amends its unit.
+    let alone = amend("01-a/u/first", cm::state::Priority::Whenever);
+    assert!(alone.ok(), "{:?}", alone.violations);
+    assert_eq!(alone.fields["target"], "01-a/u");
+    let act = coordinator_cm(&c, &["next", "--act"]).output().unwrap();
+    let act = String::from_utf8(act.stdout).unwrap();
+    assert!(
+        act.lines().next().unwrap().contains("01-b/v/second"),
+        "{act}"
+    );
+    let synced = sync(&host, &FakeForge::default(), &c.root).unwrap();
+    assert!(synced.ok(), "{:?}", synced.violations);
+    let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+    let next = card.split_once("## Next\n\n").unwrap().1;
+    assert!(next.starts_with("1. `01-b/v/second`"), "{card}");
+    assert!(
+        fs::read_to_string(c.root.join("JOURNAL.md"))
+            .unwrap()
+            .contains("amend 01-b/v")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn card_guarantee_lines_name_the_oldest_of_each_wait() {
+    let old = at("2026-11-22T08:00:00Z");
+    let host = at("2026-11-22T16:00:00Z");
+    let c = campaign(&old);
+    for (release, repo) in [
+        ("00-release/widget/1.0.0", "o/widget"),
+        ("00-release/gadget/1.0.0", "o/gadget"),
+    ] {
+        assert!(declare_release(&old, &c, release, repo, "v{version}").ok());
+        set_track(&old, &c, release, Phase::Released, Evidence::default());
+    }
+    assert!(declare(&old, &c, "01-a/u/one", Lane::Codex, &[]).ok());
+    set_track(
+        &old,
+        &c,
+        "01-a/u/one",
+        Phase::Merged,
+        Evidence {
+            pr: Some("https://github.com/o/widget/pull/1".into()),
+            sha: Some("a".repeat(40)),
+            merged_at: Some("2026-11-22T09:00:00Z".into()),
+            ..Evidence::default()
+        },
+    );
+    for (pin, gate) in [
+        ("01-a/u/widget-pin", "tag:widget@1.0.0"),
+        ("01-a/u/gadget-pin", "tag:gadget@1.0.0"),
+    ] {
+        assert!(declare_work(&old, &c, pin, Lane::Coordinator, &[gate], Work::Rollout).ok());
+    }
+    set_track(
+        &old,
+        &c,
+        "01-a/u/widget-pin",
+        Phase::Deployed,
+        Evidence::default(),
+    );
+    assert!(declare(&old, &c, "01-a/u/open", Lane::ClaudeCloud, &[]).ok());
+    launch_for(&old, &c, "01-a/u/open", "session_current");
+    assert!(declare(&old, &c, "01-a/u/ready", Lane::ClaudeCloud, &[]).ok());
+    kickoff(&c, "01-a/u/ready");
+    sync(&host, &FakeForge::default(), &c.root).unwrap();
+    let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+    let lines: Vec<&str> = card
+        .lines()
+        .skip_while(|line| !line.starts_with("Actionable: "))
+        .skip(1)
+        .take(6)
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "Deployed in 24 h: 1 (last: 2026-11-22T08:00Z)",
+            "Oldest open code card: 01-a/u/open since 2026-11-22T08:00Z",
+            "Oldest merge-ready: —",
+            "Oldest unreleased merge: 01-a/u/one since 2026-11-22T09:00:00Z",
+            "Oldest undeployed tag: gadget@1.0.0 since 2026-11-22T08:00Z",
+            "Launchable at sync: 1 (oldest: 2026-11-22T08:00Z)",
+        ],
+        "{card}"
+    );
+    // `last` is the newest deploy ever, not the newest inside the window.
+    sync(&at("2026-11-25T16:00:00Z"), &FakeForge::default(), &c.root).unwrap();
+    let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+    assert!(
+        card.lines()
+            .any(|line| line == "Deployed in 24 h: 0 (last: 2026-11-22T08:00Z)"),
+        "{card}"
+    );
+}
+
+#[test]
+fn weight_is_simple_only_when_the_checklist_holds() {
+    use cm::plan::{Weight, weight_check};
+    let line = |text: &str| weight_check(&format!("# Kickoff\n\n{text}\n\nGo.\n"));
+    for simple in [
+        "Weight: simple — repos: dekopon; files: 3; surface: none",
+        "- weight: Simple - repos: `dekopon`; files: src/a.rs, src/b.rs; surface: `none`",
+        "WEIGHT: simple: repos: dekopon; files: 2 files; surface: None",
+    ] {
+        assert_eq!(line(simple), Ok(Weight::Simple), "{simple}");
+    }
+    for complex in [
+        "Weight: complex — repos: dekopon; files: 1; surface: none",
+        "Weight: complex — repos: dekopon, cm; files: 12 files; surface: auth",
+        "No weight line.",
+    ] {
+        assert_eq!(line(complex), Ok(Weight::Complex), "{complex}");
+    }
+    for (contradicted, why) in [
+        (
+            "Weight: simple — repos: dekopon, cm; files: 1; surface: none",
+            "2 repo(s)",
+        ),
+        (
+            "Weight: simple — repos: dekopon; files: 12; surface: none",
+            "12 file(s)",
+        ),
+        (
+            "Weight: simple — repos: dekopon; files: 4 files; surface: none",
+            "4 file(s)",
+        ),
+        (
+            "Weight: simple — repos: dekopon; files: ; surface: none",
+            "no file(s)",
+        ),
+        (
+            "Weight: simple — repos: dekopon; files: 1; surface: auth",
+            "surface auth",
+        ),
+    ] {
+        let refused = line(contradicted).unwrap_err();
+        assert_eq!(refused.rule, "weight-contradiction", "{contradicted}");
+        assert!(refused.message.contains(why), "{}", refused.message);
+    }
+    for malformed in [
+        "Weight: simple",
+        "Weight: easy — repos: dekopon; files: 1; surface: none",
+        "Weight: simple — repos: dekopon; files: 1",
+        "Weight: simple repos: dekopon; files: 1; surface: none",
+    ] {
+        assert_eq!(
+            line(malformed).unwrap_err().rule,
+            "weight-malformed",
+            "{malformed}"
+        );
+    }
+}
+
+#[test]
+fn kickoff_files_and_lint_refuse_a_weight_line_by_code() {
+    let host = at("2026-11-22T10:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/card", Lane::Codex, &[]).ok());
+    let amend = |kickoff: &str| {
+        commands::amend(
+            &host,
+            &c.root,
+            &parse_target("01-a/u/card", true).unwrap(),
+            &commands::Amendment {
+                kickoff: Some(kickoff.to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let contradicted = "Go.\n\nWeight: simple — repos: dekopon, cm; files: 1; surface: none\n";
+    assert_eq!(rules(&amend(contradicted)), ["weight-contradiction"]);
+    assert!(amend("Go.\n\nWeight: simple — repos: dekopon; files: 1; surface: none\n").ok());
+    let next = plan::next_at(&c.root, None, None, host.now).unwrap();
+    assert_eq!(next.fields["steps"][0]["weight"], "simple");
+    // A hand edit is caught by lint, by the same code.
+    fs::write(
+        c.root.join("01-a/u/card/kickoff.md"),
+        "Go.\n\nWeight: simple — repos: dekopon\n",
+    )
+    .unwrap();
+    let linted = lint(&c.root).unwrap();
+    assert!(
+        linted
+            .violations
+            .iter()
+            .any(|v| v.rule == "weight-malformed" && v.path == "01-a/u/card"),
+        "{:?}",
+        linted.violations
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_owner_queue_block_names_an_open_item_and_add_block_files_and_blocks_in_one_write() {
+    let host = at("2026-11-25T02:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/park", Lane::Codex, &[]).ok());
+    let queue = c.root.join("OWNER-QUEUE.md");
+    // A number guessed from the journal names no open item.
+    assert_eq!(
+        rules(&advance(
+            &host,
+            &c,
+            "01-a/u/park",
+            "blocked:until:owner-queue:31",
+            Evidence::default()
+        )),
+        ["owner-queue-not-open"]
+    );
+    let item = cm::ledger::QueueItem {
+        title: "Chart termination",
+        context: "the broker quotes a token on a parse error",
+        question: "Redact it in the chart?",
+        recommendation: "yes",
+    };
+    // A step that cannot block refuses the whole command: no item is filed.
+    let before = fs::read_to_string(&queue).unwrap();
+    let refused = cm::ledger::owner_queue_add_blocking(
+        &host,
+        &c.root,
+        &item,
+        Some(&parse_target("01-a/u/missing", true).unwrap()),
+    )
+    .unwrap();
+    assert!(!refused.ok());
+    assert_eq!(fs::read_to_string(&queue).unwrap(), before);
+    let filed = cm::ledger::owner_queue_add_blocking(
+        &host,
+        &c.root,
+        &item,
+        Some(&parse_target("01-a/u/park", true).unwrap()),
+    )
+    .unwrap();
+    assert!(filed.ok(), "{:?}", filed.violations);
+    assert_eq!(filed.fields["item"], 1);
+    assert!(
+        fs::read_to_string(&queue)
+            .unwrap()
+            .contains("## 1. Chart termination\n")
+    );
+    assert_eq!(
+        state(&c, "01-a/u/park"),
+        Phase::Blocked("until:owner-queue:1".into())
+    );
+    let linted = |c: &Campaign| {
+        lint(&c.root)
+            .unwrap()
+            .violations
+            .into_iter()
+            .filter(|v| v.rule.starts_with("owner-queue-"))
+            .map(|v| (v.rule, v.path))
+            .collect::<Vec<_>>()
+    };
+    assert!(linted(&c).is_empty());
+    // The answer arrives after the block: the block holds and is met, not dangling.
+    let answered =
+        cm::ledger::owner_queue_answer(&at("2026-11-25T03:00:00Z"), &c.root, 1, "Redact it.")
+            .unwrap();
+    assert!(answered.ok(), "{:?}", answered.violations);
+    assert!(linted(&c).is_empty());
+    // A block written after its item closed holds nothing; a hand-written heading is not cm's.
+    set_track(
+        &at("2026-11-25T04:00:00Z"),
+        &c,
+        "01-a/u/park",
+        Phase::Blocked("until:owner-queue:1".into()),
+        Evidence::default(),
+    );
+    let text = fs::read_to_string(&queue).unwrap();
+    fs::write(
+        &queue,
+        format!("{text}\n## Chart termination (item 1)\n\nContext: x\nQuestion?\nRecommendation: y\nAnswer:\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        linted(&c),
+        [
+            ("owner-queue-heading", "OWNER-QUEUE.md".to_owned()),
+            ("owner-queue-dangling", "01-a/u/park".to_owned()),
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_owner_queue_number_past_u32_is_refused_by_the_one_item_parser() {
+    let host = at("2026-11-25T02:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/park", Lane::Codex, &[]).ok());
+    let refused = commands::advance(
+        &host,
+        &c.root,
+        &parse_target("01-a/u/park", true).unwrap(),
+        &Phase::Blocked("until:owner-queue:4294967296".into()),
+        &Evidence::default(),
+        None,
+        None,
+    );
+    assert!(
+        refused
+            .unwrap_err()
+            .to_string()
+            .contains("positive item number")
+    );
+    assert_eq!(state(&c, "01-a/u/park"), Phase::Drafted);
+    // State written by hand with such a number does not even load: the one parser refuses it.
+    set_track(
+        &host,
+        &c,
+        "01-a/u/park",
+        Phase::Blocked("until:owner-queue:4294967296".into()),
+        Evidence::default(),
+    );
+    let linted = lint(&c.root).unwrap();
+    assert!(
+        linted
+            .violations
+            .iter()
+            .any(|v| v.rule == "state-parse" && v.message.contains("positive item number")),
+        "{:?}",
+        linted.violations
+    );
+    assert!(plan::next_at(&c.root, None, None, host.now).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn one_parts_merge_is_not_its_steps_deploy() {
+    let host = at("2026-11-22T16:00:00Z");
+    let c = campaign(&host);
+    assert!(
+        declare_work(
+            &host,
+            &c,
+            "01-a/u/pin",
+            Lane::Coordinator,
+            &[],
+            Work::Rollout
+        )
+        .ok()
+    );
+    let moved = |target: &str| {
+        let dir = c.root.join("01-a/u");
+        let mut unit = store::load_unit(&dir).unwrap();
+        unit.history.push(cm::state::Move {
+            at: "2026-11-22T15:00Z".into(),
+            target: target.to_owned(),
+            from: Phase::PrOpen,
+            to: Phase::Merged,
+            evidence: Evidence::default(),
+        });
+        commands::write_unit(&dir, &unit).unwrap();
+        sync(&host, &FakeForge::default(), &c.root).unwrap();
+        fs::read_to_string(c.root.join("CARD.md"))
+            .unwrap()
+            .lines()
+            .find(|line| line.starts_with("Deployed in 24 h: "))
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(moved("01-a/u/pin#a"), "Deployed in 24 h: 0 (last: —)");
+    assert_eq!(
+        moved("01-a/u/pin"),
+        "Deployed in 24 h: 1 (last: 2026-11-22T15:00Z)"
+    );
 }

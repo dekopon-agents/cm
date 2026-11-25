@@ -387,6 +387,139 @@ fn item_number(text: &str) -> Option<u32> {
     text.split_once(". ")?.0.parse().ok()
 }
 
+/// An owner-queue item number: ASCII digits naming a positive `u32`. The one parser for queue
+/// headings, `owner-queue:N` block conditions, their checks and their lint.
+pub(crate) fn queue_item_number(text: &str) -> Option<u32> {
+    (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| text.parse::<u32>().ok())
+        .flatten()
+        .filter(|number| *number > 0)
+}
+
+/// A second-level OWNER-QUEUE.md heading in cm's `N. <title>` form.
+fn item_heading(text: &str) -> Option<u32> {
+    let (number, title) = text.split_once(". ")?;
+    queue_item_number(number).filter(|_| !title.trim().is_empty())
+}
+
+/// The numbers of the items open in OWNER-QUEUE.md.
+pub(crate) fn open_items(root: &Path) -> std::collections::BTreeSet<u32> {
+    fs::read_to_string(root.join(QUEUE_FILE))
+        .map(|text| {
+            headings(&text)
+                .iter()
+                .filter(|heading| heading.level == 2)
+                .filter_map(|heading| item_heading(heading.text))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// When each owner-queue item was answered or struck, from the journal's titles.
+fn closed_items(root: &Path) -> std::collections::BTreeMap<u32, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(text) = fs::read_to_string(root.join(store::JOURNAL)) else {
+        return out;
+    };
+    for line in text.lines().filter(|line| journal::is_stamped(line)) {
+        let Some((stamp, title)) = line
+            .strip_prefix("## ")
+            .and_then(|line| line.split_once(" — "))
+        else {
+            continue;
+        };
+        if let Some((action, item)) = title
+            .strip_prefix("owner-queue ")
+            .and_then(|text| text.split_once(' '))
+            && matches!(action, "answer" | "strike")
+            && let Some(number) = item_number(item)
+        {
+            out.insert(number, stamp.to_owned());
+        }
+    }
+    out
+}
+
+/// OWNER-QUEUE.md's items are cm's `## N. <title>` headings with unique numbers
+/// (`owner-queue-heading`), and every `blocked:until:owner-queue:N` names an item that is open
+/// or was closed after the block (`owner-queue-dangling`): one closed before it, or never
+/// filed, holds nothing.
+pub(crate) fn lint_owner_queue_items(root: &Path, units: &crate::plan::Units) -> Vec<Violation> {
+    let mut out = Vec::new();
+    if let Ok(text) = fs::read_to_string(root.join(QUEUE_FILE)) {
+        let mut seen = HashSet::new();
+        for heading in headings(&text).iter().filter(|heading| heading.level == 2) {
+            match item_heading(heading.text) {
+                None => out.push(
+                    Violation::new(
+                        QUEUE_FILE,
+                        "owner-queue-heading",
+                        format!(
+                            "`## {}` is not cm's `## N. <title>`; file items with `cm owner-queue add`",
+                            heading.text
+                        ),
+                    )
+                    .at(heading.line),
+                ),
+                Some(number) if !seen.insert(number) => out.push(
+                    Violation::new(
+                        QUEUE_FILE,
+                        "owner-queue-heading",
+                        format!("item {number} appears more than once"),
+                    )
+                    .at(heading.line),
+                ),
+                Some(_) => {}
+            }
+        }
+    }
+    let open = open_items(root);
+    let closed = closed_items(root);
+    for (unit_name, unit) in units {
+        for (name, step) in &unit.steps {
+            let tracks = std::iter::once((None, &step.track))
+                .chain(step.parts.iter().map(|(part, track)| (Some(part), track)));
+            for (part, track) in tracks {
+                let crate::state::Phase::Blocked(reason) = &track.state else {
+                    continue;
+                };
+                let Some(text) = reason.strip_prefix("until:owner-queue:") else {
+                    continue;
+                };
+                let target = part.map_or_else(
+                    || format!("{unit_name}/{name}"),
+                    |part| format!("{unit_name}/{name}#{part}"),
+                );
+                let Some(number) = queue_item_number(text) else {
+                    out.push(Violation::new(
+                        &target,
+                        "owner-queue-dangling",
+                        format!(
+                            "blocked:{reason} names no item: `{text}` is not a positive item number"
+                        ),
+                    ));
+                    continue;
+                };
+                let since = crate::plan::instant(&track.since);
+                let why = match closed.get(&number) {
+                    _ if open.contains(&number) => continue,
+                    Some(at) if crate::plan::instant(at) >= since => continue,
+                    Some(at) => format!("item {number} was closed at {at}, before the block"),
+                    None => format!("item {number} was never filed"),
+                };
+                out.push(Violation::new(
+                    &target,
+                    "owner-queue-dangling",
+                    format!(
+                        "blocked:{reason} holds nothing: {why}; file the question with `cm owner-queue add <title> … --block {unit_name}/{name}`"
+                    ),
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// The RESUME.md banner with its fenced `/loop` replaced by the withheld line; `Ok(None)` when it
 /// already carries that line, `Err` when RESUME.md opens with no `>` banner.
 fn withhold(resume: &str) -> Result<Option<String>, ()> {
@@ -435,8 +568,54 @@ pub struct QueueItem<'a> {
 }
 
 pub fn owner_queue_add(host: &dyn Host, root: &Path, item: &QueueItem) -> Result<Outcome> {
+    owner_queue_add_blocking(host, root, item, None)
+}
+
+/// `cm owner-queue add … --block <step>`: under one lock, files the item with the next number and
+/// blocks the step on it (`blocked:until:owner-queue:N`) through `cm advance`'s own move. Nothing
+/// is written unless both hold.
+pub fn owner_queue_add_blocking(
+    host: &dyn Host,
+    root: &Path,
+    item: &QueueItem,
+    block: Option<&Target>,
+) -> Result<Outcome> {
     let (_lock, violations) = guard(root)?;
-    add_queue_item(host, root, item, violations)
+    let prepared = match prepare_queue_item(root, item, violations)? {
+        Ok(prepared) => prepared,
+        Err(refused) => return Ok(refused),
+    };
+    let mut blocked = None;
+    if let Some(target) = block {
+        let to = crate::state::Phase::Blocked(format!("until:owner-queue:{}", prepared.number));
+        let outcome = crate::commands::advance_held(
+            host,
+            root,
+            target,
+            crate::commands::Advance {
+                to: &to,
+                given: &crate::state::Evidence::default(),
+                file: None,
+                repo: None,
+                part: None,
+                by: &[],
+            },
+            &crate::commands::MergeGate::default(),
+            Some(&crate::commands::Held {
+                pending: prepared.number,
+            }),
+        )?;
+        if !outcome.ok() {
+            return Ok(outcome);
+        }
+        blocked = Some(outcome);
+    }
+    let mut outcome = write_queue_item(host, root, prepared)?;
+    if let Some(blocked) = blocked {
+        outcome.lines.extend(blocked.lines);
+        outcome.field("blocked", blocked.fields.get("target").cloned());
+    }
+    Ok(outcome)
 }
 
 /// `cm owner-queue add` for a caller that already holds the lock and has run `guard`; refuses
@@ -445,8 +624,28 @@ pub(crate) fn add_queue_item(
     host: &dyn Host,
     root: &Path,
     item: &QueueItem,
-    mut violations: Vec<Violation>,
+    violations: Vec<Violation>,
 ) -> Result<Outcome> {
+    match prepare_queue_item(root, item, violations)? {
+        Ok(prepared) => write_queue_item(host, root, prepared),
+        Err(refused) => Ok(refused),
+    }
+}
+
+struct PreparedItem {
+    number: u32,
+    title: String,
+    queue: String,
+    entry: String,
+    withheld: Option<String>,
+}
+
+/// Checks an item and takes its number without writing anything.
+fn prepare_queue_item(
+    root: &Path,
+    item: &QueueItem,
+    mut violations: Vec<Violation>,
+) -> Result<Result<PreparedItem, Outcome>> {
     let recommendation = item.recommendation.trim();
     let prefix = "Recommendation:";
     let recommendation = if recommendation
@@ -476,11 +675,11 @@ pub(crate) fn add_queue_item(
     let missing = |name: &str| Violation::new(name, "missing-file", "run `cm init` to write it");
     let Some(queue) = read_existing(&root.join(QUEUE_FILE))? else {
         violations.push(missing(QUEUE_FILE));
-        return Ok(Outcome::refused(violations));
+        return Ok(Err(Outcome::refused(violations)));
     };
     let Some(resume) = read_existing(&root.join("RESUME.md"))? else {
         violations.push(missing("RESUME.md"));
-        return Ok(Outcome::refused(violations));
+        return Ok(Err(Outcome::refused(violations)));
     };
     let withheld = match withhold(&resume) {
         Ok(withheld) => withheld,
@@ -494,7 +693,7 @@ pub(crate) fn add_queue_item(
         }
     };
     if !violations.is_empty() {
-        return Ok(Outcome::refused(violations));
+        return Ok(Err(Outcome::refused(violations)));
     }
     let mut last = headings(&queue)
         .iter()
@@ -517,23 +716,37 @@ pub(crate) fn add_queue_item(
         }
     }
     let Some(number) = last.checked_add(1) else {
-        return Ok(Outcome::refused(vec![Violation::new(
+        return Ok(Err(Outcome::refused(vec![Violation::new(
             QUEUE_FILE,
             "owner-queue-number-exhausted",
             "the highest owner-queue item is u32::MAX; no new item number is available",
-        )]));
+        )])));
     };
     let title = format!("{number}. {}", item.title.trim());
-    append(
-        &root.join(QUEUE_FILE),
-        &queue,
-        &format!(
-            "## {title}\n\nContext: {}\n{}\nRecommendation: {}\nAnswer:\n",
-            item.context.trim(),
-            item.question.trim(),
-            recommendation
-        ),
-    )?;
+    let entry = format!(
+        "## {title}\n\nContext: {}\n{}\nRecommendation: {}\nAnswer:\n",
+        item.context.trim(),
+        item.question.trim(),
+        recommendation
+    );
+    Ok(Ok(PreparedItem {
+        number,
+        title,
+        queue,
+        entry,
+        withheld,
+    }))
+}
+
+fn write_queue_item(host: &dyn Host, root: &Path, prepared: PreparedItem) -> Result<Outcome> {
+    let PreparedItem {
+        number,
+        title,
+        queue,
+        entry,
+        withheld,
+    } = prepared;
+    append(&root.join(QUEUE_FILE), &queue, &entry)?;
     if let Some(text) = &withheld {
         write_atomic(&root.join("RESUME.md"), text.as_bytes())?;
     }

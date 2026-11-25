@@ -15,8 +15,8 @@ use crate::lint::unit_dirs;
 use crate::outcome::{Outcome, Violation};
 use crate::render::next_item;
 use crate::state::{
-    After, Attempt, AttemptOutcome, Finish, Lane, Phase, RELEASES, Release, Step, Track, UnitState,
-    Work,
+    After, Attempt, AttemptOutcome, Finish, Lane, Phase, Priority, RELEASES, Release, Step, Track,
+    UnitState, Work,
 };
 use crate::store::{self, Target, relative, state_path};
 
@@ -209,6 +209,131 @@ pub fn unmet(target: &str, gates: &[Gate]) -> Vec<Violation> {
         .collect()
 }
 
+/// How much review a card needs, derived by rule from its kickoff's checklist line
+/// `Weight: simple|complex — repos: <list>; files: <n or list>; surface: none|<what>`: simple only
+/// for one repository, at most three footprint files and no contract, auth or secret surface.
+/// A missing line is complex. kickoff-lint's grammar: an optional `- ` bullet, any case, `—`, `-`
+/// or `:` before the checklist, a backticked value, and `files: 12` or `12 files` as twelve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Weight {
+    Simple,
+    Complex,
+}
+
+/// Why a kickoff's `Weight:` line is refused, with its fixed violation code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WeightRefusal {
+    pub rule: &'static str,
+    pub message: String,
+}
+
+const SIMPLE_MAX_FILES: usize = 3;
+
+/// The weight a kickoff states and derives, or why its `Weight:` line is refused: the line does
+/// not parse (`weight-malformed`), or it says simple while its checklist derives complex
+/// (`weight-contradiction`). No line is complex.
+pub fn weight_check(kickoff: &str) -> Result<Weight, WeightRefusal> {
+    let Some(line) = kickoff.lines().find_map(|line| {
+        let line = line.trim_start();
+        let line = line.strip_prefix("- ").unwrap_or(line);
+        line.get(..7)
+            .filter(|head| head.eq_ignore_ascii_case("weight:"))
+            .map(|_| &line[7..])
+    }) else {
+        return Ok(Weight::Complex);
+    };
+    let malformed = || WeightRefusal {
+        rule: "weight-malformed",
+        message: format!(
+            "the kickoff's `Weight:{line}` is not `Weight: simple|complex — repos: <list>; files: <n or list>; surface: none|<what>`"
+        ),
+    };
+    let rest = line.trim_start();
+    let word_end = rest
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(rest.len());
+    let stated = match rest[..word_end].to_ascii_lowercase().as_str() {
+        "simple" => Weight::Simple,
+        "complex" => Weight::Complex,
+        _ => return Err(malformed()),
+    };
+    let after = rest[word_end..].trim_start();
+    let checklist = after.trim_start_matches(['—', ':', '-']);
+    if checklist.len() == after.len() {
+        return Err(malformed());
+    }
+    let fields: Vec<&str> = checklist.split(';').collect();
+    let [repos, files, surface] = fields.as_slice() else {
+        return Err(malformed());
+    };
+    fn value<'a>(field: &'a str, key: &str) -> Option<&'a str> {
+        let (name, value) = field.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case(key)
+            .then(|| value.trim().trim_matches('`').trim())
+    }
+    let (Some(repos), Some(files), Some(surface)) = (
+        value(repos, "repos"),
+        value(files, "files"),
+        value(surface, "surface"),
+    ) else {
+        return Err(malformed());
+    };
+    let items = |text: &str| {
+        text.split(',')
+            .map(|item| item.trim().trim_matches('`').trim())
+            .filter(|item| !item.is_empty())
+            .count()
+    };
+    let lower = files.to_ascii_lowercase();
+    let counted = lower
+        .strip_suffix("files")
+        .or_else(|| lower.strip_suffix("file"))
+        .unwrap_or(&lower)
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .or_else(|| (items(files) > 0).then(|| items(files)));
+    let derived = if items(repos) == 1
+        && counted.is_some_and(|files| files <= SIMPLE_MAX_FILES)
+        && surface.eq_ignore_ascii_case("none")
+    {
+        Weight::Simple
+    } else {
+        Weight::Complex
+    };
+    if stated == Weight::Simple && derived == Weight::Complex {
+        return Err(WeightRefusal {
+            rule: "weight-contradiction",
+            message: format!(
+                "the kickoff says simple, but its checklist derives complex ({} repo(s), {} file(s), surface {surface}); simple is one repository, at most {SIMPLE_MAX_FILES} files and surface none",
+                items(repos),
+                counted.map_or_else(|| "no".to_owned(), |files| files.to_string())
+            ),
+        });
+    }
+    Ok(stated)
+}
+
+/// The weight a kickoff derives; a refused line is complex.
+pub fn weight_of(kickoff: &str) -> Weight {
+    weight_check(kickoff).unwrap_or(Weight::Complex)
+}
+
+/// The weight refusal of a kickoff, as a violation on its step.
+pub(crate) fn weight_violation(target: &str, kickoff: &str) -> Option<Violation> {
+    weight_check(kickoff)
+        .err()
+        .map(|refusal| Violation::new(target, refusal.rule, refusal.message))
+}
+
+pub(crate) fn weight(root: &Path, target: &str) -> Weight {
+    kickoff(root, target)
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map_or(Weight::Complex, |text| weight_of(&text))
+}
+
 fn kickoff(root: &Path, target: &str) -> Option<PathBuf> {
     let path = root.join(target).join("kickoff.md");
     path.is_file().then_some(path)
@@ -268,6 +393,7 @@ impl Candidate<'_> {
             "target": self.target,
             "command": launch_command(&self.target, self.lane(), self.finish()),
             "lane": self.lane().map(Lane::name),
+            "weight": weight(root, &self.target),
             "dir": self.target,
             "kickoff": self.kickoff.as_ref().map(|path| relative(root, path)),
             "after": self.gates.iter().map(Gate::to_json).collect::<Vec<_>>(),
@@ -307,7 +433,7 @@ impl Candidate<'_> {
 }
 
 fn candidates<'a>(root: &Path, units: &'a Units) -> Vec<Candidate<'a>> {
-    units
+    let mut out = units
         .iter()
         .flat_map(|(unit, state)| {
             state
@@ -323,7 +449,17 @@ fn candidates<'a>(root: &Path, units: &'a Units) -> Vec<Candidate<'a>> {
             step,
         })
         .filter(|candidate| candidate.step.track.state == Phase::Drafted || candidate.warns_pin())
-        .collect()
+        .collect::<Vec<_>>();
+    out.sort_by_key(|candidate| priority_of(units, &candidate.target));
+    out
+}
+
+/// The priority of the unit a target (a step, or a unit itself) belongs to.
+fn priority_of(units: &Units, target: &str) -> Priority {
+    units
+        .get(target)
+        .or_else(|| units.get(split(target)?.0))
+        .map_or(Priority::Whenever, |unit| unit.priority)
 }
 
 pub struct Tag {
@@ -618,12 +754,15 @@ impl ActionKind {
 struct Action {
     kind: ActionKind,
     target: String,
+    priority: Priority,
     part: Option<String>,
     since: String,
     waiting_count: usize,
     command: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     lane: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    weight: Option<Weight>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -647,11 +786,13 @@ impl Action {
         Self {
             kind,
             target: target.to_owned(),
+            priority: Priority::Whenever,
             part: None,
             since: since.to_owned(),
             waiting_count: 0,
             command,
             lane: None,
+            weight: None,
             pr: None,
             head: None,
             base: None,
@@ -838,15 +979,14 @@ struct Undeployed<'a> {
 }
 
 /// Each line's newest release that no step gated on its tag, or a later one, has merged.
-fn undeployed_releases(units: &Units) -> Vec<Undeployed<'_>> {
+/// A deploy is a rollout, or a PR in a repository no release line ships (a homelab pin). A code
+/// PR in a released repository that waits on a tag consumes the release; it deploys nothing.
+fn deploy_predicate(units: &Units) -> impl Fn(&str, &Step) -> bool + '_ {
     let releases: Vec<(Release, &Step)> = steps(units)
         .filter_map(|(target, step)| Some((Release::of_target(&target)?, step)))
         .collect();
-    // A deploy is a rollout, or a PR in a repository no release line ships (a homelab pin). A
-    // code PR in a released repository that waits on a tag consumes the release; it deploys
-    // nothing.
     // A pin or deploy step deploys by its name, as a rollout does, even when declared as code.
-    let deploys = |target: &str, step: &Step| {
+    move |target: &str, step: &Step| {
         step.work == Work::Rollout
             || target.ends_with("/pin")
             || target.ends_with("/deploy")
@@ -861,7 +1001,11 @@ fn undeployed_releases(units: &Units) -> Vec<Undeployed<'_>> {
                         .iter()
                         .any(|(release, step)| step.ships_from(release, &repo))
                 })
-    };
+    }
+}
+
+fn undeployed_releases(units: &Units) -> Vec<Undeployed<'_>> {
+    let deploys = deploy_predicate(units);
     let mut deployers: BTreeMap<String, Vec<(Release, String, &Step)>> = BTreeMap::new();
     let mut newest: BTreeMap<String, (Release, String, &Step)> = BTreeMap::new();
     for (target, step) in steps(units) {
@@ -1444,10 +1588,12 @@ fn actionable(
     actions.extend(releasing);
     actions.extend(deploying);
     for action in &mut actions {
+        action.priority = priority_of(units, &action.target);
         let Some(step) = step(units, &action.target) else {
             continue;
         };
         action.lane = step.lane.map(Lane::name);
+        action.weight = Some(weight(root, &action.target));
         let track = match action.part.as_deref() {
             Some(part) => step.parts.get(part),
             None => Some(&step.track),
@@ -1470,12 +1616,20 @@ fn actionable(
         action.pr = Some(pr);
     }
     actions.sort_by(|a, b| {
-        (Reverse(a.waiting_count), &a.target, &a.part, a.kind).cmp(&(
-            Reverse(b.waiting_count),
-            &b.target,
-            &b.part,
-            b.kind,
-        ))
+        (
+            a.priority,
+            Reverse(a.waiting_count),
+            &a.target,
+            &a.part,
+            a.kind,
+        )
+            .cmp(&(
+                b.priority,
+                Reverse(b.waiting_count),
+                &b.target,
+                &b.part,
+                b.kind,
+            ))
     });
     actions
 }
@@ -1558,24 +1712,154 @@ fn append_held(outcome: &mut Outcome, held: &[Value]) {
     }
 }
 
-pub(crate) fn action_summary(
-    root: &Path,
-    units: &Units,
-    now: Timestamp,
-) -> (usize, Option<String>) {
+/// The actions CARD counts. The Codex quota is an environment reading and CARD changes only
+/// with a fact, so CARD leaves it out.
+fn card_actions(root: &Path, units: &Units, now: Timestamp) -> Vec<Action> {
     let mut inputs = ActionInputs::read(root, now);
-    // CARD changes only with a fact: the Codex quota is an environment reading.
     inputs.codex_quota = None;
     let stalled = stalls(units, &inputs);
     // Unlike next, sync has not historically refused an unreadable review ledger.
     let verdicts = crate::verdict::load(root).unwrap_or_default();
-    let actions = actionable(root, units, &inputs, &stalled, &verdicts);
-    let oldest = actions
+    actionable(root, units, &inputs, &stalled, &verdicts)
+}
+
+fn oldest<'a>(items: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    items
+        .into_iter()
+        .filter_map(|(what, since)| Some((instant(since)?, what, since)))
+        .min()
+        .map_or_else(
+            || "—".to_owned(),
+            |(_, what, since)| format!("{what} since {since}"),
+        )
+}
+
+/// CARD's `Actionable` line and its guarantee lines, in a fixed `Label: value` form the silence
+/// watchdog parses (README, CARD guarantees).
+pub(crate) fn card_lines(
+    root: &Path,
+    units: &Units,
+    now: Timestamp,
+    launchable: usize,
+) -> Vec<String> {
+    let actions = card_actions(root, units, now);
+    let first = actions
         .iter()
         .filter_map(|action| Some((instant(&action.since)?, &action.since)))
         .min()
-        .map(|(_, since)| since.clone());
-    (actions.len(), oldest)
+        .map_or("—", |(_, since)| since.as_str());
+    let day_ago = now - jiff::SignedDuration::from_hours(24);
+    // A deploy is a deploy step (a rollout, a pin, or a tag-gated PR in a repository no release
+    // line ships) reaching merged: the pin ends at its merge. A multipart step counts when the step
+    // itself moves, never on one part's move.
+    let deploys_step = deploy_predicate(units);
+    let deploy_steps: BTreeSet<String> = steps(units)
+        .filter(|(target, step)| {
+            deploys_step(target, step)
+                && (step.work == Work::Rollout
+                    || step
+                        .after
+                        .iter()
+                        .any(|after| matches!(after, After::Tag(_))))
+        })
+        .map(|(target, _)| target)
+        .collect();
+    let deploys: Vec<(&str, Timestamp, &str)> = units
+        .values()
+        .flat_map(|unit| &unit.history)
+        .filter(|moved| matches!(moved.to, Phase::Merged | Phase::Deployed))
+        .filter_map(|moved| {
+            // Only the step's own move counts: one part merging is not the step's deploy.
+            let target = moved.target.as_str();
+            deploy_steps.contains(target).then_some((
+                target,
+                instant(&moved.at)?,
+                moved.at.as_str(),
+            ))
+        })
+        .collect();
+    let deployed: BTreeSet<&str> = deploys
+        .iter()
+        .filter(|(_, at, _)| *at >= day_ago)
+        .map(|(target, _, _)| *target)
+        .collect();
+    let last_deploy = deploys
+        .iter()
+        .map(|(_, at, stamp)| (*at, *stamp))
+        .max()
+        .map_or("—", |(_, stamp)| stamp);
+    let first_launchable = actions
+        .iter()
+        .filter(|action| action.kind == ActionKind::LaunchableNotLaunched)
+        .filter_map(|action| Some((instant(&action.since)?, action.since.as_str())))
+        .min()
+        .map_or("—", |(_, since)| since);
+    let first_launch = |target: &str| {
+        let unit = split(target).and_then(|(unit, _)| units.get(unit))?;
+        unit.history
+            .iter()
+            .find(|moved| moved.target == target && moved.to == Phase::Launched)
+            .map(|moved| moved.at.clone())
+    };
+    let open: Vec<(String, String)> = steps(units)
+        .filter(|(target, step)| {
+            Release::of_target(target).is_none()
+                && step.finish(false) == Finish::Shipped
+                && matches!(step.track.resting(), Phase::Launched | Phase::PrOpen)
+        })
+        .map(|(target, step)| {
+            let since = first_launch(&target).unwrap_or_else(|| step.track.since.clone());
+            (target, since)
+        })
+        .collect();
+    let (_, merges) = unreleased_merges(units);
+    let undeployed: Vec<(String, String)> = undeployed_releases(units)
+        .into_iter()
+        .map(|held| {
+            (
+                format!("{}@{}", held.line, held.release.version),
+                held.step.track.since.clone(),
+            )
+        })
+        .collect();
+    vec![
+        format!("Actionable: {} (oldest: {first})", actions.len()),
+        format!("Deployed in 24 h: {} (last: {last_deploy})", deployed.len()),
+        format!(
+            "Oldest open code card: {}",
+            oldest(
+                open.iter()
+                    .map(|(target, since)| (target.as_str(), since.as_str()))
+            )
+        ),
+        format!(
+            "Oldest merge-ready: {}",
+            oldest(
+                actions
+                    .iter()
+                    .filter(|action| action.kind == ActionKind::MergeReady)
+                    .map(|action| (action.target.as_str(), action.since.as_str()))
+            )
+        ),
+        format!(
+            "Oldest unreleased merge: {}",
+            oldest(
+                merges
+                    .values()
+                    .flatten()
+                    .map(|(target, since)| (target.as_str(), *since))
+            )
+        ),
+        format!(
+            "Oldest undeployed tag: {}",
+            oldest(
+                undeployed
+                    .iter()
+                    .map(|(tag, since)| (tag.as_str(), since.as_str()))
+            )
+        ),
+        format!("Launchable at sync: {launchable} (oldest: {first_launchable})"),
+    ]
 }
 
 pub(crate) fn next_act(
@@ -1606,7 +1890,7 @@ pub(crate) fn next_act(
             forge,
         )
     };
-    actions.sort_by_key(|action| action.kind.act_priority());
+    actions.sort_by_key(|action| (action.priority, action.kind.act_priority()));
     for action in &actions {
         outcome.line(format!("{} — `{}`", action.summary(), action.command));
     }
@@ -2266,12 +2550,8 @@ pub(crate) fn block_condition(text: &str, unit: &str) -> Result<String, String> 
         return Ok(text.into());
     }
     if let Some(number) = text.strip_prefix("owner-queue:") {
-        let n: u64 = number
-            .parse()
-            .map_err(|_| "owner-queue condition needs a positive item number")?;
-        if n == 0 || !number.bytes().all(|b| b.is_ascii_digit()) {
-            return Err("owner-queue condition needs a positive item number".into());
-        }
+        let n = crate::ledger::queue_item_number(number)
+            .ok_or("owner-queue condition needs a positive item number")?;
         return Ok(format!("owner-queue:{n}"));
     }
     match After::parse(text, unit)? {
@@ -2287,13 +2567,10 @@ pub(crate) fn block_met(root: &Path, units: &Units, unit: &str, condition: &str)
     }
 
     if let Some(number) = condition.strip_prefix("owner-queue:") {
-        return fs::read_to_string(root.join("OWNER-QUEUE.md")).is_ok_and(|text| {
-            !crate::markdown::headings(&text).iter().any(|h| {
-                h.level == 2
-                    && h.text
-                        .split_once(". ")
-                        .is_some_and(|(n, _)| n.parse::<u64>().ok() == number.parse::<u64>().ok())
-            })
+        // No item number names nothing to wait for, never a met condition.
+        return crate::ledger::queue_item_number(number).is_some_and(|number| {
+            root.join("OWNER-QUEUE.md").is_file()
+                && !crate::ledger::open_items(root).contains(&number)
         });
     }
     After::parse(condition, unit).is_ok_and(|after| gate(units, &after).met())

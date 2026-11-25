@@ -146,7 +146,7 @@ fn init_never_overwrites_and_adopts_what_lints_clean() {
     fs::write(root.join("RESUME.md"), &resume).unwrap();
     fs::write(
         root.join("OWNER-QUEUE.md"),
-        "# Owner queue\n\n## Pick one\n\nAnswer:\n",
+        "# Owner queue\n\n## 1. Pick one\n\nAnswer:\n",
     )
     .unwrap();
     let journal = "# Journal\n\n## 2026-09-28 and 29: planning\n\n- old prose\n";
@@ -160,7 +160,7 @@ fn init_never_overwrites_and_adopts_what_lints_clean() {
     assert_eq!(fs::read_to_string(root.join("RESUME.md")).unwrap(), resume);
     assert_eq!(
         fs::read_to_string(root.join("OWNER-QUEUE.md")).unwrap(),
-        "# Owner queue\n\n## Pick one\n\nAnswer:\n"
+        "# Owner queue\n\n## 1. Pick one\n\nAnswer:\n"
     );
     let state = store::load_campaign(root).unwrap();
     assert_eq!(state.adopted, vec!["RESUME.md", "JOURNAL.md"]);
@@ -168,7 +168,7 @@ fn init_never_overwrites_and_adopts_what_lints_clean() {
 
     fs::write(
         root.join("OWNER-QUEUE.md"),
-        "# Owner queue\n\n## Pick one\n\nContext: two paths.\n\nRecommendation: the first\n\nAnswer:\n",
+        "# Owner queue\n\n## 1. Pick one\n\nContext: two paths.\n\nRecommendation: the first\n\nAnswer:\n",
     )
     .unwrap();
     let outcome = commands::init(&host, root).unwrap();
@@ -883,7 +883,7 @@ fn lint_lists_every_violation_in_one_run() {
     fs::write(c.root.join("LIMITS.toml"), limits).unwrap();
     fs::write(
         c.root.join("OWNER-QUEUE.md"),
-        "# Owner queue\n\n## Pick one\n\nContext: two paths.\n\nRecommendation: yes\n",
+        "# Owner queue\n\n## 1. Pick one\n\nContext: two paths.\n\nRecommendation: yes\n",
     )
     .unwrap();
 
@@ -1303,7 +1303,7 @@ fn close_seals_the_campaign() {
     );
     fs::write(
         c.root.join("OWNER-QUEUE.md"),
-        "# Owner queue\n\n## Pick one\n\nContext: two paths.\n\nRecommendation: yes\n\nAnswer:\n",
+        "# Owner queue\n\n## 1. Pick one\n\nContext: two paths.\n\nRecommendation: yes\n\nAnswer:\n",
     )
     .unwrap();
 

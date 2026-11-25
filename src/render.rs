@@ -394,9 +394,11 @@ pub fn card(
     let mut out = format!(
         "# {name} card\n\nRendered by `cm sync` from cm state after reading GitHub; the next sync overwrites it.\n\n"
     );
-    let (count, oldest) = crate::plan::action_summary(root, units, now);
-    let oldest = oldest.as_deref().unwrap_or("—");
-    out.push_str(&format!("Actionable: {count} (oldest: {oldest})\n\n"));
+    for line in crate::plan::card_lines(root, units, now, next.launchable.len()) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push('\n');
     if next.paused {
         out.push_str("**Paused:** LIMITS.toml has `paused = true`; nothing launches.\n\n");
     }
