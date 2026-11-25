@@ -1127,11 +1127,11 @@ impl<'a> Run<'a> {
                     if let (Some(head), Some(base), Some(repo)) = (&head, &base, GithubRepo::of_pr(&url))
                         && ci_head.as_deref() != Some(head.as_str())
                     {
+                        // A check page's ETag belongs to its own head's URL: a 304 says that
+                        // page is unchanged whatever `.cm/pulls.json` holds.
                         let validators = previous
                             .filter(|seen| seen.head.as_deref() == Some(head.as_str()))
-                            .and_then(|seen| {
-                                self.last_read.get(&url).filter(|read| read.validates(seen))
-                            })
+                            .and_then(|_| self.last_read.get(&url))
                             .map(|read| read.etags.clone())
                             .unwrap_or_default();
                         if let Some(Ok(checks)) = self.open_checks(&repo, head, &validators) {

@@ -569,13 +569,13 @@ fn a_read_memo_ahead_of_a_rewound_pulls_json_sends_no_validator() {
 }
 
 #[test]
-fn a_read_memo_written_without_its_pulls_json_sends_no_validator() {
+fn a_pulls_json_restored_behind_its_read_memo_sends_no_validator() {
     let (c, forge, _) = epoch();
     let moved = "f".repeat(40);
     forge.set(OPEN_PR, open(&moved));
     let pushed = sync(&at("2026-10-17T08:05:00Z"), &forge, &c.root).unwrap();
     assert!(pushed.ok(), "{:?}", pushed.violations);
-    // As if the sync stopped after the read memo and before `.cm/pulls.json`.
+    // A checkout restores `.cm/pulls.json` alone; the ignored read memo stays at the new head.
     git(&c.root, &["checkout", "-q", "--", ".cm/pulls.json"]);
     let journal = fs::read(c.root.join("JOURNAL.md")).unwrap();
     let synced = sync(&at("2026-10-17T08:10:00Z"), &forge, &c.root).unwrap();
@@ -583,6 +583,24 @@ fn a_read_memo_written_without_its_pulls_json_sends_no_validator() {
     assert!(synced.fields.get("journal").is_none(), "{:?}", synced.lines);
     assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), journal);
     assert_eq!(heads(&c), (Some(moved.clone()), Some(moved)));
+}
+
+#[test]
+fn a_sync_stopped_before_its_read_memo_sends_no_validator() {
+    let (c, forge, head) = epoch();
+    let memo = c.root.join(".cm").join(cm::sync::PULLS_READ);
+    let stale = fs::read(&memo).unwrap();
+    let moved = "f".repeat(40);
+    forge.set(OPEN_PR, open(&moved));
+    let pushed = sync(&at("2026-10-17T08:05:00Z"), &forge, &c.root).unwrap();
+    assert!(pushed.ok(), "{:?}", pushed.violations);
+    // As if the sync stopped after `.cm/pulls.json` and before the memo; then the PR's head is
+    // pushed back, so GitHub would answer the stale memo's ETag with a 304.
+    fs::write(&memo, stale).unwrap();
+    forge.set(OPEN_PR, open(&head));
+    let synced = sync(&at("2026-10-17T08:10:00Z"), &forge, &c.root).unwrap();
+    assert!(synced.ok(), "{:?}", synced.violations);
+    assert_eq!(heads(&c), (Some(head.clone()), Some(head)));
 }
 
 #[test]
