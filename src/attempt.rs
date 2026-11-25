@@ -509,13 +509,17 @@ pub const LANE_DRIVERS: &str = "lane-drivers.json";
 /// `.cm/lane-drivers.json`. A live attempt a registered driver claimed, on a step under one of its
 /// units, is the driver's own, not an earlier coordinator's. cm trusts the labels it is given: the
 /// journal names who registered whom.
+/// Fields cm does not know are refused, not dropped: a newer cm may have written a registry whose
+/// meaning this one cannot apply, and the next `add` would otherwise rewrite it without them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Drivers {
     #[serde(default)]
     pub drivers: BTreeMap<String, Driver>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Driver {
     /// The driver's session label, as its claims record it.
     pub session: String,
@@ -550,15 +554,18 @@ impl Drivers {
                 registry_path(),
                 "lane-drivers-unreadable",
                 format!(
-                    "{error:#}; restore it with `git checkout HEAD -- {}`, then `cm lane driver list` and `cm lane driver add` any driver it lacks",
+                    "{error:#}; if a newer cm wrote it, upgrade cm; otherwise restore it with `git checkout HEAD -- {}`, or delete it if it was never committed, then `cm lane driver list` and `cm lane driver add` any driver it lacks",
                     registry_path()
                 ),
             )
         })
     }
 
-    /// The lane whose registered driver is `session` with a unit covering `target`.
+    /// The lane whose registered driver is `session` with a unit covering `target`. A claim label
+    /// recorded as `cse_<id>` (an explicit `--coordinator` is stored as given) is the registered
+    /// `session_<id>`.
     pub fn driving(&self, session: &str, target: &str) -> Option<&str> {
+        let session = session_label(session);
         self.drivers
             .iter()
             .find(|(_, driver)| {
@@ -609,6 +616,41 @@ fn check_registrar(by: &str, out: &mut Vec<Violation>) {
     }
 }
 
+/// Journal a registry change, then write the registry: no registry write goes unjournaled. Each
+/// failure is a refusal naming the re-run. A failed journal append changes nothing; a failed write
+/// after it leaves the registry as it was, with a journal entry the re-run repeats.
+fn journal_then_write(
+    root: &Path,
+    at: &str,
+    title: &str,
+    body: &str,
+    drivers: &Drivers,
+) -> std::result::Result<String, Violation> {
+    let journal = crate::ledger::journal_line(root, at, title, body).map_err(|error| {
+        Violation::new(
+            store::JOURNAL,
+            "lane-driver-journal-write",
+            format!(
+                "`{title}` changed nothing: its journal entry failed ({error:#}), so the registry is as it was; re-run the same command once JOURNAL.md is writable"
+            ),
+        )
+    })?;
+    std::fs::create_dir_all(root.join(CM_DIR))
+        .map_err(anyhow::Error::from)
+        .and_then(|()| store::write_json(&drivers_path(root), drivers))
+        .map_err(|error| {
+            Violation::new(
+                registry_path(),
+                "lane-driver-write",
+                format!(
+                    "`{title}` is journaled ({journal}), but writing {} failed ({error:#}), so the registry is as it was; re-run the same command, which journals it again",
+                    registry_path()
+                ),
+            )
+        })?;
+    Ok(journal)
+}
+
 fn units_line(units: &[String]) -> String {
     units.join(", ")
 }
@@ -626,6 +668,8 @@ pub fn driver_add(
     let path = registry_path();
     let session = session_label(session);
     let session = session.as_str();
+    let by = session_label(by);
+    let by = by.as_str();
     let mut violations = Vec::new();
     check_lane(lane, &mut violations);
     if !is_name(session) {
@@ -744,15 +788,16 @@ pub fn driver_add(
         ));
         line.push_str(&format!("; replaces {}", old.session));
     }
-    // Journal first, as the owner-queue read does: no registry write goes unjournaled.
-    let journal = crate::ledger::journal_line(
+    let journal = match journal_then_write(
         root,
         &at,
         &format!("lane driver add {lane}: {session}"),
         &body,
-    )?;
-    std::fs::create_dir_all(root.join(CM_DIR))?;
-    store::write_json(&drivers_path(root), &drivers)?;
+        &drivers,
+    ) {
+        Ok(journal) => journal,
+        Err(violation) => return Ok(Outcome::refused(vec![violation])),
+    };
     let mut outcome = Outcome::default();
     outcome.line(line);
     for prefix in &undeclared {
@@ -772,6 +817,8 @@ pub fn driver_add(
 /// again.
 pub fn driver_remove(host: &dyn Host, root: &Path, lane: &str, by: &str) -> Result<Outcome> {
     let path = registry_path();
+    let by = session_label(by);
+    let by = by.as_str();
     let mut violations = Vec::new();
     check_lane(lane, &mut violations);
     check_registrar(by, &mut violations);
@@ -813,7 +860,7 @@ pub fn driver_remove(host: &dyn Host, root: &Path, lane: &str, by: &str) -> Resu
         return Ok(Outcome::refused(violations));
     }
     let at = stamp(host.now());
-    let journal = crate::ledger::journal_line(
+    let journal = match journal_then_write(
         root,
         &at,
         &format!("lane driver remove {lane}: {}", driver.session),
@@ -821,8 +868,11 @@ pub fn driver_remove(host: &dyn Host, root: &Path, lane: &str, by: &str) -> Resu
             "- units: {}\n- removed by: {by}\n",
             units_line(&driver.units)
         ),
-    )?;
-    store::write_json(&drivers_path(root), &drivers)?;
+        &drivers,
+    ) {
+        Ok(journal) => journal,
+        Err(violation) => return Ok(Outcome::refused(vec![violation])),
+    };
     let mut outcome = Outcome::default();
     outcome.line(format!(
         "lane {lane}: removed driver {} for {}",

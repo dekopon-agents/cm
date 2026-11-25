@@ -589,7 +589,9 @@ fence is unchanged: a driver's token is fenced like any other, and `claim --expe
 attempt over.
 
 `add` records a `--session` of `cse_<id>`, as the runtime reports it, as `session_<id>`, the
-label its claims carry. It refuses a lane name or session label that is not letters, digits, `.`,
+label its claims carry, and a claim recorded as `cse_<id>` (an explicit `--coordinator` is stored
+as given) is that registered `session_<id>`'s. An explicit `--coordinator cse_<id>` on `add` or
+`remove` is `session_<id>` too. It refuses a lane name or session label that is not letters, digits, `.`,
 `_` and `-` (`lane-driver-lane`, `lane-driver-session`), no `--unit` or a malformed one
 (`lane-driver-units`), a registering label that is the session it registers or a registered
 driver of any lane (`lane-driver-registrar`, which names `cm lane driver remove <name>` for a
@@ -598,15 +600,20 @@ current one (`lane-driver-unchanged`). A unit with no declared unit or step unde
 registered with a `warning:` line (JSON `undeclared`). A different session or units for a
 registered lane replace its driver, and the journal names the one replaced. `remove` of a lane
 with no driver is `lane-driver-unknown`. `add` and `remove` journal before they write the
-registry, so a journal append that fails leaves the registry as it was and a retry journals the
-change. The registering label defaults, as `attempt claim`'s does, to trimmed
+registry. A journal append that fails changes nothing (`lane-driver-journal-write`). A registry
+write that fails after it (`lane-driver-write`) leaves the registry as it was under a journal
+entry for the change, so until the re-run a removed driver still holds its claims. Both refusals
+say to re-run the same command, which journals the change again. The registering label defaults, as `attempt claim`'s does, to trimmed
 `CLAUDE_CODE_REMOTE_SESSION_ID` with `cse_` mapped to `session_`, and `--coordinator` is required
 without it. These checks catch mistakes; they are not authentication. cm trusts the labels it is
 given, and the journal names who registered or removed whom.
 
 `cm next`, `cm next --act`, the `cm lane driver` verbs and `cm lint` refuse a registry cm cannot
-parse with `lane-drivers-unreadable`, which names `git checkout HEAD -- .cm/lane-drivers.json`;
-sync's CARD count reads it as empty, so every claim reads as it would without one. cm writes the
+parse with `lane-drivers-unreadable`, which names `git checkout HEAD -- .cm/lane-drivers.json`, or
+deleting a registry that was never committed. A field cm does not know, at the top or in a driver,
+is refused the same way rather than dropped by the next `add`, since a newer cm may have written
+a registry this one cannot apply: upgrade cm. Sync's CARD count reads an unreadable registry as
+empty, so every claim reads as it would without one. cm writes the
 registry whole, so two branches that each change it conflict when merged, like cm's other
 `.cm/*.json` state: keep one side, then run `cm lane driver list` and re-run `cm lane driver add`
 for the other side's driver.

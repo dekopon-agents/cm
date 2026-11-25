@@ -6123,6 +6123,7 @@ fn a_registered_drivers_claim_under_its_units_is_live_while_unregistered_and_out
     const STRANGER: &str = "07-t/mvp/stranger";
     const OUTSIDE: &str = "07-t/other/outside";
     const LOOKALIKE: &str = "07-t/mvp2/lookalike";
+    const RAW: &str = "07-t/mvp/raw";
     const MINE: &str = "07-t/mvp/mine";
 
     let host = Fake {
@@ -6135,11 +6136,13 @@ fn a_registered_drivers_claim_under_its_units_is_live_while_unregistered_and_out
         (OUTSIDE, "session_driver"),
         (LOOKALIKE, "session_driver"),
         (MINE, "session_current"),
+        // An explicit `--coordinator` is stored as given, so a claim can carry the `cse_` id.
+        (RAW, "cse_driver"),
     ] {
         assert!(declare(&host, &c, step, Lane::ClaudeCloud, &[]).ok());
         launch_for(&host, &c, step, holder);
     }
-    let all = [DRIVEN, LOOKALIKE, STRANGER, OUTSIDE].map(str::to_owned);
+    let all = [DRIVEN, LOOKALIKE, STRANGER, OUTSIDE, RAW].map(str::to_owned);
     let sorted = |mut targets: Vec<String>| {
         targets.sort();
         targets
@@ -6337,6 +6340,47 @@ fn registering_listing_and_removing_a_lane_driver_journal_who_registered_whom_an
             "lane-driver-unchanged",
             "`cm lane driver list` shows it",
         ),
+        (
+            &[
+                "tooling",
+                "--session",
+                "cse_driver",
+                "--unit",
+                "07-t/mvp",
+                "--unit",
+                "06-d",
+            ],
+            "lane-driver-unchanged",
+            "already has driver `session_driver`",
+        ),
+        // An explicit `--coordinator` names the same session whether given as `cse_` or
+        // `session_`.
+        (
+            &[
+                "self",
+                "--session",
+                "cse_current",
+                "--unit",
+                "07-t",
+                "--coordinator",
+                "cse_current",
+            ],
+            "lane-driver-registrar",
+            "a driver never registers itself",
+        ),
+        (
+            &[
+                "other",
+                "--session",
+                "session_other",
+                "--unit",
+                "08-x",
+                "--coordinator",
+                "cse_driver",
+            ],
+            "lane-driver-registrar",
+            "`session_driver` is registered as the driver of lane `tooling`",
+        ),
     ] {
         let (code, refused) = add(args);
         assert_eq!(code, Some(1), "{args:?}: {refused}");
@@ -6527,45 +6571,58 @@ fn an_unreadable_lane_driver_registry_is_refused_with_the_command_that_restores_
     assert!(declare(&host, &c, DRIVEN, Lane::ClaudeCloud, &[]).ok());
     launch_for(&host, &c, DRIVEN, "session_driver");
     let registry = c.root.join(".cm/lane-drivers.json");
-    fs::write(&registry, "<<<<<<< ours\n").unwrap();
     let before = journal(&c);
-    for args in [
-        &["next", "--act"][..],
-        &["next"],
-        &["next", DRIVEN],
-        &["lane", "driver", "list"],
-        &[
-            "lane",
-            "driver",
-            "add",
-            "tooling",
-            "--session",
-            "session_driver",
-            "--unit",
-            "07-t",
-        ],
-        &["lane", "driver", "remove", "tooling"],
-        &["lint"],
+    // A merge conflict, and fields this cm does not know, which it refuses rather than drop.
+    for (contents, says) in [
+        (
+            "<<<<<<< ours\n",
+            "restore it with `git checkout HEAD -- .cm/lane-drivers.json`, or delete it if it was never committed",
+        ),
+        (
+            "{\"drivers\": {}, \"schema\": 2}\n",
+            "if a newer cm wrote it, upgrade cm",
+        ),
+        (
+            "{\"drivers\": {\"tooling\": {\"session\": \"session_driver\", \"units\": [\"07-t\"], \"at\": \"2026-11-25T07:00Z\", \"by\": \"session_current\", \"expires\": \"2026-11-26T00:00Z\"}}}\n",
+            "unknown field `expires`",
+        ),
     ] {
-        let (code, refused) = current_json(&c, args);
-        assert_eq!(code, Some(1), "{args:?}: {refused}");
-        let violation = refused["violations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|violation| violation["rule"] == "lane-drivers-unreadable")
-            .unwrap_or_else(|| panic!("{args:?}: {refused}"));
-        assert_eq!(violation["path"], ".cm/lane-drivers.json");
-        assert!(
-            violation["message"]
-                .as_str()
+        fs::write(&registry, contents).unwrap();
+        for args in [
+            &["next", "--act"][..],
+            &["next"],
+            &["next", DRIVEN],
+            &["lane", "driver", "list"],
+            &[
+                "lane",
+                "driver",
+                "add",
+                "tooling",
+                "--session",
+                "session_driver",
+                "--unit",
+                "07-t",
+            ],
+            &["lane", "driver", "remove", "tooling"],
+            &["lint"],
+        ] {
+            let (code, refused) = current_json(&c, args);
+            assert_eq!(code, Some(1), "{args:?}: {refused}");
+            let violation = refused["violations"]
+                .as_array()
                 .unwrap()
-                .contains("restore it with `git checkout HEAD -- .cm/lane-drivers.json`"),
-            "{args:?}: {refused}"
-        );
+                .iter()
+                .find(|violation| violation["rule"] == "lane-drivers-unreadable")
+                .unwrap_or_else(|| panic!("{args:?}: {refused}"));
+            assert_eq!(violation["path"], ".cm/lane-drivers.json");
+            assert!(
+                violation["message"].as_str().unwrap().contains(says),
+                "{args:?}: {refused}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&registry).unwrap(), contents);
+        assert_eq!(journal(&c), before);
     }
-    assert_eq!(fs::read_to_string(&registry).unwrap(), "<<<<<<< ours\n");
-    assert_eq!(journal(&c), before);
 }
 
 #[test]
@@ -6586,10 +6643,12 @@ fn a_registry_change_whose_journal_entry_fails_leaves_the_registry_as_it_was_and
         fs::create_dir(&obstruction).unwrap();
         let (code, failed) = current_json(&c, args);
         assert_eq!(code, Some(1), "{args:?}: {failed}");
+        assert_eq!(failed["violations"][0]["rule"], "lane-driver-journal-write");
+        let message = failed["violations"][0]["message"].as_str().unwrap();
         assert!(
-            failed["error"]
-                .as_str()
-                .is_some_and(|error| error.contains(".JOURNAL.md.cm-tmp")),
+            message.contains(".JOURNAL.md.cm-tmp")
+                && message.contains("changed nothing")
+                && message.contains("re-run the same command"),
             "{args:?}: {failed}"
         );
         assert_eq!(
@@ -6645,6 +6704,83 @@ fn a_registry_change_whose_journal_entry_fails_leaves_the_registry_as_it_was_and
     attempt(
         &["lane", "driver", "remove", "tooling"],
         " — lane driver remove tooling: session_next",
+    );
+    let (_, listed) = current_json(&c, &["lane", "driver", "list"]);
+    assert_eq!(listed["drivers"], serde_json::json!([]));
+}
+
+#[test]
+#[cfg(unix)]
+fn a_registry_write_that_fails_after_its_journal_entry_is_refused_with_the_registry_as_it_was_and_the_rerun()
+ {
+    let host = Fake {
+        now: Timestamp::now(),
+    };
+    let c = campaign(&host);
+    assert!(declare(&host, &c, DRIVEN, Lane::ClaudeCloud, &[]).ok());
+    launch_for(&host, &c, DRIVEN, "session_driver");
+    // The registry's atomic write cannot create its temporary file once the journal holds the entry.
+    let obstruction = c.root.join(".cm/.lane-drivers.json.cm-tmp");
+    let attempt = |args: &[&str], title: &str| {
+        let registered = registry(&c);
+        let entries = journal(&c).matches(title).count();
+        fs::create_dir(&obstruction).unwrap();
+        let (code, failed) = current_json(&c, args);
+        assert_eq!(code, Some(1), "{args:?}: {failed}");
+        assert_eq!(
+            failed["violations"][0]["rule"], "lane-driver-write",
+            "{failed}"
+        );
+        assert_eq!(failed["violations"][0]["path"], ".cm/lane-drivers.json");
+        let message = failed["violations"][0]["message"].as_str().unwrap();
+        assert!(
+            message.contains("is journaled (")
+                && message.contains("the registry is as it was")
+                && message.contains("re-run the same command, which journals it again"),
+            "{args:?}: {failed}"
+        );
+        assert_eq!(registry(&c), registered, "{args:?}");
+        assert_eq!(journal(&c).matches(title).count(), entries + 1, "{args:?}");
+        fs::remove_dir(&obstruction).unwrap();
+        let (code, retried) = current_json(&c, args);
+        assert_eq!(code, Some(0), "{args:?}: {retried}");
+        assert_eq!(journal(&c).matches(title).count(), entries + 2, "{args:?}");
+    };
+
+    let add = [
+        "lane",
+        "driver",
+        "add",
+        "tooling",
+        "--session",
+        "session_driver",
+        "--unit",
+        "07-t/mvp",
+    ];
+    fs::create_dir(&obstruction).unwrap();
+    assert_eq!(current_json(&c, &add).0, Some(1));
+    // Journaled but not registered: the claim still reads as an earlier coordinator's.
+    assert_eq!(earlier_coordinators(&c), (Some(1), vec![DRIVEN.to_owned()]));
+    fs::remove_dir(&obstruction).unwrap();
+    assert_eq!(current_json(&c, &add).0, Some(0));
+    assert_eq!(earlier_coordinators(&c), (Some(0), Vec::new()));
+
+    attempt(
+        &[
+            "lane",
+            "driver",
+            "add",
+            "tooling",
+            "--session",
+            "session_next",
+            "--unit",
+            "07-t/mvp",
+        ],
+        "lane driver add tooling: session_next",
+    );
+    attempt(
+        &["lane", "driver", "remove", "tooling"],
+        "lane driver remove tooling: session_next",
     );
     let (_, listed) = current_json(&c, &["lane", "driver", "list"]);
     assert_eq!(listed["drivers"], serde_json::json!([]));
