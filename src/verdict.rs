@@ -3,7 +3,6 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -2004,26 +2003,42 @@ pub struct Lineage<'a> {
 
 const MAX_UPDATES: usize = 100;
 
+// Every git command the gate runs is built here and nowhere else, so each one reads the history as
+// committed: replace refs and an info/grafts file change which objects and parents git shows, and
+// the gate ignores both.
+mod gate_git {
+    use std::path::Path;
+    use std::process::{Command, Output};
+
+    // /dev/null is no directory, so no graft file can exist at this path.
+    const NO_GRAFTS: &str = "/dev/null/grafts";
+
+    fn command(repo: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new("git");
+        command
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("GIT_GRAFT_FILE", NO_GRAFTS)
+            .arg("-C")
+            .arg(repo)
+            .args(args);
+        command
+    }
+
+    pub(super) fn output(repo: &Path, args: &[&str]) -> Option<Output> {
+        command(repo, args).output().ok()
+    }
+}
+
 fn git_out(repo: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .ok()?;
+    let output = gate_git::output(repo, args)?;
     output
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-pub(crate) fn is_ancestor(repo: &Path, ancestor: &str, of: &str) -> Option<bool> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["merge-base", "--is-ancestor", ancestor, of])
-        .output()
-        .ok()?;
+fn is_ancestor(repo: &Path, ancestor: &str, of: &str) -> Option<bool> {
+    let output = gate_git::output(repo, &["merge-base", "--is-ancestor", ancestor, of])?;
     match output.status.code() {
         Some(0) => Some(true),
         Some(1) => Some(false),
@@ -2151,27 +2166,47 @@ fn merge_from_base(repo: &Path, commit: &str, base: &str) -> Result<Merge, Clean
             base: base.to_owned(),
         });
     }
-    // A submodule `.gitmodules` or config marks ignored is still a change the merge made.
-    match git_out(
-        repo,
-        &[
-            "show",
-            "--remerge-diff",
-            "--format=",
-            "--ignore-submodules=none",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            commit,
-        ],
-    ) {
+    match remerge_diff(repo, commit, Listing::Waiver) {
         Some(diff) => Ok(Merge {
             first: first.to_owned(),
             second: second.to_owned(),
-            clean: diff.is_empty(),
+            clean: diff.trim_ascii().is_empty(),
         }),
         None => Err(unreadable()),
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Listing {
+    // The clean-update waiver's patch, read only for whether it is empty.
+    Waiver,
+    // The paths a merge changes, which a resolution review's merge must keep to its conflict.
+    Paths,
+}
+
+// Every listing the gate reads as a complete account of a merge comes from here, with each flag
+// that would let configuration or attributes leave a change out: a relative or submodule-blind
+// diff, a textconv or external driver, colour, renames folding two paths into one. Only the paths
+// leave out a signature check's output: in the waiver's patch it still makes a signed merge no
+// clean update under `log.showSignature`, as it always has, because leaving it out there would
+// let the waiver accept more.
+fn remerge_diff(repo: &Path, commit: &str, listing: Listing) -> Option<Vec<u8>> {
+    let mut args = vec![
+        "show",
+        "--remerge-diff",
+        "--format=",
+        "--no-renames",
+        "--ignore-submodules=none",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-relative",
+        "--no-color",
+    ];
+    if listing == Listing::Paths {
+        args.extend(["--no-show-signature", "--name-only", "-z"]);
+    }
+    args.push(commit);
+    git_bytes(repo, &args)
 }
 
 fn named_commit(repo: &Path, named: &str) -> Option<String> {
@@ -2184,18 +2219,16 @@ fn named_commit(repo: &Path, named: &str) -> Option<String> {
             &format!("{named}^{{commit}}"),
         ],
     )?;
-    full.to_ascii_lowercase()
-        .starts_with(&named.to_ascii_lowercase())
-        .then_some(full)
+    let hex = named.bytes().all(|byte| byte.is_ascii_hexdigit());
+    (!hex
+        || full
+            .to_ascii_lowercase()
+            .starts_with(&named.to_ascii_lowercase()))
+    .then_some(full)
 }
 
 fn git_bytes(repo: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .ok()?;
+    let output = gate_git::output(repo, args)?;
     output.status.success().then_some(output.stdout)
 }
 
@@ -2216,10 +2249,17 @@ fn beyond_resolution(repo: &Path, commit: &str, merge: &Merge) -> Option<String>
         }
         .to_string()
     };
-    let merged = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args([
+    // merge-tree names paths from the working directory, so both listings run at the top level.
+    let Some(top) = git_bytes(repo, &["rev-parse", "--show-toplevel"])
+        .and_then(|top| String::from_utf8(top).ok())
+        .and_then(|top| top.strip_suffix('\n').map(PathBuf::from))
+    else {
+        return Some(unreadable());
+    };
+    let repo = top.as_path();
+    let merged = gate_git::output(
+        repo,
+        &[
             "merge-tree",
             "--write-tree",
             "--name-only",
@@ -2227,11 +2267,11 @@ fn beyond_resolution(repo: &Path, commit: &str, merge: &Merge) -> Option<String>
             "-z",
             &merge.first,
             &merge.second,
-        ])
-        .output();
+        ],
+    );
     let listed = match merged {
-        Ok(output) if output.status.code() == Some(1) => output.stdout,
-        Ok(output) if output.status.code() == Some(0) => {
+        Some(output) if output.status.code() == Some(1) => output.stdout,
+        Some(output) if output.status.code() == Some(0) => {
             return Some(
                 "its parents merge without a conflict, so its remerge diff resolves none"
                     .to_owned(),
@@ -2240,23 +2280,7 @@ fn beyond_resolution(repo: &Path, commit: &str, merge: &Merge) -> Option<String>
         _ => return Some(unreadable()),
     };
     let conflicted: Vec<&[u8]> = nul_paths(&listed).into_iter().skip(1).collect();
-    // Rename detection would fold a rename's source into its target and hide it from the check.
-    let Some(changed) = git_bytes(
-        repo,
-        &[
-            "show",
-            "--remerge-diff",
-            "--format=",
-            "--name-only",
-            "--no-renames",
-            "--ignore-submodules=none",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            "-z",
-            commit,
-        ],
-    ) else {
+    let Some(changed) = remerge_diff(repo, commit, Listing::Paths) else {
         return Some(unreadable());
     };
     let beyond: Vec<String> = nul_paths(&changed)
@@ -2335,20 +2359,18 @@ fn gate(
             .chain(review_gap(&verdicts, &step, at, pr, part, model))
             .collect()
     };
-    // In a checkout the requested head, often an abbreviation, is matched as the commit it names;
-    // one a ref of that name shadows, or none at all, takes no walk.
-    let resolved = lineage.and_then(|lineage| named_commit(lineage.repo, head));
-    let head_at = resolved.as_deref().unwrap_or(head);
-    let shown = if verdicts
+    // A step holding a resolution review matches the requested head, often an abbreviation, as the
+    // commit it names in the checkout; a hex name a ref shadows, or none at all, takes no walk. Any
+    // other step keeps the head as given.
+    let resolving = verdicts
         .reviews
         .iter()
-        .any(|review| review.step == step && review.kind == ReviewKind::Resolution)
-    {
-        head_at
-    } else {
-        head
-    };
-    let gaps = gaps_at(shown, model);
+        .any(|review| review.step == step && review.kind == ReviewKind::Resolution);
+    let resolved = lineage
+        .filter(|_| resolving)
+        .and_then(|lineage| named_commit(lineage.repo, head));
+    let head_at = resolved.as_deref().unwrap_or(head);
+    let gaps = gaps_at(head_at, model);
     // The clean-update rule only skips a review nobody did: a review recorded at a commit, or a
     // finished receipt for it, binds there and is never outweighed by an earlier ACCEPT. A
     // resolution review and its receipt bind only as the cover for their merge on the walk.
@@ -2392,10 +2414,7 @@ fn gate(
         ));
         gaps
     };
-    let Some((lineage, mut at)) = lineage
-        .zip(resolved.clone())
-        .filter(|_| !gaps.is_empty() && !reviewed_at(head_at))
-    else {
+    let Some(lineage) = lineage.filter(|_| !gaps.is_empty() && !reviewed_at(head_at)) else {
         return Ok(Cleared {
             gaps,
             reviewed: None,
@@ -2405,6 +2424,22 @@ fn gate(
     };
     let repo = lineage.repo;
     let base = lineage.base.unwrap_or("origin/HEAD");
+    let start = if resolving {
+        resolved
+    } else {
+        git_out(
+            repo,
+            &["rev-parse", "--verify", &format!("{head}^{{commit}}")],
+        )
+    };
+    let Some(mut at) = start else {
+        return Ok(Cleared {
+            gaps,
+            reviewed: None,
+            stop: None,
+            resolved: Vec::new(),
+        });
+    };
     let mut gaps = gaps;
     let mut resolved = Vec::new();
     let mut why = CleanUpdateError::TooLong { limit: MAX_UPDATES };

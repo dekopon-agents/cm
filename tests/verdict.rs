@@ -6391,14 +6391,15 @@ fn a_clean_merge_that_moves_an_ignored_submodule_needs_its_own_review() {
     assert!(rules(&s.merge(&host)).contains(&"merge-gate"));
 }
 
-#[test]
-fn a_file_directory_conflict_cannot_stand_on_resolution_reviews() {
-    let host = at("2026-11-25T06:00:00Z");
-    let s = Scratch::new(&host);
+fn file_directory_merge(
+    host: &Fake,
+    resolve: impl FnOnce(&Scratch, &str, &str),
+) -> (Scratch, String, String) {
+    let s = Scratch::new(host);
     fs::write(s.c.repo.join("x"), "a file\n").unwrap();
     s.git(&["add", "x"]);
     s.git(&["commit", "-q", "-m", "x is a file"]);
-    let h2 = s.reviewed(&host, "h2");
+    let h2 = s.reviewed(host, "h2");
     s.on_main_with(|s| {
         fs::create_dir_all(s.c.repo.join("x")).unwrap();
         fs::write(s.c.repo.join("x/inner.txt"), "a directory\n").unwrap();
@@ -6411,13 +6412,17 @@ fn a_file_directory_conflict_cannot_stand_on_resolution_reviews() {
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
         .find(|name| name.starts_with("x~"))
         .unwrap();
-    fs::rename(s.c.repo.join(&aside), s.c.repo.join("x.file")).unwrap();
+    resolve(&s, &aside, &h2);
     s.git(&["add", "-A"]);
     s.git(&["commit", "-q", "--no-edit"]);
     let merge = s.head();
-    let report = s.c.report("claude-file-dir", &merge, &[], "ACCEPT");
-    let refused = scratch_cm(
-        &s,
+    (s, merge, h2)
+}
+
+fn record_through_cm(s: &Scratch, merge: &str) -> std::process::Output {
+    let report = s.c.report("claude-file-dir", merge, &[], "ACCEPT");
+    scratch_cm(
+        s,
         &[
             "review",
             "record",
@@ -6430,13 +6435,43 @@ fn a_file_directory_conflict_cannot_stand_on_resolution_reviews() {
             "--repo",
             s.c.repo.to_str().unwrap(),
         ],
-    );
+    )
+}
+
+#[test]
+fn a_file_directory_conflict_stands_only_where_the_moved_file_keeps_its_remerge_name() {
+    let host = at("2026-11-25T06:00:00Z");
+    let (s, merge, h2) = file_directory_merge(&host, |s, aside, _| {
+        fs::rename(s.c.repo.join(aside), s.c.repo.join("x.file")).unwrap();
+    });
+    let refused = record_through_cm(&s, &merge);
     assert_eq!(refused.status.code(), Some(1), "{refused:?}");
     let out = String::from_utf8_lossy(&refused.stdout);
     assert!(
         out.contains("\"x.file\"") && out.contains(&format!("\"x~{} (x is a file)\"", &h2[..7])),
         "{out}"
     );
+
+    let (s, merge, _) = file_directory_merge(&host, |s, aside, h2| {
+        fs::rename(
+            s.c.repo.join(aside),
+            s.c.repo.join(format!("x~{} (x is a file)", &h2[..7])),
+        )
+        .unwrap();
+    });
+    let kept = record_through_cm(&s, &merge);
+    assert!(kept.status.success(), "{kept:?}");
+
+    let (s, merge, _) = file_directory_merge(&host, |s, aside, h2| {
+        fs::rename(
+            s.c.repo.join(aside),
+            s.c.repo.join(format!("x~{} (x is a file)", &h2[..7])),
+        )
+        .unwrap();
+        fs::write(s.c.repo.join(format!("x~{h2}")), "added in the merge\n").unwrap();
+    });
+    let added = record_through_cm(&s, &merge);
+    assert!(added.status.success(), "{added:?}");
 }
 
 #[test]
@@ -6494,4 +6529,637 @@ fn an_abbreviated_head_reaches_a_covered_merge_while_github_is_unread() {
     let s = Scratch::new(&host);
     let merged = gate(&s, &s.h1[..12]);
     assert!(merged.ok(), "{:?}", merged.violations);
+}
+
+fn offline_cm(s: &Scratch, args: &[&str]) -> std::process::Output {
+    let bin = s.home.join("bin");
+    let gh = bin.join("gh");
+    if !gh.exists() {
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(&gh, "#!/bin/sh\necho 'gh: offline' >&2\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&s.c.root)
+        .args(args)
+        .env("HOME", &s.home)
+        .env("TMPDIR", &s.home)
+        .env("GIT_CONFIG_GLOBAL", s.home.join("gitconfig"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("PATH", path)
+        .output()
+        .unwrap()
+}
+
+fn offline_merge(s: &Scratch, head: &str, repo: &Path) -> std::process::Output {
+    let ci = s.c.write("ci-green.md", "CI green at the head.\n");
+    offline_cm(
+        s,
+        &[
+            "advance",
+            STEP,
+            "merged",
+            "--sha",
+            &s.head(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--head",
+            head,
+            "--ci-verified",
+            ci.to_str().unwrap(),
+        ],
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Knob {
+    Relative,
+    IgnoreSubmodules,
+    SubmoduleIgnore,
+    Textconv,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Scope {
+    Global,
+    Repo,
+}
+
+fn knob_history(host: &Fake) -> Scratch {
+    let s = Scratch::new(host);
+    s.on_main_with(|s| {
+        fs::create_dir_all(s.c.repo.join("dir")).unwrap();
+        fs::write(s.c.repo.join("dir/keep.txt"), "kept\n").unwrap();
+        fs::write(s.c.repo.join("data.dat"), "data one\n").unwrap();
+        fs::write(
+            s.c.repo.join(".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n",
+        )
+        .unwrap();
+        s.git(&["add", "-A"]);
+        gitlink(s, "sub", SUB_A);
+    });
+    s.merge_main(None);
+    s
+}
+
+fn hide(s: &Scratch, knob: Knob) -> &'static str {
+    match knob {
+        Knob::Relative => {
+            fs::write(s.c.repo.join("evil.txt"), "outside dir/\n").unwrap();
+            s.git(&["add", "evil.txt"]);
+            "\"evil.txt\""
+        }
+        Knob::IgnoreSubmodules | Knob::SubmoduleIgnore => {
+            gitlink(s, "sub", SUB_B);
+            "\"sub\""
+        }
+        Knob::Textconv => {
+            fs::write(s.c.repo.join("data.dat"), "data two\n").unwrap();
+            s.git(&["add", "data.dat"]);
+            "\"data.dat\""
+        }
+    }
+}
+
+fn turn_hostile(s: &Scratch, knob: Knob, scope: Scope) {
+    let pairs: &[(&str, &str)] = match knob {
+        Knob::Relative => &[("diff.relative", "true")],
+        Knob::IgnoreSubmodules => &[("diff.ignoreSubmodules", "all")],
+        Knob::SubmoduleIgnore => &[("submodule.sub.ignore", "all")],
+        Knob::Textconv => &[("diff.lossy.textconv", "sh -c 'echo same'")],
+    };
+    let attributes = "*.dat diff=lossy\n";
+    match scope {
+        Scope::Global => {
+            let mut config = String::new();
+            for (key, value) in pairs {
+                let (section, name) = key.rsplit_once('.').unwrap();
+                let section = match section.split_once('.') {
+                    Some((outer, inner)) => format!("{outer} \"{inner}\""),
+                    None => section.to_owned(),
+                };
+                config.push_str(&format!("[{section}]\n\t{name} = {value}\n"));
+            }
+            if matches!(knob, Knob::Textconv) {
+                let file = s.home.join("attributes");
+                fs::write(&file, attributes).unwrap();
+                config.push_str(&format!("[core]\n\tattributesFile = {}\n", file.display()));
+            }
+            fs::write(s.home.join("gitconfig"), config).unwrap();
+        }
+        Scope::Repo => {
+            for (key, value) in pairs {
+                s.git(&["config", key, value]);
+            }
+            if matches!(knob, Knob::Textconv) {
+                fs::create_dir_all(s.c.repo.join(".git/info")).unwrap();
+                fs::write(s.c.repo.join(".git/info/attributes"), attributes).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn no_configuration_or_attribute_hides_a_change_from_record_walk_or_waiver() {
+    let host = at("2026-11-25T06:00:00Z");
+    let knobs = [
+        Knob::Relative,
+        Knob::IgnoreSubmodules,
+        Knob::SubmoduleIgnore,
+        Knob::Textconv,
+    ];
+    for knob in knobs {
+        for scope in [Scope::Global, Scope::Repo] {
+            for subdir in [false, true] {
+                let row = format!("{knob:?} {scope:?} subdir={subdir}");
+
+                let s = knob_history(&host);
+                s.on_main("shared.txt", "main\n");
+                let main = format!("origin/{}", s.base);
+                let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", &main]);
+                assert!(!merged.status.success(), "{row}: the merge conflicts");
+                fs::write(s.c.repo.join("shared.txt"), "feature and main\n").unwrap();
+                s.git(&["add", "shared.txt"]);
+                let shown = hide(&s, knob);
+                s.git(&["commit", "-q", "--no-edit"]);
+                let merge = s.head();
+                turn_hostile(&s, knob, scope);
+                let repo = if subdir {
+                    s.c.repo.join("dir")
+                } else {
+                    s.c.repo.clone()
+                };
+                let report = s.c.report("claude-hostile", &merge, &[], "ACCEPT");
+                let record = offline_cm(
+                    &s,
+                    &[
+                        "review",
+                        "record",
+                        STEP,
+                        report.to_str().unwrap(),
+                        "--reviewer",
+                        "claude",
+                        "--kind",
+                        "resolution",
+                        "--repo",
+                        repo.to_str().unwrap(),
+                    ],
+                );
+                assert_eq!(record.status.code(), Some(1), "{row}: record {record:?}");
+                assert!(
+                    String::from_utf8_lossy(&record.stdout).contains(&format!(
+                        "it changes {shown} beyond the files its parents conflict in"
+                    )),
+                    "{row}: record {record:?}"
+                );
+                s.edit_ledger(|ledger| as_resolutions(ledger, &s.h1, &merge));
+                let walk = offline_merge(&s, &merge, &repo);
+                assert_eq!(walk.status.code(), Some(1), "{row}: walk {walk:?}");
+                assert!(
+                    String::from_utf8_lossy(&walk.stdout).contains(&format!(
+                        "resolution reviews do not clear it: it changes {shown} beyond the files its parents conflict in"
+                    )),
+                    "{row}: walk {walk:?}"
+                );
+                assert_eq!(s.c.state(), Phase::PrOpen, "{row}: walk");
+
+                let s = knob_history(&host);
+                s.on_main("other.txt", "main\n");
+                s.merge_main(None);
+                hide(&s, knob);
+                s.git(&["commit", "-q", "--amend", "--no-edit"]);
+                let clean = s.head();
+                turn_hostile(&s, knob, scope);
+                let repo = if subdir {
+                    s.c.repo.join("dir")
+                } else {
+                    s.c.repo.clone()
+                };
+                let waiver = offline_merge(&s, &clean, &repo);
+                assert_eq!(waiver.status.code(), Some(1), "{row}: waiver {waiver:?}");
+                assert!(
+                    String::from_utf8_lossy(&waiver.stdout).contains("needs its own review"),
+                    "{row}: waiver {waiver:?}"
+                );
+            }
+        }
+    }
+}
+
+fn signed_and_shown(s: &Scratch) {
+    let gpg = s.home.join("bin").join("gpg-stub");
+    fs::create_dir_all(gpg.parent().unwrap()).unwrap();
+    fs::write(
+        &gpg,
+        r#"#!/bin/sh
+cat >/dev/null
+case " $* " in
+*" --verify "*) echo 'gpg: a signature shown' >&2; exit 1 ;;
+esac
+echo '[GNUPG:] SIG_CREATED ' >&2
+printf '%s\n' '-----BEGIN PGP SIGNATURE-----' '' 'stub' '-----END PGP SIGNATURE-----'
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&gpg, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    s.git(&["config", "gpg.program", gpg.to_str().unwrap()]);
+    s.git(&["config", "commit.gpgsign", "true"]);
+    s.git(&["config", "log.showSignature", "true"]);
+}
+
+#[test]
+fn a_shown_signature_is_no_change_to_a_resolution_and_still_no_clean_update() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    signed_and_shown(&s);
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    let shown = s.git(&["show", "--remerge-diff", "--format=", &clean]);
+    assert!(shown.contains("gpg: a signature shown"), "{shown}");
+    let refused = offline_merge(&s, &clean, &s.c.repo);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stdout).contains(&format!(
+            "{} resolved merge conflicts; it needs its own review",
+            &clean[..12]
+        )),
+        "{refused:?}"
+    );
+    assert_eq!(s.c.state(), Phase::PrOpen);
+
+    let s = Scratch::new(&host);
+    signed_and_shown(&s);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    s.accepted_resolution(&host, &merge, "signed");
+    let merged = offline_merge(&s, &merge, &s.c.repo);
+    assert!(merged.status.success(), "{merged:?}");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Rewrite {
+    Replace,
+    Graft,
+}
+
+// A merge from main that also adds evil.txt, which plain git no longer shows: a replace ref swaps
+// in the same merge without it, or a graft gives the merge a second parent on main from before
+// main dropped evil.txt again.
+fn rewritten(host: &Fake, rewrite: Rewrite, conflicted: bool) -> (Scratch, String) {
+    let s = Scratch::new(host);
+    let held = match rewrite {
+        Rewrite::Replace => {
+            s.on_main(
+                if conflicted {
+                    "shared.txt"
+                } else {
+                    "other.txt"
+                },
+                "main\n",
+            );
+            None
+        }
+        Rewrite::Graft => {
+            s.on_main_with(|s| {
+                if conflicted {
+                    fs::write(s.c.repo.join("shared.txt"), "main\n").unwrap();
+                }
+                fs::write(s.c.repo.join("evil.txt"), "smuggled\n").unwrap();
+            });
+            let held = s.git(&["rev-parse", &s.base]);
+            s.on_main_with(|s| fs::remove_file(s.c.repo.join("evil.txt")).unwrap());
+            Some(held)
+        }
+    };
+    let honest = s.merge_main(conflicted.then_some("feature and main\n"));
+    fs::write(s.c.repo.join("evil.txt"), "smuggled\n").unwrap();
+    s.git(&["add", "evil.txt"]);
+    s.git(&["commit", "-q", "--amend", "--no-edit"]);
+    let merge = s.head();
+    match held {
+        None => {
+            s.git(&["replace", &merge, &honest]);
+        }
+        Some(held) => {
+            let parents = s.git(&["rev-list", "--parents", "-n", "1", &merge]);
+            let first = parents.split_whitespace().nth(1).unwrap();
+            let info = s.c.repo.join(".git").join("info");
+            fs::create_dir_all(&info).unwrap();
+            fs::write(info.join("grafts"), format!("{merge} {first} {held}\n")).unwrap();
+        }
+    }
+    let seen = s.git(&["show", "--remerge-diff", "--format=", "--name-only", &merge]);
+    let hidden = if conflicted { "shared.txt" } else { "" };
+    assert_eq!(seen, hidden, "{rewrite:?} hides evil.txt from plain git");
+    (s, merge)
+}
+
+#[test]
+fn no_replace_ref_or_graft_rewrites_what_record_walk_or_waiver_read() {
+    let host = at("2026-11-25T06:00:00Z");
+    for rewrite in [Rewrite::Replace, Rewrite::Graft] {
+        let (s, merge) = rewritten(&host, rewrite, true);
+        let report = s.c.report("claude-rewritten", &merge, &[], "ACCEPT");
+        let record = offline_cm(
+            &s,
+            &[
+                "review",
+                "record",
+                STEP,
+                report.to_str().unwrap(),
+                "--reviewer",
+                "claude",
+                "--kind",
+                "resolution",
+                "--repo",
+                s.c.repo.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            record.status.code(),
+            Some(1),
+            "{rewrite:?}: record {record:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&record.stdout)
+                .contains("it changes \"evil.txt\" beyond the files its parents conflict in"),
+            "{rewrite:?}: record {record:?}"
+        );
+        s.edit_ledger(|ledger| as_resolutions(ledger, &s.h1, &merge));
+        let walk = offline_merge(&s, &merge, &s.c.repo);
+        assert_eq!(walk.status.code(), Some(1), "{rewrite:?}: walk {walk:?}");
+        assert!(
+            String::from_utf8_lossy(&walk.stdout).contains(
+                "resolution reviews do not clear it: it changes \"evil.txt\" beyond the files its parents conflict in"
+            ),
+            "{rewrite:?}: walk {walk:?}"
+        );
+        assert_eq!(s.c.state(), Phase::PrOpen, "{rewrite:?}: walk");
+
+        let (s, clean) = rewritten(&host, rewrite, false);
+        let waiver = offline_merge(&s, &clean, &s.c.repo);
+        assert_eq!(
+            waiver.status.code(),
+            Some(1),
+            "{rewrite:?}: waiver {waiver:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&waiver.stdout).contains(&format!(
+                "{} resolved merge conflicts; it needs its own review",
+                &clean[..12]
+            )),
+            "{rewrite:?}: waiver {waiver:?}"
+        );
+        assert_eq!(s.c.state(), Phase::PrOpen, "{rewrite:?}: waiver");
+    }
+}
+
+// Puts a git first on cm's PATH that logs each command's replace and graft settings, then runs
+// the real one.
+fn logging_git(s: &Scratch) -> PathBuf {
+    let quote = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', r"'\''"));
+    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("git"))
+        .find(|git| git.is_file())
+        .unwrap();
+    let log = s.home.join("git.log");
+    let bin = s.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("git");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprintf '%s\\t%s\\t%s\\n' \"${{GIT_NO_REPLACE_OBJECTS-}}\" \"${{GIT_GRAFT_FILE-}}\" \"$*\" >> {}\nexec {} \"$@\"\n",
+            quote(&log),
+            quote(&git)
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    log
+}
+
+// The git commands cm ran in the checkout. Each must ignore replace refs and grafts, apart from
+// `cm advance`'s own read of `--sha`, which is no part of the gate.
+fn checkout_calls(s: &Scratch, log: &Path) -> Vec<String> {
+    let canonical = fs::canonicalize(&s.c.repo).unwrap();
+    let checkouts = [
+        format!("-C {} ", s.c.repo.display()),
+        format!("-C {} ", canonical.display()),
+    ];
+    let sha = format!("rev-parse --verify --quiet {}^{{commit}}", s.head());
+    fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            let (replace, graft, args) = (
+                fields.next().unwrap(),
+                fields.next().unwrap(),
+                fields.next().unwrap(),
+            );
+            let call = checkouts
+                .iter()
+                .find_map(|checkout| args.strip_prefix(checkout.as_str()))?;
+            if replace == "1" && graft == "/dev/null/grafts" {
+                Some(call.to_owned())
+            } else {
+                assert_eq!(
+                    call, sha,
+                    "a git command in the checkout reads rewritten history"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn every_git_command_the_gate_runs_ignores_replace_refs_and_grafts() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let log = logging_git(&s);
+    let report = s.c.report("claude-logged", &merge, &[], "ACCEPT");
+    let record = offline_cm(
+        &s,
+        &[
+            "review",
+            "record",
+            STEP,
+            report.to_str().unwrap(),
+            "--reviewer",
+            "claude",
+            "--kind",
+            "resolution",
+            "--repo",
+            s.c.repo.to_str().unwrap(),
+        ],
+    );
+    assert!(record.status.success(), "{record:?}");
+    let short = &merge[..12];
+    let walk = offline_merge(&s, short, &s.c.repo);
+    assert_eq!(walk.status.code(), Some(1), "{walk:?}");
+    assert!(
+        String::from_utf8_lossy(&walk.stdout).contains("no astra resolution ACCEPT"),
+        "{walk:?}"
+    );
+    let mut calls = checkout_calls(&s, &log);
+
+    let s = Scratch::new(&host);
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    let log = logging_git(&s);
+    let waiver = offline_merge(&s, &clean, &s.c.repo);
+    assert!(waiver.status.success(), "{waiver:?}");
+    calls.extend(checkout_calls(&s, &log));
+
+    for site in [
+        "rev-parse --verify origin/HEAD^{commit}".to_owned(),
+        format!("rev-parse --verify {merge}^{{commit}}"),
+        format!("rev-parse --verify --quiet {short}^{{commit}}"),
+        format!("rev-parse --verify {clean}^{{commit}}"),
+        "rev-parse --show-toplevel".to_owned(),
+        "rev-list --parents -n 1 ".to_owned(),
+        "merge-base --is-ancestor ".to_owned(),
+        "show --remerge-diff --format= --no-renames --ignore-submodules=none --no-ext-diff --no-textconv --no-relative --no-color ".to_owned(),
+        "merge-tree --write-tree ".to_owned(),
+    ] {
+        assert!(
+            calls.iter().any(|call| call.starts_with(&site)),
+            "{site}: {calls:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_step_without_a_resolution_record_takes_the_requested_head_as_given() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("other.txt", "main\n");
+    s.merge_main(None);
+    let merged = offline_merge(&s, "HEAD", &s.c.repo);
+    assert!(merged.status.success(), "{merged:?}");
+
+    let s = Scratch::new(&host);
+    let fix = s.commit("fix.txt", "unreviewed\n");
+    let short = &fix[..6];
+    let refused = offline_merge(&s, short, &s.c.repo);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let gates: Vec<String> = String::from_utf8_lossy(&refused.stdout)
+        .lines()
+        .filter(|line| line.contains("merge-gate"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(gates.len(), 3, "{gates:?}");
+    assert!(gates[0].contains(&format!("no Astra receipt at {short} with effective")));
+    assert!(gates[1].contains(&format!("no review of {short} is recorded")));
+    assert!(gates[2].contains(&format!(
+        "no reviewed head before {short} is joined to it by clean updates from the base branch: {} is not a merge from the base branch",
+        &fix[..12]
+    )));
+}
+
+#[test]
+fn case_never_decides_which_head_or_record_binds() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    s.accepted_resolution(&host, &merge, "resolution");
+    s.edit_ledger(|ledger| {
+        for review in &mut ledger.reviews[2..] {
+            review.head = review.head.to_uppercase();
+        }
+    });
+    assert!(s.cleared().gaps.is_empty(), "{:?}", s.cleared().gaps);
+    let merged = offline_merge(&s, &merge[..12].to_uppercase(), &s.c.repo);
+    assert!(merged.status.success(), "{merged:?}");
+}
+
+#[test]
+fn each_resolution_binding_site_reads_only_full_merge_shas() {
+    let host = at("2026-11-25T06:00:00Z");
+    let covered = |s: &Scratch| -> String {
+        s.on_main("shared.txt", "main\n");
+        let merge = s.merge_main(Some("feature and main\n"));
+        s.accepted_resolution(&host, &merge, "resolution");
+        merge
+    };
+    let shorten = |s: &Scratch, reviewer: &str, merge: &str| {
+        s.edit_ledger(|ledger| {
+            for review in &mut ledger.reviews[2..] {
+                if review.reviewer.as_deref() == Some(reviewer) {
+                    review.head = merge[..8].to_owned();
+                }
+            }
+        });
+    };
+
+    let s = Scratch::new(&host);
+    let merge = covered(&s);
+    shorten(&s, "claude", &merge);
+    assert_eq!(walk_gaps(&s.cleared()), ["no claude resolution ACCEPT"]);
+
+    let s = Scratch::new(&host);
+    let merge = covered(&s);
+    shorten(&s, "astra", &merge);
+    let unexcluded = s.cleared();
+    assert_eq!(unexcluded.stop, None);
+    assert!(
+        unexcluded.gaps.iter().any(|gap| gap.contains(&format!(
+            "astra-review-7-resolution-astra/receipt.json records the Astra review at {merge}, but it is not recorded"
+        ))),
+        "{:?}",
+        unexcluded.gaps
+    );
+
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    for reviewer in ["astra", "claude"] {
+        let report = s.c.write(
+            &format!("drafts/{reviewer}-unreceipted.md"),
+            &format!("# {reviewer}\n\nNo receipt.\n\n```cm-review\nhead: {merge}\n```\n\nACCEPT\n"),
+        );
+        assert!(
+            verdict::record_resolution(
+                &host,
+                &s.c.root,
+                &target(),
+                &report,
+                Some(reviewer),
+                None,
+                Some(&s.c.repo),
+            )
+            .unwrap()
+            .ok()
+        );
+    }
+    shorten(&s, "astra", &merge);
+    shorten(&s, "claude", &merge);
+    assert_eq!(
+        s.cleared().stop,
+        Some(CleanUpdateError::Conflicts { commit: merge })
+    );
 }
