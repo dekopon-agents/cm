@@ -809,6 +809,21 @@ mod tests {
         assert_eq!(sorted(found), [&b"B"[..], b"a", b"b", "\u{e9}".as_bytes()]);
     }
 
+    // heartbeat.sh's `grep -cF` never ran for a heading past 128 KiB, an exec argument the kernel
+    // refuses (MAX_ARG_STRLEN), so the script listed it even when a pickup named it.
+    #[test]
+    fn a_heading_over_128_kib_is_compared_like_any_other() {
+        let heading = format!("1 — Owner directive: {}", "x".repeat(200 << 10));
+        let picked = below_stamp(format!("## {heading}\n{MARKER}{heading}\n"));
+        assert_eq!(listed(&picked, STAMP), Some(Vec::new()));
+        let short = &heading[..heading.len() - 1];
+        let unpicked = below_stamp(format!("## {heading}\n{MARKER}{short}\n"));
+        assert_eq!(
+            listed(&unpicked, STAMP),
+            Some(vec![format!("owner-directive: {heading}")])
+        );
+    }
+
     #[test]
     fn a_hash_match_counts_only_when_the_bytes_agree_and_every_heading_with_that_hash_is_tried() {
         let one = "1 — Owner directive: ";

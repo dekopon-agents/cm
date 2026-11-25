@@ -3262,9 +3262,10 @@ fn the_built_cm_tick_leaves_a_bare_cm_to_the_default_search_path_when_path_is_un
     let harness = Harness::new(1, &act(lines()), PICK_OK);
     // With PATH unset the tick's git is the system one, which reads only this repository, so the
     // tick is bound and reaches the act loop. Only the fake handoff-pick.sh logs: once for
-    // `--check-bound`, and twice a tick, at the frame's check and its re-check. What the real
-    // gitsync prints there depends on the system git's identity, which this environment does not
-    // set, so its lines and the frame's wall-time lines are left out.
+    // `--check-bound`, and three times a tick, at the frame's check, at gitsync's `still_bound`
+    // after its pull, and at the frame's re-check. What the real gitsync prints there depends on
+    // the system git's identity, which this environment does not set, so its lines and the
+    // frame's wall-time lines are left out.
     let git_dir = main_repository(&harness.ct.path().join("git"));
     script(
         &harness.ct.path().join(beat::HANDOFF_PICK),
@@ -3303,7 +3304,7 @@ fn the_built_cm_tick_leaves_a_bare_cm_to_the_default_search_path_when_path_is_un
             );
         }
     }
-    assert_eq!(harness.log(), [FRAME[1]; 5], "{:?}", harness.log());
+    assert_eq!(harness.log(), [FRAME[1]; 7], "{:?}", harness.log());
 }
 
 #[test]
@@ -4465,8 +4466,8 @@ fn the_built_cm_tick_acts_in_the_bound_coordinator() {
     origin.acts(Some("cse_01abc"));
     assert_eq!(
         origin.log("pick.log"),
-        [local_pick("session_01abc"), local_pick("session_01abc")],
-        "the check and the re-check after gitsync, from the checkout"
+        vec![local_pick("session_01abc"); 3],
+        "the check, gitsync's still_bound after its pull, and the re-check after gitsync, from the checkout"
     );
     assert_eq!(
         origin.log("cm.log"),

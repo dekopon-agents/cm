@@ -63,9 +63,15 @@ fn push(ctx: &Ctx, report: &mut Report) {
         if git(
             ctx,
             &["pull", "-q", "--rebase", "--autostash", "origin", "main"],
-        ) && git(ctx, &["push", "-q", "origin", "main"])
-        {
-            return;
+        ) {
+            // A successor's handoff that arrived with this pull retires this session: heartbeat.sh
+            // pushed nothing and said nothing, and the frame's re-check then stops the tick.
+            if !ctx.still_bound() {
+                return;
+            }
+            if git(ctx, &["push", "-q", "origin", "main"]) {
+                return;
+            }
         }
         abort(ctx);
     }
@@ -117,10 +123,13 @@ mod tests {
     const PUSH: &str = "git push -q origin main";
     const ABORT: &str = "git rebase --abort";
 
+    const BOUND: &str = "still_bound";
+
     struct Git {
         branch: &'static str,
         status: &'static str,
         failing: &'static [&'static str],
+        pick: &'static str,
     }
 
     impl Git {
@@ -133,6 +142,8 @@ mod tests {
                     Ran::code(0, self.branch)
                 } else if line == "git status --porcelain" {
                     Ran::code(0, self.status)
+                } else if line.contains("handoff-pick.sh") {
+                    Ran::code(0, self.pick)
                 } else {
                     Ran::code(0, "")
                 })
@@ -144,10 +155,31 @@ mod tests {
         branch: "main\n",
         status: "",
         failing: &[],
+        pick: "ok store/epochs/eleemosynary-mnemosyne/handoff/coordinator-1.md\n",
     };
 
+    // The bound check's children, from its branch read to its diff, as the one entry BOUND.
+    fn checked(proc: &FakeProc) -> Vec<String> {
+        let mut log = Vec::new();
+        for call in proc.log() {
+            if call.contains("handoff-pick.sh") {
+                log.pop();
+                log.push(BOUND.to_owned());
+            } else if !(call.starts_with("git fetch ") || call.starts_with("git diff ")) {
+                log.push(call);
+            }
+        }
+        log
+    }
+
+    fn session() -> Env {
+        [("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_1")]
+            .into_iter()
+            .collect()
+    }
+
     fn synced(proc: &FakeProc, mode: Mode) -> Report {
-        let env = Env::default();
+        let env = session();
         let ctx = Ctx::new(
             Path::new("."),
             Path::new("store/epochs/eleemosynary-mnemosyne"),
@@ -168,13 +200,14 @@ mod tests {
         .proc();
         assert_eq!(synced(&proc, Mode::Always), Report::default());
         assert_eq!(
-            proc.log(),
+            checked(&proc),
             [
                 "git rev-parse --abbrev-ref HEAD",
                 "git status --porcelain",
                 "git add -A",
                 "git commit -qm chore(mnemosyne): heartbeat sync",
                 PULL,
+                BOUND,
                 PUSH,
             ]
         );
@@ -186,11 +219,12 @@ mod tests {
         let proc = CLEAN.proc();
         assert_eq!(synced(&proc, Mode::Always), Report::default());
         assert_eq!(
-            proc.log(),
+            checked(&proc),
             [
                 "git rev-parse --abbrev-ref HEAD",
                 "git status --porcelain",
                 PULL,
+                BOUND,
                 PUSH
             ]
         );
@@ -264,11 +298,11 @@ mod tests {
                 ]
             );
             assert!(report.failed);
-            let tries: Vec<String> = proc.log().into_iter().skip(2).collect();
+            let tries: Vec<String> = checked(&proc).into_iter().skip(2).collect();
             let one: &[&str] = if failing == [PULL] {
                 &[PULL, ABORT]
             } else {
-                &[PULL, PUSH, ABORT]
+                &[PULL, BOUND, PUSH, ABORT]
             };
             assert_eq!(tries, one.repeat(3));
             assert_eq!(proc.pauses(), [Duration::from_secs(2); 2]);
@@ -345,16 +379,42 @@ mod tests {
             } else if line == PULL {
                 pulls.set(pulls.get() + 1);
                 Ran::code(if pulls.get() < 2 { 1 } else { 0 }, "")
+            } else if line.contains("handoff-pick.sh") {
+                Ran::code(0, CLEAN.pick)
             } else {
                 Ran::code(0, "")
             })
         });
         assert_eq!(synced(&proc, Mode::Always), Report::default());
         assert_eq!(
-            proc.log().into_iter().skip(2).collect::<Vec<_>>(),
-            [PULL, ABORT, PULL, PUSH]
+            checked(&proc).into_iter().skip(2).collect::<Vec<_>>(),
+            [PULL, ABORT, PULL, BOUND, PUSH]
         );
         assert_eq!(proc.pauses(), [Duration::from_secs(2)]);
+    }
+
+    // heartbeat.sh's `is_bound || exit 0` after the pull: no push, no abort, no later try and no
+    // line, whatever the tree held.
+    #[test]
+    fn a_pull_that_retires_the_session_pushes_nothing_and_says_nothing() {
+        for pick in [
+            "",
+            "missing other-lineage store/epochs/e/handoff/coordinator-2.md\n",
+        ] {
+            let proc = Git {
+                status: " M x\n",
+                pick,
+                ..CLEAN
+            }
+            .proc();
+            assert_eq!(synced(&proc, Mode::Always), Report::default());
+            assert_eq!(checked(&proc).last().map(String::as_str), Some(BOUND));
+            assert_eq!(
+                checked(&proc).iter().filter(|call| *call == PULL).count(),
+                1
+            );
+            assert!(proc.pauses().is_empty());
+        }
     }
 
     #[test]

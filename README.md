@@ -100,7 +100,7 @@ error. `review wait` additionally uses 3 for its deadline and 4 for unreadable c
 6. `gitsync` (`Mode::IfDirty`) when an executor ran, then the bound check again.
 7. `claude_md`.
 
-`Ctx::still_bound()` runs the same check afresh, nothing cached, and spends none of the calling phase's budget: its time, whatever the check answers and also when it panics, moves that `Ctx`'s deadline out by the check's whole time and is left out of the phase's wall time. Each call moves the deadline by its own check's time, so a phase that calls it N times can run N checks longer. It is the hook gitsync's port calls after each successful pull, to push nothing once a successor's handoff has arrived. Until 07-tick/mvp/housekeeping fills `gitsync.rs`, only a test-local phase calls it.
+`Ctx::still_bound()` runs the same check afresh, nothing cached, and spends none of the calling phase's budget: its time, whatever the check answers and also when it panics, moves that `Ctx`'s deadline out by the check's whole time and is left out of the phase's wall time. Each call moves the deadline by its own check's time, so a phase that calls it N times can run N checks longer. gitsync calls it after each successful pull, before the push: once a successor's handoff has arrived it pushes nothing and prints nothing, as heartbeat.sh's `is_bound || exit 0` did, and the frame's re-check then stops the tick (`a_pull_that_lands_a_successor_s_handoff_pushes_nothing_and_says_nothing_where_its_twin_pushes`).
 
 **Where `cm tick` and heartbeat.sh differ.** B is bound, U unbound; each row's test shows the `cm tick` side.
 
@@ -120,6 +120,12 @@ error. `review wait` additionally uses 3 for its deadline and 4 for unreadable c
 | a successor's handoff that arrives with the `IfDirty` git sync | no check after it | stops there, before the CLAUDE.md import | `the_frame_re_checks_after_each_gitsync_and_stops_once_a_successor_appears` |
 | a `HEARTBEAT_DEADLINE` that is not a whole number, in the bound coordinator | no line about it | `heartbeat: HEARTBEAT_DEADLINE=<value> is not a whole number of seconds; using 230` | `an_executor_gets_120_seconds_or_what_is_left_of_the_deadline` |
 | an `EPOCH.md` that cannot be read, beside the one live epoch | skipped | `--check-bound` skips it; a tick prints `heartbeat: could not read …` and runs nothing | `check_bound_skips_an_epoch_md_it_cannot_read_as_heartbeat_sh_does` |
+| the budget ends gitsync's tries before the third | `failed 3 times` after three tries | the same line after fewer | `once_the_budget_is_spent_the_abort_still_runs_and_no_try_follows` |
+| a pull and a `git rebase --abort` that both ignore TERM | no deadline | gitsync ends at most 40 s past its 60 s budget | `gitsync_ends_at_most_40_s_past_its_budget` |
+| a staged CLAUDE.md write, chmod or rename fails | `printf >` wrote in place | written in place after the failure | `a_staged_write_that_fails_as_on_a_full_disk_is_written_in_place` |
+| a FIFO named like a coordinator handoff | grep blocks on it | skipped | `a_folder_or_fifo_named_like_a_handoff_is_skipped_though_heartbeat_sh_blocked_on_the_fifo` |
+| an owner directive heading over 128 KiB | listed though picked up: exec refuses `grep -cF`'s argument | compared like any other | `a_heading_over_128_kib_is_compared_like_any_other` |
+| the directive phase's reading | grep's, no deadline | in-process, no deadline; its work is the journal's bytes plus pickups × distinct heading lengths | `every_journal_shape_costs_work_in_proportion_to_its_bytes` |
 
 The checkout's `core.autocrlf`, `core.eol` and `core.attributesFile` leave `cm tick`'s copy as origin's, so a converting setting there unbinds nothing (`the_built_cm_tick_reads_origin_whole_whatever_the_checkouts_eol_config`, `the_built_cm_tick_reads_origin_whole_whatever_the_checkouts_core_attributes_file_says`).
 

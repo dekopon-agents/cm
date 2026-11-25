@@ -479,11 +479,15 @@ fn a_pull_killed_mid_rebase_is_aborted_with_the_tree_as_it_was_and_the_next_try_
     assert_eq!(
         proc.log().into_iter().skip(4).collect::<Vec<_>>(),
         [
-            "git pull -q --rebase --autostash origin main",
-            "git rebase --abort",
-            "git pull -q --rebase --autostash origin main",
-            "git push -q origin main",
+            &[
+                "git pull -q --rebase --autostash origin main",
+                "git rebase --abort"
+            ][..],
+            &["git pull -q --rebase --autostash origin main"],
+            &STILL_BOUND,
+            &["git push -q origin main"],
         ]
+        .concat()
     );
     assert_eq!(proc.pauses(), [Duration::from_secs(2)]);
     assert!(!ct.join(".git/rebase-merge").exists());
@@ -497,6 +501,63 @@ fn a_pull_killed_mid_rebase_is_aborted_with_the_tree_as_it_was_and_the_next_try_
         fs::read_to_string(ct.join(EPOCH).join("CARD.md")).unwrap(),
         "card, in the autostash\n"
     );
+}
+
+// `Ctx::still_bound`'s check, which gitsync runs after each pull that succeeds.
+const STILL_BOUND: [&str; 4] = [
+    "git rev-parse --abbrev-ref HEAD",
+    "sh tools/cloud-env/handoff-pick.sh store/epochs/eleemosynary-mnemosyne coordinator --lineage session_01abc --max-age-hours 24",
+    "git fetch -q origin main",
+    "git diff --name-only -z --no-renames --diff-filter=A HEAD origin/main -- store/epochs/eleemosynary-mnemosyne/handoff/",
+];
+
+// Twin campaigns, each with its own bare origin, whose pull lands a newer handoff superseding
+// this lineage's: a successor's retires the session, as heartbeat.sh's `is_bound || exit 0` did,
+// so nothing is pushed and nothing is said; this lineage's own keeps it bound, and it pushes.
+#[test]
+fn a_pull_that_lands_a_successor_s_handoff_pushes_nothing_and_says_nothing_where_its_twin_pushes() {
+    let next = "handoff/coordinator-2026-11-26T0100Z.md";
+    for (lineage, pushed) in [("session_01xyz", false), ("session_01abc", true)] {
+        let scratch = Scratch::new();
+        scratch.push_from_other(
+            next,
+            &handoff_by(lineage, "none", &format!(" supersedes={OURS}")),
+        );
+        let ct = scratch.ct();
+        write(&ct.join(EPOCH).join("CARD.md"), "card, synced\n");
+        let proc = scratch.proc();
+        assert_eq!(
+            scratch.sync(&proc, Mode::Always),
+            Report::default(),
+            "{lineage}"
+        );
+        let log = proc.log();
+        let pull = log
+            .iter()
+            .position(|call| call == "git pull -q --rebase --autostash origin main")
+            .unwrap();
+        let after: Vec<&str> = log[pull + 1..].iter().map(String::as_str).collect();
+        if pushed {
+            assert_eq!(
+                after,
+                [&STILL_BOUND[..], &["git push -q origin main"]].concat()
+            );
+        } else {
+            assert_eq!(
+                after,
+                STILL_BOUND[..2],
+                "the pick refuses: no fetch, no push"
+            );
+        }
+        let ours = "chore(mnemosyne): heartbeat sync";
+        assert_eq!(scratch.origin_log()[0] == ours, pushed, "{lineage}");
+        assert_eq!(
+            scratch.git(&ct, &["log", "--format=%s", "-2"]),
+            format!("{ours}\nother: {next}\n"),
+            "the commit stays on top of the pulled handoff"
+        );
+        assert_eq!(scratch.status(), "");
+    }
 }
 
 const RELEASED: &str = "cp \"$TICK_FIXTURE/release.tar.gz\" \"$3\"";
