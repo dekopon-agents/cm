@@ -544,6 +544,71 @@ fn a_concurrent_sync_makes_the_reads_and_writes_of_a_serial_one() {
     assert_eq!(strip(files(&twin)), strip(files(&c.root)));
 }
 
+/// What `.cm/pulls.json` and the open step's unit hold for the open PR's head.
+fn heads(c: &Campaign) -> (Option<String>, Option<String>) {
+    let pulls: BTreeMap<String, cm::plan::Observed> =
+        store::read_json(&cm::plan::pulls_path(&c.root)).unwrap();
+    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    (
+        pulls.get(OPEN_PR).and_then(|seen| seen.head.clone()),
+        unit.steps["OPEN"].track.evidence.sha.clone(),
+    )
+}
+
+#[test]
+fn a_read_memo_ahead_of_a_rewound_pulls_json_sends_no_validator() {
+    let (c, forge, _) = epoch();
+    let moved = "f".repeat(40);
+    forge.set(OPEN_PR, open(&moved));
+    let pushed = sync(&at("2026-10-17T08:05:00Z"), &forge, &c.root).unwrap();
+    assert!(pushed.ok(), "{:?}", pushed.violations);
+    assert_eq!(heads(&c), (Some(moved.clone()), Some(moved.clone())));
+    commit(&c);
+    // A checkout rewinds the tracked observation; the ignored read memo stays at the new head,
+    // whose ETag GitHub would answer with a 304.
+    git(&c.root, &["reset", "-q", "--hard", "HEAD~1"]);
+    assert_ne!(heads(&c).0, Some(moved.clone()));
+    let synced = sync(&at("2026-10-17T08:10:00Z"), &forge, &c.root).unwrap();
+    assert!(synced.ok(), "{:?}", synced.violations);
+    assert_eq!(heads(&c), (Some(moved.clone()), Some(moved)));
+}
+
+#[test]
+fn a_read_memo_written_without_its_pulls_json_sends_no_validator() {
+    let (c, forge, _) = epoch();
+    let moved = "f".repeat(40);
+    forge.set(OPEN_PR, open(&moved));
+    let pushed = sync(&at("2026-10-17T08:05:00Z"), &forge, &c.root).unwrap();
+    assert!(pushed.ok(), "{:?}", pushed.violations);
+    // As if the sync stopped after the read memo and before `.cm/pulls.json`.
+    git(&c.root, &["checkout", "-q", "--", ".cm/pulls.json"]);
+    let journal = fs::read(c.root.join("JOURNAL.md")).unwrap();
+    let synced = sync(&at("2026-10-17T08:10:00Z"), &forge, &c.root).unwrap();
+    assert!(synced.ok(), "{:?}", synced.violations);
+    assert!(synced.fields.get("journal").is_none(), "{:?}", synced.lines);
+    assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), journal);
+    assert_eq!(heads(&c), (Some(moved.clone()), Some(moved)));
+}
+
+#[test]
+fn an_unknown_mergeable_state_keeps_the_stored_one() {
+    let (c, forge, head) = epoch();
+    let unknown = Pull {
+        mergeable_state: Some("unknown".to_owned().into()),
+        ..open(&head)
+    };
+    for (now, pull) in [
+        ("2026-10-17T09:00:00Z", unknown.clone()),
+        ("2026-10-17T09:05:00Z", unknown),
+        ("2026-10-17T09:10:00Z", open(&head)),
+        ("2026-10-17T10:00:00Z", open(&head)),
+    ] {
+        forge.set(OPEN_PR, pull);
+        quiet(&sync(&at(now), &forge, &c.root).unwrap());
+        assert_eq!(status(&c), Vec::<String>::new(), "after the sync at {now}");
+    }
+}
+
 #[test]
 fn a_failing_sync_reports_each_phase_and_a_quiet_one_does_not() {
     let (c, forge, _) = epoch();

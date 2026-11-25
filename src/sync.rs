@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use crate::attempt::{recorded_id, remote_turn};
 use crate::commands::{check_release_pr, closed, is_pr_url, write_unit};
 use crate::forge::{
-    CheckState, CommitSha, Forge, ForgeError, GithubRepo, Pull, PullState, TURN_READER_TIMEOUT,
-    TagName, TurnRead, ci_green, read_remote_turn,
+    CheckState, CommitSha, Forge, ForgeError, GithubRepo, MergeableState, Pull, PullState,
+    TURN_READER_TIMEOUT, TagName, TurnRead, ci_green, read_remote_turn,
 };
 use crate::host::{Host, stamp};
 use crate::journal;
@@ -51,12 +51,28 @@ const PULL_MAX_AGE: jiff::SignedDuration = jiff::SignedDuration::from_mins(30);
 /// validators it holds, so a quiet sync's reads change no tracked file.
 pub const PULLS_READ: &str = "pulls-read.json";
 
-/// The last full read of an open PR and the ETags to send with the next.
+/// The last full read of an open PR, the ETags to send with the next, and the observation those
+/// ETags validate: a 304 restores that observation, so the ETags are sent only while
+/// `.cm/pulls.json` holds it.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct LastRead {
     at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mergeable_state: Option<MergeableState>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     etags: BTreeMap<String, String>,
+}
+
+impl LastRead {
+    fn validates(&self, seen: &plan::Observed) -> bool {
+        self.head == seen.head
+            && self.base == seen.base
+            && self.mergeable_state == seen.mergeable_state
+    }
 }
 
 #[derive(Clone)]
@@ -578,12 +594,18 @@ impl<'a> Run<'a> {
                 (jiff::SignedDuration::ZERO..PULL_MAX_AGE).contains(&self.now.duration_since(at))
             })
         });
-        let validators = fresh.map(|read| read.etags.clone()).unwrap_or_default();
         let previous = self
             .seen
             .get(url)
-            .filter(|seen| fresh.is_some() && Some(seen.target.as_str()) == target)
+            .filter(|seen| {
+                Some(seen.target.as_str()) == target
+                    && fresh.is_some_and(|read| read.validates(seen))
+            })
             .cloned();
+        let validators = fresh
+            .filter(|_| previous.is_some())
+            .map(|read| read.etags.clone())
+            .unwrap_or_default();
         let read = url.to_owned();
         self.read(
             "pull",
@@ -591,11 +613,6 @@ impl<'a> Run<'a> {
             url.to_owned(),
             move |forge| {
                 let mut etags = BTreeMap::new();
-                let validators = if previous.is_some() {
-                    validators
-                } else {
-                    BTreeMap::new()
-                };
                 if let Some(pull) = forge.pull_conditional(&read, &validators, &mut etags)? {
                     return Ok(PullRead {
                         pull,
@@ -1090,12 +1107,26 @@ impl<'a> Run<'a> {
                     let previous = self.seen.get(&url).filter(|seen| seen.target == target);
                     let mut ci_head = previous.and_then(|seen| seen.ci_head.clone());
                     let mut ci_base = previous.and_then(|seen| seen.ci_base.clone());
+                    // GitHub answers `unknown` while it computes mergeability: keep what was
+                    // stored for the same head and base rather than write it twice.
+                    let mergeable_state = match (&mergeable_state, previous) {
+                        (Some(MergeableState::Other(state)), Some(seen))
+                            if state == "unknown"
+                                && seen.head.as_deref() == head.as_ref().map(CommitSha::as_str)
+                                && seen.base.as_deref() == base.as_ref().map(CommitSha::as_str) =>
+                        {
+                            seen.mergeable_state.clone()
+                        }
+                        _ => mergeable_state,
+                    };
                     if let (Some(head), Some(base), Some(repo)) = (&head, &base, GithubRepo::of_pr(&url))
                         && ci_head.as_deref() != Some(head.as_str())
                     {
                         let validators = previous
                             .filter(|seen| seen.head.as_deref() == Some(head.as_str()))
-                            .and_then(|_| self.last_read.get(&url))
+                            .and_then(|seen| {
+                                self.last_read.get(&url).filter(|read| read.validates(seen))
+                            })
                             .map(|read| read.etags.clone())
                             .unwrap_or_default();
                         if let Some(Ok(checks)) = self.open_checks(&repo, head, &validators) {
@@ -1121,10 +1152,7 @@ impl<'a> Run<'a> {
                         mergeable_state,
                         etags,
                     };
-                    if let Some(at) = read_at {
-                        let etags = observed.etags.clone();
-                        self.read_now.insert(url.clone(), LastRead { at, etags });
-                    }
+                    let etags = observed.etags.clone();
                     // A read that saw no new fact keeps the stored observation, its stamp and
                     // validators included, so `.cm/pulls.json` changes only with a fact.
                     let observed = self
@@ -1133,6 +1161,16 @@ impl<'a> Run<'a> {
                         .filter(|seen| same_facts(seen, &observed))
                         .cloned()
                         .unwrap_or(observed);
+                    if let Some(at) = read_at {
+                        let read = LastRead {
+                            at,
+                            head: observed.head.clone(),
+                            base: observed.base.clone(),
+                            mergeable_state: observed.mergeable_state.clone(),
+                            etags,
+                        };
+                        self.read_now.insert(url.clone(), read);
+                    }
                     self.open.insert(url.clone(), observed);
                 }
             }
@@ -1624,15 +1662,17 @@ fn run_sync(
         }
     }
     last_read.retain(|url, _| open.contains_key(url));
+    let mut campaign = store::load_campaign(root)?;
+    campaign.schema = crate::state::SCHEMA;
+    store::write_json(&store::state_path(root), &campaign)?;
+    // The observations before the memo of their validators: a sync stopped between the two
+    // leaves validators that no longer match, which `LastRead::validates` refuses.
+    store::write_json(&plan::pulls_path(root), &open)?;
     let last_read_path = root.join(store::CM_DIR).join(PULLS_READ);
     if !last_read.is_empty() || last_read_path.exists() {
         store::ignore(root, PULLS_READ)?;
         store::write_json(&last_read_path, &last_read)?;
     }
-    let mut campaign = store::load_campaign(root)?;
-    campaign.schema = crate::state::SCHEMA;
-    store::write_json(&store::state_path(root), &campaign)?;
-    store::write_json(&plan::pulls_path(root), &open)?;
     phases.mark("write");
     let mut outcome = Outcome::refused(std::mem::take(&mut run.violations));
     crate::ledger::owner_queue_banner(root, &mut outcome)?;
