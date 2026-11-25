@@ -10,10 +10,8 @@ use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 use crate::tick::act::{ActLine, Ctx, Env, Outcome, Registry, Report, clip};
-use crate::tick::proc::{
-    Cmd, Exit, KILL_AFTER, Keep, Proc, Ran, Spilled, StdoutKeep, SystemProc, WHOLE_CAP,
-};
-use crate::tick::{claude_md, collect, directive, exec, gitsync, pin};
+use crate::tick::proc::{Cmd, Exit, KILL_AFTER, Keep, Proc, Ran, Spilled, StdoutKeep, SystemProc};
+use crate::tick::{TickError, claude_md, collect, directive, exec, gitsync, pin};
 
 pub const DEADLINE_SECS: i64 = 230;
 
@@ -69,7 +67,7 @@ pub fn cli(checkout: &Path, cm: Option<&OsStr>, out: &mut dyn FnMut(String)) -> 
     let started = Instant::now();
     let env = Env::system();
     let registry = exec::registry();
-    let cm = cm.map_or_else(this_cm, OsStr::to_owned);
+    let cm = cm.map_or_else(this_cm, resolve);
     let checkout = std::path::absolute(checkout).unwrap_or_else(|_| checkout.to_path_buf());
     let beat = Beat {
         checkout: &checkout,
@@ -88,12 +86,34 @@ pub fn this_cm() -> OsString {
     std::env::current_exe().map_or_else(|_| "cm".into(), PathBuf::into_os_string)
 }
 
+// Children run in the checkout, so `--cm` is resolved where it was given: a path made absolute,
+// a bare name looked up on PATH. A name PATH does not hold stays bare, to fail as one line.
+pub fn resolve(cm: &OsStr) -> OsString {
+    use std::os::unix::fs::PermissionsExt;
+    let named = Path::new(cm);
+    if cm.as_encoded_bytes().contains(&b'/') {
+        return std::path::absolute(named).map_or_else(|_| cm.to_owned(), PathBuf::into_os_string);
+    }
+    let runnable = |path: &Path| {
+        path.metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    };
+    std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(named))
+                .find(|path| !cm.is_empty() && runnable(path))
+        })
+        .and_then(|path| std::path::absolute(path).ok())
+        .map_or_else(|| cm.to_owned(), PathBuf::into_os_string)
+}
+
 pub fn run(beat: &Beat, out: &mut dyn FnMut(String)) {
     let epochs = match live_epochs(beat.checkout) {
         Ok(epochs) => epochs,
         Err(error) => {
             out(format!(
-                "heartbeat: store/epochs could not be read: {error}"
+                "heartbeat: could not read {error}; stay read-only until cm, PR and journal state are reconciled"
             ));
             return;
         }
@@ -152,14 +172,18 @@ pub fn run(beat: &Beat, out: &mut dyn FnMut(String)) {
 // A store or EPOCH.md that is missing or not the kind of file it should be is no epoch, as
 // heartbeat.sh's glob matched none; a read that fails (EMFILE, EACCES, ELOOP) is returned, not
 // counted as no epoch.
-pub fn live_epochs(checkout: &Path) -> std::io::Result<Vec<PathBuf>> {
+pub fn live_epochs(checkout: &Path) -> std::result::Result<Vec<PathBuf>, TickError> {
     use std::io::ErrorKind::{IsADirectory, NotADirectory, NotFound};
     let epochs = Path::new("store/epochs");
     let missing =
         |error: &std::io::Error| matches!(error.kind(), NotFound | NotADirectory | IsADirectory);
+    let failed = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| TickError::Io { path, source }
+    };
     let entries = match std::fs::read_dir(checkout.join(epochs)) {
         Err(error) if missing(&error) => return Ok(Vec::new()),
-        entries => entries?,
+        entries => entries.map_err(failed(epochs))?,
     };
     let live = |bytes: &[u8]| {
         bytes.split(|byte| *byte == b'\n').any(|line| {
@@ -168,16 +192,17 @@ pub fn live_epochs(checkout: &Path) -> std::io::Result<Vec<PathBuf>> {
     };
     let mut found = Vec::new();
     for entry in entries {
-        let name = entry?.file_name();
+        let name = entry.map_err(failed(epochs))?.file_name();
         if name.as_encoded_bytes().starts_with(b".") {
             continue;
         }
         let epoch = epochs.join(name);
-        match std::fs::read(checkout.join(&epoch).join("EPOCH.md")) {
+        let file = epoch.join("EPOCH.md");
+        match std::fs::read(checkout.join(&file)) {
             Ok(bytes) if live(&bytes) => found.push(epoch),
             Ok(_) => {}
             Err(error) if missing(&error) => {}
-            Err(error) => return Err(error),
+            Err(error) => return Err(failed(&file)(error)),
         }
     }
     found.sort();
@@ -276,8 +301,7 @@ fn act(
             ..
         }) => {
             out(format!(
-                "heartbeat: cm --json next --act printed more than {} MiB, which could not be stored in {}: {error}; no act line was read",
-                WHOLE_CAP >> 20,
+                "heartbeat: cm --json next --act's list was too large to keep in memory and could not be stored in {}: {error}; no act line was read",
                 std::env::temp_dir().display()
             ));
             return READ_FAILED;

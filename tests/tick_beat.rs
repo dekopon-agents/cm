@@ -1301,7 +1301,7 @@ fn a_list_that_could_not_be_spilled_is_one_line_naming_the_store() {
     let ct = Ct::new();
     let error = std::io::Error::from(std::io::ErrorKind::StorageFull);
     let named = format!(
-        "heartbeat: cm --json next --act printed more than 64 MiB, which could not be stored in {}: {error}; no act line was read",
+        "heartbeat: cm --json next --act's list was too large to keep in memory and could not be stored in {}: {error}; no act line was read",
         std::env::temp_dir().display()
     );
     let mut answers = Answers::new(1, "");
@@ -1667,7 +1667,7 @@ fn the_built_cm_tick_runs_the_loop_with_fake_cm_and_git_on_path() {
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         json,
-        json!({"command": "tick", "ok": true, "violations": [], "cm": "cm", "lines": [
+        json!({"command": "tick", "ok": true, "violations": [], "cm": refused.bin.join("cm"), "lines": [
             "heartbeat: executors off (handoff-pick.sh for session_01abc: refused superseded x); every act line below is yours",
             "attempt-ended 01-a/u/c: cm attempt 01-a/u/c restart",
             "missing-kickoff 01-a/u/b: cm amend 01-a/u/b",
@@ -2458,7 +2458,7 @@ fn the_built_cm_tick_names_a_spill_that_could_not_be_stored() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert_eq!(stdout.lines().count(), 1, "{stdout}");
     let prefix = format!(
-        "heartbeat: cm --json next --act printed more than 64 MiB, which could not be stored in {}: ",
+        "heartbeat: cm --json next --act's list was too large to keep in memory and could not be stored in {}: ",
         tmpdir.display()
     );
     assert!(stdout.starts_with(&prefix), "{stdout}");
@@ -2551,7 +2551,7 @@ fn the_built_cm_tick_names_a_spill_that_would_pass_the_file_size_limit() {
     assert_eq!(stdout.lines().count(), 1, "{stdout}");
     assert!(
         stdout.starts_with(
-            "heartbeat: cm --json next --act printed more than 64 MiB, which could not be stored in "
+            "heartbeat: cm --json next --act's list was too large to keep in memory and could not be stored in "
         ),
         "{stdout}"
     );
@@ -2603,12 +2603,39 @@ fn the_built_cm_tick_stops_writing_a_stdout_file_at_the_file_size_limit() {
     }
 }
 
+// The smallest address space, in KiB, in which this build of cm ticks a two-line list: about
+// 20 MB for a debug build, more under coverage or sanitizers.
+fn floor_kib() -> u64 {
+    let harness = Harness::new(1, &act(lines()), PICK_OK);
+    let ticks = |kib: u64| {
+        let output = harness
+            .limited("cse_01abc", &format!("ulimit -v {kib}"))
+            .args(["tick", "--cm", "cm"])
+            .output()
+            .unwrap();
+        output.status.success() && output.stdout == format!("{}\n", PRINTED.join("\n")).as_bytes()
+    };
+    let (mut low, mut high) = (1_024, 4_194_304);
+    assert!(ticks(high), "cm does not tick in 4 GiB");
+    while high - low > 1_024 {
+        let middle = (low + high) / 2;
+        if ticks(middle) {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    high
+}
+
 #[test]
 fn the_built_cm_tick_moves_the_list_to_its_file_when_memory_for_it_runs_out() {
+    // Room for a small list's tick and 40 MiB more: less than the 64 MiB hold needs.
+    let limit = floor_kib() + 40 * 1_024;
     let harness = Harness::new(1, "", PICK_OK);
     write_big_list(&harness.ct.path().join("next.json"));
     let output = harness
-        .limited("cse_01abc", "ulimit -v 60000")
+        .limited("cse_01abc", &format!("ulimit -v {limit}"))
         .args(["tick", "--cm", "cm"])
         .output()
         .unwrap();
@@ -2627,32 +2654,44 @@ fn the_built_cm_tick_moves_the_list_to_its_file_when_memory_for_it_runs_out() {
 
 #[test]
 fn an_epoch_store_that_cannot_be_read_is_named_not_counted_as_none() {
-    let dir = tempfile::tempdir().unwrap();
-    fs::create_dir(dir.path().join("store")).unwrap();
-    std::os::unix::fs::symlink("epochs", dir.path().join("store/epochs")).unwrap();
-    let error = beat::live_epochs(dir.path()).unwrap_err();
-    assert_eq!(error.raw_os_error(), Some(40), "ELOOP: {error}");
-    let proc = Answers::new(1, act(lines())).proc();
-    let mut out = Vec::new();
-    beat::run(
-        &Beat {
-            checkout: dir.path(),
-            proc: &proc,
-            env: &bound_env(),
-            registry: &Registry::new(),
-            phases: &QUIET,
-            cm: OsStr::new("cm"),
-            started: Instant::now(),
-        },
-        &mut |line| out.push(line),
-    );
-    assert_eq!(
-        out,
-        [format!(
-            "heartbeat: store/epochs could not be read: {error}"
-        )]
-    );
-    assert!(proc.calls().is_empty());
+    let stay = "stay read-only until cm, PR and journal state are reconciled";
+    let eloop = std::io::Error::from_raw_os_error(40);
+    let store = tempfile::tempdir().unwrap();
+    fs::create_dir(store.path().join("store")).unwrap();
+    std::os::unix::fs::symlink("epochs", store.path().join("store/epochs")).unwrap();
+    let one_epoch = Ct::new();
+    fs::create_dir_all(one_epoch.path().join("store/epochs/looped")).unwrap();
+    std::os::unix::fs::symlink(
+        "EPOCH.md",
+        one_epoch.path().join("store/epochs/looped/EPOCH.md"),
+    )
+    .unwrap();
+    for (checkout, path) in [
+        (store.path(), "store/epochs"),
+        (one_epoch.path(), "store/epochs/looped/EPOCH.md"),
+    ] {
+        let error = beat::live_epochs(checkout).unwrap_err();
+        assert_eq!(error.to_string(), format!("{path}: {eloop}"));
+        let proc = Answers::new(1, act(lines())).proc();
+        let mut out = Vec::new();
+        beat::run(
+            &Beat {
+                checkout,
+                proc: &proc,
+                env: &bound_env(),
+                registry: &Registry::new(),
+                phases: &QUIET,
+                cm: OsStr::new("cm"),
+                started: Instant::now(),
+            },
+            &mut |line| out.push(line),
+        );
+        assert_eq!(
+            out,
+            [format!("heartbeat: could not read {path}: {eloop}; {stay}")]
+        );
+        assert!(proc.calls().is_empty());
+    }
     let shapes = tempfile::tempdir().unwrap();
     assert!(beat::live_epochs(shapes.path()).unwrap().is_empty());
     write(
@@ -2666,4 +2705,42 @@ fn an_epoch_store_that_cannot_be_read_is_named_not_counted_as_none() {
         "a file among epochs\n",
     );
     assert!(beat::live_epochs(shapes.path()).unwrap().is_empty());
+}
+
+#[test]
+fn the_built_cm_tick_resolves_its_cm_where_it_was_given() {
+    let harness = Harness::new(1, &act(lines()), PICK_OK);
+    let elsewhere = harness.ct.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    let tick = |cm: &str| {
+        let output = harness
+            .command("cse_01abc")
+            .current_dir(&elsewhere)
+            .args(["--json", "tick", "--checkout"])
+            .arg(harness.ct.path())
+            .args(["--cm", cm])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{cm}: {output:?}");
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let real = fs::canonicalize(harness.bin.join("cm")).unwrap();
+    for cm in ["../bin/cm", "cm"] {
+        let json = tick(cm);
+        let used = Path::new(json["cm"].as_str().unwrap());
+        assert!(used.is_absolute(), "{cm}: {json}");
+        assert_eq!(fs::canonicalize(used).unwrap(), real, "{cm}");
+        assert_eq!(json["lines"], json!(PRINTED), "{cm}");
+    }
+    let json = tick("no-such-cm");
+    assert_eq!(json["cm"], "no-such-cm");
+    let lines = json["lines"].as_array().unwrap();
+    assert_eq!(lines.len(), 1, "{json}");
+    assert!(
+        lines[0]
+            .as_str()
+            .unwrap()
+            .starts_with("heartbeat: cm --json next --act could not run: no-such-cm: "),
+        "{json}"
+    );
 }
