@@ -19,9 +19,10 @@
 //!     (heartbeat.sh step 1 with `Mode::Always`, step 5 with `Mode::IfDirty`);
 //!   - [`pin::run`](crate::tick::pin::run)`(ctx: &Ctx) -> Report` (step 2);
 //!   - [`directive::run`](crate::tick::directive::run)`(ctx: &Ctx) -> Report` (step 3);
-//!   - [`collect::run`](crate::tick::collect::run)`(ctx: &Ctx) -> Report` (before the act
-//!     loop);
 //!   - [`claude_md::run`](crate::tick::claude_md::run)`(ctx: &Ctx) -> Report` (step 6).
+//! - `07-tick/mvp/exec-codex` also fills
+//!   [`collect::run`](crate::tick::collect::run)`(ctx: &Ctx) -> Report` (review-latency U4,
+//!   run in the bound coordinator only, before `cm --json next --act` is read).
 //! - `07-tick/mvp/exec-merge` and `07-tick/mvp/exec-codex`: in each `exec/<name>.rs`, keep
 //!   `pub const KEY: &str` (the `act.d/` name, `<kind>` or `<kind>.<lane>`) and the unit struct
 //!   with `impl Executor`, whose
@@ -91,7 +92,9 @@ impl ActLine {
         jq_raw(self.json.get("command"))
     }
 
-    /// `<kind> <target>[#<part>]: <command>`, the line the model sees when nothing ran.
+    /// `<kind> <target>[#<part>]: <command>`, the line the model sees when nothing ran, as
+    /// heartbeat.sh's `jq` built it (act_lib.py's `text` differs only for an empty `part`, which
+    /// it drops, and a missing `command`, which it prints empty; cm emits neither).
     pub fn text(&self) -> String {
         format!("{} {}: {}", self.kind(), self.target(), self.command())
     }
@@ -264,28 +267,44 @@ impl<'a> Ctx<'a> {
     }
 
     /// act_lib.py's `step_state`: `.steps[<step>]` of
-    /// `<epoch>/<NN-area>/<unit>/.cm/state.json`, or `no cm state for <target>`.
-    pub fn step_state(&self, line: &ActLine) -> std::result::Result<Value, String> {
-        let target = line.target();
-        let (unit, step) = unit_and_step(&target);
-        read_json(&self.epoch_dir().join(unit).join(".cm/state.json"))
+    /// `<epoch>/<NN-name>/<unit>/.cm/state.json` for a target (its `#<part>` ignored); fails
+    /// `<target> is not <NN-name>/<unit>/<step>` or `no cm state for <target>`.
+    pub fn step_state(&self, target: &str) -> std::result::Result<Value, String> {
+        let parts: Vec<&str> = target
+            .split('#')
+            .next()
+            .unwrap_or_default()
+            .split('/')
+            .collect();
+        let [area, unit, step] = parts[..] else {
+            return Err(format!("{target} is not <NN-name>/<unit>/<step>"));
+        };
+        let state = self
+            .epoch_dir()
+            .join(area)
+            .join(unit)
+            .join(".cm/state.json");
+        read_json(&state)
             .and_then(|state| state.get("steps")?.get(step).cloned())
             .ok_or_else(|| format!("no cm state for {target}"))
     }
 
     /// act_lib.py's `pull`: the step's pull request, from the line's `pr`, else the step's
-    /// `evidence.pr`, else its `pr`; with what `cm sync` last saw of it in
-    /// `<epoch>/.cm/pulls.json`, or an empty object.
+    /// `evidence.pr`, else its `pr` (each only when not empty); fails `<target> records no PR
+    /// URL`. `observed` is what `cm sync` last saw of it in `<epoch>/.cm/pulls.json`, or `{}`.
     pub fn pull(&self, line: &ActLine, step: &Value) -> std::result::Result<Pull, String> {
-        let url = line
-            .field("pr")
-            .or_else(|| step["evidence"]["pr"].as_str())
-            .or_else(|| step["pr"].as_str())
+        fn given(value: &Value) -> Option<&str> {
+            value.as_str().filter(|url| !url.is_empty())
+        }
+        let url = given(&line.json["pr"])
+            .or_else(|| given(&step["evidence"]["pr"]))
+            .or_else(|| given(&step["pr"]))
             .unwrap_or_default();
-        let (repo, number) =
-            pull_url(url).ok_or_else(|| format!("no pull request URL for {}", line.target()))?;
+        let target = jq_raw(line.json.get("target"));
+        let (repo, number) = pull_url(url).ok_or_else(|| format!("{target} records no PR URL"))?;
         let observed = read_json(&self.epoch_dir().join(".cm/pulls.json"))
             .and_then(|pulls| pulls.get(url).cloned())
+            .filter(truthy)
             .unwrap_or_else(|| Value::Object(Map::new()));
         Ok(Pull {
             repo,
@@ -293,6 +312,18 @@ impl<'a> Ctx<'a> {
             url: url.to_owned(),
             observed,
         })
+    }
+}
+
+/// Python's truth: `null`, `false`, `0`, `""`, `[]` and `{}` are false.
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number.as_f64() != Some(0.0),
+        Value::String(text) => !text.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(fields) => !fields.is_empty(),
     }
 }
 
@@ -327,14 +358,20 @@ fn pull_url(url: &str) -> Option<(String, u64)> {
         .then(|| (format!("{owner}/{repo}"), number))
 }
 
-/// act_lib.py's `last_line`: the last non-empty line of stdout and stderr, at most 300 bytes;
-/// `exit <status>` when there is none.
+/// act_lib.py's `last_line`: the last line of stdout, a newline and stderr that is not blank,
+/// cut to 300 characters; `exit <status>` when there is none.
 pub fn last_line(ran: &Ran) -> String {
-    let mut output = ran.stdout.clone();
-    output.extend_from_slice(&ran.stderr);
-    let text = String::from_utf8_lossy(&output);
-    match text.lines().rev().find(|line| !line.trim().is_empty()) {
-        Some(line) => clip(line).to_owned(),
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&ran.stdout),
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    // Python's `str.splitlines` boundaries.
+    let breaks = [
+        '\n', '\r', '\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\u{85}', '\u{2028}', '\u{2029}',
+    ];
+    match text.split(breaks).rfind(|line| !line.trim().is_empty()) {
+        Some(line) => line.chars().take(300).collect(),
         None => format!("exit {}", ran.exit.shell_status()),
     }
 }
@@ -455,13 +492,51 @@ mod tests {
     }
 
     #[test]
-    fn last_line_is_the_last_non_empty_line_cut_to_300_bytes() {
+    fn last_line_is_act_libs() {
         let ran = Ran::code(1, "first\n\nno thread recorded\n\n").with_stderr("");
         assert_eq!(last_line(&ran), "no thread recorded");
-        let ran = Ran::code(1, "out\n").with_stderr("err line\n");
+        let ran = Ran::code(1, "out").with_stderr("err line\n  \n");
         assert_eq!(last_line(&ran), "err line");
+        let ran = Ran::code(1, "out").with_stderr("");
+        assert_eq!(
+            last_line(&ran),
+            "out",
+            "stdout and stderr are joined by a newline"
+        );
+        assert_eq!(last_line(&Ran::code(1, "a\rb\u{2028} \x0c")), "b");
         assert_eq!(last_line(&Ran::code(3, "\n \n")), "exit 3");
-        assert_eq!(last_line(&Ran::code(1, "é".repeat(200))).len(), 300);
+        assert_eq!(
+            last_line(&Ran {
+                exit: Exit::Signal(9),
+                ..Ran::code(0, "")
+            }),
+            "exit 137"
+        );
+        assert_eq!(last_line(&Ran::code(1, "é".repeat(400))), "é".repeat(300));
+    }
+
+    #[test]
+    fn truthy_is_pythons() {
+        for value in [
+            json!(null),
+            json!(false),
+            json!(0),
+            json!(0.0),
+            json!(""),
+            json!([]),
+            json!({}),
+        ] {
+            assert!(!truthy(&value), "{value}");
+        }
+        for value in [
+            json!(true),
+            json!(1),
+            json!("x"),
+            json!([0]),
+            json!({"a": 0}),
+        ] {
+            assert!(truthy(&value), "{value}");
+        }
     }
 
     #[test]
@@ -476,6 +551,9 @@ mod tests {
             "https://github.com/o/r/pull/1/files",
             "https://github.com/o/r/pull/x",
             "https://github.com/o/r/pull/+1",
+            "https://github.com/o/r/pull/",
+            "https://github.com/o r/r/pull/1",
+            "https://github.com//r/pull/1",
             "http://github.com/o/r/pull/1",
         ] {
             assert_eq!(pull_url(bad), None, "{bad}");

@@ -3,11 +3,12 @@
 //! 1. Choose the one live epoch: `store/epochs/*/EPOCH.md` with a line starting
 //!    `status: PLANNING` or `status: WORKING`. Any other count prints heartbeat.sh's "not one"
 //!    line and stops before any child runs.
-//! 2. The phases, in heartbeat.sh's order: [`gitsync`] (always), [`pin`], [`directive`],
-//!    [`collect`], the act loop, [`gitsync`] again when an executor ran (only a dirty tree), and
-//!    [`claude_md`].
-//! 3. The act loop reads `cm --json next -C <epoch> --act` by argv. In the bound coordinator
-//!    (the checkout on `main`, and handoff-pick.sh printing `ok` for this session's lineage) each
+//! 2. In heartbeat.sh's order: [`gitsync`] (always), [`pin`], [`directive`]; then the bound
+//!    check (the checkout on `main`, and handoff-pick.sh printing `ok` for this session's
+//!    lineage); then [`collect`], in the bound coordinator only, so a verdict it records is in
+//!    the act list read next; the act loop; [`gitsync`] again when an executor ran (only a dirty
+//!    tree); and [`claude_md`].
+//! 3. The act loop reads `cm --json next -C <epoch> --act` by argv. In the bound coordinator each
 //!    line goes to its executor, `<kind>.<lane>` then `<kind>`; elsewhere every line is printed.
 //!    While OWNER-QUEUE.md has unread items, `merge-ready` and `review-owed` lines are printed
 //!    instead. Each executor gets `min(120, deadline - elapsed)` seconds (deadline 230,
@@ -21,7 +22,6 @@
 //! heartbeat.sh named its `act.d/<file>`.
 
 use std::ffi::{OsStr, OsString};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -97,12 +97,12 @@ impl Beat<'_> {
 }
 
 /// `cm tick`: one tick with the real children, environment and executors, each line handed to
-/// `out` as it is decided.
-pub fn cli(checkout: &Path, out: &mut dyn FnMut(String)) {
+/// `out` as it is decided. `cm` is the program cm calls go to, by default this executable.
+pub fn cli(checkout: &Path, cm: Option<&OsStr>, out: &mut dyn FnMut(String)) {
     let started = Instant::now();
     let env = Env::system();
     let registry = exec::registry();
-    let cm = cm_program(&env);
+    let cm = cm.map_or_else(this_cm, OsStr::to_owned);
     let checkout = std::path::absolute(checkout).unwrap_or_else(|_| checkout.to_path_buf());
     let beat = Beat {
         checkout: &checkout,
@@ -116,21 +116,11 @@ pub fn cli(checkout: &Path, out: &mut dyn FnMut(String)) {
     run(&beat, out);
 }
 
-/// `cm` as heartbeat.sh ran it, the first executable `cm` on an absolute `PATH` entry (the
-/// pinned one, once the pin phase installed it there); this executable when `PATH` has none.
-pub fn cm_program(env: &Env) -> OsString {
-    let executable = |path: &Path| {
-        std::fs::metadata(path)
-            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-    };
-    env.get("PATH")
-        .into_iter()
-        .flat_map(std::env::split_paths)
-        .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join("cm"))
-        .find(|path| executable(path))
-        .or_else(|| std::env::current_exe().ok())
-        .map_or_else(|| "cm".into(), PathBuf::into_os_string)
+/// This executable's path, read once when the tick starts: once the pin phase installs the
+/// pinned cm at that path, the act lines come from the pinned cm, as in heartbeat.sh. `cm` on
+/// `PATH` when the path cannot be read.
+pub fn this_cm() -> OsString {
+    std::env::current_exe().map_or_else(|_| "cm".into(), PathBuf::into_os_string)
 }
 
 /// One tick: every line for the model goes to `out`, in order.
@@ -160,11 +150,14 @@ pub fn run(beat: &Beat, out: &mut dyn FnMut(String)) {
         directive::BUDGET,
         phases.directive,
     );
-    phase(beat, epoch, out, "collect", collect::BUDGET, phases.collect);
+    let bound = bound(beat, epoch);
+    if bound.is_ok() {
+        phase(beat, epoch, out, "collect", collect::BUDGET, phases.collect);
+    }
     let started = Instant::now();
     let left = u64::try_from(deadline.saturating_sub(beat.elapsed_secs())).unwrap_or(0);
     let budget = Duration::from_secs(left).saturating_add(KILL_AFTER);
-    let act = act(beat, epoch, deadline, out);
+    let act = act(beat, epoch, &bound, deadline, out);
     wall_time(out, "act", started.elapsed(), budget, act.failed);
     if act.ran {
         phase(beat, epoch, out, "gitsync", gitsync::BUDGET, |ctx| {
@@ -267,7 +260,13 @@ struct Act {
 }
 
 /// heartbeat.sh step 4.
-fn act(beat: &Beat, epoch: &Path, deadline: i64, out: &mut dyn FnMut(String)) -> Act {
+fn act(
+    beat: &Beat,
+    epoch: &Path,
+    bound: &Result<(), String>,
+    deadline: i64,
+    out: &mut dyn FnMut(String),
+) -> Act {
     let failed = Act {
         ran: false,
         failed: true,
@@ -328,8 +327,7 @@ fn act(beat: &Beat, epoch: &Path, deadline: i64, out: &mut dyn FnMut(String)) ->
     if lines.is_empty() {
         return act;
     }
-    let bound = bound(beat, epoch);
-    if let Err(why) = &bound {
+    if let Err(why) = bound {
         out(format!(
             "heartbeat: executors off ({why}); every act line below is yours"
         ));

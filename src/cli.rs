@@ -401,6 +401,9 @@ enum Commands {
         /// The campaign-trail checkout holding `store/epochs/`.
         #[arg(long, value_name = "DIR", default_value = ".")]
         checkout: PathBuf,
+        /// The cm that `cm next --act` and the executors' cm calls run; defaults to this executable. A bare name is looked up on PATH.
+        #[arg(long, value_name = "PROGRAM")]
+        cm: Option<PathBuf>,
     },
     /// Report every violation in the campaign folder; exit 1 when there is any.
     Lint {
@@ -1320,9 +1323,9 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             act: Some(FollowupAct::Close { id, by }),
             ..
         } => crate::verdict::close_followup(host, &root()?, id, by),
-        Commands::Tick { checkout } => {
+        Commands::Tick { checkout, cm } => {
             let mut lines = Vec::new();
-            crate::tick::beat::cli(checkout, &mut |line| {
+            crate::tick::beat::cli(checkout, cm.as_deref().map(Path::as_os_str), &mut |line| {
                 if cli.json {
                     lines.push(line);
                 } else {

@@ -230,12 +230,18 @@ fn nothing_to_do_prints_nothing() {
     );
     assert_eq!(
         proc.log(),
-        ["cm --json next -C store/epochs/eleemosynary-mnemosyne --act"]
+        [
+            "git rev-parse --abbrev-ref HEAD",
+            "sh tools/cloud-env/handoff-pick.sh store/epochs/eleemosynary-mnemosyne coordinator --lineage session_01abc --max-age-hours 24",
+            "cm --json next -C store/epochs/eleemosynary-mnemosyne --act",
+        ],
+        "the bound check, then the act list; no `cm sync`"
     );
-    let next = &proc.calls()[0];
-    assert_eq!(next.cwd.as_deref(), Some(ct.path()));
-    assert_eq!(next.timeout, beat::FRAME_CAP);
-    assert_eq!(next.stdin, None);
+    for call in proc.calls() {
+        assert_eq!(call.cwd.as_deref(), Some(ct.path()));
+        assert_eq!(call.timeout, beat::FRAME_CAP);
+        assert_eq!(call.stdin, None);
+    }
 }
 
 #[test]
@@ -405,6 +411,37 @@ fn an_executor_prints_what_is_left_for_the_model_and_its_writes_are_pushed() {
         ],
         "no executor ran, so nothing to push"
     );
+
+    log.borrow_mut().clear();
+    let proc = {
+        let log = log.clone();
+        let answers = Answers {
+            pick: Ran::code(4, "unbound x\n"),
+            ..Answers::new(1, act(lines()))
+        };
+        FakeProc::new(move |cmd| {
+            log.borrow_mut().push(cmd.program_name());
+            Ok(answers.answer(cmd))
+        })
+    };
+    let out = tick_with(&ct, &proc, &bound_env(), &Registry::new(), &phases);
+    assert_eq!(
+        out[0],
+        "heartbeat: executors off (handoff-pick.sh for session_01abc: unbound x); every act line below is yours"
+    );
+    assert_eq!(
+        *log.borrow(),
+        [
+            "gitsync Always",
+            "pin",
+            "directive",
+            "git",
+            "sh",
+            "cm",
+            "claude-md"
+        ],
+        "the bound check runs after the directives; collect only in the bound coordinator"
+    );
 }
 
 #[test]
@@ -512,7 +549,7 @@ fn spent_time_budget_prints_the_line_unrun() {
             )]
         );
         assert!(seen.calls().is_empty());
-        assert_eq!(proc.log()[0], format!("cm --json next -C {EPOCH} --act"));
+        assert_eq!(proc.log()[2], format!("cm --json next -C {EPOCH} --act"));
     }
 }
 
@@ -563,9 +600,9 @@ fn executors_run_only_in_the_bound_coordinator() {
     let (out, ran, proc) = run(next(), &bound_env());
     assert_eq!((out, ran), (Vec::<String>::new(), 1));
     let calls = proc.calls();
-    assert_eq!(calls[1].line(), "git rev-parse --abbrev-ref HEAD");
+    assert_eq!(calls[0].line(), "git rev-parse --abbrev-ref HEAD");
     assert_eq!(
-        calls[2].argv,
+        calls[1].argv,
         [
             "sh",
             beat::HANDOFF_PICK,
@@ -577,7 +614,7 @@ fn executors_run_only_in_the_bound_coordinator() {
             "24"
         ]
     );
-    for call in &calls[1..] {
+    for call in &calls[..2] {
         assert_eq!(call.cwd.as_deref(), Some(ct.path()));
         assert_eq!(call.timeout, beat::FRAME_CAP);
     }
@@ -1279,7 +1316,7 @@ fn the_built_cm_tick_runs_the_loop_with_fake_cm_and_git_on_path() {
     harness.ct.write(".claude/CLAUDE.md", mac);
     let output = harness
         .command("cse_01abc")
-        .args(["tick", "--checkout"])
+        .args(["tick", "--cm", "cm", "--checkout"])
         .arg(harness.ct.path())
         .current_dir("/")
         .output()
@@ -1292,9 +1329,9 @@ fn the_built_cm_tick_runs_the_loop_with_fake_cm_and_git_on_path() {
     assert_eq!(
         harness.log(),
         [
-            "cm --json next -C store/epochs/eleemosynary-mnemosyne --act",
             "git rev-parse --abbrev-ref HEAD",
             "handoff-pick.sh store/epochs/eleemosynary-mnemosyne coordinator --lineage session_01abc --max-age-hours 24",
+            "cm --json next -C store/epochs/eleemosynary-mnemosyne --act",
         ]
     );
 
@@ -1305,7 +1342,11 @@ fn the_built_cm_tick_runs_the_loop_with_fake_cm_and_git_on_path() {
     );
 
     let refused = Harness::new(1, &act(actionable), "refused superseded x\n");
-    let output = refused.command("cse_01abc").arg("tick").output().unwrap();
+    let output = refused
+        .command("cse_01abc")
+        .args(["tick", "--cm", "cm"])
+        .output()
+        .unwrap();
     assert_eq!(output.status.code(), Some(0));
     assert!(
         !refused.ct.path().join(".claude").exists(),
@@ -1317,7 +1358,7 @@ fn the_built_cm_tick_runs_the_loop_with_fake_cm_and_git_on_path() {
     );
     let output = refused
         .command("cse_01abc")
-        .args(["--json", "tick"])
+        .args(["--json", "tick", "--cm", "cm"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0));
@@ -1338,7 +1379,11 @@ fn the_built_cm_tick_stops_at_two_live_epochs_and_refuses_c() {
     harness
         .ct
         .write("store/epochs/second/EPOCH.md", "status: PLANNING\n");
-    let output = harness.command("cse_01abc").arg("tick").output().unwrap();
+    let output = harness
+        .command("cse_01abc")
+        .args(["tick", "--cm", "cm"])
+        .output()
+        .unwrap();
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
@@ -1364,12 +1409,181 @@ fn the_built_cm_tick_stops_at_two_live_epochs_and_refuses_c() {
 #[test]
 fn the_built_cm_tick_prints_nothing_when_there_is_nothing_to_do() {
     let harness = Harness::new(0, &act(Vec::new()), PICK_OK);
-    let output = harness.command("cse_01abc").arg("tick").output().unwrap();
+    let output = harness
+        .command("cse_01abc")
+        .args(["tick", "--cm", "cm"])
+        .output()
+        .unwrap();
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stdout.is_empty(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
     assert_eq!(
         harness.log(),
-        ["cm --json next -C store/epochs/eleemosynary-mnemosyne --act"]
+        [
+            "git rev-parse --abbrev-ref HEAD",
+            "handoff-pick.sh store/epochs/eleemosynary-mnemosyne coordinator --lineage session_01abc --max-age-hours 24",
+            "cm --json next -C store/epochs/eleemosynary-mnemosyne --act",
+        ]
     );
+}
+
+#[test]
+fn the_built_cm_tick_reads_its_own_cm_next_act_by_default() {
+    let harness = Harness::new(0, &act(lines()), PICK_OK);
+    let epoch = harness.ct.path().join(EPOCH);
+    let me = env!("CARGO_BIN_EXE_cm");
+    let cm = |args: &[&str]| {
+        let output = Command::new(me)
+            .current_dir(&epoch)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+    };
+    cm(&["init"]);
+    cm(&["init", "01-a/u/nokick", "--lane", "codex"]);
+    let output = harness
+        .command("cse_01abc")
+        .args(["tick", "--checkout"])
+        .arg(harness.ct.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "missing-kickoff 01-a/u/nokick: cm amend 01-a/u/nokick --kickoff-file '<kickoff-file>'\n"
+    );
+    assert!(
+        !harness.log().iter().any(|call| call.starts_with("cm ")),
+        "the fake cm on PATH is not used: {:?}",
+        harness.log()
+    );
+}
+
+#[test]
+fn the_ctx_helpers_are_act_libs() {
+    let ct = Ct::new();
+    ct.write(
+        &format!("{EPOCH}/01-a/u/.cm/state.json"),
+        &json!({"steps": {
+            "b": {"lane": "codex", "evidence": {"pr": "https://github.com/o/r/pull/7"}},
+            "c": {"pr": "https://github.com/o/r/pull/8", "evidence": {"pr": ""}},
+            "d": {},
+        }})
+        .to_string(),
+    );
+    ct.write(
+        &format!("{EPOCH}/.cm/pulls.json"),
+        &json!({
+            "https://github.com/o/r/pull/7": {"head": "abc"},
+            "https://github.com/o/r/pull/8": null,
+        })
+        .to_string(),
+    );
+    let proc = FakeProc::new(|cmd| {
+        Ok(match cmd.argv[1].to_str() {
+            Some("ok") => Ran::code(0, "fine\n"),
+            Some("bad") => Ran::code(1, "progress\n").with_stderr("error: refused\n\n"),
+            _ => Ran::code(2, ""),
+        })
+    });
+    let env = Env::default();
+    let ctx = Ctx::new(
+        ct.path(),
+        Path::new(EPOCH),
+        &proc,
+        &env,
+        OsStr::new("/bin/cm"),
+        Duration::from_secs(10),
+    );
+
+    assert_eq!(ctx.step_state("01-a/u/b#api").unwrap()["lane"], "codex");
+    assert_eq!(
+        ctx.step_state("01-a/u").unwrap_err(),
+        "01-a/u is not <NN-name>/<unit>/<step>"
+    );
+    assert_eq!(
+        ctx.step_state("01-a/u/z").unwrap_err(),
+        "no cm state for 01-a/u/z"
+    );
+    assert_eq!(
+        ctx.step_state("01-a/v/b").unwrap_err(),
+        "no cm state for 01-a/v/b"
+    );
+
+    let act_line = |target: &str, pr: Option<&str>| {
+        let mut json = line("merge-ready", target, "merge it");
+        if let Some(pr) = pr {
+            json["pr"] = json!(pr);
+        }
+        ActLine { json, lane: None }
+    };
+    let b = ctx.step_state("01-a/u/b").unwrap();
+    let pull = ctx.pull(&act_line("01-a/u/b", None), &b).unwrap();
+    assert_eq!(
+        (pull.repo.as_str(), pull.number, pull.url.as_str()),
+        ("o/r", 7, "https://github.com/o/r/pull/7")
+    );
+    assert_eq!(pull.observed, json!({"head": "abc"}));
+    let pull = ctx
+        .pull(
+            &act_line("01-a/u/b", Some("https://github.com/x/y/pull/9")),
+            &b,
+        )
+        .unwrap();
+    assert_eq!((pull.repo.as_str(), pull.observed), ("x/y", json!({})));
+    let c = ctx.step_state("01-a/u/c").unwrap();
+    let pull = ctx.pull(&act_line("01-a/u/c", Some("")), &c).unwrap();
+    assert_eq!((pull.number, pull.observed), (8, json!({})));
+    let d = ctx.step_state("01-a/u/d").unwrap();
+    assert_eq!(
+        ctx.pull(&act_line("01-a/u/d", None), &d).unwrap_err(),
+        "01-a/u/d records no PR URL"
+    );
+
+    let ran = ctx.cm("ok", &["--x", "y"]).unwrap();
+    assert_eq!(ran.stdout_text(), "fine\n");
+    assert_eq!(
+        ctx.cm("bad", &[]).unwrap_err(),
+        "cm bad failed: error: refused"
+    );
+    assert_eq!(ctx.cm("other", &[]).unwrap_err(), "cm other failed: exit 2");
+    let calls = proc.calls();
+    assert_eq!(
+        calls[0].argv,
+        ["/bin/cm", "ok", "-C", EPOCH, "--x", "y"],
+        "cm <sub> -C <epoch> <args>"
+    );
+    assert_eq!(calls[0].cwd.as_deref(), Some(ct.path()));
+    assert!(calls[0].timeout <= Duration::from_secs(10));
+    let unstartable = FakeProc::new(|_| {
+        Err(TickError::Spawn {
+            program: "/bin/cm".into(),
+            source: std::io::ErrorKind::NotFound.into(),
+        })
+    });
+    let ctx = Ctx::new(
+        ct.path(),
+        Path::new(EPOCH),
+        &unstartable,
+        &env,
+        OsStr::new("/bin/cm"),
+        Duration::from_secs(10),
+    );
+    assert!(
+        ctx.cm("ok", &[])
+            .unwrap_err()
+            .starts_with("cm ok failed: /bin/cm: ")
+    );
+    let spent = Ctx::new(
+        ct.path(),
+        Path::new(EPOCH),
+        &proc,
+        &env,
+        OsStr::new("/bin/cm"),
+        Duration::ZERO,
+    );
+    assert_eq!(spent.run(Cmd::new("x")).unwrap().exit, Exit::TimedOut);
+    assert!(spent.timed_out());
+    assert_eq!(proc.calls().len(), 3, "a spent budget starts nothing");
 }
