@@ -763,9 +763,18 @@ fn what_an_executor_returns_is_printed_as_heartbeat_sh_printed_its_output() {
             vec!["two".into(), "lines".into()],
         ),
         (
+            Outcome::Done(vec!["\nx".into()]),
+            vec!["".into(), "x".into()],
+        ),
+        (
+            Outcome::Done(vec!["a\r\nb".into()]),
+            vec!["a\\r".into(), "b".into()],
+        ),
+        (
             Outcome::Left("left as it is".into()),
             vec!["left as it is".into()],
         ),
+        (Outcome::Left("a\nb".into()), vec!["a\\nb".into()]),
         (
             Outcome::Failed(String::new()),
             vec![format!(
@@ -787,6 +796,21 @@ fn what_an_executor_returns_is_printed_as_heartbeat_sh_printed_its_output() {
                 "{} [tick/launchable-not-launched failed: x{}]",
                 PRINTED[0],
                 "é".repeat(149)
+            )],
+        ),
+        (
+            Outcome::Failed("boom\r\n".into()),
+            vec![format!(
+                "{} [tick/launchable-not-launched failed: boom\\r]",
+                PRINTED[0]
+            )],
+        ),
+        (
+            Outcome::Failed("\t".repeat(300)),
+            vec![format!(
+                "{} [tick/launchable-not-launched failed: {}]",
+                PRINTED[0],
+                "\\t".repeat(300)
             )],
         ),
     ] {
@@ -2453,6 +2477,25 @@ fn peak_kib(pid: u32) -> Option<u64> {
         .ok()
 }
 
+// The spill is unlinked as it is made, so no folder lists it; the tick's descriptors still name
+// where it was made.
+fn spills(pid: u32) -> Vec<PathBuf> {
+    fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .filter_map(|fd| fs::read_link(fd.unwrap().path()).ok())
+        .filter(|target| target.to_string_lossy().ends_with(" (deleted)"))
+        .collect()
+}
+
+fn spilled_in(pid: u32, tmpdir: &Path) {
+    let spills = spills(pid);
+    let tmpdir = fs::canonicalize(tmpdir).unwrap();
+    assert!(
+        matches!(spills.as_slice(), [spill] if spill.parent() == Some(tmpdir.as_path())),
+        "{spills:?} for {tmpdir:?}"
+    );
+}
+
 #[test]
 fn the_built_cm_tick_spills_a_list_above_64_mib_and_prints_every_line_in_bounded_memory() {
     let harness = Harness::new(1, "", PICK_OK);
@@ -2469,6 +2512,9 @@ fn the_built_cm_tick_spills_a_list_above_64_mib_and_prints_every_line_in_bounded
     let mut count = 0;
     for line in BufReader::new(child.stdout.take().unwrap()).lines() {
         assert_eq!(line.unwrap(), big_line(count));
+        if count == 0 {
+            spilled_in(pid, &tmpdir);
+        }
         count += 1;
         if count % 1000 == 0 {
             peak = peak.max(peak_kib(pid).unwrap_or(0));
@@ -2520,6 +2566,7 @@ fn a_killed_cm_tick_leaves_no_spilled_list_behind() {
     let mut first = String::new();
     stdout.read_line(&mut first).unwrap();
     assert_eq!(first.trim_end(), big_line(0), "the act loop is running");
+    spilled_in(child.id(), &tmpdir);
     let status = Command::new("kill")
         .args(["-TERM", &child.id().to_string()])
         .status()
@@ -2641,6 +2688,45 @@ fn the_built_cm_tick_stops_writing_a_stdout_file_at_the_file_size_limit() {
             .unwrap();
         assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
         assert_eq!(fs::read_to_string(&file).unwrap(), kept, "{args:?}");
+    }
+}
+
+#[test]
+fn the_built_cm_tick_writes_a_json_object_ending_at_the_file_size_limit_and_none_past_it() {
+    let harness = Harness::new(1, &act(lines()), PICK_OK);
+    let whole = harness
+        .command("cse_01abc")
+        .args(["--json", "tick", "--cm", "cm"])
+        .output()
+        .unwrap();
+    assert_eq!(whole.status.code(), Some(0), "{whole:?}");
+    let object = String::from_utf8(whole.stdout).unwrap();
+    // `ulimit -f 2` in bash is 2 blocks of 1024 bytes.
+    let limit = 2048;
+    assert!(object.len() < limit, "{object}");
+    let file = harness.ct.path().join("out");
+    for past in [0, 1] {
+        let pad = " ".repeat(limit - object.len() + past);
+        for append in [false, true] {
+            let open = if append {
+                fs::write(&file, &pad).unwrap();
+                format!("exec >> '{}'", file.display())
+            } else {
+                format!("exec > '{}'; printf '%s' '{pad}'", file.display())
+            };
+            let output = harness
+                .limited("cse_01abc", &format!("ulimit -f 2; {open}"))
+                .args(["--json", "tick", "--cm", "cm"])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(0), "{past} {append}: {output:?}");
+            let kept = if past == 0 { object.as_str() } else { "" };
+            assert_eq!(
+                fs::read_to_string(&file).unwrap(),
+                format!("{pad}{kept}"),
+                "{past} past, append {append}"
+            );
+        }
     }
 }
 
@@ -2891,10 +2977,17 @@ fn the_built_cm_tick_takes_the_first_cm_on_path_its_user_may_run() {
         &format!("{path}:{}:/usr/bin:/bin", harness.bin.display()),
     );
     // A directory, a dangling symlink and a file with no execute bit are skipped by everyone.
-    // Execute for others only is not the owner's to run, but is root's (any execute bit will
-    // do for root), so the first entry this user may run is decided by who runs the suite.
-    let runs = if rustix::process::geteuid().is_root() {
-        entries.join("others/cm")
+    // Execute for others only is not the owner's to run, but is a user's with CAP_DAC_OVERRIDE
+    // (any execute bit will do), so the kernel says whether this process may run that entry.
+    let others = entries.join("others/cm");
+    let runnable = rustix::fs::accessat(
+        rustix::fs::CWD,
+        &others,
+        rustix::fs::Access::EXEC_OK,
+        rustix::fs::AtFlags::EACCESS,
+    );
+    let runs = if runnable.is_ok() {
+        others
     } else {
         harness.bin.join("cm")
     };
@@ -2923,6 +3016,69 @@ fn the_built_cm_tick_reads_empty_and_relative_path_entries_from_where_it_started
         assert_eq!(fs::canonicalize(used).unwrap(), runs, "{path}");
         assert_eq!(json["lines"], json!(PRINTED), "{path}: {json}");
     }
+}
+
+#[test]
+fn the_built_cm_tick_leaves_a_bare_cm_to_the_default_search_path_when_path_is_unset() {
+    let harness = Harness::new(1, &act(lines()), PICK_OK);
+    for (cm, ran) in [("true", true), ("no-such-cm", false)] {
+        let output = harness
+            .command("cse_01abc")
+            .env_remove("PATH")
+            .args(["--json", "tick", "--cm", cm])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{cm}: {output:?}");
+        let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["cm"], cm, "{json}");
+        let lines = json["lines"].as_array().unwrap();
+        let could_not_run = format!("heartbeat: cm --json next --act could not run: {cm}: ");
+        assert_eq!(
+            !lines
+                .iter()
+                .any(|line| line.as_str().unwrap().starts_with(&could_not_run)),
+            ran,
+            "{json}"
+        );
+    }
+}
+
+#[test]
+fn the_built_cm_tick_started_in_a_deleted_folder_runs_a_relative_cm_from_the_checkout() {
+    let harness = Harness::new(1, &act(lines()), PICK_OK);
+    let own = harness.ct.path().join("own-next.json");
+    fs::write(
+        &own,
+        act(vec![line(
+            "missing-kickoff",
+            "01-a/u/b",
+            "cm amend 01-a/u/b",
+        )]),
+    )
+    .unwrap();
+    script(
+        &harness.ct.path().join("cm"),
+        &format!(
+            "if [ \"$1 $2\" = '--json next' ]; then cat '{}'; exit 1; fi\n",
+            own.display()
+        ),
+    );
+    fs::create_dir(harness.ct.path().join("gone")).unwrap();
+    let output = harness
+        .limited("cse_01abc", "cd gone && rmdir \"$PWD\"")
+        .args(["--json", "tick", "--checkout"])
+        .arg(harness.ct.path())
+        .args(["--cm", "./cm"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["cm"], "./cm", "{json}");
+    assert_eq!(
+        json["lines"],
+        json!(["missing-kickoff 01-a/u/b: cm amend 01-a/u/b"]),
+        "{json}"
+    );
 }
 
 #[test]
