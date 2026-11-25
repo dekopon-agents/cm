@@ -9,7 +9,7 @@ use serde::Deserializer as _;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
-use crate::tick::act::{ActLine, Ctx, Env, Outcome, Registry, Report, clip};
+use crate::tick::act::{ActLine, Ctx, Env, MAX_BUDGET, Outcome, Registry, Report, clip};
 use crate::tick::proc::{Cmd, Exit, KILL_AFTER, Keep, Proc, Ran, Spilled, StdoutKeep, SystemProc};
 use crate::tick::{TickError, claude_md, collect, directive, exec, gitsync, pin};
 
@@ -55,7 +55,13 @@ pub struct Beat<'a> {
 
 impl Beat<'_> {
     fn ctx<'b>(&'b self, epoch: &'b Path, budget: Duration) -> Ctx<'b> {
-        Ctx::new(self.checkout, epoch, self.proc, self.env, self.cm, budget)
+        Ctx::new(self.checkout, epoch, self.proc, self.env, self.cm, budget).within(self.until())
+    }
+
+    fn until(&self) -> Instant {
+        let secs = deadline(self.env).unwrap_or(DEADLINE_SECS);
+        let left = Duration::from_secs(u64::try_from(secs).unwrap_or(0)).min(MAX_BUDGET);
+        self.started.checked_add(left).unwrap_or(self.started)
     }
 
     fn elapsed_secs(&self) -> i64 {
@@ -293,8 +299,8 @@ pub(crate) fn bound(checkout: &Path, epoch: &Path, proc: &dyn Proc, env: &Env) -
                 .arg(&tar),
         )
         .is_some();
-    // git archive drops what origin's .gitattributes marks export-ignore, so every file origin's
-    // tree lists must be in the extract before the pick reads it.
+    // git archive applies origin's export-ignore, export-subst and eol attributes, and a changed
+    // copy is not origin's folder: every file its tree lists must be in the extract, byte for byte.
     let listed = archived
         .then(|| {
             succeeded(
@@ -304,25 +310,90 @@ pub(crate) fn bound(checkout: &Path, epoch: &Path, proc: &dyn Proc, env: &Env) -
             )
         })
         .flatten();
-    let whole = listed.is_some_and(|ran| !ran.stdout_truncated && extracted(dir, &ran.stdout));
+    let whole = listed.is_some_and(|ran| {
+        !ran.stdout_truncated && extract_is_origins(&succeeded, dir, &ran.stdout)
+    });
     whole && picked(&dir.join(epoch))
 }
 
-// `git ls-tree -r -z` entries are `<mode> <type> <object>\t<path>`; a submodule (`commit`) has
-// no file in an archive.
-fn extracted(dir: &Path, listing: &[u8]) -> bool {
+const HASH_ARGV_BYTES: usize = 128 << 10;
+
+// `git ls-tree -r -z` entries are `<mode> <type> <object>\t<path>`. A file's bytes, or a
+// symlink's target, must hash to its object; a submodule has nothing in an archive to compare,
+// and the executable bit is no part of a file's content.
+fn extract_is_origins(succeeded: &dyn Fn(Cmd) -> Option<Ran>, dir: &Path, listing: &[u8]) -> bool {
     use std::os::unix::ffi::OsStrExt;
-    listing
+    let links = dir.join("links");
+    let mut files: Vec<(PathBuf, &[u8])> = Vec::new();
+    for entry in listing
         .split(|byte| *byte == 0)
         .filter(|entry| !entry.is_empty())
-        .all(|entry| {
-            let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
-                return false;
-            };
-            let (head, path) = (&entry[..tab], &entry[tab + 1..]);
-            head.split(|byte| *byte == b' ').nth(1) == Some(b"commit")
-                || dir.join(OsStr::from_bytes(path)).symlink_metadata().is_ok()
-        })
+    {
+        let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+            return false;
+        };
+        let mut head = entry[..tab].split(|byte| *byte == b' ');
+        let (Some(mode), Some(_), Some(object)) = (head.next(), head.next(), head.next()) else {
+            return false;
+        };
+        let path = dir.join(OsStr::from_bytes(&entry[tab + 1..]));
+        let kind = path.symlink_metadata().map(|meta| meta.file_type());
+        match mode {
+            b"160000" => continue,
+            b"100644" | b"100755" if kind.as_ref().is_ok_and(|kind| kind.is_file()) => {
+                files.push((path, object));
+            }
+            b"120000" if kind.as_ref().is_ok_and(|kind| kind.is_symlink()) => {
+                let copy = links.join(files.len().to_string());
+                let Ok(target) = std::fs::read_link(&path) else {
+                    return false;
+                };
+                if std::fs::create_dir_all(&links)
+                    .and_then(|()| std::fs::write(&copy, target.as_os_str().as_bytes()))
+                    .is_err()
+                {
+                    return false;
+                }
+                files.push((copy, object));
+            }
+            _ => return false,
+        }
+    }
+    let mut rest = files.as_slice();
+    while !rest.is_empty() {
+        let mut bytes = 0;
+        let count = rest
+            .iter()
+            .take_while(|(path, _)| {
+                bytes += path.as_os_str().len() + 1;
+                bytes <= HASH_ARGV_BYTES
+            })
+            .count()
+            .max(1);
+        let (chunk, later) = rest.split_at(count);
+        rest = later;
+        let hashed = succeeded(
+            Cmd::new("git")
+                .args(["hash-object", "--no-filters", "--"])
+                .args(chunk.iter().map(|(path, _)| path)),
+        );
+        let Some(hashed) = hashed.filter(|ran| !ran.stdout_truncated) else {
+            return false;
+        };
+        let objects: Vec<&[u8]> = hashed
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .collect();
+        if !objects
+            .iter()
+            .copied()
+            .eq(chunk.iter().map(|(_, object)| *object))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 // heartbeat.sh re-checks after git_sync: a successor's handoff pulled just now retires this
@@ -430,18 +501,28 @@ fn run_phase(
     budget: Duration,
     body: impl FnOnce(&Ctx) -> Report,
 ) -> Option<String> {
-    let ctx = beat.ctx(epoch, budget);
-    let started = Instant::now();
-    let report = contained(|| body(&ctx)).unwrap_or_else(|panic| Report {
+    phase_in(&beat.ctx(epoch, budget), out, name, budget, body)
+}
+
+fn phase_in(
+    ctx: &Ctx,
+    out: &mut dyn FnMut(String),
+    name: &str,
+    budget: Duration,
+    body: impl FnOnce(&Ctx) -> Report,
+) -> Option<String> {
+    let started = ctx.now();
+    let report = contained(|| body(ctx)).unwrap_or_else(|panic| Report {
         lines: vec![format!("tick: {name} phase panicked: {panic}")],
         failed: true,
     });
     for line in report.lines {
         out(line);
     }
+    let wall = ctx.now().saturating_duration_since(started);
     wall_line(
         name,
-        started.elapsed().saturating_sub(ctx.checking()),
+        wall.saturating_sub(ctx.checking()),
         budget,
         report.failed || ctx.timed_out(),
     )
@@ -756,6 +837,96 @@ mod tests {
 
     fn printed(wall: Duration, budget: Duration, failed: bool) -> Vec<String> {
         wall_line("pin", wall, budget, failed).into_iter().collect()
+    }
+
+    #[test]
+    fn a_phase_wall_leaves_out_the_bound_checks_it_ran() {
+        use crate::tick::act::{Ticking, bound_children};
+        let clock = std::rc::Rc::new(std::cell::Cell::new(Instant::now()));
+        let proc = bound_children(&clock, |word, clock| {
+            (word == "fetch").then(|| {
+                clock.set(clock.get() + Duration::from_secs(62));
+                Ran::code(0, "")
+            })
+        });
+        let env: Env = [("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_1")]
+            .into_iter()
+            .collect();
+        let ticking = Ticking(clock.clone());
+        let ctx = || {
+            Ctx::new(
+                Path::new("."),
+                Path::new("store/epochs/e"),
+                &proc,
+                &env,
+                OsStr::new("cm"),
+                Duration::ZERO,
+            )
+            .clocked(&ticking, gitsync::BUDGET)
+        };
+        let mut lines = Vec::new();
+        let wall = phase_in(
+            &ctx(),
+            &mut |line| lines.push(line),
+            "gitsync",
+            gitsync::BUDGET,
+            |ctx| {
+                assert!(ctx.still_bound());
+                Report::default()
+            },
+        );
+        assert_eq!(wall, None, "a 62 s check is not the 60 s phase's");
+        let wall = phase_in(
+            &ctx(),
+            &mut |line| lines.push(line),
+            "gitsync",
+            gitsync::BUDGET,
+            |ctx| {
+                assert!(ctx.still_bound());
+                clock.set(clock.get() + Duration::from_secs(2));
+                Report {
+                    lines: vec!["synced".into()],
+                    failed: true,
+                }
+            },
+        );
+        assert_eq!(
+            wall.as_deref(),
+            Some("tick: gitsync phase took 2.0 s (budget 60 s)")
+        );
+        assert_eq!(lines, ["synced"]);
+    }
+
+    #[test]
+    fn each_ctx_of_a_beat_is_capped_at_the_heartbeat_deadline() {
+        let proc = crate::tick::proc::FakeProc::new(|_| Ok(Ran::code(0, "")));
+        let started = Instant::now();
+        for (value, secs) in [
+            (None, 230),
+            (Some("100"), 100),
+            (Some("soon"), 230),
+            (Some("-5"), 0),
+        ] {
+            let env: Env = value
+                .map(|value| ("HEARTBEAT_DEADLINE", value))
+                .into_iter()
+                .collect();
+            let beat = Beat {
+                checkout: Path::new("."),
+                proc: &proc,
+                env: &env,
+                registry: &Registry::new(),
+                phases: &Phases::REAL,
+                cm: OsStr::new("cm"),
+                started,
+            };
+            assert_eq!(
+                beat.ctx(Path::new("store/epochs/e"), Duration::from_secs(60))
+                    .until(),
+                started + Duration::from_secs(secs),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]
