@@ -1,8 +1,10 @@
+use std::io::Write;
+
 use serde_json::Value;
 
 use crate::tick::act::{ActLine, Ctx, Executor, Outcome, last_line};
-use crate::tick::exec::merge_ready::{TOOLS, shell_words, target, tmpdir};
-use crate::tick::proc::{Cmd, Exit, Keep};
+use crate::tick::exec::merge_ready::{TOOLS, command, shell_words, target, tmpdir};
+use crate::tick::proc::{Cmd, Exit, FileSizeLimit, Keep};
 
 pub const KEY: &str = "released-undeployed";
 
@@ -15,7 +17,7 @@ impl Executor for ReleasedUndeployed {
 }
 
 fn deploy(line: &ActLine, ctx: &Ctx) -> Result<Outcome, String> {
-    let command = line.field("command").unwrap_or_default();
+    let command = command(line)?;
     let words =
         shell_words(command).ok_or_else(|| format!("cannot split into words: {command}"))?;
     let release = match &words[..] {
@@ -71,17 +73,26 @@ fn deploy(line: &ActLine, ctx: &Ctx) -> Result<Outcome, String> {
         ));
     };
     let pr = shown(done.get("pr"));
-    let merge_sha = shown(done.get("merge_sha"));
+    let merge_sha = match done.get("merge_sha") {
+        Some(sha @ Value::String(_)) => shown(Some(sha)),
+        Some(other) if shown(Some(other)).is_some() => {
+            return Err(format!(
+                "deploy.sh {release} merged but its receipt's merge_sha is {other}, not a string ({said}); record the deploy by hand"
+            ));
+        }
+        _ => None,
+    };
     let body = tmp.path().join("deploy.md");
-    std::fs::write(
-        &body,
+    let note = format!(
+        "# Deploy of {deployed_release}\n\n- deploy PR: {}\n- merge SHA: {}\n- digest: {digest}\n- deploy.sh: {said}\n",
+        pr.as_deref().unwrap_or("none: main already ran it"),
+        merge_sha.as_deref().unwrap_or("none"),
+    );
+    write_note(&body, &note).map_err(|why| {
         format!(
-            "# Deploy of {deployed_release}\n\n- deploy PR: {}\n- merge SHA: {}\n- digest: {digest}\n- deploy.sh: {said}\n",
-            pr.as_deref().unwrap_or("none: main already ran it"),
-            merge_sha.as_deref().unwrap_or("none"),
-        ),
-    )
-    .map_err(|error| format!("deployed {release}; cannot write its evidence note: {error}"))?;
+            "deployed {release}; cannot write its evidence note: {why}; record the deploy by hand"
+        )
+    })?;
     let name = format!(
         "deploy-{}",
         merge_sha
@@ -117,6 +128,19 @@ fn deploy(line: &ActLine, ctx: &Ctx) -> Result<Outcome, String> {
         "deployed {release} ({}); cm advance {step} deployed refused: {refused}",
         pr.as_deref().unwrap_or("already on main")
     ))
+}
+
+// A write past RLIMIT_FSIZE raises SIGXFSZ, which would kill the tick rather than fail the line.
+fn write_note(path: &std::path::Path, note: &str) -> Result<(), String> {
+    let mut file = std::fs::File::create(path).map_err(|error| error.to_string())?;
+    if FileSizeLimit::of(&file).is_some_and(|limit| !limit.fits(&file, note.len())) {
+        return Err(format!(
+            "its {} bytes would pass the file size limit",
+            note.len()
+        ));
+    }
+    file.write_all(note.as_bytes())
+        .map_err(|error| error.to_string())
 }
 
 // Python's `str(value)` for a value `or` would keep.

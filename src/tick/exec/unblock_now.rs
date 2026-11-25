@@ -1,5 +1,5 @@
 use crate::tick::act::{ActLine, Ctx, Executor, Outcome};
-use crate::tick::exec::merge_ready::{shell_words, target};
+use crate::tick::exec::merge_ready::{command, shell_words, target};
 
 pub const KEY: &str = "unblock-now";
 
@@ -18,7 +18,7 @@ fn unblock(line: &ActLine, ctx: &Ctx) -> Result<Outcome, String> {
             line.text()
         )));
     }
-    let command = line.field("command").unwrap_or_default();
+    let command = command(line)?;
     let words = shell_words(command)
         .filter(|words| {
             words.starts_with(&["cm".to_owned(), "unblock".to_owned()])

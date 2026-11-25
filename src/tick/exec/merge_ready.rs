@@ -1,9 +1,9 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::tick::act::{ActLine, Ctx, Executor, Outcome, last_line};
+use crate::tick::act::{ActLine, Ctx, Env, Executor, Outcome, last_line};
 use crate::tick::proc::{Cmd, Keep};
 
 pub const KEY: &str = "merge-ready";
@@ -26,6 +26,7 @@ fn merge(line: &ActLine, ctx: &Ctx) -> Result<Outcome, String> {
         return Err("a part's merge is the model's".to_owned());
     }
     let step = ctx.step_state(target)?;
+    typed_pr(line, &step)?;
     let pull = ctx.pull(line, &step)?;
     let left = |note: String| Ok(Outcome::Left(format!("{} [{note}]", line.text())));
     if pull.repo.eq_ignore_ascii_case(QUEUED) {
@@ -40,6 +41,12 @@ fn merge(line: &ActLine, ctx: &Ctx) -> Result<Outcome, String> {
             pull.repo
         ));
     }
+    if !pull.observed.is_object() {
+        return Err(format!(
+            "cm's observation of {} in .cm/pulls.json is {}, not an object",
+            pull.url, pull.observed
+        ));
+    }
     let head = either(line.json.get("head"), pull.observed.get("head"))
         .and_then(Value::as_str)
         .filter(|head| is_sha(head))
@@ -50,32 +57,38 @@ fn merge(line: &ActLine, ctx: &Ctx) -> Result<Outcome, String> {
             )
         })?;
     let pulls = format!("repos/{}/pulls/{}", pull.repo, pull.number);
-    let base_ref = ctx
-        .run(Cmd::new("gh").args(["api", pulls.as_str(), "--jq", ".base.ref"]))
+    let live = ctx
+        .run(Cmd::new("gh").args(["api", pulls.as_str(), "--jq", ".base.ref, .base.sha"]))
         .map_err(|error| error.to_string())?;
-    let branch = base_ref.stdout_text().trim().to_owned();
-    if !base_ref.exit.success() || branch.is_empty() {
-        return Err(format!(
-            "cannot read the base branch of {}: {}",
-            pull.url,
-            last_line(&base_ref)
-        ));
-    }
+    let answer = live.stdout_text();
+    let (branch, live_base) = match answer.lines().map(str::trim).collect::<Vec<_>>()[..] {
+        [branch, sha] if live.exit.success() && !branch.is_empty() && is_sha(sha) => {
+            (branch.to_owned(), sha.to_owned())
+        }
+        _ => {
+            return Err(format!(
+                "cannot read the base branch and SHA of {}: {}",
+                pull.url,
+                last_line(&live)
+            ));
+        }
+    };
     let ci_base = pull.observed.get("ci_base");
     let base = either(line.json.get("base"), pull.observed.get("base"));
+    let stale = |now: String| {
+        left(format!(
+            "stale base: CI ran on {}, the base is now {now}; update the branch and wait for green CI",
+            short(ci_base)
+        ))
+    };
     if !truthy(ci_base) || ci_base != base {
-        return left(format!(
-            "stale base: CI ran on {}, the base is now {}; update the branch and wait for green CI",
-            short(ci_base),
-            short(base)
-        ));
+        return stale(short(base));
     }
-    let receipts = tmpdir(ctx).join("dekopon-merge").join(format!(
-        "{}-{}-{}",
-        pull.repo.replace('/', "-"),
-        pull.number,
-        &head[..12]
-    ));
+    // The script compared cm's observations only: a base that moved since cm looked is stale too.
+    if ci_base.and_then(Value::as_str) != Some(live_base.as_str()) {
+        return stale(live_base[..12].to_owned());
+    }
+    let receipts = receipts(ctx.env, &pull.repo, pull.number, head)?;
     match receipts.join("merge-attempted.json").try_exists() {
         Ok(false) => {}
         Ok(true) => {
@@ -107,18 +120,27 @@ fn merge(line: &ActLine, ctx: &Ctx) -> Result<Outcome, String> {
     if !merged.exit.success() {
         return Err(format!("merge-pr.py: {}", last_line(&merged)));
     }
-    let Ok(receipt) = serde_json::from_slice::<Value>(&merged.stdout) else {
+    let Some(receipt) = serde_json::from_slice::<Value>(&merged.stdout)
+        .ok()
+        .filter(Value::is_object)
+    else {
         return Err(format!(
             "merge-pr.py merged {} but printed no JSON receipt ({}); record the merge by hand",
             pull.url,
             last_line(&merged)
         ));
     };
-    let sha = receipt
-        .get("merge_sha")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let words = shell_words(line.field("command").unwrap_or_default()).unwrap_or_default();
+    let sha = match receipt.get("merge_sha") {
+        Some(Value::String(sha)) => sha.as_str(),
+        Some(other) if truthy(Some(other)) => {
+            return Err(format!(
+                "merge-pr.py merged {} but its merge_sha is {other}, not a string; record the merge by hand",
+                pull.url
+            ));
+        }
+        _ => "",
+    };
+    let words = command(line).ok().and_then(shell_words).unwrap_or_default();
     let rest: Vec<&str> = match &words[..] {
         [cm, advance, named, rest @ ..]
             if cm == "cm"
@@ -178,9 +200,10 @@ fn may_merge(ctx: &Ctx, repo: &str) -> Result<bool, String> {
         .map_err(|error| error.to_string())?;
     let unreadable =
         |why: String| format!("cannot read [authority] from LIMITS.toml at the stamp SHA: {why}");
+    // cm reads LIMITS.toml as TOML 1.1, as src/limits.rs does; the script's tomllib refused a BOM.
     let authority = std::str::from_utf8(&shown.stdout)
         .ok()
-        .filter(|_| shown.exit.success())
+        .filter(|text| shown.exit.success() && !text.starts_with('\u{feff}'))
         .and_then(|text| text.parse::<toml::Table>().ok())
         .and_then(|mut limits| match limits.remove("authority") {
             Some(toml::Value::Table(authority)) => Some(authority),
@@ -196,6 +219,54 @@ fn may_merge(ctx: &Ctx, repo: &str) -> Result<bool, String> {
         Some(_) => return Err(unreadable("merge_excluded_repos is not a list".to_owned())),
     };
     Ok(authority.get("merge") == Some(&toml::Value::Boolean(true)) && !excluded)
+}
+
+// The script crashed on a PR source of the wrong type; Ctx::pull reads one as absent.
+fn typed_pr(line: &ActLine, step: &Value) -> Result<(), String> {
+    let url = |value: Option<&Value>, place: &str| match value {
+        Some(value) if truthy(Some(value)) && !value.is_string() => {
+            Err(format!("{place} is {value}, not a PR URL"))
+        }
+        _ => Ok(truthy(value)),
+    };
+    if url(line.json.get("pr"), "the act line's pr")? {
+        return Ok(());
+    }
+    let evidence = step.get("evidence");
+    if let Some(evidence) = evidence
+        && truthy(Some(evidence))
+        && !evidence.is_object()
+    {
+        return Err(format!("the step's evidence is {evidence}, not an object"));
+    }
+    if url(
+        evidence.and_then(|evidence| evidence.get("pr")),
+        "the step's evidence.pr",
+    )? {
+        return Ok(());
+    }
+    url(step.get("pr"), "the step's pr").map(drop)
+}
+
+// Receipts stay outside the checkout, whose changes the tick commits.
+fn receipts(env: &Env, repo: &str, number: u64, head: &str) -> Result<PathBuf, String> {
+    let tmp = match env.get("TMPDIR") {
+        None => "/tmp",
+        Some("") => {
+            return Err("TMPDIR is set but empty; receipts need a private directory".to_owned());
+        }
+        Some(dir) if Path::new(dir).is_relative() => {
+            return Err(format!(
+                "TMPDIR {dir} is relative; receipts need a private directory"
+            ));
+        }
+        Some(dir) => dir,
+    };
+    Ok(Path::new(tmp).join("dekopon-merge").join(format!(
+        "{}-{number}-{}",
+        repo.replace('/', "-"),
+        &head[..12]
+    )))
 }
 
 fn stamp(front: &str) -> Option<&str> {
@@ -223,6 +294,14 @@ fn is_sha(text: &str) -> bool {
         && text
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+pub(crate) fn command(line: &ActLine) -> Result<&str, String> {
+    match line.json.get("command") {
+        None => Ok(""),
+        Some(Value::String(command)) => Ok(command),
+        Some(other) => Err(format!("the act line's command is {other}, not a string")),
+    }
 }
 
 pub(crate) fn target(line: &ActLine) -> Result<&str, String> {
@@ -370,6 +449,27 @@ mod tests {
         assert_eq!(short(Some(&json!("b".repeat(40)))), "b".repeat(12));
         assert_eq!(short(Some(&json!("ééééééééééééé"))), "é".repeat(12));
         assert_eq!(short(Some(&json!(12))), "12");
+    }
+
+    #[test]
+    fn receipts_live_under_an_absolute_tmpdir_or_tmp_when_it_is_unset() {
+        let head = "a".repeat(40);
+        let at =
+            |pairs: &[(&str, &str)]| receipts(&pairs.iter().copied().collect(), "o/r", 7, &head);
+        let receipt = "dekopon-merge/o-r-7-aaaaaaaaaaaa";
+        assert_eq!(at(&[]), Ok(Path::new("/tmp").join(receipt)));
+        assert_eq!(
+            at(&[("TMPDIR", "/scratch/it's here")]),
+            Ok(Path::new("/scratch/it's here").join(receipt))
+        );
+        assert_eq!(
+            at(&[("TMPDIR", "")]),
+            Err("TMPDIR is set but empty; receipts need a private directory".to_owned())
+        );
+        assert_eq!(
+            at(&[("TMPDIR", "tmp")]),
+            Err("TMPDIR tmp is relative; receipts need a private directory".to_owned())
+        );
     }
 
     #[test]

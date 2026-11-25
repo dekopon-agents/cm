@@ -33,6 +33,11 @@ fn write(path: &Path, text: &str) {
     fs::write(path, text).unwrap();
 }
 
+// Shell-quotes text a fixture script holds; paths reach the scripts through FX_* variables.
+fn q(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
 struct Fx {
     root: tempfile::TempDir,
 }
@@ -40,7 +45,10 @@ struct Fx {
 impl Fx {
     fn new() -> Self {
         let fx = Fx {
-            root: tempfile::tempdir().unwrap(),
+            root: tempfile::Builder::new()
+                .prefix("cm fx's root ")
+                .tempdir()
+                .unwrap(),
         };
         for dir in [fx.bin(), fx.home(), fx.tmp(), fx.tools()] {
             fs::create_dir_all(dir).unwrap();
@@ -50,17 +58,18 @@ impl Fx {
         fx.git(&["init", "-q", "-b", "main"]);
         fx.stamp(LIMITS);
         fx.fake_cm("never-a-subcommand", "");
-        fx.fake(
-            "gh",
-            &format!("echo \"gh $*\" >> '{}'\necho main\n", fx.log().display()),
-        );
+        fx.fake_gh(BASE);
         fx.fake_merge(0);
         fx.fake_deploy(0, DEPLOYED, Some(530));
         fx
     }
 
+    fn file(&self, name: &str) -> PathBuf {
+        self.root.path().join(name)
+    }
+
     fn ct(&self) -> PathBuf {
-        self.root.path().join("ct")
+        self.file("ct")
     }
 
     fn epoch(&self) -> PathBuf {
@@ -72,50 +81,62 @@ impl Fx {
     }
 
     fn bin(&self) -> PathBuf {
-        self.root.path().join("bin")
+        self.file("bin")
     }
 
     fn home(&self) -> PathBuf {
-        self.root.path().join("home")
+        self.file("home")
     }
 
     fn tmp(&self) -> PathBuf {
-        self.root.path().join("tmp")
+        self.file("tmp")
     }
 
     fn log(&self) -> PathBuf {
-        self.root.path().join("calls")
+        self.file("calls")
     }
 
     fn note(&self) -> PathBuf {
-        self.root.path().join("evidence.md")
+        self.file("evidence.md")
     }
 
-    fn hermetic(&self, mut cmd: Cmd) -> Cmd {
+    fn child_env(&self) -> Vec<(OsString, OsString)> {
         let mut path = OsString::from(self.bin());
         path.push(":");
         path.push(std::env::var_os("PATH").unwrap_or_default());
-        for (key, value) in [
-            ("PATH", path.as_os_str()),
-            ("HOME", self.home().as_os_str()),
-            ("TMPDIR", self.tmp().as_os_str()),
-            ("GIT_CONFIG_GLOBAL", OsStr::new("/dev/null")),
-            ("GIT_CONFIG_NOSYSTEM", OsStr::new("1")),
-        ] {
-            cmd = cmd.env(key, value);
-        }
-        cmd
+        [
+            ("PATH", path),
+            ("HOME", self.home().into()),
+            ("TMPDIR", self.tmp().into()),
+            ("GIT_CONFIG_GLOBAL", "/dev/null".into()),
+            ("GIT_CONFIG_NOSYSTEM", "1".into()),
+            ("FX_LOG", self.log().into()),
+            ("FX_NOTE", self.note().into()),
+            ("FX_RECEIPT", self.file("receipt.json").into()),
+            ("FX_MERGED", self.file("merged").into()),
+            ("FX_NEXT", self.file("next.json").into()),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value))
+        .collect()
+    }
+
+    fn hermetic(&self, cmd: Cmd) -> Cmd {
+        self.child_env()
+            .into_iter()
+            .fold(cmd, |cmd, (key, value)| cmd.env(key, value))
     }
 
     fn git(&self, args: &[&str]) -> String {
-        let cmd = self
-            .hermetic(Cmd::new("git").arg("-C").arg(self.ct()))
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(self.ct())
             .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
             .args(["-c", "commit.gpgsign=false"])
-            .args(args);
-        let mut command = Command::new(&cmd.argv[0]);
-        command.args(&cmd.argv[1..]).envs(cmd.env.iter().cloned());
-        let output = command.output().unwrap();
+            .args(args)
+            .envs(self.child_env())
+            .output()
+            .unwrap();
         assert!(output.status.success(), "git {args:?}: {output:?}");
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
@@ -169,12 +190,22 @@ impl Fx {
         self.fake(
             "cm",
             &format!(
-                "echo \"cm $*\" >> '{log}'\n\
-                 if [ \"$1\" = evidence ]; then for a; do last=$a; done; cp \"$last\" '{note}'; fi\n\
-                 case \"$1\" in {fail_on}) echo '{refusal}' >&2; exit 1 ;; esac\n\
+                "if [ \"$1 $2\" = '--json next' ]; then cat \"$FX_NEXT\"; exit 0; fi\n\
+                 echo \"cm $*\" >> \"$FX_LOG\"\n\
+                 if [ \"$1\" = evidence ]; then for a; do last=$a; done; cp \"$last\" \"$FX_NOTE\"; fi\n\
+                 case \"$1\" in {fail_on}) printf '%s\\n' {} >&2; exit 1 ;; esac\n\
                  exit 0\n",
-                log = self.log().display(),
-                note = self.note().display(),
+                q(refusal)
+            ),
+        );
+    }
+
+    fn fake_gh(&self, base: &str) {
+        self.fake(
+            "gh",
+            &format!(
+                "echo \"gh $*\" >> \"$FX_LOG\"\nprintf '%s\\n' main {}\n",
+                q(base)
             ),
         );
     }
@@ -186,13 +217,17 @@ impl Fx {
         );
     }
 
-    // merge-ready runs it with python3 -I, so the fake is Python.
+    // merge-ready runs it with python3 -I, so the fake is Python, and it logs the -I it ran under.
     fn fake_merge_printing(&self, stdout: &str, code: i32) {
+        write(&self.file("merged"), stdout);
         write(
             &self.tools().join("merge-pr.py"),
             &format!(
-                "import sys\nopen({log:?}, 'a').write('merge ' + ' '.join(sys.argv[1:]) + '\\n')\nprint({stdout:?})\nsys.exit({code})\n",
-                log = self.log().to_str().unwrap(),
+                "import os, sys\n\
+                 isolated = '-I ' if sys.flags.isolated else ''\n\
+                 open(os.environ['FX_LOG'], 'a').write('merge ' + isolated + ' '.join(sys.argv[1:]) + '\\n')\n\
+                 print(open(os.environ['FX_MERGED']).read())\n\
+                 sys.exit({code})\n"
             ),
         );
     }
@@ -208,14 +243,20 @@ impl Fx {
     }
 
     fn fake_deploy_writing(&self, code: i32, said: &str, receipt: &str) {
+        let file = self.file("receipt.json");
+        if receipt.is_empty() {
+            let _ = fs::remove_file(&file);
+        } else {
+            write(&file, receipt);
+        }
         self.script(
             &self.tools().join("deploy.sh"),
             &format!(
-                "echo \"deploy $*\" >> '{log}'\n\
-                 [ {code} -ne 0 ] || [ \"$2\" != --receipt ] || [ -z '{receipt}' ] || echo '{receipt}' > \"$3\"\n\
-                 echo '{said}'\n\
+                "echo \"deploy $*\" >> \"$FX_LOG\"\n\
+                 [ {code} -ne 0 ] || [ \"$2\" != --receipt ] || [ ! -f \"$FX_RECEIPT\" ] || cp \"$FX_RECEIPT\" \"$3\"\n\
+                 printf '%s\\n' {}\n\
                  exit {code}\n",
-                log = self.log().display(),
+                q(said)
             ),
         );
     }
@@ -295,6 +336,12 @@ fn left(note: &str) -> Outcome {
     Outcome::Left(format!("{} [{note}]", merge_text()))
 }
 
+fn stale(ran_on: &str, now: &str) -> Outcome {
+    left(&format!(
+        "stale base: CI ran on {ran_on}, the base is now {now}; update the branch and wait for green CI"
+    ))
+}
+
 fn done() -> Outcome {
     Outcome::Done(Vec::new())
 }
@@ -305,6 +352,13 @@ fn failed(reason: &str) -> Outcome {
 
 fn failed_with(outcome: &Outcome, prefix: &str) -> bool {
     matches!(outcome, Outcome::Failed(reason) if reason.starts_with(prefix))
+}
+
+fn receipts(fx: &Fx, head: &str) -> PathBuf {
+    fx.tmp().join(format!(
+        "dekopon-merge/dekopon-agents-vm-runner-77-{}",
+        &head[..12]
+    ))
 }
 
 struct Scripts<'a>(&'a Fx);
@@ -329,20 +383,28 @@ impl Proc for Missing<'_> {
     }
 }
 
+struct ShowFails<'a>(&'a Fx);
+
+impl Proc for ShowFails<'_> {
+    fn run(&self, cmd: &Cmd) -> cm::tick::Result<Ran> {
+        if cmd.program_name() == "git" && cmd.argv.iter().any(|arg| arg == "show") {
+            return Ok(Ran::code(128, LIMITS).with_stderr("fatal: bad object"));
+        }
+        Scripts(self.0).run(cmd)
+    }
+}
+
 #[test]
 fn merge_ready_merges_at_the_observed_head_then_advances() {
     let fx = Fx::new();
     assert_eq!(fx.merge(), done());
-    let receipts = fx
-        .tmp()
-        .join("dekopon-merge/dekopon-agents-vm-runner-77-aaaaaaaaaaaa");
     assert_eq!(
         fx.calls(""),
         [
-            "gh api repos/dekopon-agents/vm-runner/pulls/77 --jq .base.ref".to_owned(),
+            "gh api repos/dekopon-agents/vm-runner/pulls/77 --jq .base.ref, .base.sha".to_owned(),
             format!(
-                "merge dekopon-agents/vm-runner 77 {HEAD} --base main --evidence {}",
-                receipts.display()
+                "merge -I dekopon-agents/vm-runner 77 {HEAD} --base main --evidence {}",
+                receipts(&fx, HEAD).display()
             ),
             format!("cm advance -C {EPOCH} {STEP} merged --pr {PR} --sha {NEXT}"),
         ]
@@ -350,16 +412,35 @@ fn merge_ready_merges_at_the_observed_head_then_advances() {
 }
 
 #[test]
+fn fixtures_run_under_a_path_with_an_apostrophe_and_a_space() {
+    let fx = Fx::new();
+    let root = fx.root.path().to_str().unwrap();
+    assert!(root.contains('\'') && root.contains(' '), "{root}");
+    assert_eq!(fx.merge(), done());
+    let line =
+        json!({"kind": "unblock-now", "target": STEP, "command": format!("cm unblock {STEP}")});
+    assert_eq!(fx.run(&UnblockNow, line), done());
+    assert_eq!(fx.deploy(RELEASE), done());
+    assert_eq!(fx.calls("merge ").len(), 1);
+    assert_eq!(fx.calls("cm ").len(), 4);
+    assert!(fs::read_to_string(fx.note()).unwrap().contains(DEPLOYED));
+}
+
+#[test]
 fn a_stale_base_goes_to_the_model() {
     let fx = Fx::new();
     fx.observe(json!(HEAD), json!(NEXT));
-    assert_eq!(
-        fx.merge(),
-        left(
-            "stale base: CI ran on cccccccccccc, the base is now bbbbbbbbbbbb; update the branch and wait for green CI"
-        )
-    );
+    assert_eq!(fx.merge(), stale("cccccccccccc", "bbbbbbbbbbbb"));
     assert_eq!(fx.calls("merge "), Vec::<String>::new());
+}
+
+#[test]
+fn a_base_that_moved_since_cm_looked_is_stale_and_never_merged() {
+    let fx = Fx::new();
+    fx.fake_gh(NEXT);
+    assert_eq!(fx.merge(), stale("bbbbbbbbbbbb", "cccccccccccc"));
+    assert_eq!(fx.calls("merge "), Vec::<String>::new());
+    assert_eq!(fx.calls("cm "), Vec::<String>::new());
 }
 
 #[test]
@@ -367,28 +448,26 @@ fn a_base_cm_never_saw_ci_run_on_is_stale_and_named() {
     let fx = Fx::new();
     for ci_base in [json!(null), json!("")] {
         fx.observe(json!(HEAD), ci_base);
-        assert_eq!(
-            fx.merge(),
-            left(
-                "stale base: CI ran on no observed base, the base is now bbbbbbbbbbbb; update the branch and wait for green CI"
-            )
-        );
+        assert_eq!(fx.merge(), stale("no observed base", "bbbbbbbbbbbb"));
     }
+    fx.pulls(json!({PR: {"head": HEAD}}));
+    assert_eq!(
+        fx.merge(),
+        stale("no observed base", "no observed base"),
+        "neither a CI base nor a base"
+    );
     assert_eq!(fx.calls("merge "), Vec::<String>::new());
 }
 
 #[test]
 fn a_receipt_from_an_earlier_merge_attempt_refuses_a_second_merge() {
     let fx = Fx::new();
-    let receipts = fx
-        .tmp()
-        .join("dekopon-merge/dekopon-agents-vm-runner-77-aaaaaaaaaaaa");
-    write(&receipts.join("merge-attempted.json"), "{}");
+    write(&receipts(&fx, HEAD).join("merge-attempted.json"), "{}");
     assert_eq!(
         fx.merge(),
         failed(&format!(
             "an earlier merge attempt left {}; reconcile {PR} before any retry",
-            receipts.display()
+            receipts(&fx, HEAD).display()
         ))
     );
     assert_eq!(
@@ -407,9 +486,7 @@ fn a_receipt_directory_that_cannot_be_checked_refuses_the_merge() {
             &outcome,
             &format!(
                 "cannot tell whether an earlier merge attempt left {}: ",
-                fx.tmp()
-                    .join("dekopon-merge/dekopon-agents-vm-runner-77-aaaaaaaaaaaa")
-                    .display()
+                receipts(&fx, HEAD).display()
             )
         ),
         "{outcome:?}"
@@ -418,30 +495,29 @@ fn a_receipt_directory_that_cannot_be_checked_refuses_the_merge() {
 }
 
 #[test]
-fn the_receipt_directory_is_under_tmpdir_as_the_children_see_it() {
+fn an_empty_or_relative_tmpdir_refuses_the_merge_before_any_effect() {
     let fx = Fx::new();
-    let receipt = "dekopon-merge/dekopon-agents-vm-runner-77-aaaaaaaaaaaa";
-    let cases = [
-        (Env::default(), PathBuf::from("/tmp").join(receipt)),
+    for (tmpdir, reason) in [
         (
-            [("TMPDIR", "")].into_iter().collect(),
-            PathBuf::from("/tmp").join(receipt),
+            "",
+            "TMPDIR is set but empty; receipts need a private directory",
         ),
         (
-            [("TMPDIR", "scratch")].into_iter().collect(),
-            fx.ct().join("scratch").join(receipt),
+            "scratch",
+            "TMPDIR scratch is relative; receipts need a private directory",
         ),
-    ];
-    fx.fake_merge(1);
-    for (env, receipts) in cases {
+    ] {
+        let env = [("TMPDIR", tmpdir)].into_iter().collect();
         let line = json!({"kind": "merge-ready", "target": STEP, "command": "merge it"});
-        fx.run_with(&MergeReady, line, &env, &Scripts(&fx));
-        let merge = fx.calls("merge ").pop().unwrap();
-        assert!(
-            merge.ends_with(&format!(" --evidence {}", receipts.display())),
-            "{merge}"
+        assert_eq!(
+            fx.run_with(&MergeReady, line, &env, &Scripts(&fx)),
+            failed(reason)
         );
     }
+    assert_eq!(
+        (fx.calls("merge "), fx.calls("cm ")),
+        (Vec::new(), Vec::new())
+    );
 }
 
 #[test]
@@ -457,6 +533,55 @@ fn merge_ready_without_cms_advance_command_builds_it() {
         let line = json!({"kind": "merge-ready", "target": STEP, "command": command});
         assert_eq!(fx.run(&MergeReady, line), done(), "{command}");
         assert_eq!(fx.calls("cm "), std::slice::from_ref(&built), "{command}");
+    }
+}
+
+#[test]
+fn a_command_that_is_not_a_string_merges_then_builds_the_advance() {
+    for command in [json!(5), json!(null), json!(["cm", "advance"])] {
+        let fx = Fx::new();
+        let line = json!({"kind": "merge-ready", "target": STEP, "command": command});
+        assert_eq!(fx.run(&MergeReady, line), done(), "{command}");
+        assert_eq!(
+            fx.calls("cm "),
+            [format!(
+                "cm advance -C {EPOCH} {STEP} merged --pr {PR} --sha {NEXT}"
+            )],
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn a_command_that_is_not_a_string_fails_an_unblock_or_a_deploy() {
+    let fx = Fx::new();
+    for command in [json!(5), json!(null), json!(["cm", "unblock", STEP])] {
+        let reason = failed(&format!(
+            "the act line's command is {command}, not a string"
+        ));
+        let line = json!({"kind": "unblock-now", "target": STEP, "command": command});
+        assert_eq!(fx.run(&UnblockNow, line), reason, "{command}");
+        let line = json!({"kind": "released-undeployed", "target": RELEASE, "command": command});
+        assert_eq!(fx.run(&ReleasedUndeployed, line), reason, "{command}");
+    }
+    assert_eq!(fx.calls(""), Vec::<String>::new());
+}
+
+#[test]
+fn an_observation_that_is_not_an_object_fails_before_any_merge() {
+    for seen in [json!("x"), json!([HEAD]), json!(7)] {
+        let fx = Fx::new();
+        fx.pulls(json!({PR: seen}));
+        let reason = failed(&format!(
+            "cm's observation of {PR} in .cm/pulls.json is {seen}, not an object"
+        ));
+        assert_eq!(fx.merge(), reason, "{seen}");
+        assert_eq!(
+            fx.merge_line(json!({"head": HEAD, "base": BASE})),
+            reason,
+            "{seen}"
+        );
+        assert_eq!(fx.calls(""), Vec::<String>::new(), "{seen}");
     }
 }
 
@@ -598,6 +723,7 @@ fn an_authority_that_cannot_be_read_at_the_stamp_merges_nothing() {
             "[authority]\nmerge = true\nmerge_excluded_repos = \"scientist-hq/rx\"\n",
             "merge_excluded_repos is not a list",
         ),
+        ("\u{feff}[authority]\nmerge = true\n", "merge = true"),
     ];
     for (limits, why) in cases {
         let fx = Fx::new();
@@ -630,6 +756,23 @@ fn an_authority_that_cannot_be_read_at_the_stamp_merges_nothing() {
     let outcome = fx.merge();
     assert!(failed_with(&outcome, unreadable), "{outcome:?}");
     assert_eq!(fx.calls(""), Vec::<String>::new());
+
+    let fx = Fx::new();
+    let line = json!({"kind": "merge-ready", "target": STEP, "command": "merge it"});
+    assert_eq!(
+        fx.run_with(&MergeReady, line, &fx.env(), &ShowFails(&fx)),
+        failed(&format!("{unreadable}fatal: bad object")),
+        "git show's output is read only when it exits 0"
+    );
+    assert_eq!(fx.calls(""), Vec::<String>::new());
+}
+
+#[test]
+fn toml_1_1_is_cms_dialect_for_the_stamp() {
+    let fx = Fx::new();
+    fx.stamp("x = { a = 1,\n b = 2, }\nwhen = 07:32\n\n[authority]\nmerge = true\n");
+    assert_eq!(fx.merge(), done());
+    assert_eq!(fx.calls("merge ").len(), 1);
 }
 
 #[test]
@@ -647,12 +790,25 @@ fn a_failed_merge_fails_and_advances_nothing() {
 
 #[test]
 fn a_merge_without_a_json_receipt_fails_and_advances_nothing() {
+    for printed in ["merged, I think", "[\"MERGED\"]"] {
+        let fx = Fx::new();
+        fx.fake_merge_printing(printed, 0);
+        assert_eq!(
+            fx.merge(),
+            failed(&format!(
+                "merge-pr.py merged {PR} but printed no JSON receipt ({printed}); record the merge by hand"
+            ))
+        );
+        assert_eq!(fx.calls("merge ").len(), 1);
+        assert_eq!(fx.calls("cm "), Vec::<String>::new());
+    }
+
     let fx = Fx::new();
-    fx.fake_merge_printing("merged, I think", 0);
+    fx.fake_merge_printing("{\"merge_sha\": 5}", 0);
     assert_eq!(
         fx.merge(),
         failed(&format!(
-            "merge-pr.py merged {PR} but printed no JSON receipt (merged, I think); record the merge by hand"
+            "merge-pr.py merged {PR} but its merge_sha is 5, not a string; record the merge by hand"
         ))
     );
     assert_eq!(fx.calls("cm "), Vec::<String>::new());
@@ -702,10 +858,8 @@ fn cm_017_merge_ready_lines_carry_pr_head_and_base() {
     assert_eq!(
         fx.calls("merge "),
         [format!(
-            "merge dekopon-agents/vm-runner 77 {NEXT} --base main --evidence {}",
-            fx.tmp()
-                .join("dekopon-merge/dekopon-agents-vm-runner-77-cccccccccccc")
-                .display()
+            "merge -I dekopon-agents/vm-runner 77 {NEXT} --base main --evidence {}",
+            receipts(&fx, NEXT).display()
         )]
     );
 
@@ -713,9 +867,7 @@ fn cm_017_merge_ready_lines_carry_pr_head_and_base() {
     fx.observe(json!(HEAD), json!(BASE));
     assert_eq!(
         fx.merge_line(json!({"base": NEXT})),
-        left(
-            "stale base: CI ran on bbbbbbbbbbbb, the base is now cccccccccccc; update the branch and wait for green CI"
-        )
+        stale("bbbbbbbbbbbb", "cccccccccccc")
     );
     assert_eq!(fx.calls("merge "), Vec::<String>::new());
 }
@@ -740,6 +892,64 @@ fn a_merge_ready_line_without_a_pr_or_state_fails() {
 }
 
 #[test]
+fn a_pr_source_of_the_wrong_type_fails_as_the_script_crashed() {
+    let wrong = [json!(5), json!([PR]), json!({"url": PR}), json!(true)];
+    for pr in &wrong {
+        let fx = Fx::new();
+        assert_eq!(
+            fx.merge_line(json!({"pr": pr})),
+            failed(&format!("the act line's pr is {pr}, not a PR URL")),
+            "{pr}"
+        );
+        fx.write_state(json!({"evidence": {"pr": pr}, "pr": PR}));
+        assert_eq!(
+            fx.merge(),
+            failed(&format!("the step's evidence.pr is {pr}, not a PR URL"))
+        );
+        fx.write_state(json!({"pr": pr}));
+        assert_eq!(
+            fx.merge(),
+            failed(&format!("the step's pr is {pr}, not a PR URL"))
+        );
+        assert_eq!(fx.calls(""), Vec::<String>::new(), "{pr}");
+    }
+    for evidence in [json!("x"), json!([PR]), json!(5), json!(true)] {
+        let fx = Fx::new();
+        fx.write_state(json!({"evidence": evidence, "pr": PR}));
+        assert_eq!(
+            fx.merge(),
+            failed(&format!("the step's evidence is {evidence}, not an object"))
+        );
+        assert_eq!(fx.calls(""), Vec::<String>::new(), "{evidence}");
+    }
+}
+
+#[test]
+fn a_pr_source_the_script_skips_or_never_reads_is_not_checked() {
+    let fx = Fx::new();
+    fx.write_state(json!({"evidence": "x", "pr": 5}));
+    assert_eq!(
+        fx.merge_line(json!({"pr": PR})),
+        done(),
+        "the line's pr wins"
+    );
+    for skipped in [
+        json!(0),
+        json!(""),
+        json!(null),
+        json!(false),
+        json!([]),
+        json!({}),
+    ] {
+        let fx = Fx::new();
+        fx.write_state(json!({"evidence": {"pr": skipped}, "pr": PR}));
+        assert_eq!(fx.merge_line(json!({"pr": skipped})), done(), "{skipped}");
+        fx.write_state(json!({"evidence": skipped, "pr": PR}));
+        assert_eq!(fx.merge(), done(), "{skipped}");
+    }
+}
+
+#[test]
 fn a_parts_merge_is_the_models() {
     let fx = Fx::new();
     assert_eq!(
@@ -754,17 +964,23 @@ fn a_parts_merge_is_the_models() {
 fn a_base_branch_that_cannot_be_read_fails_before_any_merge() {
     for (gh, said) in [
         (
-            "echo 'HTTP 404: Not Found' >&2\nexit 1\n",
+            "echo 'HTTP 404: Not Found' >&2\nexit 1\n".to_owned(),
             "HTTP 404: Not Found",
         ),
-        ("echo main\nexit 1\n", "main"),
-        ("echo '  '\n", "exit 0"),
+        (format!("printf 'main\\n{BASE}\\n'\nexit 1\n"), BASE),
+        ("echo '  '\n".to_owned(), "exit 0"),
+        ("echo main\n".to_owned(), "main"),
+        (format!("printf ' \\n{BASE}\\n'\n"), BASE),
+        ("printf 'main\\nnot-a-sha\\n'\n".to_owned(), "not-a-sha"),
+        (format!("printf 'main\\n{BASE}\\nmore\\n'\n"), "more"),
     ] {
         let fx = Fx::new();
-        fx.fake("gh", gh);
+        fx.fake("gh", &gh);
         assert_eq!(
             fx.merge(),
-            failed(&format!("cannot read the base branch of {PR}: {said}")),
+            failed(&format!(
+                "cannot read the base branch and SHA of {PR}: {said}"
+            )),
             "{gh}"
         );
         assert_eq!(fx.calls(""), Vec::<String>::new());
@@ -844,6 +1060,7 @@ fn unblock_now_refuses_a_placeholder_or_another_command() {
     let fx = Fx::new();
     for command in [
         format!("cm unblock {STEP} --evidence \"<file>\""),
+        format!("cm advance {STEP} done"),
         "rm -rf /".to_owned(),
         format!("cm unblock '{STEP}"),
         "cm".to_owned(),
@@ -1073,6 +1290,13 @@ fn a_merged_deploy_without_a_usable_receipt_fails_and_records_nothing() {
             &format!("{{\"digest\": \"{}\"}}", digest()),
             "its receipt names no release and digest",
         ),
+        (
+            &format!(
+                "{{\"release\": \"dekopon@0.90.0\", \"digest\": \"{}\", \"merge_sha\": 123}}",
+                digest()
+            ),
+            "its receipt's merge_sha is 123, not a string",
+        ),
     ];
     for (receipt, why) in cases {
         let fx = Fx::new();
@@ -1129,4 +1353,53 @@ fn a_receipt_directory_that_cannot_be_made_deploys_nothing() {
         "{outcome:?}"
     );
     assert_eq!(fx.calls(""), Vec::<String>::new());
+}
+
+#[test]
+fn an_evidence_note_past_the_file_size_limit_fails_its_line_and_the_tick_goes_on() {
+    let fx = Fx::new();
+    let said = "y".repeat(300);
+    let merge_sha = "m".repeat(40);
+    let mut receipt =
+        json!({"release": "", "pr": HOMELAB_PR, "merge_sha": merge_sha, "digest": digest()});
+    let release = "x".repeat(4000 - receipt.to_string().len());
+    receipt["release"] = json!(release);
+    let receipt = receipt.to_string();
+    let note = format!(
+        "# Deploy of {release}\n\n- deploy PR: {HOMELAB_PR}\n- merge SHA: {merge_sha}\n- digest: {}\n- deploy.sh: {said}\n",
+        digest()
+    );
+    assert!(
+        receipt.len() < 4096 && note.len() > 4096,
+        "deploy.sh can write its receipt under `ulimit -f 4`, the tick cannot write its note"
+    );
+    fx.fake_deploy_writing(0, &said, &receipt);
+    write(
+        &fx.tools().join("handoff-pick.sh"),
+        "echo ok store/epochs/ep/handoff/coordinator-x.md\n",
+    );
+    write(
+        &fx.file("next.json"),
+        &json!({"ok": true, "violations": [], "actionable": [deploy_line(RELEASE)]}).to_string(),
+    );
+    let output = Command::new("bash")
+        .args(["-c", "ulimit -f 4 && exec \"$@\"", "bash"])
+        .arg(env!("CARGO_BIN_EXE_cm"))
+        .args(["tick", "--cm", "cm", "--checkout"])
+        .arg(fx.ct())
+        .env_clear()
+        .envs(fx.child_env())
+        .env("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_01abc")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let failed = format!(
+        "{} [tick/released-undeployed failed: deployed {RELEASE}; cannot write its evidence note: its {} bytes would pass the file size limit; record the deploy by hand]",
+        text(&deploy_line(RELEASE)),
+        note.len()
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.lines().any(|line| line == failed), "{stdout}");
+    assert_eq!(fx.calls("deploy ").len(), 1);
+    assert_eq!(fx.calls("cm "), Vec::<String>::new());
 }
