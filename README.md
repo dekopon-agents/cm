@@ -148,6 +148,7 @@ Children:
 
 - A kill of `cm tick` itself does not reach a running child's own group, so the Stop hook must bound `cm tick` by session.
 - A spill write that blocks (a frozen filesystem under `TMPDIR`) holds the capture, and so its timeout, until the write returns.
+- A list above 64 MiB is moved to a file in `TMPDIR`; when that file cannot be written the tick prints one line saying so and no act line, even if memory could have held the list; exit 0.
 - Each act line is parsed and its text formatted whole, in text and `--json` output alike: when memory for one line cannot be had, Rust's allocation abort ends the tick (exit 134). Allocation failure can occur before or after the current move; moves already made stand, later moves do not run, and output stops at the failure (under `--json`, no object is printed). Only the list's 64 MiB hold moves to a file when memory runs out; `cm next` prints lines of a few kilobytes, a few megabytes at most.
 - `--json` holds every line, and the object built from them, to stream one object after the loop (never a second copy as text), so its memory grows with the list (text output does not): memory short of a few times the list's size ends the tick with the same allocation abort (exit 134), during the loop, before or after a move, or after the loop: moves already made stand, later moves do not run, and no object is printed.
 - A `cm next` that floods its stdout fills the spill in `TMPDIR` until its 30 s cap and the 5 s grace after it, so a runaway producer can write gigabytes before it is killed.
