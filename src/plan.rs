@@ -372,10 +372,13 @@ pub(crate) struct ActionInputs {
 }
 
 impl ActionInputs {
-    // Sync does not refuse an unreadable registry, as it does not refuse an unreadable review
-    // ledger: it registers no driver, so every claim reads as it would without one.
+    // What any reader sees, for CARD.md and sync's stall lines: which session runs the sync is not
+    // a campaign fact, so neither its coordinator nor the lane-driver registry enters.
     pub(crate) fn read(root: &Path, now: Timestamp) -> Self {
-        Self::with_drivers(root, now, Drivers::read(root).unwrap_or_default())
+        Self {
+            coordinator: None,
+            ..Self::with_drivers(root, now, Drivers::default())
+        }
     }
 
     pub(crate) fn load(root: &Path, now: Timestamp) -> Result<Self, Violation> {
@@ -896,8 +899,6 @@ pub struct Observed {
     pub head: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mergeable_state: Option<MergeableState>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub etags: BTreeMap<String, String>,
 }
 
 pub const PULLS: &str = "pulls.json";
@@ -1087,23 +1088,20 @@ pub(crate) fn unblock_command(target: &str, condition_met: bool) -> String {
     }
 }
 
+// CARD.md, its only caller, shows no Codex hold: CM_CODEX_WEEKLY_PCT is the caller's environment.
 pub fn summary(root: &Path, units: &Units) -> Next {
     let paused = paused(root).unwrap_or(true);
-    let quota = limits::codex_pause();
     let mut ready = Vec::new();
     let mut waiting = Vec::new();
     for candidate in candidates(root, units) {
-        let quota_hold = candidate.dispatch_hold(quota.as_deref());
-        if !paused && candidate.ready() && quota_hold.is_none() {
+        if !paused && candidate.ready() {
             ready.push((
                 candidate.target.clone(),
                 candidate.lane(),
                 candidate.finish(),
             ));
         } else {
-            let mut on = candidate.waits_on();
-            on.extend(quota_hold.map(str::to_owned));
-            waiting.push((candidate.target.clone(), on));
+            waiting.push((candidate.target.clone(), candidate.waits_on()));
         }
     }
     Next {

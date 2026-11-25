@@ -14,7 +14,6 @@ use cm::outcome::Outcome;
 use cm::plan;
 use cm::state::{Evidence, Lane, Phase, Work};
 use cm::store::{self, parse_target};
-use cm::sync::sync;
 use jiff::Timestamp;
 
 struct Fake {
@@ -66,6 +65,26 @@ use campaign_fixture::{Campaign, campaign};
 #[path = "support/forge.rs"]
 mod forge_fixture;
 use forge_fixture::FakeForge;
+
+#[path = "support/readers.rs"]
+mod readers;
+use readers::both as sync;
+
+impl readers::Twin for FakeForge {
+    fn twin(&self, root: &Path) -> Self {
+        FakeForge::twin(self, root)
+    }
+}
+
+// For a `gh` script that keeps no state between calls.
+impl readers::Twin for Gh {
+    fn twin(&self, _: &Path) -> Self {
+        Gh {
+            program: self.program.clone(),
+            timeout: self.timeout,
+        }
+    }
+}
 
 #[path = "support/watch.rs"]
 mod watch_fixture;
@@ -498,7 +517,6 @@ fn card_rechecks_unmet_until_blocks_and_unblocks_satisfied_or_free_text_blocks()
             "campaign",
             &units,
             &plan::summary(&c.root, &units),
-            &[],
         );
         let blocked = card
             .split_once("## Blocked\n\n")
@@ -556,7 +574,6 @@ fn ready_owner_commands_finish_with_named_evidence() {
         "campaign",
         &units,
         &plan::summary(&c.root, &units),
-        &[],
     );
     assert!(
         card.contains(&format!("1. `01-a/u/owner` (owner) — `{command}`")),
@@ -640,7 +657,6 @@ fn ready_owner_rollouts_offer_launch_in_next_and_card() {
         "campaign",
         &units,
         &plan::summary(&c.root, &units),
-        &[],
     );
     assert!(
         card.contains(&format!("1. `{step}` (owner) — `{command}`")),
@@ -1289,17 +1305,15 @@ fn sync_moves_steps_from_github_state_and_renders_the_card() {
     assert_eq!(state(&c, "01-a/u/S1"), Phase::Merged);
     assert_eq!(state(&c, "01-a/u/S9"), Phase::PrOpen);
     let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
-    assert_eq!(card.lines().next(), Some("Last run: 2026-10-17T09:05Z"));
+    assert_eq!(card.lines().next(), Some("# campaign card"), "no run stamp");
     assert!(
         card.contains("1. `00-release/dekopon/0.49.0` (pi) — `cm launch 00-release/dekopon/0.49.0 --worktree '<worktree-path>'`"),
         "{card}"
     );
-    assert!(
-        card.contains("- `01-a/u/S1` pr-open → merged (sha aaa1)"),
-        "{card}"
-    );
+    assert!(!card.contains("Moved this run"), "{card}");
     let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
     assert!(journal.contains("## 2026-10-17T09:05Z — cm sync: 1 move(s) from GitHub\n"));
+    assert!(journal.contains("- 01-a/u/S1: pr-open → merged (sha aaa1)\n"));
 
     let next = plan::next(&c.root, None, None).unwrap();
     assert_eq!(
@@ -1348,9 +1362,13 @@ fn sync_moves_steps_from_github_state_and_renders_the_card() {
         },
     );
     assert!(deployed.ok(), "{:?}", deployed.violations);
-    let calls = *forge.calls.borrow();
+    let calls = *forge.calls.lock().unwrap();
     sync(&later, &forge, &c.root).unwrap();
-    assert_eq!(*forge.calls.borrow(), calls + 2, "one read per open PR");
+    assert_eq!(
+        *forge.calls.lock().unwrap(),
+        calls + 2,
+        "one read per open PR"
+    );
     assert_eq!(state(&c, "01-a/u/S1"), Phase::Deployed);
     let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
     assert_eq!(
@@ -1921,13 +1939,19 @@ esac
     let observe = |mode, now| {
         fs::write(gh.fixture().join("mode"), mode).unwrap();
         fs::write(&args_path, "").unwrap();
-        let outcome = sync(&at(now), &forge, &c.root).unwrap();
+        let outcome = cm::sync::sync(&at(now), &forge, &c.root).unwrap();
         let pulls = store::read_json::<BTreeMap<String, plan::Observed>>(&pulls_path).unwrap();
         (
             outcome,
             pulls[pr].clone(),
             fs::read_to_string(&args_path).unwrap(),
         )
+    };
+    // The validators live beside the tracked observation, in the ignored read memo.
+    let validators = || {
+        let memo: serde_json::Value =
+            store::read_json(&c.root.join(".cm").join(cm::sync::PULLS_READ)).unwrap();
+        serde_json::from_value::<BTreeMap<String, String>>(memo[pr]["etags"].clone()).unwrap()
     };
     let pull = "repos/o/r/pulls/1";
     let runs = "repos/o/r/commits/head/check-runs?per_page=100&page=";
@@ -1936,7 +1960,7 @@ esac
     let (outcome, first, args) = observe("first", "2026-10-17T08:00:00Z");
     assert!(outcome.ok(), "{:?}", outcome.violations);
     assert_eq!(
-        first.etags,
+        validators(),
         BTreeMap::from([
             (pull.to_owned(), "W/\"old-pull\"".to_owned()),
             (format!("{runs}2"), "\"runs-two\"".to_owned()),
@@ -1965,7 +1989,7 @@ esac
     assert_eq!(aged.ci_base.as_deref(), Some("new"));
     assert_eq!(aged.mergeable_state, Some("clean".to_owned().into()));
     assert_eq!(
-        aged.etags,
+        validators(),
         BTreeMap::from([(pull.to_owned(), "\"new-pull\"".to_owned())])
     );
     assert_eq!(
@@ -2025,7 +2049,7 @@ fi
         program: gh.program(),
         timeout: Duration::from_secs(10),
     };
-    let observe = || sync(&host, &forge, &c.root).unwrap();
+    let observe = || cm::sync::sync(&host, &forge, &c.root).unwrap();
     let pulls = || {
         store::read_json::<BTreeMap<String, plan::Observed>>(&plan::pulls_path(&c.root)).unwrap()
     };
@@ -2111,7 +2135,7 @@ esac
         let launched = store::load_unit(&c.root.join("01-a/u")).unwrap();
         let claim = &launched.steps["S1"].attempt.as_ref().unwrap().claim;
         let end = cm(&["attempt", step, "--claim", claim, "end", "complete"]);
-        cm(&["sync"]);
+        let synced = cm(&["sync"]);
 
         let ended = store::load_unit(&c.root.join("01-a/u")).unwrap();
         let outcome = ended.steps["S1"]
@@ -2125,7 +2149,7 @@ esac
         assert_eq!(outcome, cm::state::AttemptOutcome::Complete);
 
         let expected = usize::from(mode == "valid");
-        for report in [&launch, &end] {
+        for report in [&launch, &end, &synced] {
             assert_eq!(
                 report.lines().filter(|line| *line == stamp).count(),
                 expected
@@ -2141,10 +2165,7 @@ esac
             2 * expected
         );
         let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
-        assert_eq!(
-            card.lines().nth(1),
-            Some(if mode == "valid" { stamp } else { "" })
-        );
+        assert!(!card.contains("GitHub REST core"), "{card}");
         assert_eq!(
             fs::read_to_string(&args_path).unwrap(),
             "api rate_limit\napi rate_limit\napi rate_limit\n"
@@ -2181,16 +2202,23 @@ echo '{"resources":{"core":{"used":17,"limit":5000,"reset":1792227600}}}'
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
-        fs::read_to_string(c.root.join("CARD.md")).unwrap()
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let sampled = |output: &str| {
+        output
+            .lines()
+            .filter(|line| line.starts_with("GitHub REST core: "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
     };
 
     // The same memory limit must still allow a normal sample.
     assert_eq!(
-        sync().lines().nth(1),
-        Some("GitHub REST core: 17/5000 used (reset 1792227600)")
+        sampled(&sync()),
+        ["GitHub REST core: 17/5000 used (reset 1792227600)"]
     );
     fs::write(gh.fixture().join("large"), "").unwrap();
-    assert_eq!(sync().lines().nth(1), Some(""));
+    assert!(sampled(&sync()).is_empty());
     assert_eq!(
         fs::read_to_string(gh.fixture().join("requests")).unwrap(),
         "api rate_limit\napi rate_limit\n"
@@ -2897,7 +2925,7 @@ fn a_tag_only_release_does_not_release_a_member_it_does_not_contain() {
     sync(&host, &forge, &c.root).unwrap();
     assert_eq!(state(&c, "01-a/u/S1"), Phase::Merged);
     assert_eq!(
-        *forge.containment_queries.borrow(),
+        *forge.containment_queries.lock().unwrap(),
         vec![("o/cm".into(), "v0.7.0".into(), "s1".into())]
     );
 }
@@ -2911,7 +2939,7 @@ fn a_tag_only_release_without_a_declared_repository_is_skipped() {
         .insert(("o/cm".into(), "v0.7.0".into()), ["s1".to_owned()].into());
     sync(&host, &forge, &c.root).unwrap();
     assert_eq!(state(&c, "01-a/u/S1"), Phase::Merged);
-    assert!(forge.containment_queries.borrow().is_empty());
+    assert!(forge.containment_queries.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -4006,7 +4034,6 @@ fn card_watch_counts_and_rows_stay_bounded_and_prioritized() {
         "test",
         &units,
         &next,
-        &[],
     );
     let section = card
         .split_once("## Watches\n\n")
@@ -4077,7 +4104,6 @@ fn card_watch_withdrawals_are_visible_for_twenty_four_hours() {
         "test",
         &units,
         &next,
-        &[],
     );
     assert!(
         boundary
@@ -4097,7 +4123,6 @@ fn card_watch_withdrawals_are_visible_for_twenty_four_hours() {
         "test",
         &units,
         &next,
-        &[],
     );
     assert!(!card.contains("check#1"), "{card}");
     assert!(
@@ -4187,7 +4212,6 @@ fn card_watch_rows_are_short_and_only_show_relevant_live_watches() {
         "test",
         &units,
         &next,
-        &[],
     );
     assert!(!card.contains("live#1"), "{card}");
     assert!(!card.contains("finished#1"), "{card}");
@@ -4220,7 +4244,6 @@ fn card_watch_rows_are_short_and_only_show_relevant_live_watches() {
         "test",
         &units,
         &next,
-        &[],
     );
     assert!(
         reopened
@@ -5303,12 +5326,17 @@ esac"#
         fs::read_to_string(c.root.join("CARD.md")).unwrap()
     };
     let card = sync_card();
+    // The card counts what any reader sees: another session's claim is this session's action.
+    let shared = actions
+        .iter()
+        .filter(|action| action["kind"] != "earlier-coordinator")
+        .count();
+    assert_eq!(shared, lines.lines().count() - 1);
     assert_eq!(
         card.lines().find(|line| line.starts_with("Actionable: ")),
         Some(
             format!(
-                "Actionable: {} (oldest: {})",
-                lines.lines().count(),
+                "Actionable: {shared} (oldest: {})",
                 cm::host::stamp(old.now)
             )
             .as_str()
@@ -6148,6 +6176,15 @@ fn a_registered_drivers_claim_under_its_units_is_live_while_unregistered_and_out
     let (code, before) = earlier_coordinators(&c);
     assert_eq!(code, Some(1));
     assert_eq!(sorted(before), sorted(all.to_vec()));
+    let synced_card = || {
+        let synced = coordinator_cm(&c, &["sync"])
+            .env("PATH", support::FakeGh::new("exit 1").path())
+            .output()
+            .unwrap();
+        assert!(synced.status.code().is_some(), "{synced:?}");
+        fs::read_to_string(c.root.join("CARD.md")).unwrap()
+    };
+    let unregistered = synced_card();
 
     let (code, added) = current_json(
         &c,
@@ -6189,19 +6226,14 @@ fn a_registered_drivers_claim_under_its_units_is_live_while_unregistered_and_out
     assert_eq!(code, Some(1));
     assert_eq!(after, [STRANGER]);
 
-    let card = {
-        let synced = coordinator_cm(&c, &["sync"])
-            .env("PATH", support::FakeGh::new("exit 1").path())
-            .output()
-            .unwrap();
-        assert!(synced.status.code().is_some(), "{synced:?}");
-        fs::read_to_string(c.root.join("CARD.md")).unwrap()
-    };
+    // The card counts no caller-relative item, registry or not: an earlier coordinator depends
+    // on who asks.
+    let card = synced_card();
     assert!(
-        card.lines()
-            .any(|line| line.starts_with("Actionable: 1 (oldest: ")),
+        card.lines().any(|line| line == "Actionable: 0 (oldest: —)"),
         "{card}"
     );
+    assert_eq!(card, unregistered);
 }
 
 #[test]
