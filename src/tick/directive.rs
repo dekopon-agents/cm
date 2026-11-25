@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
-use std::io::ErrorKind;
+use std::fs::File;
+use std::io::{BufRead, BufReader, ErrorKind};
+use std::ops::Bound;
 use std::path::Path;
 use std::time::Duration;
 
@@ -36,16 +38,18 @@ pub fn run(ctx: &Ctx) -> Report {
         }
     };
     let path = epoch.join("JOURNAL.md");
-    let journal = match std::fs::read(&path) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+    let listed = match File::open(&path) {
+        Ok(file) => unpicked(BufReader::new(file), stamp),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    };
+    let lines = match listed {
+        Ok(Some(lines)) => lines,
+        Ok(None) => vec![format!(
+            "heartbeat: no JOURNAL.md heading for stamp_entry {stamp}; owner directives not listed"
+        )],
         Err(error) => return unread(could_not_read(&path, &error)),
     };
-    let lines = unpicked(&journal, stamp).unwrap_or_else(|| {
-        vec![format!(
-            "heartbeat: no JOURNAL.md heading for stamp_entry {stamp}; owner directives not listed"
-        )]
-    });
     Report {
         lines,
         failed: false,
@@ -114,26 +118,44 @@ fn stamp_fields(line: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-// A pickup anywhere in the journal counts, as heartbeat.sh's `grep -cF` over the whole file did.
-fn unpicked(journal: &str, stamp: &str) -> Option<Vec<String>> {
-    let lines: Vec<&str> = journal.split('\n').collect();
+// A pickup anywhere in the journal counts, as heartbeat.sh's `grep -cF` over the whole file did,
+// and one pass keeps only the headings below the stamp and the text after each pickup.
+fn unpicked(mut journal: impl BufRead, stamp: &str) -> std::io::Result<Option<Vec<String>>> {
     let heading = format!("## {stamp} ");
-    let at = lines.iter().position(|line| line.starts_with(&heading))?;
-    let picked: Vec<&str> = lines
-        .iter()
-        .flat_map(|line| {
-            line.match_indices(PICKED_UP)
-                .map(|(at, _)| &line[at + PICKED_UP.len()..])
-        })
-        .collect();
-    Some(
-        lines[at + 1..]
-            .iter()
-            .filter_map(|line| line.strip_prefix("## ").filter(|_| is_directive(line)))
-            .filter(|heading| !picked.iter().any(|rest| rest.starts_with(heading)))
+    let mut below = false;
+    let mut directives = Vec::new();
+    let mut picked = BTreeSet::new();
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        if journal.read_until(b'\n', &mut bytes)? == 0 {
+            break;
+        }
+        let line = String::from_utf8_lossy(bytes.strip_suffix(b"\n").unwrap_or(&bytes));
+        for (at, _) in line.match_indices(PICKED_UP) {
+            picked.insert(line[at + PICKED_UP.len()..].to_owned());
+        }
+        if !below {
+            below = line.starts_with(&heading);
+        } else if is_directive(&line) {
+            directives.push(line["## ".len()..].to_owned());
+        }
+    }
+    Ok(below.then(|| {
+        directives
+            .into_iter()
+            .filter(|heading| !picked_up(&picked, heading))
             .map(|heading| format!("owner-directive: {heading}"))
-            .collect(),
-    )
+            .collect()
+    }))
+}
+
+// Every text starting with the heading sorts at or after it, before any that does not.
+fn picked_up(picked: &BTreeSet<String>, heading: &str) -> bool {
+    picked
+        .range::<str, _>((Bound::Included(heading), Bound::Unbounded))
+        .next()
+        .is_some_and(|rest| rest.starts_with(heading))
 }
 
 fn is_directive(line: &str) -> bool {
@@ -153,6 +175,10 @@ mod tests {
 
     const STAMP: &str = "2026-11-19T17:38Z";
 
+    fn listed(text: &str, stamp: &str) -> Option<Vec<String>> {
+        unpicked(text.as_bytes(), stamp).unwrap()
+    }
+
     fn journal(open: &str) -> String {
         format!(
             "# journal\n\n## 2026-11-18T10:00Z — Owner directive: before the stamp, never listed\n\n## {STAMP} — owner-queue answer 10. URGENT: gate review\n\n## {STAMP} — epoch working\n\n## 2026-11-20T01:00Z — Owner directive: picked up already\n\n## 2026-11-20T01:05Z — Directive picked up: 2026-11-20T01:00Z — Owner directive: picked up already\n{open}"
@@ -161,17 +187,17 @@ mod tests {
 
     #[test]
     fn only_unpicked_directives_below_the_first_stamp_heading_are_listed() {
-        assert_eq!(unpicked(&journal(""), STAMP), Some(Vec::new()));
+        assert_eq!(listed(&journal(""), STAMP), Some(Vec::new()));
         let open = "\n## 2026-11-25T04:05Z — Owner directive: unstick throughput now\n";
         assert_eq!(
-            unpicked(&journal(open), STAMP),
+            listed(&journal(open), STAMP),
             Some(vec![
                 "owner-directive: 2026-11-25T04:05Z — Owner directive: unstick throughput now"
                     .to_owned()
             ])
         );
-        assert_eq!(unpicked(&journal(open), "2026-11-19T17:39Z"), None);
-        assert_eq!(unpicked("", STAMP), None);
+        assert_eq!(listed(&journal(open), "2026-11-19T17:39Z"), None);
+        assert_eq!(listed("", STAMP), None);
     }
 
     #[test]
@@ -180,9 +206,41 @@ mod tests {
             "x {PICKED_UP}2026-11-25T04:05Z — Owner directive: unstick throughput now, as asked\n## {STAMP} — stamp\n## 2026-11-25T04:05Z — Owner directive: unstick throughput now\n## 2026-11-25T04:06Z — Owner directive: other\n"
         );
         assert_eq!(
-            unpicked(&text, STAMP),
+            listed(&text, STAMP),
             Some(vec![
                 "owner-directive: 2026-11-25T04:06Z — Owner directive: other".to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn the_first_stamp_heading_bounds_the_listing_and_its_stamp_is_followed_by_a_space() {
+        let text = format!(
+            "## {STAMP} — first\n## 2026-11-19T18:00Z — Owner directive: between\n## {STAMP} — second\n## 2026-11-19T19:00Z — Owner directive: after\n"
+        );
+        assert_eq!(
+            listed(&text, STAMP),
+            Some(vec![
+                "owner-directive: 2026-11-19T18:00Z — Owner directive: between".to_owned(),
+                "owner-directive: 2026-11-19T19:00Z — Owner directive: after".to_owned(),
+            ])
+        );
+        let longer = format!(
+            "## {STAMP}5 — another stamp\n## 2026-11-25T04:05Z — Owner directive: x\n## {STAMP}\n"
+        );
+        assert_eq!(listed(&longer, STAMP), None);
+    }
+
+    #[test]
+    fn a_pickup_counts_when_its_text_starts_with_the_whole_heading() {
+        let text = format!(
+            "{PICKED_UP}2026-11-25T04:05Z — Owner directive: ab, done\n{PICKED_UP}2026-11-25T04:06Z — Owner directive: c\n## {STAMP} — s\n## 2026-11-25T04:05Z — Owner directive: ab\n## 2026-11-25T04:06Z — Owner directive: cd\n## 2026-11-25T04:07Z — Owner directive: a\n"
+        );
+        assert_eq!(
+            listed(&text, STAMP),
+            Some(vec![
+                "owner-directive: 2026-11-25T04:06Z — Owner directive: cd".to_owned(),
+                "owner-directive: 2026-11-25T04:07Z — Owner directive: a".to_owned(),
             ])
         );
     }

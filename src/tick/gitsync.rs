@@ -9,6 +9,8 @@ pub const TRIES: u32 = 3;
 
 pub const BETWEEN_TRIES: Duration = Duration::from_secs(2);
 
+pub const ABORT_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Always,
@@ -46,6 +48,12 @@ pub fn sync(ctx: &Ctx, mode: Mode) -> Report {
         return report;
     }
     for done in 1..=TRIES {
+        if done > 1 {
+            if ctx.remaining().is_zero() {
+                break;
+            }
+            ctx.pause(BETWEEN_TRIES);
+        }
         if git(
             ctx,
             &["pull", "-q", "--rebase", "--autostash", "origin", "main"],
@@ -53,10 +61,7 @@ pub fn sync(ctx: &Ctx, mode: Mode) -> Report {
         {
             return report;
         }
-        git(ctx, &["rebase", "--abort"]);
-        if done < TRIES {
-            ctx.pause(BETWEEN_TRIES);
-        }
+        abort(ctx);
     }
     report.lines.push(format!(
         "heartbeat: git pull --rebase and push to main failed {TRIES} times; main does not have this checkout's commits"
@@ -73,6 +78,16 @@ fn command(args: &[&str]) -> Cmd {
     Cmd::new("git").args(args).keep(Keep::Head, Keep::Tail)
 }
 
+// A pull the budget cut can stop mid-rebase, with the tree's change in the autostash, so the
+// abort gets its own timeout rather than what is left of the spent budget.
+fn abort(ctx: &Ctx) {
+    let _ = ctx.proc.run(
+        &command(&["rebase", "--abort"])
+            .cwd(ctx.checkout)
+            .timeout(ABORT_TIMEOUT),
+    );
+}
+
 fn git(ctx: &Ctx, args: &[&str]) -> bool {
     ctx.run(command(args)).is_ok_and(|ran| ran.exit.success())
 }
@@ -87,6 +102,7 @@ fn output(ctx: &Ctx, args: &[&str]) -> String {
 mod tests {
     use std::ffi::OsStr;
     use std::path::Path;
+    use std::time::Duration;
 
     use super::*;
     use crate::tick::act::Env;
@@ -250,8 +266,48 @@ mod tests {
                 &[PULL, PUSH, ABORT]
             };
             assert_eq!(tries, one.repeat(3));
-            assert_eq!(proc.pauses(), [BETWEEN_TRIES; 2]);
+            assert_eq!(proc.pauses(), [Duration::from_secs(2); 2]);
         }
+    }
+
+    #[test]
+    fn a_pull_the_budget_cut_is_still_aborted_and_not_tried_again() {
+        let budget = Duration::from_millis(500);
+        let proc = FakeProc::new(move |cmd| {
+            let line = cmd.line();
+            Ok(if line == "git rev-parse --abbrev-ref HEAD" {
+                Ran::code(0, "main\n")
+            } else if line == PULL {
+                std::thread::sleep(budget + Duration::from_millis(100));
+                Ran::timed_out()
+            } else {
+                Ran::code(0, "")
+            })
+        });
+        let env = Env::default();
+        let ctx = Ctx::new(
+            Path::new("/ct"),
+            Path::new("store/epochs/eleemosynary-mnemosyne"),
+            &proc,
+            &env,
+            OsStr::new("cm"),
+            budget,
+        );
+        let report = sync(&ctx, Mode::Always);
+        assert_eq!(
+            report.lines,
+            [
+                "heartbeat: git pull --rebase and push to main failed 3 times; main does not have this checkout's commits"
+            ]
+        );
+        assert_eq!(
+            proc.log().into_iter().skip(2).collect::<Vec<_>>(),
+            [PULL, ABORT]
+        );
+        let abort = proc.calls().pop().unwrap();
+        assert_eq!(abort.cwd.as_deref(), Some(Path::new("/ct")));
+        assert_eq!(abort.timeout, ABORT_TIMEOUT);
+        assert!(proc.pauses().is_empty());
     }
 
     #[test]
@@ -273,7 +329,7 @@ mod tests {
             proc.log().into_iter().skip(2).collect::<Vec<_>>(),
             [PULL, ABORT, PULL, PUSH]
         );
-        assert_eq!(proc.pauses(), [BETWEEN_TRIES]);
+        assert_eq!(proc.pauses(), [Duration::from_secs(2)]);
     }
 
     #[test]

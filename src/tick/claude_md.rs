@@ -1,9 +1,10 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::tick::act::{Ctx, Report};
+use crate::tick::proc::FileSizeLimit;
 
 pub const BUDGET: Duration = Duration::from_secs(5);
 
@@ -53,18 +54,44 @@ fn boot_time(path: &Path) -> bool {
 }
 
 // Renamed over from a staged file, so a failed write leaves the boot-time rules for the next
-// tick to replace.
+// tick to replace. A folder that refuses the staged file gets the import written in place, as
+// heartbeat.sh's `printf >` wrote it.
 fn import(path: &Path) -> std::io::Result<()> {
     let path = std::fs::canonicalize(path)?;
     let dir = path.parent().ok_or(ErrorKind::InvalidInput)?;
-    let mode = std::fs::metadata(&path)?.permissions();
-    let mut staged = tempfile::Builder::new()
+    let text = format!("{IMPORT}\n");
+    let mut staged = match tempfile::Builder::new()
         .prefix(".CLAUDE.md-")
-        .tempfile_in(dir)?;
-    staged.write_all(format!("{IMPORT}\n").as_bytes())?;
-    staged.as_file().set_permissions(mode)?;
+        .tempfile_in(dir)
+    {
+        Ok(staged) => staged,
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+            return in_place(&path, &text);
+        }
+        Err(error) => return Err(error),
+    };
+    within_size_limit(staged.as_file(), text.len())?;
+    staged.write_all(text.as_bytes())?;
+    staged
+        .as_file()
+        .set_permissions(std::fs::metadata(&path)?.permissions())?;
     staged.persist(&path).map_err(|error| error.error)?;
     Ok(())
+}
+
+fn in_place(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().write(true).open(path)?;
+    within_size_limit(&file, text.len())?;
+    file.write_all(text.as_bytes())?;
+    file.set_len(text.len() as u64)
+}
+
+// A write past RLIMIT_FSIZE would end the tick with SIGXFSZ, so it is refused before it is made.
+pub(crate) fn within_size_limit(file: &File, len: usize) -> std::io::Result<()> {
+    match FileSizeLimit::of(file) {
+        Some(limit) if !limit.fits(file, len) => Err(ErrorKind::FileTooLarge.into()),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -149,5 +176,49 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(left.len(), 2, "no staged file is left: {left:?}");
+    }
+
+    #[test]
+    fn an_import_written_in_place_keeps_the_file_its_mode_and_nothing_of_the_old_rules() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        for old in [
+            format!("{BOOT_TIME}\n{}\n", "old rules ".repeat(40)),
+            "x".to_owned(),
+        ] {
+            fs::write(&path, &old).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o604)).unwrap();
+            let inode = fs::metadata(&path).unwrap().ino();
+            in_place(&path, &format!("{IMPORT}\n")).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), format!("{IMPORT}\n"));
+            let meta = fs::metadata(&path).unwrap();
+            assert_eq!(
+                (meta.ino(), meta.permissions().mode() & 0o777),
+                (inode, 0o604)
+            );
+        }
+    }
+
+    #[test]
+    fn a_claude_folder_that_refuses_a_staged_file_still_gets_the_import() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        fs::create_dir(&claude).unwrap();
+        let path = claude.join("CLAUDE.md");
+        fs::write(&path, format!("{BOOT_TIME}\nold rules\n")).unwrap();
+        fs::set_permissions(&claude, fs::Permissions::from_mode(0o555)).unwrap();
+        let report = tick(Some(home.path()));
+        fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            report.lines,
+            ["rules: now imported from tools/cloud-env/COORDINATOR.md; read it"]
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{IMPORT}\n"));
+        let left: Vec<_> = fs::read_dir(&claude)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["CLAUDE.md"]);
     }
 }

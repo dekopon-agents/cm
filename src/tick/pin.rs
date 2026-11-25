@@ -1,9 +1,11 @@
 use std::fs::{File, Permissions};
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
 use crate::tick::act::{Ctx, Report};
+use crate::tick::claude_md::within_size_limit;
 use crate::tick::proc::{Cmd, Keep};
 
 pub const BUDGET: Duration = Duration::from_secs(60);
@@ -13,7 +15,7 @@ pub const SETUP: &str = "tools/cloud-env/dekopon-coordinator-setup.sh";
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Pin {
     version: String,
-    asset: String,
+    asset: Option<String>,
 }
 
 pub fn run(ctx: &Ctx) -> Report {
@@ -47,12 +49,15 @@ fn pinned(ctx: &Ctx) -> Option<Pin> {
         )
         .ok()?;
     let rows = ran.stdout_text();
-    let mut fields = rows
+    let mut cm_rows = rows
         .split('\n')
         .map(|row| row.split('|'))
-        .find_map(|mut fields| (fields.next() == Some("cm")).then_some(fields))?;
+        .filter_map(|mut fields| (fields.next() == Some("cm")).then_some(fields));
+    let mut fields = cm_rows.next()?;
     let version = fields.next().unwrap_or_default().to_owned();
     let asset = fields.next().unwrap_or_default().to_owned();
+    // heartbeat.sh read a second cm row into the asset's name, which no fetch could install.
+    let asset = cm_rows.next().is_none().then_some(asset);
     (!version.is_empty()).then_some(Pin { version, asset })
 }
 
@@ -79,7 +84,10 @@ fn running(ctx: &Ctx) -> String {
 
 fn install(ctx: &Ctx, pin: &Pin) -> bool {
     let target = Path::new(ctx.cm);
-    if !target.is_absolute() || !plain_name(&pin.asset) {
+    let Some(name) = pin.asset.as_deref().filter(|name| plain_name(name)) else {
+        return false;
+    };
+    if !target.is_absolute() {
         return false;
     }
     let Ok(tmp) = tempfile::Builder::new().prefix("cm-pin-").tempdir_in(
@@ -88,7 +96,7 @@ fn install(ctx: &Ctx, pin: &Pin) -> bool {
     ) else {
         return false;
     };
-    let asset = tmp.path().join(&pin.asset);
+    let asset = tmp.path().join(name);
     let step = |cmd: Cmd| {
         ctx.run(cmd.cwd(tmp.path()).keep(Keep::Tail, Keep::Tail))
             .is_ok_and(|ran| ran.exit.success())
@@ -101,7 +109,7 @@ fn install(ctx: &Ctx, pin: &Pin) -> bool {
     ) && step(Cmd::new("tar").arg("-xzf").arg(&asset));
     let unpacked = tmp
         .path()
-        .join(pin.asset.strip_suffix(".tar.gz").unwrap_or(&pin.asset))
+        .join(name.strip_suffix(".tar.gz").unwrap_or(name))
         .join("cm");
     fetched && replace(&unpacked, target).is_ok()
 }
@@ -117,7 +125,10 @@ fn replace(from: &Path, target: &Path) -> std::io::Result<()> {
     let mut staged = tempfile::Builder::new()
         .prefix(".cm-pin-")
         .tempfile_in(dir)?;
-    std::io::copy(&mut File::open(from)?, staged.as_file_mut())?;
+    let source = File::open(from)?;
+    let len = source.metadata()?.len();
+    within_size_limit(staged.as_file(), usize::try_from(len).unwrap_or(usize::MAX))?;
+    std::io::copy(&mut source.take(len), staged.as_file_mut())?;
     staged
         .as_file()
         .set_permissions(Permissions::from_mode(0o755))?;
@@ -168,21 +179,21 @@ mod tests {
             pin(PINS),
             Some(Pin {
                 version: "0.17.1".into(),
-                asset: "cm-0.17.1-x86_64-unknown-linux-musl.tar.gz".into()
+                asset: Some("cm-0.17.1-x86_64-unknown-linux-musl.tar.gz".into())
             })
         );
         assert_eq!(
             pin("cm|1|a\ncm|2|b\n"),
             Some(Pin {
                 version: "1".into(),
-                asset: "a".into()
+                asset: None
             })
         );
         assert_eq!(
             pin("cm|3\n"),
             Some(Pin {
                 version: "3".into(),
-                asset: String::new()
+                asset: Some(String::new())
             })
         );
         for none in ["", "cm\n", "cm||a\n", "cmx|1|a\n", " cm|1|a\n", "uv|1|a\n"] {
@@ -223,6 +234,25 @@ mod tests {
             report.lines,
             [
                 "heartbeat: cm 0.17.1 (setup.sh's pin) could not be fetched or installed; still running cm none"
+            ]
+        );
+        assert!(report.failed);
+        assert!(
+            !proc
+                .log()
+                .iter()
+                .any(|call| call.contains("--fetch-pinned"))
+        );
+    }
+
+    #[test]
+    fn two_cm_pins_install_nothing_and_say_so() {
+        let proc = answering("cm|0.17.1|a.tar.gz\ncm|0.17.2|b.tar.gz\n", "cm 0.17.0\n");
+        let report = ctx_run(&proc, "/bin/cm", run);
+        assert_eq!(
+            report.lines,
+            [
+                "heartbeat: cm 0.17.1 (setup.sh's pin) could not be fetched or installed; still running cm 0.17.0"
             ]
         );
         assert!(report.failed);
