@@ -1642,6 +1642,18 @@ pub struct Advance<'a> {
     pub by: &'a [String],
 }
 
+/// The steps whose merge the gate holds: every model-written PR, in the `codex`, `claude-cloud`,
+/// `fable` and `coordinator` lanes (owner, 2026-11-25). Only a deploy script's pin, a rollout
+/// named `…/pin` or `…/deploy`, is exempt; a config rollout is model-written and gated.
+pub(crate) fn merge_gated(target: &str, step: &Step) -> bool {
+    crate::verdict::model_lane(step.lane) && !script_pin(target, step)
+}
+
+/// A deploy script's pin: a rollout named `…/pin` or `…/deploy`, merged on clean, green CI alone.
+pub(crate) fn script_pin(target: &str, step: &Step) -> bool {
+    step.work == Work::Rollout && (target.ends_with("/pin") || target.ends_with("/deploy"))
+}
+
 pub fn advance_gated(
     host: &dyn Host,
     root: &Path,
@@ -1685,7 +1697,7 @@ pub fn advance_gated(
         .then(|| store::load_unit(&root.join(&target.unit)).ok())
         .flatten()
         .and_then(|unit| unit.steps.get(target.step.as_deref()?).cloned())
-        .filter(|step| step.lane == Some(Lane::Codex) || given.pr.is_some())
+        .filter(|step| merge_gated(&step_full, step) || given.pr.is_some())
         .and_then(|step| {
             let track = match part {
                 Some(part) => step.parts.get(part)?,
@@ -2295,7 +2307,9 @@ pub fn advance_gated(
     let gated = *to == Phase::Merged
         && !remerge
         && !resuming
-        && declared.as_ref().and_then(|step| step.lane) == Some(Lane::Codex);
+        && declared
+            .as_ref()
+            .is_some_and(|step| merge_gated(&step_full, step));
     let mut gate_lines = Vec::new();
     let mut waived = Vec::new();
     if gated {

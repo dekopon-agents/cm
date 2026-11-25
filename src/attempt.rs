@@ -117,7 +117,7 @@ pub(crate) fn check_coordinator(full: &str, coordinator: &str) -> Option<Violati
 }
 
 /// Past the deadline; a deadline cm cannot read counts as past.
-fn expired(attempt: &Attempt, now: Timestamp) -> bool {
+pub(crate) fn expired(attempt: &Attempt, now: Timestamp) -> bool {
     attempt.deadline.as_deref().is_some_and(|deadline| {
         deadline
             .parse::<Timestamp>()

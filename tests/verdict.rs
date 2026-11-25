@@ -97,13 +97,8 @@ struct FakeForge {
 impl FakeForge {
     fn assert_unlocked(&self) {
         if let Some(root) = &self.campaign {
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .open(root.join(store::CM_DIR).join(store::LOCK))
-                .unwrap();
             assert!(
-                rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-                    .is_ok(),
+                forge_fixture::lock_free(root),
                 "forge read held the campaign lock"
             );
         }
@@ -751,6 +746,15 @@ fn merge_gate_needs_astra_a_cleared_review_and_green_ci_at_the_head() {
     )
     .unwrap();
     assert_eq!(rules(&again), vec!["resolve-done"]);
+    // Resolved findings are no ACCEPT, and a model lane's head needs Astra's and a Claude
+    // reviewer's.
+    assert!(
+        c.merge(&host, &gate).violations[0]
+            .message
+            .contains("no astra or claude ACCEPT")
+    );
+    claude_accept(&host, &c, &head);
+    astra_accept(&host, &c, &head);
 
     let red = FakeForge::open(&head, &[("fmt, clippy, test", "failure")]);
     let refused = c.merge(
@@ -791,6 +795,7 @@ fn merge_gate_refuses_unknown_ci_unless_verified_and_overrides_only_with_evidenc
     );
     c.receipt("astra-review-7", &head, "gpt-6-astra", "xhigh");
     assert!(record(&host, &c, &accept, "astra").ok());
+    claude_accept(&host, &c, &head);
     let down = FakeForge {
         down: true,
         ..FakeForge::open(&head, &[])
@@ -1940,6 +1945,7 @@ fn sync_holds_a_codex_merge_at_pr_open_until_its_gate_holds() {
         let accept = c.report("astra-review-7", &head, &[], "ACCEPT");
         c.receipt("astra-review-7", &head, "gpt-6-astra", "xhigh");
         assert!(record(&host, &c, &accept, "astra").ok());
+        claude_accept(&host, &c, &head);
         let later = at("2026-10-25T07:00:00Z");
         let moved = sync(&later, &merged, &c.root).unwrap();
         assert!(moved.ok(), "{:?}", moved.violations);
@@ -1994,6 +2000,7 @@ fn advance_merged_with_pr_records_merge_time_and_refuses_a_different_pr() {
         let report = c.report("astra-review-7", &head, &[], "ACCEPT");
         c.receipt("astra-review-7", &head, "gpt-6-astra", "xhigh");
         assert!(record(&host, &c, &report, "astra").ok());
+        claude_accept(&host, &c, &head);
         let forge = FakeForge {
             state,
             merged_at: reported.map(str::to_owned),
@@ -2193,13 +2200,15 @@ fn a_receipt_counts_only_for_a_review_that_happened_and_was_recorded() {
             };
         });
     }
+    // No receipt holds, and so no Astra ACCEPT is recorded either: both gaps are named.
     let refused = c.merge(&host, &gate);
     assert_eq!(
         rules(&refused),
-        vec!["merge-gate"],
+        vec!["merge-gate", "merge-gate"],
         "{:?}",
         refused.violations
     );
+    assert!(refused.violations[1].message.contains("no astra ACCEPT"));
     let message = &refused.violations[0].message;
     for why in [
         "turn not completed",
@@ -2220,7 +2229,8 @@ fn a_receipt_counts_only_for_a_review_that_happened_and_was_recorded() {
         receipt["verdict"] = "FIX REQUIRED".into();
     });
     let unrecorded = c.merge(&host, &gate);
-    assert_eq!(rules(&unrecorded), vec!["merge-gate"]);
+    // The receipt binds no recorded review, and so no Astra ACCEPT is recorded either.
+    assert_eq!(rules(&unrecorded), vec!["merge-gate", "merge-gate"]);
     assert!(
         unrecorded.violations[0].message.contains(
             "it is not recorded; `cm review record 01-a/u/S1 01-a/u/S1/evidence/astra-review-7/report.md --reviewer astra`"
@@ -2238,6 +2248,14 @@ fn a_receipt_counts_only_for_a_review_that_happened_and_was_recorded() {
             .unwrap()
             .ok()
     );
+    // A resolved FIX REQUIRED is no ACCEPT: the model lane's head still needs Astra's.
+    let unaccepted = c.merge(&host, &gate);
+    assert!(
+        unaccepted.violations[0].message.contains("no astra ACCEPT"),
+        "{:?}",
+        unaccepted.violations
+    );
+    astra_accept(&host, &c, &head);
     assert!(c.merge(&host, &gate).ok());
 }
 
@@ -2400,6 +2418,7 @@ fn reviewed_feature(host: &Fake, c: &Campaign) -> (String, String) {
     let report = c.report("astra-review-7-h1", &h1, &[], "ACCEPT");
     c.receipt("astra-review-7-h1", &h1, "gpt-6-astra", "xhigh");
     assert!(record(host, c, &report, "astra").ok());
+    claude_accept(host, c, &h1);
     (h1, base)
 }
 
@@ -2515,6 +2534,7 @@ fn a_merge_that_resolved_conflicts_needs_its_own_review() {
     let report = c.report("astra-review-7-merge", &merge, &[], "ACCEPT");
     c.receipt("astra-review-7-merge", &merge, "gpt-6-astra", "xhigh");
     assert!(record(&host, &c, &report, "astra").ok());
+    claude_accept(&host, &c, &merge);
     let merged = merge_with(&host, &c, &base);
     assert!(merged.ok(), "{:?}", merged.violations);
 }
@@ -2607,7 +2627,7 @@ fn a_clean_update_never_outweighs_a_review_at_the_head_or_a_walked_commit() {
         refused
             .violations
             .iter()
-            .any(|v| v.message.contains("R2.F1 unresolved"))
+            .any(|v| v.message.contains("R3.F1 unresolved"))
     );
 
     // So does a finished Astra receipt at the head whose review is not recorded.
@@ -2645,7 +2665,7 @@ fn a_clean_update_never_outweighs_a_review_at_the_head_or_a_walked_commit() {
         refused.violations.iter().any(|v| v.message.contains(&format!(
             "the nearest reviewed commit before {}, {walked}, joined to it by clean updates, does not clear",
             c.head()
-        )) && v.message.contains("R2.F1 unresolved")),
+        )) && v.message.contains("R3.F1 unresolved")),
         "{:?}",
         refused.violations
     );
@@ -2673,6 +2693,7 @@ fn the_recorded_astra_review_must_be_the_receipted_report() {
     });
     let other = c.report("other", &head, &[], "ACCEPT");
     assert!(record(&host, &c, &other, "astra").ok());
+    claude_accept(&host, &c, &head);
     let refused = c.merge(&host, &gate);
     assert_eq!(
         rules(&refused),
@@ -2719,7 +2740,7 @@ fn the_recorded_astra_review_must_be_the_receipted_report() {
     assert!(record(&host, &c, &receipted, "astra").ok());
     let blocked = c.merge(&host, &gate);
     assert_eq!(rules(&blocked), vec!["merge-gate"]);
-    assert!(blocked.violations[0].message.contains("R2.F1 unresolved"));
+    assert!(blocked.violations[0].message.contains("R3.F1 unresolved"));
 }
 
 #[test]
@@ -2735,6 +2756,7 @@ fn every_finished_astra_receipt_at_the_head_binds() {
     let accept = c.report("astra-review-7-a", &head, &[], "ACCEPT");
     c.receipt("astra-review-7-a", &head, "gpt-6-astra", "xhigh");
     assert!(record(&host, &c, &accept, "astra").ok());
+    claude_accept(&host, &c, &head);
     let rerun = c.report(
         "astra-review-7-b",
         &head,
@@ -2767,10 +2789,10 @@ fn every_finished_astra_receipt_at_the_head_binds() {
     assert!(record(&host, &c, &rerun, "astra").ok());
     let blocked = c.merge(&host, &gate);
     assert_eq!(rules(&blocked), vec!["merge-gate"]);
-    assert!(blocked.violations[0].message.contains("R2.F1 unresolved"));
+    assert!(blocked.violations[0].message.contains("R3.F1 unresolved"));
     let ruling = c.write("ruling.md", "Coordinator: F1 is out of scope.\n");
     assert!(
-        verdict::resolve(&host, &c.root, &target(), "R2.F1", "ruling.md", &ruling)
+        verdict::resolve(&host, &c.root, &target(), "R3.F1", "ruling.md", &ruling)
             .unwrap()
             .ok()
     );
@@ -2855,11 +2877,34 @@ fn known_red(
     .unwrap()
 }
 
+/// A Claude reviewer's ACCEPT at `head`: the family that did not write a Codex-built PR.
+/// A second Astra report at `head`, an explicit ACCEPT after a FIX REQUIRED was resolved.
+fn astra_accept(host: &Fake, c: &Campaign, head: &str) {
+    let astra = c.write(
+        &format!("drafts/astra-accept-{head}.md"),
+        &format!("# Astra re-review\n\nFixed.\n\n```cm-review\nhead: {head}\n```\n\nACCEPT\n"),
+    );
+    let recorded = record(host, c, &astra, "astra");
+    assert!(recorded.ok(), "{:?}", recorded.violations);
+}
+
+fn claude_accept(host: &Fake, c: &Campaign, head: &str) {
+    let claude = c.write(
+        &format!("drafts/claude-{head}.md"),
+        &format!("# Claude review\n\nRead in full.\n\n```cm-review\nhead: {head}\n```\n\nACCEPT\n"),
+    );
+    let recorded = record(host, c, &claude, "claude");
+    assert!(recorded.ok(), "{:?}", recorded.violations);
+}
+
+/// The stamp's gate at the head of a Codex-built PR: Astra's receipted ACCEPT and a Claude
+/// reviewer's, the family that did not write it.
 fn accepted(host: &Fake, c: &Campaign) {
     let head = c.head();
     let accept = c.report("astra-review-7", &head, &[], "ACCEPT");
     c.receipt("astra-review-7", &head, "gpt-6-astra", "xhigh");
     assert!(record(host, c, &accept, "astra").ok());
+    claude_accept(host, c, &head);
     let fix = Declaration {
         lane: Some(Lane::Coordinator),
         work: cm::state::Work::Study,
@@ -3645,10 +3690,13 @@ fn sync_surfaces_a_moved_base_since_ci_and_refreshes_only_at_a_tested_new_head()
             .iter()
             .any(|line| line.as_str().unwrap().starts_with("stale-base "))
     );
-    let before: serde_json::Value = store::read_json(&plan::pulls_path(&c.root)).unwrap();
+    let mut before: serde_json::Value = store::read_json(&plan::pulls_path(&c.root)).unwrap();
     forge.down = true;
     assert!(!sync(&host, &forge, &c.root).unwrap().ok());
     let after: serde_json::Value = store::read_json(&plan::pulls_path(&c.root)).unwrap();
+    // An unread PR keeps its observation, but its CI is unknown now, never the last green.
+    assert_eq!(before[PR]["ci_green"], true);
+    before[PR].as_object_mut().unwrap().remove("ci_green");
     assert_eq!(before, after);
     forge.down = false;
     forge.head = "d".repeat(40);
@@ -3737,6 +3785,7 @@ fn unread_owner_queue_refuses_merge_even_with_override_then_allows_it_after_read
             .unwrap()
             .ok()
     );
+    claude_accept(&host, &c, &head);
     let forge = FakeForge::open(&head, &[("test", "success")]);
     let waiver = c.write("override.md", "Independent gate evidence.\n");
     let advance = || {
@@ -3783,6 +3832,7 @@ fn sync_refuses_an_unread_owner_merge_then_moves_it_after_read() {
             .unwrap()
             .ok()
     );
+    claude_accept(&host, &c, &head);
     let mut forge = FakeForge::open(&head, &[("test", "success")]);
     forge.state = PullState::Merged;
     review_fixture::new_owner_item(&host, &c.root, "Choose a setting");
@@ -3830,7 +3880,7 @@ fn invalid_missing_and_unreadable_queues_do_not_invent_new_merge_refusals() {
         let c = campaign(&host, true);
         let dir = c.root.join("01-a/u");
         let mut unit = store::load_unit(&dir).unwrap();
-        unit.steps.get_mut("S1").unwrap().lane = Some(Lane::ClaudeCloud);
+        unit.steps.get_mut("S1").unwrap().lane = Some(Lane::Pi);
         commands::write_unit(&dir, &unit).unwrap();
         let path = c.root.join("OWNER-QUEUE.md");
         match kind {
@@ -4120,6 +4170,463 @@ fn review_wait_does_not_match_an_outer_round_through_a_malformed_inner_campaign(
 }
 
 #[test]
+fn review_owed_and_merge_ready_follow_the_observed_head_and_its_verdicts() {
+    let host = at("2026-10-25T00:00Z");
+    let c = campaign(&host, true);
+    let owed = |c: &Campaign, forge: Option<&dyn Forge>| -> Vec<(String, String)> {
+        plan::next_with(&c.root, None, None, host.now(), forge)
+            .unwrap()
+            .fields["actionable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|action| {
+                ["review-owed", "merge-ready"].contains(&action["kind"].as_str().unwrap())
+            })
+            .map(|action| {
+                (
+                    action["kind"].as_str().unwrap().to_owned(),
+                    action["command"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let brief = ("review-owed".to_owned(), format!("cm brief {STEP}"));
+    assert_eq!(owed(&c, None), std::slice::from_ref(&brief));
+    let fix = c.report(
+        "r1",
+        &c.head(),
+        &["F1 | contract | introduced | src/lib.rs:40 | the refusal drops its reason"],
+        "FIX REQUIRED",
+    );
+    assert!(record(&host, &c, &fix, "astra").ok());
+    assert_eq!(
+        owed(&c, None),
+        [(
+            "review-owed".to_owned(),
+            format!(
+                "cm attention --pr {PR} --worker '<worker-session>' --coordinator '<coordinator-session>'"
+            )
+        )]
+    );
+    // The worker's new head, observed green by sync, is owed its own review.
+    git(&c.repo, &["commit", "-q", "--allow-empty", "-m", "fix"]);
+    let mut forge = FakeForge::open(&c.head(), &[("test", "success")]);
+    forge.campaign = Some(c.root.clone());
+    forge.base = Some("b".repeat(40));
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    let seen: serde_json::Value = store::read_json(&plan::pulls_path(&c.root)).unwrap();
+    assert_eq!(seen[PR]["ci_green"], true);
+    assert_eq!(owed(&c, Some(&forge)), std::slice::from_ref(&brief));
+    accepted(&host, &c);
+    let next = plan::next_with(&c.root, None, None, host.now(), Some(&forge)).unwrap();
+    let ready = next.fields["actionable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["kind"] == "merge-ready")
+        .unwrap()
+        .clone();
+    assert_eq!(ready["lane"], "codex");
+    assert_eq!(ready["pr"], PR);
+    assert_eq!(ready["head"], c.head());
+    assert_eq!(ready["base"], "b".repeat(40));
+    assert_eq!(ready["ci_green"], true);
+    assert_eq!(
+        owed(&c, Some(&forge)),
+        [(
+            "merge-ready".to_owned(),
+            format!("cm advance {STEP} merged --pr {PR} --sha '<merge-sha>'")
+        )]
+    );
+    // A red head is owed its review and is not merge-ready.
+    git(&c.repo, &["commit", "-q", "--allow-empty", "-m", "again"]);
+    forge.head = c.head();
+    forge.checks = vec![("test", "failure")];
+    sync(&host, &forge, &c.root).unwrap();
+    let seen: serde_json::Value = store::read_json(&plan::pulls_path(&c.root)).unwrap();
+    assert_eq!(seen[PR]["ci_green"], false);
+    assert_eq!(owed(&c, Some(&forge)), [brief]);
+}
+
+/// The `merge-ready` commands `cm next` gives with `forge` as GitHub for its fresh read.
+fn merge_ready(c: &Campaign, now: Timestamp, forge: &dyn Forge) -> Vec<String> {
+    plan::next_with(&c.root, None, None, now, Some(forge))
+        .unwrap()
+        .fields["actionable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|action| action["kind"] == "merge-ready")
+        .map(|action| action["command"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn merge_ready_reads_ci_on_every_sync_and_needs_a_clean_mergeable_head() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host, true);
+    accepted(&host, &c);
+    let head = c.head();
+    let ready = format!("cm advance {STEP} merged --pr {PR} --sha '<merge-sha>'");
+    let mut forge = FakeForge::open(&head, &[("test", "success")]);
+    forge.campaign = Some(c.root.clone());
+    forge.base = Some("b".repeat(40));
+    let synced = |forge: &FakeForge| {
+        sync(&host, forge, &c.root).unwrap();
+        store::read_json::<serde_json::Value>(&plan::pulls_path(&c.root)).unwrap()[PR]["ci_green"]
+            .clone()
+    };
+    assert_eq!(synced(&forge), true);
+    assert_eq!(
+        merge_ready(&c, host.now(), &forge),
+        std::slice::from_ref(&ready)
+    );
+    // A check registered later at the same head makes the green stale.
+    forge.checks = vec![("test", "success"), ("late", "in_progress")];
+    assert_eq!(synced(&forge), serde_json::Value::Null);
+    assert!(merge_ready(&c, host.now(), &forge).is_empty());
+    // Its rerun finishing green at the same head is merge-ready again.
+    forge.checks = vec![("test", "success"), ("late", "success")];
+    assert_eq!(synced(&forge), true);
+    assert_eq!(
+        merge_ready(&c, host.now(), &forge),
+        std::slice::from_ref(&ready)
+    );
+    // A pause is the owner's stop and quiets it; the Codex quota hold holds dispatch only.
+    let limits = c.root.join("LIMITS.toml");
+    let text = fs::read_to_string(&limits).unwrap();
+    fs::write(&limits, text.replace("paused = false", "paused = true")).unwrap();
+    assert!(merge_ready(&c, host.now(), &forge).is_empty());
+    fs::write(&limits, &text).unwrap();
+    assert_eq!(
+        merge_ready(&c, host.now(), &forge),
+        std::slice::from_ref(&ready)
+    );
+    // The CLI confirms with a fresh read of GitHub, here a `gh` that answers for this PR.
+    let gh = support::FakeGh::new(&format!(
+        r#"case "$*" in
+    'api repos/o/r/pulls/7')
+        echo '{{"state":"open","merged":false,"merge_commit_sha":null,"mergeable_state":"clean","head":{{"sha":"{head}"}},"base":{{"sha":"{base}"}}}}' ;;
+    'api repos/o/r/commits/{head}/check-runs?per_page=100&page=1')
+        printf '{{"total_count":1,"check_runs":[{{"id":1,"name":"test","status":"completed","conclusion":"%s"}}]}}' "$(cat "$FAKE_GH/conclusion")" ;;
+    'api repos/o/r/commits/{head}/status?per_page=100&page=1')
+        echo '{{"total_count":0,"statuses":[]}}' ;;
+    *) echo "$*" >&2; exit 1 ;;
+esac"#,
+        base = "b".repeat(40),
+    ));
+    let act = |quota: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("-C")
+            .arg(&c.root)
+            .args(["--json", "next", "--act"])
+            .env("CM_CODEX_WEEKLY_PCT", quota)
+            .env("PATH", gh.path())
+            .output()
+            .unwrap();
+        let act: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        act["actionable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["kind"] == "merge-ready")
+    };
+    fs::write(gh.fixture().join("conclusion"), "success").unwrap();
+    assert!(act("90"), "the Codex quota hold does not hold a merge");
+    // The cached observation is green, but the head is red now: the fresh read fails closed.
+    fs::write(gh.fixture().join("conclusion"), "failure").unwrap();
+    assert!(!act("0"));
+    let mut rerun = forge.clone();
+    rerun.checks = vec![("test", "in_progress")];
+    assert!(merge_ready(&c, host.now(), &rerun).is_empty());
+    let down = FakeForge {
+        down: true,
+        ..forge.clone()
+    };
+    assert!(merge_ready(&c, host.now(), &down).is_empty());
+    assert!(
+        plan::next_at(&c.root, None, None, host.now())
+            .unwrap()
+            .fields["actionable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["kind"] != "merge-ready"),
+        "no GitHub, no merge-ready"
+    );
+    // A conflicted PR is not merge-ready.
+    forge.mergeable = "dirty";
+    synced(&forge);
+    assert!(merge_ready(&c, host.now(), &forge).is_empty());
+    // A red check is never merge-ready, even one a known-red exception covers: that merge
+    // stays with `cm advance … merged`.
+    let mut red = red_at_head(&head, "failure", "failure");
+    red.campaign = Some(c.root.clone());
+    let why = "red by design until build lands";
+    assert!(known_red(&host, &c, &red, &head, why, "build").ok());
+    assert_eq!(synced(&red), false);
+    assert!(merge_ready(&c, host.now(), &forge).is_empty());
+    forge.mergeable = "clean";
+    assert_eq!(synced(&forge), true);
+    assert_eq!(merge_ready(&c, host.now(), &forge), [ready]);
+}
+
+#[test]
+fn each_part_of_a_multipart_step_is_merge_ready_on_its_own_pr() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host, true);
+    let amendment = commands::Amendment {
+        parts: vec!["one".into(), "two".into()],
+        ..Default::default()
+    };
+    assert!(
+        commands::amend(&host, &c.root, &target(), &amendment)
+            .unwrap()
+            .ok()
+    );
+    let head = c.head();
+    let second_pr = "https://github.com/o/r/pull/8";
+    let second_head = commit(&c.repo, "second.txt", "second part\n");
+    let opened = commands::advance_gated(
+        &host,
+        &c.root,
+        &target(),
+        commands::Advance {
+            to: &Phase::PrOpen,
+            given: &Evidence {
+                pr: Some(second_pr.into()),
+                sha: Some(second_head.clone()),
+                ..Default::default()
+            },
+            file: None,
+            repo: Some(&c.repo),
+            part: Some("two"),
+            by: &[],
+        },
+        &MergeGate::default(),
+    )
+    .unwrap();
+    assert!(opened.ok(), "{:?}", opened.violations);
+    let mut forge = FakeForge::open(&head, &[("test", "success")]);
+    forge.campaign = Some(c.root.clone());
+    forge.base = Some("b".repeat(40));
+    let mut second = FakeForge::open(&second_head, &[("test", "success")]);
+    second.base = Some("b".repeat(40));
+    forge.parts.insert(second_pr.into(), second);
+    sync(&host, &forge, &c.root).unwrap();
+    let one = format!("cm advance {STEP} merged --pr {PR} --sha '<merge-sha>' --part one");
+    assert!(merge_ready(&c, host.now(), &forge).is_empty());
+    // Part one's own reviews: Astra's receipted report and a Claude reviewer's, each recorded
+    // for that part. A review recorded for another part, or for none, would clear neither.
+    for (reviewer, name) in [("astra", "astra-review-7-one"), ("claude", "claude-one")] {
+        let report = if reviewer == "astra" {
+            let report = c.report(name, &head, &[], "ACCEPT");
+            c.receipt(name, &head, "gpt-6-astra", "xhigh");
+            report
+        } else {
+            c.write(
+                &format!("drafts/{name}.md"),
+                &format!(
+                    "# {name}\n\nRead in full.\n\n```cm-review\nhead: {head}\n```\n\nACCEPT\n"
+                ),
+            )
+        };
+        let recorded = verdict::record(
+            &host,
+            &c.root,
+            &target(),
+            &report,
+            Some(reviewer),
+            Some("one"),
+        )
+        .unwrap();
+        assert!(recorded.ok(), "{:?}", recorded.violations);
+    }
+    assert_eq!(
+        merge_ready(&c, host.now(), &forge),
+        std::slice::from_ref(&one)
+    );
+    let report = c.report("astra-review-8", &second_head, &[], "ACCEPT");
+    c.receipt_with(
+        "astra-review-8",
+        &second_head,
+        "gpt-6-astra",
+        "xhigh",
+        |receipt| {
+            receipt["pr"] = 8.into();
+        },
+    );
+    let recorded = verdict::record(
+        &host,
+        &c.root,
+        &target(),
+        &report,
+        Some("astra"),
+        Some("two"),
+    )
+    .unwrap();
+    assert!(recorded.ok(), "{:?}", recorded.violations);
+    let claude = c.write(
+        "drafts/claude-two.md",
+        &format!(
+            "# Claude review\n\nRead in full.\n\n```cm-review\nhead: {second_head}\n```\n\nACCEPT\n"
+        ),
+    );
+    let recorded = verdict::record(
+        &host,
+        &c.root,
+        &target(),
+        &claude,
+        Some("claude"),
+        Some("two"),
+    )
+    .unwrap();
+    assert!(recorded.ok(), "{:?}", recorded.violations);
+    assert_eq!(
+        merge_ready(&c, host.now(), &forge),
+        [
+            one,
+            format!("cm advance {STEP} merged --pr {second_pr} --sha '<merge-sha>' --part two")
+        ]
+    );
+    // Each action carries its own part, so the JSON names that part's PR, head and CI.
+    let next = plan::next_with(&c.root, None, None, host.now(), Some(&forge)).unwrap();
+    let two = next.fields["actionable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["kind"] == "merge-ready" && action["part"] == "two")
+        .unwrap()
+        .clone();
+    assert_eq!(two["pr"], second_pr);
+    assert_eq!(two["head"], second_head);
+    assert_eq!(two["ci_green"], true);
+    // A blocked step merges none of its parts.
+    let blocked = commands::advance(
+        &host,
+        &c.root,
+        &target(),
+        &Phase::Blocked("waiting-on-the-owner".into()),
+        &Evidence::default(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(blocked.ok(), "{:?}", blocked.violations);
+    assert!(merge_ready(&c, host.now(), &forge).is_empty());
+}
+
+#[test]
+fn every_model_lane_needs_astra_and_a_claude_verdict_at_the_head() {
+    for lane in [
+        Lane::Codex,
+        Lane::ClaudeCloud,
+        Lane::Fable,
+        Lane::Coordinator,
+    ] {
+        let host = at("2026-10-26T08:00:00Z");
+        let c = campaign(&host, true);
+        let head = c.head();
+        let dir = c.root.join(target().unit);
+        let mut unit = store::load_unit(&dir).unwrap();
+        unit.steps.get_mut("S1").unwrap().lane = Some(lane);
+        commands::write_unit(&dir, &unit).unwrap();
+        let gaps = || {
+            verdict::merge_gaps(&c.root, &target(), None, Some(PR), &head, None)
+                .unwrap()
+                .gaps
+        };
+        let missing = || {
+            verdict::missing_reviews(
+                &verdict::load(&c.root).unwrap(),
+                STEP,
+                &head,
+                Some(PR),
+                None,
+                verdict::model_lane(Some(lane)),
+            )
+        };
+        assert_eq!(missing(), ["astra", "claude"], "{lane:?}");
+        let accept = c.report("astra-review-7", &head, &[], "ACCEPT");
+        c.receipt("astra-review-7", &head, "gpt-6-astra", "xhigh");
+        assert!(record(&host, &c, &accept, "astra").ok());
+        assert_eq!(missing(), ["claude"], "{lane:?}");
+        let gaps_now = gaps();
+        assert_eq!(gaps_now.len(), 1, "{lane:?} {gaps_now:?}");
+        assert!(gaps_now[0].contains("no claude ACCEPT"), "{gaps_now:?}");
+        claude_accept(&host, &c, &head);
+        assert!(missing().is_empty(), "{lane:?}");
+        assert!(gaps().is_empty(), "{lane:?} {:?}", gaps());
+    }
+    // A lane no model builds in needs any one verdict.
+    assert!(!verdict::model_lane(Some(Lane::Owner)));
+    assert!(!verdict::model_lane(Some(Lane::Pi)));
+}
+
+#[test]
+fn every_model_lane_refuses_a_merge_without_astra_and_claude_at_the_head() {
+    for lane in [
+        Lane::Codex,
+        Lane::ClaudeCloud,
+        Lane::Fable,
+        Lane::Coordinator,
+    ] {
+        let host = at("2026-10-26T08:00:00Z");
+        let c = campaign(&host, true);
+        let head = c.head();
+        let dir = c.root.join(target().unit);
+        let mut unit = store::load_unit(&dir).unwrap();
+        unit.steps.get_mut("S1").unwrap().lane = Some(lane);
+        commands::write_unit(&dir, &unit).unwrap();
+        let green = FakeForge::open(&head, &[("test", "success")]);
+        let gate = MergeGate {
+            forge: Some(&green),
+            ..MergeGate::default()
+        };
+        let accept = c.report("astra-review-7", &head, &[], "ACCEPT");
+        c.receipt("astra-review-7", &head, "gpt-6-astra", "xhigh");
+        assert!(record(&host, &c, &accept, "astra").ok());
+        let refused = c.merge(&host, &gate);
+        assert_eq!(rules(&refused), ["merge-gate"], "{lane:?}");
+        assert!(
+            refused.violations[0].message.contains("no claude ACCEPT"),
+            "{lane:?}: {:?}",
+            refused.violations
+        );
+        assert_eq!(c.state(), Phase::PrOpen);
+        claude_accept(&host, &c, &head);
+        let merged = c.merge(&host, &gate);
+        assert!(merged.ok(), "{lane:?}: {:?}", merged.violations);
+        assert_eq!(c.state(), Phase::Merged);
+    }
+}
+
+#[test]
+fn next_act_json_carries_the_unread_owner_queue_for_the_merge_hold() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host, true);
+    let act = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("-C")
+            .arg(&c.root)
+            .args(["--json", "next", "--act"])
+            .env_remove("CM_CODEX_WEEKLY_PCT")
+            .output()
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    assert_eq!(act()["owner_queue_unread"], serde_json::json!([]));
+    review_fixture::new_owner_item(&host, &c.root, "Choose a setting");
+    let unread = act()["owner_queue_unread"].clone();
+    assert_eq!(unread.as_array().unwrap().len(), 1, "{unread}");
+    assert!(
+        unread[0].as_str().unwrap().contains("Choose a setting"),
+        "{unread}"
+    );
+}
+
+#[test]
 fn a_known_red_note_is_journaled_only_with_the_merge_it_explains() {
     let host = at("2026-10-26T08:00:00Z");
     let c = campaign(&host, true);
@@ -4154,4 +4661,110 @@ fn a_known_red_note_is_journaled_only_with_the_merge_it_explains() {
     let added = after.strip_prefix(before.as_str()).unwrap();
     assert!(!added.contains("cm sync:"), "{added}");
     assert!(!added.contains("known-red"), "{added}");
+}
+
+#[test]
+fn an_explicit_accept_is_stated_as_well_as_computed() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host, true);
+    let head = c.head();
+    let accept = c.report("astra-review-7", &head, &[], "ACCEPT");
+    c.receipt("astra-review-7", &head, "gpt-6-astra", "xhigh");
+    assert!(record(&host, &c, &accept, "astra").ok());
+    let gaps = || {
+        verdict::merge_gaps(&c.root, &target(), None, Some(PR), &head, None)
+            .unwrap()
+            .gaps
+    };
+    // A Claude report with no findings and no verdict line computes ACCEPT but states none.
+    let unstated = c.write(
+        "drafts/claude-unstated.md",
+        &format!("# Claude review\n\nRead.\n\n```cm-review\nhead: {head}\n```\n"),
+    );
+    let recorded = record(&host, &c, &unstated, "claude");
+    assert!(recorded.ok(), "{:?}", recorded.violations);
+    let open = gaps();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert!(open[0].contains("no claude ACCEPT"), "{open:?}");
+    claude_accept(&host, &c, &head);
+    assert!(gaps().is_empty(), "{:?}", gaps());
+}
+
+#[test]
+fn reviews_recorded_before_parts_can_be_recorded_again_for_a_part() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host, true);
+    accepted(&host, &c);
+    let head = c.head();
+    let amendment = commands::Amendment {
+        parts: vec!["one".into(), "two".into()],
+        ..Default::default()
+    };
+    assert!(
+        commands::amend(&host, &c.root, &target(), &amendment)
+            .unwrap()
+            .ok()
+    );
+    let gaps = || {
+        verdict::merge_gaps(&c.root, &target(), Some("one"), Some(PR), &head, None)
+            .unwrap()
+            .gaps
+    };
+    // The step's reviews from before it had parts bind no part, so its receipt stays unbound.
+    assert!(!gaps().is_empty());
+    let astra = c.root.join(STEP).join("evidence/astra-review-7/report.md");
+    let claude = c.root.join(format!("drafts/claude-{head}.md"));
+    for (report, reviewer) in [(&astra, "astra"), (&claude, "claude")] {
+        let again = verdict::record(
+            &host,
+            &c.root,
+            &target(),
+            report,
+            Some(reviewer),
+            Some("one"),
+        )
+        .unwrap();
+        assert!(again.ok(), "{:?}", again.violations);
+    }
+    assert!(gaps().is_empty(), "{:?}", gaps());
+    // Within one PR and part a report is still recorded once.
+    let twice = verdict::record(
+        &host,
+        &c.root,
+        &target(),
+        &astra,
+        Some("astra"),
+        Some("one"),
+    )
+    .unwrap();
+    assert_eq!(rules(&twice), ["review-duplicate"]);
+}
+
+#[test]
+fn a_report_recorded_before_pr_open_is_not_recorded_again_as_another_family() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host, false);
+    let head = c.head();
+    let astra = c.report("astra-review-7", &head, &[], "ACCEPT");
+    assert!(record(&host, &c, &astra, "astra").ok());
+    let opened = commands::advance(
+        &host,
+        &c.root,
+        &target(),
+        &Phase::PrOpen,
+        &Evidence {
+            pr: Some(PR.into()),
+            sha: Some(head.clone()),
+            ..Evidence::default()
+        },
+        None,
+        Some(&c.repo),
+    )
+    .unwrap();
+    assert!(opened.ok(), "{:?}", opened.violations);
+    // The review recorded with no PR stands for this one: the same report is no Claude verdict.
+    assert_eq!(
+        rules(&record(&host, &c, &astra, "claude")),
+        ["review-duplicate"]
+    );
 }

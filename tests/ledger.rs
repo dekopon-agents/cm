@@ -1226,7 +1226,7 @@ fn mac_lane(root: &Path) -> String {
 fn card(root: &Path) -> String {
     let next = cm::plan::Next {
         paused: false,
-        ready: Vec::new(),
+        launchable: Vec::new(),
         waiting: Vec::new(),
     };
     cm::render::card(root, Fake.now(), "c", &Default::default(), &next)

@@ -399,12 +399,24 @@ fn a_second_sync_leaves_git_status_clean() {
         reads(now, Reader::Concurrent(&forge));
         assert_eq!(read_at(&memo), before, "a 304 at {now} is not a full read");
     }
+    // A full read of the PR also re-reads its finished CI, so a check registered later or a
+    // rerun at the same head is seen within the 30 minutes.
+    let full = reads("2026-10-17T09:00:00Z", Reader::Serial(&forge));
     assert_eq!(
-        reads("2026-10-17T09:00:00Z", Reader::Serial(&forge)),
+        full.iter()
+            .filter(|read| !read.starts_with("checks "))
+            .cloned()
+            .collect::<Vec<_>>(),
         [
             format!("contains o/r v1.0.0 {}", "c".repeat(40)),
             format!("pull {OPEN_PR}"),
         ]
+    );
+    assert_eq!(
+        full.iter()
+            .filter(|read| read.starts_with("checks "))
+            .count(),
+        1
     );
     assert!(read_at(&memo).contains("\"at\": \"2026-10-17T09:00Z\""));
     // A fresh clone has no read times: it reads every PR in full once.

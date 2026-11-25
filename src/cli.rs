@@ -80,7 +80,7 @@ enum Commands {
         #[arg(long, value_name = "F")]
         kickoff_file: Option<PathBuf>,
     },
-    /// List the declared steps whose `--after` is met, or, given one, refuse it unless it is next.
+    /// List the launchable steps (drafted, `--after` met, kickoff written, no pause or quota hold), or, given one, refuse it unless it is next.
     Next {
         /// <NN-name>/<unit>/<step>: check this step only.
         #[arg(value_parser = step_target)]
@@ -88,7 +88,7 @@ enum Commands {
         /// Only steps in this lane.
         #[arg(long)]
         lane: Option<Lane>,
-        /// Print only coordinator actions. Exit 1 when any remain.
+        /// Print only coordinator actions, launchable steps among them. Exit 1 when any remain.
         #[arg(long)]
         act: bool,
     },
@@ -893,11 +893,23 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
         }
         Commands::Next { target, lane, act } => {
             if *act {
-                let (outcome, actionable) =
-                    crate::plan::next_act(&root()?, target.as_ref(), *lane, host.now())?;
+                let forge = crate::forge::Gh::default();
+                let (outcome, actionable) = crate::plan::next_act(
+                    &root()?,
+                    target.as_ref(),
+                    *lane,
+                    host.now(),
+                    Some(&forge),
+                )?;
                 return Ok((outcome, ExitCode::from(u8::from(actionable))));
             }
-            crate::plan::next_at(&root()?, target.as_ref(), *lane, host.now())
+            crate::plan::next_with(
+                &root()?,
+                target.as_ref(),
+                *lane,
+                host.now(),
+                Some(&crate::forge::Gh::default()),
+            )
         }
         Commands::Sync { budget_secs } => crate::sync::sync_with(
             host,

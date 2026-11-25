@@ -431,11 +431,7 @@ fn lint_holds(root: &Path, unit: &UnitState, seen: &mut Seen, out: &mut Vec<Viol
         {
             seen.warnings.push(format!("release-artifacts-undeclared: {target} declares no artifacts; cm amend {target} --artifact <spec>"));
         }
-        if let Phase::Blocked(reason) = &step.track.state
-            && !reason.starts_with("until:")
-            && crate::plan::instant(&step.track.since)
-                .is_some_and(|since| seen.now.duration_since(since).as_secs() > 24 * 3600)
-        {
+        if let Some(reason) = crate::plan::stale_block(step, seen.now) {
             let mentioned = latest_mention(&seen.mentions, &target)
                 .zip(crate::plan::instant(&step.track.since))
                 .is_some_and(|(at, since)| at > since);

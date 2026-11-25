@@ -370,7 +370,7 @@ fn merged_non_release_steps_refuse_a_descendant_merge_sha() {
     let c = campaign(&host);
     let (repo, first) = repo(c.root.parent().unwrap());
     let step = "01-first/alpha/BUILD";
-    c.merged_step(&host, step, Lane::Coordinator, &repo, &first);
+    c.merged_step(&host, step, Lane::Pi, &repo, &first);
     git(
         &repo,
         &["commit", "-q", "--allow-empty", "-m", "second merge"],
@@ -1899,19 +1899,46 @@ fn coordinator_pr_steps_keep_their_ladder_and_gates() {
     let gate = cm::plan::gate(&units, &After::PrOpen(step.into()));
     assert_eq!(gate.needs(), Phase::PrOpen);
     assert!(gate.met());
+    // A coordinator-written PR takes the merge gate like any model lane's; this one waives it.
+    let refused = advance(
+        &host,
+        &c,
+        step,
+        "merged",
+        Evidence {
+            sha: Some(sha.clone()),
+            ..Evidence::default()
+        },
+    );
     assert!(
-        advance(
-            &host,
-            &c,
-            step,
-            "merged",
-            Evidence {
+        refused.violations.iter().any(|v| v.rule == "merge-gate"),
+        "{:?}",
+        refused.violations
+    );
+    let waiver = c.root.join("waiver.md");
+    fs::write(&waiver, "Merging without review for this fixture.\n").unwrap();
+    let merged = commands::advance_gated(
+        &host,
+        &c.root,
+        &target(step),
+        commands::Advance {
+            to: &Phase::Merged,
+            given: &Evidence {
                 sha: Some(sha),
                 ..Evidence::default()
-            }
-        )
-        .ok()
-    );
+            },
+            file: None,
+            repo: None,
+            part: None,
+            by: &[],
+        },
+        &commands::MergeGate {
+            waiver: Some(waiver),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(merged.ok(), "{:?}", merged.violations);
     for (keep_pr, keep_sha) in [(true, false), (false, true), (true, true)] {
         let mut units = cm::plan::load_units(&c.root).unwrap();
         let evidence = &mut units

@@ -16,6 +16,12 @@ pub struct Limits {
     pub supervisor_model: String,
     pub supervisor_effort: String,
     pub codex_stall_hours: f64,
+    /// Hours a merge in a repository with a release line may wait for a release before
+    /// `cm next --act` lists it. Absent, nothing is listed.
+    pub release_after_hours: Option<f64>,
+    /// Hours a release with a rollout may wait for its deploy before `cm next --act` lists it.
+    /// Absent, nothing is listed.
+    pub deploy_after_hours: Option<f64>,
     stall_limits: StallLimits,
 }
 
@@ -23,7 +29,18 @@ pub struct Limits {
 pub const CODEX_STALL_HOURS: f64 = 2.0;
 
 /// Keys a campaign may leave out; each is checked when present.
-const OPTIONAL: [(&str, Shape); 1] = [("codex_stall_hours", Shape::Number)];
+const OPTIONAL: [(&str, Shape); 3] = [
+    ("codex_stall_hours", Shape::Number),
+    ("release_after_hours", Shape::Number),
+    ("deploy_after_hours", Shape::Number),
+];
+
+/// LIMITS.toml, or `None` when it is missing or does not check.
+pub(crate) fn read(root: &Path) -> Option<Limits> {
+    std::fs::read_to_string(root.join("LIMITS.toml"))
+        .ok()
+        .and_then(|text| check(&text).ok())
+}
 
 /// The keys for other lanes were previously ignored by lint. Invalid values still default.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -328,6 +345,12 @@ pub fn check(text: &str) -> Result<Limits, Vec<Violation>> {
         } else {
             CODEX_STALL_HOURS
         },
+        release_after_hours: table
+            .contains_key("release_after_hours")
+            .then(|| number("release_after_hours")),
+        deploy_after_hours: table
+            .contains_key("deploy_after_hours")
+            .then(|| number("deploy_after_hours")),
     })
 }
 
@@ -373,5 +396,20 @@ mod tests {
         let bad = check(&format!("{without}codex_stall_hours = \"two\"\n")).unwrap_err();
         assert_eq!(bad[0].rule, "limits-key");
         assert!(bad[0].message.contains("codex_stall_hours"), "{bad:?}");
+    }
+
+    #[test]
+    fn release_and_deploy_dials_are_optional_checked_and_tolerate_unknown_keys() {
+        let base = include_str!("../templates/LIMITS.toml");
+        assert_eq!(check(base).unwrap().release_after_hours, None);
+        assert_eq!(check(base).unwrap().deploy_after_hours, None);
+        let set = format!(
+            "{base}release_after_hours = 4\ndeploy_after_hours = 2.5\nsome_future_dial = 1\n"
+        );
+        assert_eq!(check(&set).unwrap().release_after_hours, Some(4.0));
+        assert_eq!(check(&set).unwrap().deploy_after_hours, Some(2.5));
+        let bad = check(&format!("{base}release_after_hours = -1\n")).unwrap_err();
+        assert_eq!(bad[0].rule, "limits-key");
+        assert!(bad[0].message.contains("release_after_hours"), "{bad:?}");
     }
 }

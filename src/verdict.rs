@@ -795,8 +795,15 @@ pub fn record(
         ));
     }
     if let Some((_, text)) = &block
+        // A report is recorded once per step, except that one recorded before the step had parts
+        // may be recorded again for a part, so its receipt can bind there; a report recorded for
+        // one part never serves another.
         && let Some(again) = verdicts.reviews.iter().find(|review| {
             review.step == full
+                && (review.part.is_some()
+                    || (review.part.as_deref() == part
+                        // A review recorded before pr-open names no PR: it stands for this one.
+                        && (review.pr.is_none() || pr.is_none() || review.pr == pr)))
                 && fs::read_to_string(root.join(review.report.as_str()))
                     .ok()
                     .as_ref()
@@ -1450,6 +1457,7 @@ fn astra_gap(
     head: &str,
     part: Option<&str>,
 ) -> Vec<String> {
+    let scope = part;
     let part = part
         .map(|part| format!(" --part={}", crate::commands::shell_word(part)))
         .unwrap_or_default();
@@ -1502,10 +1510,16 @@ fn astra_gap(
                     verdicts
                         .reviews
                         .iter()
+                        // Bound to this PR and part, as every review the gate reads.
                         .filter(|review| {
                             review.step == step
                                 && review.at_head(head)
                                 && review.reviewer.as_deref() == Some(ASTRA_REVIEWER)
+                                && review.part.as_deref() == scope
+                                && review
+                                    .pr
+                                    .as_deref()
+                                    .is_none_or(|recorded| pr.is_none_or(|pr| recorded == pr))
                         })
                         .map(|review| (review, report_sha256(root, review)))
                         .collect()
@@ -1559,15 +1573,115 @@ fn astra_gap(
 
 /// Why the recorded reviews do not clear `head`; `None` when at least one review was recorded
 /// there and each is ACCEPT or has every blocking finding resolved.
-fn review_gap(verdicts: &Verdicts, step: &str, head: &str, part: Option<&str>) -> Option<String> {
+/// The model family a `--reviewer` name belongs to: Codex models (`astra`, `sol`, `terra`,
+/// `gpt-*`) or Claude models (`claude`, `opus`, `fresh-opus`, `fable`, `sonnet`, `haiku`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    Gpt,
+    Claude,
+}
+
+impl Family {
+    pub fn reviewer(name: Option<&str>) -> Option<Family> {
+        let name = name?.to_ascii_lowercase();
+        if ["astra", "sol", "terra"].contains(&name.as_str()) || name.starts_with("gpt") {
+            Some(Family::Gpt)
+        } else if ["claude", "opus", "fresh-opus", "fable", "sonnet", "haiku"]
+            .contains(&name.as_str())
+        {
+            Some(Family::Claude)
+        } else {
+            None
+        }
+    }
+}
+
+/// A lane a model builds in: its PRs need both families' verdicts, Astra's and a Claude
+/// reviewer's, whichever family wrote them.
+pub fn model_lane(lane: Option<crate::state::Lane>) -> bool {
+    use crate::state::Lane;
+    matches!(
+        lane,
+        Some(Lane::Codex | Lane::ClaudeCloud | Lane::Fable | Lane::Coordinator)
+    )
+}
+
+/// The reviews recorded for this PR of this step or part at `head`: a review binds to the part
+/// it was recorded for and, when it names one, its PR, so two parts never share a verdict.
+fn reviews_at<'a>(
+    verdicts: &'a Verdicts,
+    step: &str,
+    head: &str,
+    pr: Option<&str>,
+    part: Option<&str>,
+) -> Vec<&'a Recorded> {
+    verdicts
+        .reviews
+        .iter()
+        .filter(|review| {
+            review.step == step
+                && review.at_head(head)
+                && review.part.as_deref() == part
+                && review
+                    .pr
+                    .as_deref()
+                    .is_none_or(|recorded| pr.is_none_or(|pr| recorded == pr))
+        })
+        .collect()
+}
+
+/// The verdicts a model lane's head needs (owner, 2026-11-25): an explicit ACCEPT from Astra
+/// and one from a Claude reviewer. A FIX REQUIRED whose findings were resolved is no ACCEPT.
+fn missing_accepts(at_head: &[&Recorded]) -> Vec<&'static str> {
+    let accepted = |family: &dyn Fn(&Recorded) -> bool| {
+        at_head.iter().any(|review| {
+            review.verdict == Verdict::Accept
+                && review.stated == Some(Verdict::Accept)
+                && family(review)
+        })
+    };
+    let mut missing = Vec::new();
+    if !accepted(&|review| review.reviewer.as_deref() == Some(ASTRA_REVIEWER)) {
+        missing.push(ASTRA_REVIEWER);
+    }
+    if !accepted(&|review| Family::reviewer(review.reviewer.as_deref()) == Some(Family::Claude)) {
+        missing.push("claude");
+    }
+    missing
+}
+
+/// The verdicts a head still needs: on a model lane, Astra's and a Claude reviewer's ACCEPT; on
+/// any other lane, any one review.
+pub fn missing_reviews(
+    verdicts: &Verdicts,
+    step: &str,
+    head: &str,
+    pr: Option<&str>,
+    part: Option<&str>,
+    model: bool,
+) -> Vec<&'static str> {
+    let at_head = reviews_at(verdicts, step, head, pr, part);
+    if model {
+        missing_accepts(&at_head)
+    } else if at_head.is_empty() {
+        vec!["any"]
+    } else {
+        Vec::new()
+    }
+}
+
+fn review_gap(
+    verdicts: &Verdicts,
+    step: &str,
+    head: &str,
+    pr: Option<&str>,
+    part: Option<&str>,
+    model: bool,
+) -> Option<String> {
+    let at_head = reviews_at(verdicts, step, head, pr, part);
     let part = part
         .map(|part| format!(" --part={}", crate::commands::shell_word(part)))
         .unwrap_or_default();
-    let at_head: Vec<&Recorded> = verdicts
-        .reviews
-        .iter()
-        .filter(|review| review.step == step && review.at_head(head))
-        .collect();
     if at_head.is_empty() {
         return Some(format!(
             "no review of {head} is recorded; `cm review record {step} <report>{part}`"
@@ -1582,10 +1696,24 @@ fn review_gap(verdicts: &Verdicts, step: &str, head: &str, part: Option<&str>) -
                 .map(move |logged| format!("{}.{}", review.id(), logged.finding.id))
         })
         .collect();
-    (!open.is_empty()).then(|| {
-        format!(
+    if !open.is_empty() {
+        return Some(format!(
             "the review at {head} is FIX REQUIRED and {} unresolved; `cm review resolve {step} <id> --by <commit|ruling-file>`",
             open.join(", ")
+        ));
+    }
+    // On a model lane both families accept the head explicitly: Astra and a Claude reviewer,
+    // each with a computed and a stated ACCEPT.
+    let missing: Vec<&str> = if model {
+        missing_accepts(&at_head)
+    } else {
+        Vec::new()
+    };
+    (!missing.is_empty()).then(|| {
+        format!(
+            "no {} ACCEPT of {head} is recorded; a model lane's head needs an ACCEPT from Astra and from a Claude reviewer, and a resolved FIX REQUIRED is not one; `cm review record {step} <report> --reviewer <{}>{part}`",
+            missing.join(" or "),
+            missing.join("|")
         )
     })
 }
@@ -1751,10 +1879,28 @@ pub fn merge_gaps(
     lineage: Option<&Lineage>,
 ) -> Result<Cleared> {
     let verdicts = load(root)?;
+    let model = model_lane(
+        store::load_unit(&root.join(&target.unit))
+            .ok()
+            .and_then(|unit| unit.steps.get(target.step.as_deref()?)?.lane),
+    );
+    // (a)'s Astra receipt binds model lanes only; any other lane needs any one cleared review.
     let gaps_at = |at: &str| -> Vec<String> {
-        astra_gap(root, target, &verdicts, pr, at, part)
+        let astra = if model {
+            astra_gap(root, target, &verdicts, pr, at, part)
+        } else {
+            Vec::new()
+        };
+        astra
             .into_iter()
-            .chain(review_gap(&verdicts, &full_name(target), at, part))
+            .chain(review_gap(
+                &verdicts,
+                &full_name(target),
+                at,
+                pr,
+                part,
+                model,
+            ))
             .collect()
     };
     let gaps = gaps_at(head);
