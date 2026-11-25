@@ -1567,9 +1567,16 @@ fn merge_gate(
     let cleared =
         crate::verdict::merge_gaps(root, target, part, Some(&pr), &head, lineage.as_ref())?;
     if let Some(reviewed) = &cleared.reviewed {
-        lines.push(format!(
-            "- reviewed at {reviewed}; every commit since is a clean update from the base branch"
-        ));
+        lines.push(if cleared.resolved.is_empty() {
+            format!(
+                "- reviewed at {reviewed}; every commit since is a clean update from the base branch"
+            )
+        } else {
+            format!(
+                "- reviewed at {reviewed}; every commit since is a clean update from the base branch or a merge from it whose conflict resolution both families accepted ({})",
+                cleared.resolved.join(", ")
+            )
+        });
     }
     gaps.extend(cleared.gaps);
     match read.checks {

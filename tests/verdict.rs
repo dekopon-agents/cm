@@ -256,7 +256,10 @@ struct Campaign {
 
 /// A campaign with the codex step S1 launched remotely and, with `pr`, at pr-open on PR 7.
 fn campaign(host: &Fake, pr: bool) -> Campaign {
-    let temp = tempfile::tempdir().unwrap();
+    campaign_in(host, tempfile::tempdir().unwrap(), pr, false)
+}
+
+fn campaign_in(host: &Fake, temp: tempfile::TempDir, pr: bool, worktree: bool) -> Campaign {
     let root = temp.path().join("campaign");
     assert!(commands::init(host, &root).unwrap().ok());
     git(&root, &["init", "-q"]);
@@ -279,7 +282,14 @@ fn campaign(host: &Fake, pr: bool) -> Campaign {
         coordinator: Some("session_a".into()),
         cap_min: None,
     };
-    let launched = commands::launch_remote(host, &root, &target(), None, &remote).unwrap();
+    let launched = commands::launch_remote(
+        host,
+        &root,
+        &target(),
+        worktree.then_some(repo.as_path()),
+        &remote,
+    )
+    .unwrap();
     assert!(launched.ok(), "{:?}", launched.violations);
     let c = Campaign {
         _temp: temp,
@@ -4768,4 +4778,638 @@ fn a_report_recorded_before_pr_open_is_not_recorded_again_as_another_family() {
         rules(&record(&host, &c, &astra, "claude")),
         ["review-duplicate"]
     );
+}
+
+fn scratch_git(home: &Path, repo: &Path, args: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "user.name=cm", "-c", "user.email=cm@example.com"])
+        .args(args)
+        .env("HOME", home)
+        .env("TMPDIR", home)
+        .env("GIT_CONFIG_GLOBAL", home.join("gitconfig"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap()
+}
+
+struct Scratch {
+    c: Campaign,
+    home: PathBuf,
+    base: String,
+    h1: String,
+}
+
+impl Scratch {
+    // A resolution review reads the base branch's tip as origin/HEAD, as a clone has it.
+    fn new(host: &Fake) -> Scratch {
+        Scratch::launched(host, false)
+    }
+
+    fn launched(host: &Fake, worktree: bool) -> Scratch {
+        let temp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let origin = temp.path().join("origin.git");
+        let c = campaign_in(host, temp, true, worktree);
+        let mut s = Scratch {
+            c,
+            home,
+            base: String::new(),
+            h1: String::new(),
+        };
+        s.base = s.git(&["rev-parse", "--abbrev-ref", "HEAD"]);
+        let bare = scratch_git(
+            &s.home,
+            origin.parent().unwrap(),
+            &["init", "-q", "--bare", "origin.git"],
+        );
+        assert!(bare.status.success(), "{bare:?}");
+        s.git(&["remote", "add", "origin", origin.to_str().unwrap()]);
+        s.git(&["push", "-q", "origin", &s.base]);
+        s.git(&["remote", "set-head", "origin", &s.base]);
+        s.git(&["checkout", "-q", "-b", "feature"]);
+        s.h1 = s.commit("shared.txt", "feature\n");
+        s.astra(host, &s.h1, "h1", "ACCEPT");
+        claude_accept(host, &s.c, &s.h1);
+        s
+    }
+
+    fn git(&self, args: &[&str]) -> String {
+        let output = scratch_git(&self.home, &self.c.repo, args);
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn head(&self) -> String {
+        self.git(&["rev-parse", "HEAD"])
+    }
+
+    fn commit(&self, file: &str, text: &str) -> String {
+        fs::write(self.c.repo.join(file), text).unwrap();
+        self.git(&["add", file]);
+        self.git(&["commit", "-q", "-m", file]);
+        self.head()
+    }
+
+    fn on_main(&self, file: &str, text: &str) {
+        self.git(&["checkout", "-q", &self.base]);
+        self.commit(file, text);
+        self.git(&["push", "-q", "origin", &self.base]);
+        self.git(&["checkout", "-q", "feature"]);
+    }
+
+    fn merge_main(&self, resolution: Option<&str>) -> String {
+        let main = format!("origin/{}", self.base);
+        let merged = scratch_git(
+            &self.home,
+            &self.c.repo,
+            &["merge", "-q", "--no-edit", &main],
+        );
+        match resolution {
+            None => assert!(merged.status.success(), "{merged:?}"),
+            Some(text) => {
+                assert!(!merged.status.success(), "the merge conflicts: {merged:?}");
+                fs::write(self.c.repo.join("shared.txt"), text).unwrap();
+                self.git(&["add", "shared.txt"]);
+                self.git(&["commit", "-q", "--no-edit"]);
+            }
+        }
+        self.head()
+    }
+
+    fn astra(&self, host: &Fake, head: &str, name: &str, verdict: &str) {
+        let dir = format!("astra-review-7-{name}");
+        let report = self.c.report(&dir, head, &[], verdict);
+        self.c.receipt(&dir, head, "gpt-6-astra", "xhigh");
+        let recorded = record(host, &self.c, &report, "astra");
+        assert!(recorded.ok(), "{:?}", recorded.violations);
+    }
+
+    fn resolution(
+        &self,
+        host: &Fake,
+        reviewer: Option<&str>,
+        merge: &str,
+        name: &str,
+        findings: &[&str],
+    ) -> Outcome {
+        let verdict = if findings.is_empty() {
+            "ACCEPT"
+        } else {
+            "FIX REQUIRED"
+        };
+        let mut block = format!("head: {merge}\n");
+        for finding in findings {
+            block.push_str(finding);
+            block.push('\n');
+        }
+        let text = format!(
+            "# Resolution review by {}\n\nThe remerge diff only.\n\n```cm-review\n{block}```\n\n{verdict}\n",
+            reviewer.unwrap_or("nobody")
+        );
+        let report = if reviewer == Some("astra") {
+            let dir = format!("astra-review-7-{name}");
+            let report = self
+                .c
+                .write(&format!("{STEP}/evidence/{dir}/report.md"), &text);
+            self.c.receipt(&dir, merge, "gpt-6-astra", "xhigh");
+            report
+        } else {
+            self.c.write(&format!("drafts/{name}.md"), &text)
+        };
+        verdict::record_resolution(
+            host,
+            &self.c.root,
+            &target(),
+            &report,
+            reviewer,
+            None,
+            Some(&self.c.repo),
+        )
+        .unwrap()
+    }
+
+    fn accepted_resolution(&self, host: &Fake, merge: &str, name: &str) {
+        for reviewer in ["astra", "claude"] {
+            let recorded = self.resolution(
+                host,
+                Some(reviewer),
+                merge,
+                &format!("{name}-{reviewer}"),
+                &[],
+            );
+            assert!(recorded.ok(), "{:?}", recorded.violations);
+        }
+    }
+
+    fn cleared(&self) -> verdict::Cleared {
+        let tip = self.git(&["rev-parse", &self.base]);
+        let lineage = Lineage {
+            repo: &self.c.repo,
+            base: Some(&tip),
+        };
+        verdict::merge_gaps(
+            &self.c.root,
+            &target(),
+            None,
+            Some(PR),
+            &self.head(),
+            Some(&lineage),
+        )
+        .unwrap()
+    }
+
+    fn reviews(&self) -> usize {
+        verdict::load(&self.c.root).unwrap().reviews.len()
+    }
+
+    fn journal(&self) -> String {
+        fs::read_to_string(self.c.root.join("JOURNAL.md")).unwrap()
+    }
+}
+
+fn walk_gaps(cleared: &verdict::Cleared) -> Vec<String> {
+    match &cleared.stop {
+        Some(CleanUpdateError::ResolutionGaps { gaps, .. }) => gaps.clone(),
+        other => panic!("the walk stops at a merge's resolution reviews, not {other:?}"),
+    }
+}
+
+#[test]
+fn a_conflicted_merge_from_main_clears_once_both_families_accept_its_resolution() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    assert_eq!(
+        s.cleared().stop,
+        Some(CleanUpdateError::Conflicts {
+            commit: merge.clone()
+        })
+    );
+
+    let claude = s.resolution(&host, Some("claude"), &merge, "claude-resolution", &[]);
+    assert!(claude.ok(), "{:?}", claude.violations);
+    assert_eq!(claude.fields["kind"], "resolution");
+    assert_eq!(claude.fields["first_parent"], s.h1.as_str());
+    let one = s.cleared();
+    assert!(!one.gaps.is_empty());
+    assert!(
+        walk_gaps(&one).contains(&"no astra resolution ACCEPT".to_owned()),
+        "{:?}",
+        one.stop
+    );
+    let refused = merge_with(&host, &s.c, &s.base);
+    assert!(
+        rules(&refused).contains(&"merge-gate"),
+        "{:?}",
+        refused.violations
+    );
+    assert_eq!(s.c.state(), Phase::PrOpen);
+
+    let astra = s.resolution(&host, Some("astra"), &merge, "resolution", &[]);
+    assert!(astra.ok(), "{:?}", astra.violations);
+    let both = s.cleared();
+    assert!(both.gaps.is_empty(), "{:?}", both.gaps);
+    assert_eq!(both.reviewed.as_deref(), Some(s.h1.as_str()));
+    assert_eq!(both.resolved, vec![merge.clone()]);
+
+    let ledger: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(s.c.root.join(".cm/verdicts.json")).unwrap())
+            .unwrap();
+    let kinds: Vec<Option<&str>> = ledger["reviews"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|review| review.get("kind").map(|kind| kind.as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![None, None, Some("resolution"), Some("resolution")]
+    );
+
+    let merged = merge_with(&host, &s.c, &s.base);
+    assert!(merged.ok(), "{:?}", merged.violations);
+    assert!(
+        s.journal().contains(&format!(
+            "- reviewed at {}; every commit since is a clean update from the base branch or a merge from it whose conflict resolution both families accepted ({merge})",
+            s.h1
+        )),
+        "{}",
+        s.journal()
+    );
+}
+
+#[test]
+fn a_resolution_accept_is_never_an_accept_of_the_head() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    s.accepted_resolution(&host, &merge, "resolution");
+    assert!(s.cleared().gaps.is_empty());
+
+    let without_checkout =
+        verdict::merge_gaps(&s.c.root, &target(), None, Some(PR), &merge, None).unwrap();
+    assert!(
+        without_checkout
+            .gaps
+            .iter()
+            .any(|gap| gap.starts_with(&format!(
+                "only resolution reviews of {merge} are recorded (R3, R4)"
+            ))),
+        "{:?}",
+        without_checkout.gaps
+    );
+    let verdicts = verdict::load(&s.c.root).unwrap();
+    assert_eq!(
+        verdict::missing_reviews(&verdicts, STEP, &merge, Some(PR), None, true),
+        vec!["astra", "claude"]
+    );
+
+    // A review of the head recorded at the merge governs it, over the resolution ACCEPTs.
+    let fix = s.c.report(
+        "head-review",
+        &merge,
+        &["F1 | contract | introduced | src/lib.rs:1 | broken"],
+        "FIX REQUIRED",
+    );
+    assert!(record(&host, &s.c, &fix, "claude").ok());
+    let governed = s.cleared();
+    assert_eq!(governed.stop, None);
+    assert!(
+        governed
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("R5.F1 unresolved")),
+        "{:?}",
+        governed.gaps
+    );
+}
+
+#[test]
+fn an_open_resolution_finding_or_an_unrecorded_receipt_at_the_merge_keeps_the_gate_shut() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let blocking = ["F1 | contract | exposed | shared.txt:1 | main's change breaks it"];
+    assert!(
+        s.resolution(&host, Some("astra"), &merge, "resolution-1", &blocking)
+            .ok()
+    );
+    assert!(
+        s.resolution(&host, Some("claude"), &merge, "claude-resolution", &[])
+            .ok()
+    );
+    assert_eq!(
+        walk_gaps(&s.cleared()),
+        vec!["R3.F1 unresolved", "no astra resolution ACCEPT"]
+    );
+
+    let ruling =
+        s.c.write("ruling.md", "Coordinator: F1 is main's to fix.\n");
+    assert!(
+        verdict::resolve(&host, &s.c.root, &target(), "R3.F1", "ruling.md", &ruling)
+            .unwrap()
+            .ok()
+    );
+    assert_eq!(walk_gaps(&s.cleared()), vec!["no astra resolution ACCEPT"]);
+
+    let unstated = s.c.write(
+        &format!("{STEP}/evidence/astra-review-7-unstated/report.md"),
+        &format!("# Astra resolution\n\nNo verdict line.\n\n```cm-review\nhead: {merge}\n```\n"),
+    );
+    s.c.receipt("astra-review-7-unstated", &merge, "gpt-6-astra", "xhigh");
+    assert!(
+        verdict::record_resolution(
+            &host,
+            &s.c.root,
+            &target(),
+            &unstated,
+            Some("astra"),
+            None,
+            Some(&s.c.repo),
+        )
+        .unwrap()
+        .ok()
+    );
+    assert_eq!(walk_gaps(&s.cleared()), vec!["no astra resolution ACCEPT"]);
+
+    assert!(
+        s.resolution(&host, Some("astra"), &merge, "resolution-2", &[])
+            .ok()
+    );
+    assert!(s.cleared().gaps.is_empty());
+
+    // A finished receipt at the merge for a report nobody recorded is a review that happened.
+    s.c.receipt_with(
+        "astra-review-7-unrecorded",
+        &merge,
+        "gpt-6-astra",
+        "xhigh",
+        |receipt| {
+            receipt["verdict"] = "FIX REQUIRED".into();
+        },
+    );
+    let bound = s.cleared();
+    assert_eq!(bound.stop, None);
+    assert!(
+        bound
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("astra-review-7-unrecorded/receipt.json")),
+        "{:?}",
+        bound.gaps
+    );
+}
+
+#[test]
+fn a_commit_after_an_accepted_resolution_needs_a_review_of_its_own() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    s.accepted_resolution(&host, &merge, "resolution");
+    let fix = s.commit("fix.txt", "a fix after the merge\n");
+    assert_eq!(
+        s.cleared().stop,
+        Some(CleanUpdateError::NotMerge {
+            commit: fix.clone()
+        })
+    );
+    let refused = merge_with(&host, &s.c, &s.base);
+    assert!(
+        rules(&refused).contains(&"merge-gate"),
+        "{:?}",
+        refused.violations
+    );
+
+    s.astra(&host, &fix, "fix", "ACCEPT");
+    claude_accept(&host, &s.c, &fix);
+    let merged = merge_with(&host, &s.c, &s.base);
+    assert!(merged.ok(), "{:?}", merged.violations);
+}
+
+#[test]
+fn a_second_merge_from_main_walks_back_through_the_first_resolution() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let first = s.merge_main(Some("feature and main\n"));
+    s.accepted_resolution(&host, &first, "resolution-1");
+
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    let cleared = s.cleared();
+    assert!(cleared.gaps.is_empty(), "{:?}", cleared.gaps);
+    assert_eq!(cleared.reviewed.as_deref(), Some(s.h1.as_str()));
+    assert_eq!(cleared.resolved, vec![first.clone()]);
+
+    s.on_main("shared.txt", "main again\n");
+    let second = s.merge_main(Some("feature and main again\n"));
+    assert_eq!(
+        s.cleared().stop,
+        Some(CleanUpdateError::Conflicts {
+            commit: second.clone()
+        })
+    );
+    let astra = s.resolution(&host, Some("astra"), &second, "resolution-2", &[]);
+    assert!(astra.ok(), "{:?}", astra.violations);
+    assert_eq!(astra.fields["first_parent"], clean.as_str());
+    assert_eq!(walk_gaps(&s.cleared()), vec!["no claude resolution ACCEPT"]);
+    assert!(
+        s.resolution(&host, Some("claude"), &second, "claude-resolution-2", &[])
+            .ok()
+    );
+    let merged = merge_with(&host, &s.c, &s.base);
+    assert!(merged.ok(), "{:?}", merged.violations);
+    assert!(
+        s.journal().contains(&format!(
+            "a merge from it whose conflict resolution both families accepted ({second}, {first})"
+        )),
+        "{}",
+        s.journal()
+    );
+}
+
+#[test]
+fn an_amended_merge_loses_the_resolution_accepts_of_the_merge_it_replaced() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    s.accepted_resolution(&host, &merge, "resolution");
+    assert!(s.cleared().gaps.is_empty());
+    s.git(&["commit", "-q", "--amend", "-m", "Merge main, amended"]);
+    let amended = s.head();
+    assert_ne!(amended, merge);
+    assert_eq!(
+        s.cleared().stop,
+        Some(CleanUpdateError::Conflicts { commit: amended })
+    );
+    let refused = merge_with(&host, &s.c, &s.base);
+    assert!(
+        rules(&refused).contains(&"merge-gate"),
+        "{:?}",
+        refused.violations
+    );
+}
+
+#[test]
+fn a_resolution_review_stands_only_on_a_conflicted_merge_from_main_whose_first_parent_clears() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    let refused = |outcome: Outcome, why: &str| {
+        assert_eq!(
+            rules(&outcome),
+            ["review-resolution"],
+            "{:?}",
+            outcome.violations
+        );
+        assert!(
+            outcome.violations[0].message.contains(why),
+            "{:?} lacks {why}",
+            outcome.violations
+        );
+        assert_eq!(
+            s.reviews(),
+            2,
+            "a refused resolution review is not recorded"
+        );
+    };
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    refused(
+        s.resolution(&host, None, &merge, "nobody", &[]),
+        "or a Claude one (claude, opus, fresh-opus, fable, sonnet, haiku) with --reviewer",
+    );
+    refused(
+        s.resolution(&host, Some("bot"), &merge, "bot", &[]),
+        "or a Claude one (claude, opus, fresh-opus, fable, sonnet, haiku) with --reviewer",
+    );
+    let report = s.c.report("no-checkout", &merge, &[], "ACCEPT");
+    refused(
+        verdict::record_resolution(
+            &host,
+            &s.c.root,
+            &target(),
+            &report,
+            Some("claude"),
+            None,
+            None,
+        )
+        .unwrap(),
+        "pass --repo <a checkout of the repo>",
+    );
+    s.git(&["remote", "set-head", "origin", "--delete"]);
+    refused(
+        s.resolution(&host, Some("claude"), &merge, "no-origin-head", &[]),
+        "cannot read origin/HEAD, the base branch's tip",
+    );
+    s.git(&["remote", "set-head", "origin", &s.base]);
+    refused(
+        s.resolution(&host, Some("claude"), &s.h1, "not-a-merge", &[]),
+        "is not a merge from the base branch",
+    );
+
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    refused(
+        s.resolution(&host, Some("claude"), &clean, "clean", &[]),
+        "is a clean update from the base branch: its remerge diff is empty, so it needs no review",
+    );
+
+    s.git(&["checkout", "-q", "-b", "side", &s.base]);
+    s.commit("shared.txt", "side\n");
+    s.git(&["checkout", "-q", "feature"]);
+    let side = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", "side"]);
+    assert!(!side.status.success(), "the side merge conflicts");
+    fs::write(s.c.repo.join("shared.txt"), "feature and side\n").unwrap();
+    s.git(&["add", "shared.txt"]);
+    s.git(&["commit", "-q", "--no-edit"]);
+    refused(
+        s.resolution(&host, Some("claude"), &s.head(), "off-base", &[]),
+        "which is not on the base branch origin/HEAD",
+    );
+
+    s.git(&["reset", "-q", "--hard", &clean]);
+    s.commit("fix.txt", "not reviewed\n");
+    s.on_main("shared.txt", "main again\n");
+    let unreviewed_parent = s.merge_main(Some("feature, side and main\n"));
+    refused(
+        s.resolution(&host, Some("claude"), &unreviewed_parent, "parent", &[]),
+        "does not clear the gate, so no resolution review can stand on it",
+    );
+}
+
+#[test]
+fn the_cli_records_a_resolution_review_only_under_kind_resolution() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let report = s.c.report("cli-resolution", &merge, &[], "ACCEPT");
+    let cm = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("-C")
+            .arg(&s.c.root)
+            .args(["--json", "review", "record", STEP])
+            .arg(&report)
+            .args(["--reviewer", "claude"])
+            .args(args)
+            .env("HOME", &s.home)
+            .env("TMPDIR", &s.home)
+            .env("GIT_CONFIG_GLOBAL", s.home.join("gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
+    };
+    let repo = s.c.repo.to_str().unwrap();
+    for usage in [
+        vec!["--repo", repo],
+        vec!["--kind", "delta", "--repo", repo],
+    ] {
+        let output = cm(&usage);
+        assert_eq!(output.status.code(), Some(2), "{usage:?}: {output:?}");
+    }
+    assert_eq!(s.reviews(), 2);
+    let output = cm(&["--kind", "resolution", "--repo", repo]);
+    assert!(output.status.success(), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["kind"], "resolution");
+    assert_eq!(json["first_parent"], s.h1.as_str());
+    let recorded = verdict::load(&s.c.root).unwrap();
+    assert_eq!(
+        recorded.reviews.last().unwrap().kind,
+        verdict::ReviewKind::Resolution
+    );
+}
+
+#[test]
+fn a_resolution_review_reads_the_merge_in_the_steps_worktree_when_no_repo_is_named() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::launched(&host, true);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let report = s.c.write(
+        "drafts/worktree-resolution.md",
+        &format!(
+            "# Resolution\n\nRead in the worktree.\n\n```cm-review\nhead: {merge}\n```\n\nACCEPT\n"
+        ),
+    );
+    let recorded = verdict::record_resolution(
+        &host,
+        &s.c.root,
+        &target(),
+        &report,
+        Some("claude"),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(recorded.ok(), "{:?}", recorded.violations);
+    assert_eq!(recorded.fields["first_parent"], s.h1.as_str());
 }

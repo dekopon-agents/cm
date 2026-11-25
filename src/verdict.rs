@@ -499,6 +499,20 @@ pub struct Verdicts {
     pub reviews: Vec<Recorded>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewKind {
+    #[default]
+    Head,
+    Resolution,
+}
+
+impl ReviewKind {
+    fn is_head(&self) -> bool {
+        *self == ReviewKind::Head
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recorded {
     pub number: u32,
@@ -511,6 +525,8 @@ pub struct Recorded {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part: Option<String>,
     pub head: String,
+    #[serde(default, skip_serializing_if = "ReviewKind::is_head")]
+    pub kind: ReviewKind,
     pub verdict: Verdict,
     /// The verdict line the report ends with, when it has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -697,6 +713,115 @@ pub fn record(
     reviewer: Option<&str>,
     part: Option<&str>,
 ) -> Result<Outcome> {
+    record_as(host, root, target, report, reviewer, part, None)
+}
+
+pub fn record_resolution(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    report: &Path,
+    reviewer: Option<&str>,
+    part: Option<&str>,
+    repo: Option<&Path>,
+) -> Result<Outcome> {
+    record_as(
+        host,
+        root,
+        target,
+        report,
+        reviewer,
+        part,
+        Some(Resolving { repo }),
+    )
+}
+
+struct Resolving<'a> {
+    repo: Option<&'a Path>,
+}
+
+fn step_worktree(root: &Path, target: &Target) -> Option<PathBuf> {
+    let unit = store::load_unit(&root.join(&target.unit)).ok()?;
+    let step = unit.steps.get(target.step.as_deref()?)?;
+    let worktree = PathBuf::from(&step.worktree);
+    (!step.worktree.is_empty() && worktree.exists()).then_some(worktree)
+}
+
+fn resolution_parent(
+    root: &Path,
+    target: &Target,
+    part: Option<&str>,
+    pr: Option<&str>,
+    merge: &str,
+    reviewer: Option<&str>,
+    repo: Option<&Path>,
+) -> Result<String, String> {
+    if Family::reviewer(reviewer).is_none() {
+        return Err(
+            "a resolution review counts only for its reviewer's family: name a Codex reviewer (astra, sol, terra, gpt-…) or a Claude one (claude, opus, fresh-opus, fable, sonnet, haiku) with --reviewer"
+                .to_owned(),
+        );
+    }
+    let Some(repo) = repo
+        .map(Path::to_path_buf)
+        .or_else(|| step_worktree(root, target))
+    else {
+        return Err(
+            "a resolution review is checked against the merge in a checkout; pass --repo <a checkout of the repo>"
+                .to_owned(),
+        );
+    };
+    let base = "origin/HEAD";
+    if git_out(&repo, &["rev-parse", "--verify", "origin/HEAD^{commit}"]).is_none() {
+        return Err(format!(
+            "cannot read {base}, the base branch's tip, in {}; fetch the base branch there",
+            repo.display()
+        ));
+    }
+    let Some(merge) = git_out(
+        &repo,
+        &["rev-parse", "--verify", &format!("{merge}^{{commit}}")],
+    ) else {
+        return Err(CleanUpdateError::Unreadable {
+            commit: merge.to_owned(),
+            repo,
+        }
+        .to_string());
+    };
+    let (first, clean) = merge_from_base(&repo, &merge, base).map_err(|why| why.to_string())?;
+    if clean {
+        return Err(format!(
+            "{} is a clean update from the base branch: its remerge diff is empty, so it needs no review",
+            short(&merge)
+        ));
+    }
+    let lineage = Lineage {
+        repo: &repo,
+        base: Some(base),
+    };
+    let cleared = merge_gaps(root, target, part, pr, &first, Some(&lineage))
+        .map_err(|error| format!("{error:#}"))?;
+    if cleared.gaps.is_empty() {
+        Ok(first)
+    } else {
+        Err(format!(
+            "{}'s first parent {} does not clear the gate, so no resolution review can stand on it: {}",
+            short(&merge),
+            short(&first),
+            cleared.gaps.join("; ")
+        ))
+    }
+}
+
+fn record_as(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    report: &Path,
+    reviewer: Option<&str>,
+    part: Option<&str>,
+    resolving: Option<Resolving>,
+) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
     let full = full_name(target);
     let mut non_convergence_block = false;
@@ -756,6 +881,23 @@ pub fn record(
     };
     let mut verdicts = load(root)?;
     let pr = step_pr(root, target, part)?;
+    let mut first_parent = None;
+    if let Some(resolving) = &resolving
+        && let Some((block, _)) = &block
+    {
+        match resolution_parent(
+            root,
+            target,
+            part,
+            pr.as_deref(),
+            &block.head,
+            reviewer,
+            resolving.repo,
+        ) {
+            Ok(parent) => first_parent = Some(parent),
+            Err(why) => violations.push(Violation::new(&full, "review-resolution", why)),
+        }
+    }
     let heads = fix_heads(
         verdicts
             .reviews
@@ -916,6 +1058,11 @@ pub fn record(
         pr: pr.clone(),
         part: part.map(str::to_owned),
         head: block.head.clone(),
+        kind: if resolving.is_some() {
+            ReviewKind::Resolution
+        } else {
+            ReviewKind::Head
+        },
         verdict,
         stated: block.stated,
         report: report_file.clone(),
@@ -958,6 +1105,11 @@ pub fn record(
     if let Some(part) = part {
         body.push_str(&format!("- part: {part}\n"));
     }
+    if let Some(parent) = &first_parent {
+        body.push_str(&format!(
+            "- resolution: the conflict resolutions of a merge from the base branch; its first parent {parent} clears\n"
+        ));
+    }
     if converging == Some(false) {
         body.push_str(&format!("- converging: false; ruling: “{RULING}”\n"));
     }
@@ -986,6 +1138,13 @@ pub fn record(
         outcome.line(format!(
             "the report says {stated}; cm computes {verdict}: only an introduced or exposed contract finding blocks"
         ));
+    }
+    if let Some(parent) = &first_parent {
+        outcome.line(format!(
+            "resolution review of the merge; its first parent {parent} clears"
+        ));
+        outcome.field("kind", "resolution");
+        outcome.field("first_parent", parent.clone());
     }
     if let Some(converging) = converging {
         outcome.line(format!("converging: {converging}"));
@@ -1428,9 +1587,11 @@ fn report_sha256(root: &Path, review: &Recorded) -> Option<String> {
 }
 
 /// The step's evidence holds a receipt for a review of `head` that happened, whatever its model.
-fn finished_receipt_at(root: &Path, target: &Target, head: &str) -> bool {
+fn finished_receipt_at(root: &Path, target: &Target, verdicts: &Verdicts, head: &str) -> bool {
     let mut found = Vec::new();
     receipts(&evidence_dir(root, target), &mut found);
+    let step = full_name(target);
+    let mut resolutions: Option<Vec<String>> = None;
     found.iter().any(|path| {
         fs::read_to_string(path)
             .ok()
@@ -1441,6 +1602,26 @@ fn finished_receipt_at(root: &Path, target: &Target, head: &str) -> bool {
                     .and_then(Value::as_str)
                     .is_some_and(|at| same_commit(at, head))
                     && unfinished(&receipt).is_none()
+                    && !receipt
+                        .pointer("/report_sha256")
+                        .and_then(Value::as_str)
+                        .is_some_and(|want| {
+                            resolutions
+                                .get_or_insert_with(|| {
+                                    verdicts
+                                        .reviews
+                                        .iter()
+                                        .filter(|review| {
+                                            review.step == step
+                                                && review.at_head(head)
+                                                && review.kind == ReviewKind::Resolution
+                                        })
+                                        .filter_map(|review| report_sha256(root, review))
+                                        .collect()
+                                })
+                                .iter()
+                                .any(|sha256| sha256.eq_ignore_ascii_case(want))
+                        })
             })
     })
 }
@@ -1614,6 +1795,7 @@ fn reviews_at<'a>(
     head: &str,
     pr: Option<&str>,
     part: Option<&str>,
+    kind: ReviewKind,
 ) -> Vec<&'a Recorded> {
     verdicts
         .reviews
@@ -1621,6 +1803,7 @@ fn reviews_at<'a>(
         .filter(|review| {
             review.step == step
                 && review.at_head(head)
+                && review.kind == kind
                 && review.part.as_deref() == part
                 && review
                     .pr
@@ -1660,7 +1843,7 @@ pub fn missing_reviews(
     part: Option<&str>,
     model: bool,
 ) -> Vec<&'static str> {
-    let at_head = reviews_at(verdicts, step, head, pr, part);
+    let at_head = reviews_at(verdicts, step, head, pr, part, ReviewKind::Head);
     if model {
         missing_accepts(&at_head)
     } else if at_head.is_empty() {
@@ -1678,10 +1861,21 @@ fn review_gap(
     part: Option<&str>,
     model: bool,
 ) -> Option<String> {
-    let at_head = reviews_at(verdicts, step, head, pr, part);
+    let at_head = reviews_at(verdicts, step, head, pr, part, ReviewKind::Head);
+    let resolutions = reviews_at(verdicts, step, head, pr, part, ReviewKind::Resolution);
     let part = part
         .map(|part| format!(" --part={}", crate::commands::shell_word(part)))
         .unwrap_or_default();
+    if at_head.is_empty() && !resolutions.is_empty() {
+        return Some(format!(
+            "only resolution reviews of {head} are recorded ({}); they count only on the walk from a checkout (`--repo` or the step's worktree) to a first parent that clears; `cm review record {step} <report>{part}`",
+            resolutions
+                .iter()
+                .map(|review| review.id())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     if at_head.is_empty() {
         return Some(format!(
             "no review of {head} is recorded; `cm review record {step} <report>{part}`"
@@ -1785,6 +1979,10 @@ pub enum CleanUpdateError {
         head: String,
         base: String,
     },
+    ResolutionGaps {
+        commit: String,
+        gaps: Vec<String>,
+    },
 }
 
 fn short(sha: &str) -> &str {
@@ -1821,6 +2019,12 @@ impl fmt::Display for CleanUpdateError {
                 "the base {base} already contains {}, so no merge can be told apart from the PR's own commits",
                 short(head)
             ),
+            CleanUpdateError::ResolutionGaps { commit, gaps } => write!(
+                f,
+                "{} resolved merge conflicts and its resolution reviews do not clear it: {}",
+                short(commit),
+                gaps.join("; ")
+            ),
         }
     }
 }
@@ -1828,6 +2032,19 @@ impl fmt::Display for CleanUpdateError {
 /// `commit`'s first parent when it is a clean update from the base branch: a merge whose second
 /// parent is on `base` and whose `git show --remerge-diff` is empty (no conflict resolved).
 pub fn clean_update(repo: &Path, commit: &str, base: &str) -> Result<String, CleanUpdateError> {
+    match merge_from_base(repo, commit, base)? {
+        (first, true) => Ok(first),
+        (_, false) => Err(CleanUpdateError::Conflicts {
+            commit: commit.to_owned(),
+        }),
+    }
+}
+
+fn merge_from_base(
+    repo: &Path,
+    commit: &str,
+    base: &str,
+) -> Result<(String, bool), CleanUpdateError> {
     let unreadable = || CleanUpdateError::Unreadable {
         commit: commit.to_owned(),
         repo: repo.to_path_buf(),
@@ -1848,10 +2065,7 @@ pub fn clean_update(repo: &Path, commit: &str, base: &str) -> Result<String, Cle
         });
     }
     match git_out(repo, &["show", "--remerge-diff", "--format=", commit]) {
-        Some(diff) if diff.is_empty() => Ok(first.to_owned()),
-        Some(_) => Err(CleanUpdateError::Conflicts {
-            commit: commit.to_owned(),
-        }),
+        Some(diff) => Ok((first.to_owned(), diff.is_empty())),
         None => Err(unreadable()),
     }
 }
@@ -1865,6 +2079,18 @@ pub struct Cleared {
     pub reviewed: Option<String>,
     /// Why the walk back from the head stopped short of a reviewed commit, when it did.
     pub stop: Option<CleanUpdateError>,
+    pub resolved: Vec<String>,
+}
+
+fn walked_updates(resolved: &[String]) -> String {
+    if resolved.is_empty() {
+        "clean updates".to_owned()
+    } else {
+        format!(
+            "clean updates and merges whose conflict resolutions both families accepted ({})",
+            resolved.join(", ")
+        )
+    }
 }
 
 /// The gate's (a) and (b) at `head`, or, with `lineage`, at the nearest earlier head on its
@@ -1884,6 +2110,7 @@ pub fn merge_gaps(
             .ok()
             .and_then(|unit| unit.steps.get(target.step.as_deref()?)?.lane),
     );
+    let step = full_name(target);
     // (a)'s Astra receipt binds model lanes only; any other lane needs any one cleared review.
     let gaps_at = |at: &str| -> Vec<String> {
         let astra = if model {
@@ -1893,32 +2120,53 @@ pub fn merge_gaps(
         };
         astra
             .into_iter()
-            .chain(review_gap(
-                &verdicts,
-                &full_name(target),
-                at,
-                pr,
-                part,
-                model,
-            ))
+            .chain(review_gap(&verdicts, &step, at, pr, part, model))
             .collect()
     };
     let gaps = gaps_at(head);
     // The clean-update rule only skips a review nobody did: a review recorded at a commit, or a
-    // finished receipt for it, binds there and is never outweighed by an earlier ACCEPT.
+    // finished receipt for it, binds there and is never outweighed by an earlier ACCEPT. A
+    // resolution review and its receipt bind only as the cover for their merge on the walk.
     let reviewed_at = |at: &str| {
-        let step = full_name(target);
-        verdicts
-            .reviews
+        verdicts.reviews.iter().any(|review| {
+            review.step == step && review.at_head(at) && review.kind == ReviewKind::Head
+        }) || finished_receipt_at(root, target, &verdicts, at)
+    };
+    let resolution_at = |at: &str| {
+        verdicts.reviews.iter().any(|review| {
+            review.step == step && review.at_head(at) && review.kind == ReviewKind::Resolution
+        })
+    };
+    let resolution_gaps = |at: &str| -> Vec<String> {
+        let reviews = reviews_at(&verdicts, &step, at, pr, part, ReviewKind::Resolution);
+        let open: Vec<String> = reviews
             .iter()
-            .any(|review| review.step == step && review.at_head(at))
-            || finished_receipt_at(root, target, at)
+            .flat_map(|review| {
+                review
+                    .unresolved()
+                    .into_iter()
+                    .map(move |logged| format!("{}.{}", review.id(), logged.finding.id))
+            })
+            .collect();
+        let missing = missing_accepts(&reviews);
+        let mut gaps = Vec::new();
+        if !open.is_empty() {
+            gaps.push(format!("{} unresolved", open.join(", ")));
+        }
+        if !missing.is_empty() {
+            gaps.push(format!("no {} resolution ACCEPT", missing.join(" or ")));
+        }
+        if model {
+            gaps.extend(astra_gap(root, target, &verdicts, pr, at, part));
+        }
+        gaps
     };
     let Some(lineage) = lineage.filter(|_| !gaps.is_empty() && !reviewed_at(head)) else {
         return Ok(Cleared {
             gaps,
             reviewed: None,
             stop: None,
+            resolved: Vec::new(),
         });
     };
     let repo = lineage.repo;
@@ -1931,9 +2179,11 @@ pub fn merge_gaps(
             gaps,
             reviewed: None,
             stop: None,
+            resolved: Vec::new(),
         });
     };
     let mut gaps = gaps;
+    let mut resolved = Vec::new();
     let mut why = CleanUpdateError::TooLong { limit: MAX_UPDATES };
     if is_ancestor(repo, &at, base).unwrap_or(false) {
         why = CleanUpdateError::BaseContainsHead {
@@ -1942,8 +2192,23 @@ pub fn merge_gaps(
         };
     } else {
         for _ in 0..MAX_UPDATES {
-            match clean_update(repo, &at, base) {
-                Ok(parent) => at = parent,
+            match merge_from_base(repo, &at, base) {
+                Ok((parent, true)) => at = parent,
+                Ok((parent, false)) if resolution_at(&at) => {
+                    let open = resolution_gaps(&at);
+                    if !open.is_empty() {
+                        why = CleanUpdateError::ResolutionGaps {
+                            commit: at,
+                            gaps: open,
+                        };
+                        break;
+                    }
+                    resolved.push(std::mem::replace(&mut at, parent));
+                }
+                Ok((_, false)) => {
+                    why = CleanUpdateError::Conflicts { commit: at };
+                    break;
+                }
                 Err(reason) => {
                     why = reason;
                     break;
@@ -1956,34 +2221,38 @@ pub fn merge_gaps(
                         gaps: Vec::new(),
                         reviewed: Some(at),
                         stop: None,
+                        resolved,
                     });
                 }
                 gaps.push(format!(
-                    "the nearest reviewed commit before {head}, {at}, joined to it by clean updates, does not clear: {}",
+                    "the nearest reviewed commit before {head}, {at}, joined to it by {}, does not clear: {}",
+                    walked_updates(&resolved),
                     earlier.join("; ")
                 ));
                 return Ok(Cleared {
                     gaps,
                     reviewed: None,
                     stop: None,
+                    resolved,
                 });
             }
         }
     }
-    let step = full_name(target);
     let earlier = verdicts
         .reviews
         .iter()
         .any(|review| review.step == step && !review.at_head(head));
     if earlier {
         gaps.push(format!(
-            "no reviewed head before {head} is joined to it by clean updates from the base branch: {why}"
+            "no reviewed head before {head} is joined to it by {} from the base branch: {why}",
+            walked_updates(&resolved)
         ));
     }
     Ok(Cleared {
         gaps,
         reviewed: None,
         stop: Some(why),
+        resolved,
     })
 }
 
@@ -2175,6 +2444,7 @@ mod tests {
                 pr: None,
                 part: None,
                 head: SHA.to_owned(),
+                kind: ReviewKind::Head,
                 verdict: Verdict::Accept,
                 stated: None,
                 report: CampaignFile::resolve(root, &copy).unwrap(),
