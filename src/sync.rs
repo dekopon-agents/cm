@@ -1187,6 +1187,7 @@ impl<'a> Run<'a> {
             let Some(release) = Release::of_target(&target) else {
                 continue;
             };
+            self.unread_publications.insert(target.clone());
             let Some((repo, sha)) = merge_of(&step.track.evidence) else {
                 self.unknown(
                     &target,
@@ -1209,14 +1210,9 @@ impl<'a> Run<'a> {
             }
             let tag = step.release_tag(&release);
             match self.tag_exists(&repo, &tag) {
-                None => {
-                    self.unread_publications.insert(target);
-                }
-                Some(Ok(false)) => {}
+                None | Some(Ok(false)) => {}
                 Some(Ok(true)) => match self.contains(&repo, &tag, &sha) {
-                    None => {
-                        self.unread_publications.insert(target);
-                    }
+                    None => {}
                     Some(Ok(true)) => {
                         let key = (
                             step.artifacts.iter().map(ToString::to_string).collect(),
@@ -1244,9 +1240,9 @@ impl<'a> Run<'a> {
                                 ))
                             },
                         ) else {
-                            self.unread_publications.insert(target);
                             continue;
                         };
+                        self.unread_publications.remove(&target);
                         let present = read.missing.is_empty() && read.unknown.is_empty();
                         for message in read.missing {
                             self.violations.push(Violation::new(
@@ -1279,15 +1275,9 @@ impl<'a> Run<'a> {
                         "release-tag",
                         format!("{repo} tag {tag} does not contain the prep merge {sha}"),
                     )),
-                    Some(Err(error)) => {
-                        self.unknown(&target, format!("{repo} {tag}: {error}"));
-                        self.unread_publications.insert(target);
-                    }
+                    Some(Err(error)) => self.unknown(&target, format!("{repo} {tag}: {error}")),
                 },
-                Some(Err(error)) => {
-                    self.unknown(&target, format!("{repo} {tag}: {error}"));
-                    self.unread_publications.insert(target);
-                }
+                Some(Err(error)) => self.unknown(&target, format!("{repo} {tag}: {error}")),
             }
         }
     }
@@ -1776,7 +1766,8 @@ fn run_sync(
     if changed {
         store::write_json(&marker_path, &notified)?;
     }
-    // A publication left unread by a failed tag read has not become readable: keep its notes.
+    // A merged release whose publication went unread this sync, whatever stopped the read, keeps
+    // the notes last published for it; one no longer merged keeps none.
     let standing: BTreeSet<String> = published
         .iter()
         .filter(|note| {
