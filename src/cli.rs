@@ -409,7 +409,8 @@ enum Commands {
         act: Option<FollowupAct>,
     },
     #[command(
-        about = "The coordinator's routine moves once, as heartbeat.sh made them: choose the one PLANNING or WORKING epoch, then, in the bound coordinator only, run each `cm --json next --act` line's executor or print the line. Prints only lines left for the model, and nothing past the epoch choice in any other session; exits 0 whenever the loop ran"
+        about = "The coordinator's routine moves once, as heartbeat.sh made them: choose the one PLANNING or WORKING epoch, then run each `cm --json next --act` line's executor in the bound coordinator, or print the line. Prints only lines left for the model; exits 0 whenever it ran",
+        long_about = "The coordinator's routine moves once, as heartbeat.sh made them: choose the one PLANNING or WORKING epoch, then, in the bound coordinator only, run each `cm --json next --act` line's executor or print the line. Prints only lines left for the model, and nothing past the epoch choice in any other session; exits 0 whenever the loop ran"
     )]
     Tick {
         #[arg(

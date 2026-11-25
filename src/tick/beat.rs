@@ -211,7 +211,8 @@ pub(crate) fn bound(checkout: &Path, epoch: &Path, proc: &dyn Proc, env: &Env) -
         return false;
     };
     let lineage = format!("session_{}", id.strip_prefix("cse_").unwrap_or(id));
-    // Age never unbinds: an unsuperseded head of any age (`stale`) is still this coordinator's.
+    // Age never unbinds: an unsuperseded head of any age (`stale`, exit 6) is still this
+    // coordinator's. Any other status is a pick that failed, whatever it printed.
     let picked = |dir: &Path| {
         let pick = Cmd::new("sh").arg(HANDOFF_PICK).arg(dir).args([
             "coordinator",
@@ -220,9 +221,10 @@ pub(crate) fn bound(checkout: &Path, epoch: &Path, proc: &dyn Proc, env: &Env) -
             "--max-age-hours",
             "24",
         ]);
-        answered(pick).is_some_and(|ran| {
+        run(pick).is_some_and(|ran| {
             let line = first_line(&ran.stdout, ran.stdout.len());
-            line.starts_with("ok ") || line.starts_with("stale ")
+            matches!(ran.exit, Exit::Code(0 | 6))
+                && (line.starts_with("ok ") || line.starts_with("stale "))
         })
     };
     if !picked(epoch) {
@@ -240,6 +242,7 @@ pub(crate) fn bound(checkout: &Path, epoch: &Path, proc: &dyn Proc, env: &Env) -
                 "diff",
                 "--name-only",
                 "-z",
+                "--no-renames",
                 "--diff-filter=A",
                 "HEAD",
                 "origin/main",
@@ -258,7 +261,16 @@ pub(crate) fn bound(checkout: &Path, epoch: &Path, proc: &dyn Proc, env: &Env) -
     if !added.stdout_truncated && !added.stdout.split(|byte| *byte == 0).any(coordinator) {
         return true;
     }
-    let Ok(tmp) = tempfile::Builder::new().prefix("cm-tick-").tempdir() else {
+    // mktemp's choice of folder, except that a relative TMPDIR, which heartbeat.sh resolved in
+    // the checkout, is refused: the extract is never made inside the checkout's tree.
+    let tmpdir = env.non_empty("TMPDIR").map_or(Path::new("/tmp"), Path::new);
+    if !tmpdir.is_absolute() {
+        return false;
+    }
+    let Ok(tmp) = tempfile::Builder::new()
+        .prefix("cm-tick-")
+        .tempdir_in(tmpdir)
+    else {
         return false;
     };
     let dir = tmp.path();
@@ -281,7 +293,36 @@ pub(crate) fn bound(checkout: &Path, epoch: &Path, proc: &dyn Proc, env: &Env) -
                 .arg(&tar),
         )
         .is_some();
-    archived && picked(&dir.join(epoch))
+    // git archive drops what origin's .gitattributes marks export-ignore, so every file origin's
+    // tree lists must be in the extract before the pick reads it.
+    let listed = archived
+        .then(|| {
+            succeeded(
+                Cmd::new("git")
+                    .args(["ls-tree", "-r", "-z", "origin/main", "--"])
+                    .arg(&handoff),
+            )
+        })
+        .flatten();
+    let whole = listed.is_some_and(|ran| !ran.stdout_truncated && extracted(dir, &ran.stdout));
+    whole && picked(&dir.join(epoch))
+}
+
+// `git ls-tree -r -z` entries are `<mode> <type> <object>\t<path>`; a submodule (`commit`) has
+// no file in an archive.
+fn extracted(dir: &Path, listing: &[u8]) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    listing
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .all(|entry| {
+            let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+                return false;
+            };
+            let (head, path) = (&entry[..tab], &entry[tab + 1..]);
+            head.split(|byte| *byte == b' ').nth(1) == Some(b"commit")
+                || dir.join(OsStr::from_bytes(path)).symlink_metadata().is_ok()
+        })
 }
 
 // heartbeat.sh re-checks after git_sync: a successor's handoff pulled just now retires this
@@ -400,7 +441,7 @@ fn run_phase(
     }
     wall_line(
         name,
-        started.elapsed(),
+        started.elapsed().saturating_sub(ctx.checking()),
         budget,
         report.failed || ctx.timed_out(),
     )

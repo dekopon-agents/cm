@@ -132,7 +132,8 @@ pub struct Ctx<'a> {
     pub proc: &'a dyn Proc,
     pub env: &'a Env,
     pub cm: &'a OsStr,
-    deadline: Instant,
+    deadline: Cell<Instant>,
+    checking: Cell<Duration>,
     timed_out: Cell<bool>,
 }
 
@@ -151,7 +152,8 @@ impl<'a> Ctx<'a> {
             proc,
             env,
             cm,
-            deadline: Instant::now() + budget.min(MAX_BUDGET),
+            deadline: Cell::new(Instant::now() + budget.min(MAX_BUDGET)),
+            checking: Cell::new(Duration::ZERO),
             timed_out: Cell::new(false),
         }
     }
@@ -168,16 +170,30 @@ impl<'a> Ctx<'a> {
     }
 
     pub fn remaining(&self) -> Duration {
-        self.deadline.saturating_duration_since(Instant::now())
+        self.deadline
+            .get()
+            .saturating_duration_since(Instant::now())
     }
 
     pub fn timed_out(&self) -> bool {
         self.timed_out.get()
     }
 
-    // gitsync calls this after each pull, so nothing of an earlier check is kept.
+    // gitsync calls this after each pull, so nothing of an earlier check is kept; the check's
+    // time is not the calling phase's.
     pub fn still_bound(&self) -> bool {
-        crate::tick::beat::bound(self.checkout, self.epoch, self.proc, self.env)
+        let started = Instant::now();
+        let bound = crate::tick::beat::bound(self.checkout, self.epoch, self.proc, self.env);
+        let took = started.elapsed();
+        let deadline = self.deadline.get();
+        self.deadline
+            .set(deadline.checked_add(took).unwrap_or(deadline));
+        self.checking.set(self.checking.get().saturating_add(took));
+        bound
+    }
+
+    pub(crate) fn checking(&self) -> Duration {
+        self.checking.get()
     }
 
     pub fn run(&self, mut cmd: Cmd) -> Result<Ran> {
