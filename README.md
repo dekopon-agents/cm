@@ -434,17 +434,17 @@ else the recorded one), `base` and `ci_green` (only when CI completed at that he
 | Kind | Fires when | Command |
 |---|---|---|
 | `turn-ended` | a launched step's configured turn reader saw its turn complete with no PR | the lane's logs command |
-| `review-owed` | a `pr-open` head, the one sync last observed or else the recorded one, has no verdict, or its verdict is FIX REQUIRED and no newer head has come; a recorded review ledger row for the PR or a `cm review wait` marker silences the first case | `cm brief <step>`, or `cm attention --pr …` for the fix |
+| `review-owed` | a `pr-open` head, the one sync last observed or else the recorded one, lacks a verdict from a review the merge gate needs (Astra, and the family other than the author's: see [Merge gate](#merge-gate)), or its verdict is FIX REQUIRED and no newer head has come. A lane with no model author needs any one verdict. A `cm review wait` marker silences it, and a review ledger row for the PR silences a head with no verdict at all | `cm brief <step>`, or `cm attention --pr …` for the fix |
 | `missing-kickoff` | a drafted step's gates are met and `kickoff.md` is missing | `cm amend <step> --kickoff-file …` |
 | `stalled-attempt` | a live attempt passed its lane's stall limit (see above) | `cm attempt <step>` |
 | `earlier-coordinator` | a live attempt is claimed by another coordinator | `cm attempt <step> claim --expect <generation>` |
 | `launchable-not-launched` | the step is in `cm next`'s launchable list: one predicate serves both, so pauses and the Codex quota hold apply. `since` is the newest of the step's stamp and its gate targets' | the step's launch command |
-| `attempt-ended` | a launched step with no PR (on it or any part) whose last attempt ended; a live attempt is `turn-ended` or `stalled-attempt` instead. Mac-lane steps are excluded | `cm attempt <step> restart --lane <lane>` after `end unknown`; otherwise `cm advance <step> done --evidence …` for a step that finishes by evidence, or `cm advance <step> pr-open --pr … --sha …` |
+| `attempt-ended` | a launched step with no PR (on it or any part) whose last attempt ended; a live attempt is `turn-ended` or `stalled-attempt` instead. Mac-lane steps are excluded | `cm attempt <step> restart --lane <lane>` after `end unknown` while the attempt's deadline is ahead, `cm attempt <step>` once it has passed; otherwise `cm advance <step> done --evidence …` for a step that finishes by evidence, or `cm advance <step> pr-open --pr … --sha …` |
 | `merged-unreleased` | `release_after_hours` is set, the campaign is not paused, and the oldest merge (GitHub's `merged_at`, else the step's stamp) of a repository some `00-release/<line>/*` step ships from is older than the dial. One line per line: the repository's own name wins, as in sync. Repositories with no release line, rollouts and studies never fire. Quiet while a release of the line is launched, `pr-open` or `merged`, or while a drafted one is launchable (that is its own line). `waiting_count` is the merged steps it holds | `cm init 00-release/<line>/'<version>' … --after …`, or the drafted release's `cm next`/`cm amend --kickoff-file` |
-| `released-undeployed` | `deploy_after_hours` is set, the campaign is not paused, and a line's newest release is older than the dial while no step gated on its tag (or a later one of the line) has merged: a pin ends at its merge. Lines no step deploys never fire; quiet while a covering deploy is launched or `pr-open`, or launchable. `waiting_count` is the line's releases since its last deploy | the drafted deploy step's `cm next`/`cm amend --kickoff-file`, or `tools/cloud-env/deploy.sh 00-release/<line>/<version>` |
+| `released-undeployed` | `deploy_after_hours` is set, the campaign is not paused, and a line's newest release is older than the dial while no deploy step gated on its `tag:` (or a later one of the line) has merged: a pin ends at its merge. A deploy step is a rollout, or a step whose PR is in a repository no release line ships (a homelab pin); a code PR in a released repository that waits on the tag consumes it and deploys nothing. Lines no deploy step names never fire; quiet while a covering deploy is launched or `pr-open`, or launchable. `waiting_count` is the line's releases since its last deploy | the drafted deploy step's `cm next`/`cm amend --kickoff-file`, or `tools/cloud-env/deploy.sh 00-release/<line>/<version>` |
 | `unblock-now` | each `unblock now` line `cm next` prints | its `cm unblock <step>` |
 | `expired-watch` | an unresolved watch is past its deadline | `cm watch <step> resolve <id> --evidence …` (or `withdraw <id> --reason …`) |
-| `merge-ready` | a `pr-open` PR whose observed head is the head CI completed green at (`ci_green` in `.cm/pulls.json`, recorded by sync) and whose merge gate has no gaps there | `cm advance <step> merged --pr <url> --sha '<merge-sha>'` after the merge |
+| `merge-ready` | a `pr-open` PR whose observed head is the head CI completed green at, its red checks covered by known-red exceptions (`ci_green` in `.cm/pulls.json`: sync re-reads checks on every run with stored ETags, keeps the value on a 304 and clears it on a read that finds checks still running), whose `mergeable_state` is `clean`, and whose merge gate has no gaps there. A pause and the Codex quota hold do not quiet it: merging launches nothing | `cm advance <step> merged --pr <url> --sha '<merge-sha>'` after the merge |
 | `stale-block` | a free-text `blocked:` older than 24 h: lint's `block-stale`, without lint's journal-mention silencer | `cm unblock <step> --evidence …` |
 
 `pr-open-unreviewed` is the old name of `review-owed`, which now also covers a new head after a
@@ -670,7 +670,10 @@ one `merge-gate` violation per gap, unless at the PR's head (GitHub's, via `gh a
   receipt at the head binds: a second, unrecorded one (a rerun) refuses the gate until it too is
   recorded;
 - (b) at least one review is recorded at that head, and each one there is ACCEPT or has every
-  blocking finding resolved (`cm review resolve`);
+  blocking finding resolved (`cm review resolve`); and one of them is from the family that did not
+  write the change: a Claude reviewer (`claude`, `opus`, `fresh-opus`, `fable`, `sonnet`, `haiku`)
+  for a `codex`-lane step, a GPT one (`astra`, `sol`, `terra`, `gpt-*`) for a `claude-cloud`,
+  `fable` or `coordinator` step. `cm next --act`'s `merge-ready` uses the same gate;
 - (c) CI is green: GitHub reports at least one check run or commit status on the head and each is
   `success`, `neutral` or `skipped`. Every page of both lists is read; a page that cannot be read,
   or a list that ends short of its `total_count`, leaves CI unknown.

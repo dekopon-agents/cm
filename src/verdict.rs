@@ -1559,7 +1559,101 @@ fn astra_gap(
 
 /// Why the recorded reviews do not clear `head`; `None` when at least one review was recorded
 /// there and each is ACCEPT or has every blocking finding resolved.
-fn review_gap(verdicts: &Verdicts, step: &str, head: &str, part: Option<&str>) -> Option<String> {
+/// The model family that wrote or reviewed a change: the merge gate wants a review from the
+/// family that did not write it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    Gpt,
+    Claude,
+}
+
+impl Family {
+    pub fn name(self) -> &'static str {
+        match self {
+            Family::Gpt => "gpt",
+            Family::Claude => "claude",
+        }
+    }
+
+    fn other(self) -> Family {
+        match self {
+            Family::Gpt => Family::Claude,
+            Family::Claude => Family::Gpt,
+        }
+    }
+
+    /// The family a step's lane builds with; `None` for lanes whose author is no model family
+    /// this gate knows (a person, the owner's Mac, the retired pi harness).
+    pub fn author(lane: Option<crate::state::Lane>) -> Option<Family> {
+        use crate::state::Lane;
+        match lane? {
+            Lane::Codex => Some(Family::Gpt),
+            Lane::ClaudeCloud | Lane::Fable | Lane::Coordinator => Some(Family::Claude),
+            Lane::Pi | Lane::Owner | Lane::Mac => None,
+        }
+    }
+
+    /// The family a `--reviewer` name belongs to: Codex models (`astra`, `sol`, `terra`, `gpt-*`)
+    /// or Claude models (`claude`, `opus`, `fresh-opus`, `fable`, `sonnet`, `haiku`).
+    pub fn reviewer(name: Option<&str>) -> Option<Family> {
+        let name = name?.to_ascii_lowercase();
+        if ["astra", "sol", "terra"].contains(&name.as_str()) || name.starts_with("gpt") {
+            Some(Family::Gpt)
+        } else if ["claude", "opus", "fresh-opus", "fable", "sonnet", "haiku"]
+            .contains(&name.as_str())
+        {
+            Some(Family::Claude)
+        } else {
+            None
+        }
+    }
+}
+
+/// The reviews a step's head still needs a verdict from: Astra, whose receipt (a) binds, and the
+/// family other than the author's. A lane with no known author family needs any one review.
+pub fn missing_reviews(
+    verdicts: &Verdicts,
+    step: &str,
+    head: &str,
+    author: Option<Family>,
+) -> Vec<&'static str> {
+    let at_head: Vec<&Recorded> = verdicts
+        .reviews
+        .iter()
+        .filter(|review| review.step == step && review.at_head(head))
+        .collect();
+    let Some(author) = author else {
+        return if at_head.is_empty() {
+            vec!["any"]
+        } else {
+            Vec::new()
+        };
+    };
+    let mut missing = Vec::new();
+    if !at_head
+        .iter()
+        .any(|review| review.reviewer.as_deref() == Some(ASTRA_REVIEWER))
+    {
+        missing.push(ASTRA_REVIEWER);
+    }
+    let other = author.other();
+    if other != Family::Gpt
+        && !at_head
+            .iter()
+            .any(|review| Family::reviewer(review.reviewer.as_deref()) == Some(other))
+    {
+        missing.push(other.name());
+    }
+    missing
+}
+
+fn review_gap(
+    verdicts: &Verdicts,
+    step: &str,
+    head: &str,
+    part: Option<&str>,
+    author: Option<Family>,
+) -> Option<String> {
     let part = part
         .map(|part| format!(" --part={}", crate::commands::shell_word(part)))
         .unwrap_or_default();
@@ -1582,12 +1676,25 @@ fn review_gap(verdicts: &Verdicts, step: &str, head: &str, part: Option<&str>) -
                 .map(move |logged| format!("{}.{}", review.id(), logged.finding.id))
         })
         .collect();
-    (!open.is_empty()).then(|| {
-        format!(
+    if !open.is_empty() {
+        return Some(format!(
             "the review at {head} is FIX REQUIRED and {} unresolved; `cm review resolve {step} <id> --by <commit|ruling-file>`",
             open.join(", ")
-        )
-    })
+        ));
+    }
+    // The stamp's gate is a cleared review from the family that did not write the change.
+    if let Some(other) = author.map(Family::other)
+        && !at_head
+            .iter()
+            .any(|review| Family::reviewer(review.reviewer.as_deref()) == Some(other))
+    {
+        return Some(format!(
+            "no {} review of {head} is recorded, and the author's family cannot clear its own change; `cm review record {step} <report> --reviewer <{}-reviewer>{part}`",
+            other.name(),
+            other.name()
+        ));
+    }
+    None
 }
 
 /// Where the gate may walk a PR's history: a checkout holding its commits, and the base branch's
@@ -1751,10 +1858,18 @@ pub fn merge_gaps(
     lineage: Option<&Lineage>,
 ) -> Result<Cleared> {
     let verdicts = load(root)?;
+    let author = store::load_unit(&root.join(&target.unit))
+        .ok()
+        .and_then(|unit| {
+            unit.steps
+                .get(target.step.as_deref()?)
+                .map(|step| step.lane)
+        })
+        .and_then(Family::author);
     let gaps_at = |at: &str| -> Vec<String> {
         astra_gap(root, target, &verdicts, pr, at, part)
             .into_iter()
-            .chain(review_gap(&verdicts, &full_name(target), at, part))
+            .chain(review_gap(&verdicts, &full_name(target), at, part, author))
             .collect()
     };
     let gaps = gaps_at(head);

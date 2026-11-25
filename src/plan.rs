@@ -695,7 +695,7 @@ fn waiting_counts(root: &Path, units: &Units, actions: &mut [Action]) {
 
 /// A launched step with no PR whose last attempt has ended: the coordinator owes the next move.
 /// It cannot overlap `turn-ended` or `stalled-attempt`, which need a live attempt.
-fn attempt_ended(target: &str, step: &Step) -> Option<Action> {
+fn attempt_ended(target: &str, step: &Step, now: Timestamp) -> Option<Action> {
     if step.track.state != Phase::Launched
         || step.lane == Some(Lane::Mac)
         || step.track.evidence.pr.is_some()
@@ -706,22 +706,26 @@ fn attempt_ended(target: &str, step: &Step) -> Option<Action> {
     let attempt = step.attempt.as_ref()?;
     let ended = attempt.ended.as_ref()?;
     let word = shell_word(target);
-    let command = if ended.outcome == AttemptOutcome::Unknown {
-        let lane = attempt.lane.or(step.lane).map_or("'<lane>'", Lane::name);
-        format!("cm attempt {word} restart --lane {lane}")
-    } else {
-        let part = if step.parts.is_empty() {
-            ""
+    // Restart is refused past the attempt's deadline (`attempt-deadline`): inspect it instead.
+    let command =
+        if ended.outcome == AttemptOutcome::Unknown && crate::attempt::expired(attempt, now) {
+            format!("cm attempt {word}")
+        } else if ended.outcome == AttemptOutcome::Unknown {
+            let lane = attempt.lane.or(step.lane).map_or("'<lane>'", Lane::name);
+            format!("cm attempt {word} restart --lane {lane}")
         } else {
-            " --part '<part>'"
-        };
-        match step.finish(Release::of_target(target).is_some()) {
-            Finish::Evidence => format!("cm advance {word} done --evidence '<evidence-file>'"),
-            Finish::Shipped | Finish::Rollout => {
-                format!("cm advance {word} pr-open --pr '<pr-url>' --sha '<head-sha>'{part}")
+            let part = if step.parts.is_empty() {
+                ""
+            } else {
+                " --part '<part>'"
+            };
+            match step.finish(Release::of_target(target).is_some()) {
+                Finish::Evidence => format!("cm advance {word} done --evidence '<evidence-file>'"),
+                Finish::Shipped | Finish::Rollout => {
+                    format!("cm advance {word} pr-open --pr '<pr-url>' --sha '<head-sha>'{part}")
+                }
             }
-        }
-    };
+        };
     Some(Action::new(
         ActionKind::AttemptEnded,
         target,
@@ -745,7 +749,9 @@ fn merge_ready(
 ) -> Option<Action> {
     let observed = observed?;
     let head = observed.head.as_deref()?;
-    if observed.ci_head.as_deref() != Some(head) || observed.ci_green != Some(true) {
+    let clean =
+        matches!(&observed.mergeable_state, Some(MergeableState::Other(state)) if state == "clean");
+    if observed.ci_head.as_deref() != Some(head) || observed.ci_green != Some(true) || !clean {
         return None;
     }
     let parsed = store::parse_target(target, true).ok()?;
@@ -795,8 +801,9 @@ fn reached(step: &Step, phase: &Phase) -> bool {
 }
 
 /// One `released-undeployed` action per deploy that a line's newest release waits on, once it
-/// has waited past `deploy_after_hours`. A release is deployed when a step gated on its tag, or a
-/// later one of its line, has merged (a pin ends at its merge). Lines that no step deploys stay
+/// has waited past `deploy_after_hours`. A release is deployed when a deploy step (a rollout, or a
+/// PR in a repository no release line ships) gated on its tag, or a later one of its line, has
+/// merged: a pin ends at its merge. Lines that no step deploys stay
 /// quiet, as do lines whose deploy is in flight or already launchable. Off without the dial and
 /// while paused.
 struct Undeployed<'a> {
@@ -804,7 +811,7 @@ struct Undeployed<'a> {
     release: Release,
     target: String,
     step: &'a Step,
-    /// The steps gated on this release's tag or a later one of its line.
+    /// The deploy steps gated on this release's tag or a later one of its line.
     covering: Vec<(Release, String, &'a Step)>,
     /// The released versions of the line no merged deploy covers.
     waiting: usize,
@@ -812,6 +819,26 @@ struct Undeployed<'a> {
 
 /// Each line's newest release that no step gated on its tag, or a later one, has merged.
 fn undeployed_releases(units: &Units) -> Vec<Undeployed<'_>> {
+    let releases: Vec<(Release, &Step)> = steps(units)
+        .filter_map(|(target, step)| Some((Release::of_target(&target)?, step)))
+        .collect();
+    // A deploy is a rollout, or a PR in a repository no release line ships (a homelab pin). A
+    // code PR in a released repository that waits on a tag consumes the release; it deploys
+    // nothing.
+    let deploys = |step: &Step| {
+        step.work == Work::Rollout
+            || step
+                .track
+                .evidence
+                .pr
+                .as_deref()
+                .and_then(GithubRepo::of_pr)
+                .is_some_and(|repo| {
+                    !releases
+                        .iter()
+                        .any(|(release, step)| step.ships_from(release, &repo))
+                })
+    };
     let mut deployers: BTreeMap<String, Vec<(Release, String, &Step)>> = BTreeMap::new();
     let mut newest: BTreeMap<String, (Release, String, &Step)> = BTreeMap::new();
     for (target, step) in steps(units) {
@@ -825,8 +852,11 @@ fn undeployed_releases(units: &Units) -> Vec<Undeployed<'_>> {
             }
             continue;
         }
+        if !deploys(step) {
+            continue;
+        }
         for after in &step.after {
-            if let After::Tag(release) | After::Deployed(release) = after {
+            if let After::Tag(release) = after {
                 deployers.entry(release.line.clone()).or_default().push((
                     release.clone(),
                     target.clone(),
@@ -1157,7 +1187,7 @@ fn actionable(
         }
     }
     for (target, step) in steps(units) {
-        if let Some(action) = attempt_ended(&target, step) {
+        if let Some(action) = attempt_ended(&target, step, inputs.now) {
             actions.push(action);
         }
         if let Some(reason) = stale_block(step, inputs.now) {
@@ -1288,15 +1318,27 @@ fn actionable(
                         fix.id()
                     ),
                 )
-            } else if !at_head.is_empty()
-                || (head.is_none() && verdict_prs.contains(pr))
-                || reviews
-                    .as_ref()
-                    .is_some_and(|rows| crate::review::reviewed(rows, pr, &target))
-                || crate::review::wait_marker(root, pr).is_some_and(|mark| mark.is_file())
-            {
-                return;
             } else {
+                // Every review the merge gate needs is owed at the head, not just the first.
+                let missing = match head {
+                    Some(head) => crate::verdict::missing_reviews(
+                        verdicts,
+                        &target,
+                        head,
+                        crate::verdict::Family::author(step.lane),
+                    ),
+                    None if verdict_prs.contains(pr) => Vec::new(),
+                    None => vec!["any"],
+                };
+                if missing.is_empty()
+                    || crate::review::wait_marker(root, pr).is_some_and(|mark| mark.is_file())
+                    || (at_head.is_empty()
+                        && reviews
+                            .as_ref()
+                            .is_some_and(|rows| crate::review::reviewed(rows, pr, &target)))
+                {
+                    return;
+                }
                 // A head after a verdict is owed its review from that verdict on, not from pr-open.
                 let since = on_step
                     .iter()
@@ -1306,10 +1348,15 @@ fn actionable(
                     .max_by_key(|at| instant(at))
                     .unwrap_or_default()
                     .to_owned();
+                let owed = if missing == ["any"] {
+                    "no verdict".to_owned()
+                } else {
+                    format!("no {} verdict", missing.join(" and "))
+                };
                 (
                     since,
                     format!("cm brief {}", shell_word(&target)),
-                    format!("{detail}: no verdict at {head_word}"),
+                    format!("{detail}: {owed} at {head_word}"),
                 )
             };
             let mut action = Action::new(ActionKind::ReviewOwed, &target, &since, command, detail);
@@ -1475,7 +1522,8 @@ pub struct Observed {
     pub ci_head: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_base: Option<String>,
-    /// Whether every check run and status was green when CI completed at `ci_head`.
+    /// Whether CI was green, or its red checks covered by known-red exceptions, when the last
+    /// read completed at `ci_head`; cleared by a later read that found checks still running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_green: Option<bool>,
     pub target: String,

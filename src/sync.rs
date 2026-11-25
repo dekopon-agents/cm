@@ -44,8 +44,11 @@ struct PullRead {
 
 #[derive(Clone, Default)]
 struct OpenChecks {
+    /// GitHub answered 304 for every page: nothing changed since the stored ETags.
+    unchanged: bool,
     completed: bool,
     green: bool,
+    checks: Vec<CheckState>,
     etags: BTreeMap<String, String>,
 }
 
@@ -450,11 +453,55 @@ impl<'a> Run<'a> {
             });
             let green = checks.as_deref().is_some_and(ci_green);
             Ok(OpenChecks {
+                unchanged: checks.is_none(),
                 completed,
                 green,
+                checks: checks.unwrap_or_default(),
                 etags,
             })
         })
+    }
+
+    /// Whether known-red exceptions cover every red check at an open PR's head, as the merge gate
+    /// would take them.
+    fn red_covered(
+        &mut self,
+        target: &str,
+        repo: &GithubRepo,
+        head: &CommitSha,
+        base: &CommitSha,
+        checks: &[CheckState],
+    ) -> bool {
+        let name = target.split('#').next().unwrap_or(target);
+        let Some(step) = plan::step(&self.units, name).cloned() else {
+            return false;
+        };
+        let standing = self
+            .units
+            .values()
+            .flat_map(|unit| unit.steps.values())
+            .flat_map(|step| &step.known_red)
+            .any(|exception| exception.standing && exception.campaign);
+        if step.known_red.is_empty() && !standing {
+            return false;
+        }
+        let before = match self.checks(repo, base) {
+            Some(Ok(before)) => Some(before),
+            Some(Err(_)) | None => None,
+        };
+        let completed = self
+            .completed_checks(repo, base, checks, &step)
+            .and_then(Result::ok);
+        crate::commands::red_checks(
+            &step.known_red,
+            &self.units,
+            head.as_str(),
+            checks,
+            before.as_deref(),
+            completed.as_deref(),
+        )
+        .1
+        .is_empty()
     }
 
     fn tag_exists(&mut self, repo: &GithubRepo, tag: &TagName) -> Option<Read<bool>> {
@@ -879,19 +926,34 @@ impl<'a> Run<'a> {
                     let mut ci_head = previous.and_then(|seen| seen.ci_head.clone());
                     let mut ci_base = previous.and_then(|seen| seen.ci_base.clone());
                     let mut ci_green = previous.and_then(|seen| seen.ci_green);
-                    if let (Some(head), Some(base), Some(repo)) = (&head, &base, GithubRepo::of_pr(&url))
-                        && ci_head.as_deref() != Some(head.as_str())
-                    {
+                    // Checks are read on every sync, conditionally: a check registered later or a
+                    // rerun at the same head changes what `ci_green` says about it.
+                    if let (Some(head), Some(base), Some(repo)) = (&head, &base, GithubRepo::of_pr(&url)) {
                         let validators = previous
                             .filter(|seen| seen.head.as_deref() == Some(head.as_str()))
                             .map(|seen| seen.etags.clone())
                             .unwrap_or_default();
                         if let Some(Ok(checks)) = self.open_checks(&repo, head, &validators) {
-                            etags.extend(checks.etags);
-                            if checks.completed {
-                                ci_head = Some(head.to_string());
-                                ci_base = Some(base.to_string());
-                                ci_green = Some(checks.green);
+                            if checks.unchanged {
+                                for (page, tag) in validators {
+                                    etags.entry(page).or_insert(tag);
+                                }
+                            } else {
+                                etags.extend(checks.etags.clone());
+                                if checks.completed {
+                                    // CI ran against the base it saw then: a re-read at the same
+                                    // head keeps that base, so a moved base stays visible.
+                                    if ci_head.as_deref() != Some(head.as_str()) {
+                                        ci_head = Some(head.to_string());
+                                        ci_base = Some(base.to_string());
+                                    }
+                                    ci_green = Some(
+                                        checks.green
+                                            || self.red_covered(&target, &repo, head, base, &checks.checks),
+                                    );
+                                } else {
+                                    ci_green = None;
+                                }
                             }
                         }
                     }

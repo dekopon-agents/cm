@@ -6283,6 +6283,33 @@ fn an_ended_attempt_names_the_move_its_outcome_allows() {
         );
         claims.insert(step, claim);
     }
+    // Past its deadline an unknown attempt cannot restart: inspect it instead.
+    const LATE: &str = "01-a/u/late";
+    assert!(declare(&old, &c, LATE, Lane::ClaudeCloud, &[]).ok());
+    kickoff(&c, LATE);
+    let launched = commands::launch_remote(
+        &old,
+        &c.root,
+        &parse_target(LATE, true).unwrap(),
+        None,
+        &commands::Remote {
+            coordinator: Some("session_current".to_owned()),
+            cap_min: Some(30),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(launched.ok(), "{:?}", launched.violations);
+    attempt_action(
+        &old,
+        &c,
+        LATE,
+        Some(launched.fields["attempt"]["claim"].as_str().unwrap()),
+        Act::End {
+            outcome: AttemptOutcome::Unknown,
+            file: None,
+        },
+    );
     // An attempt that ended complete with its PR recorded owes nothing here.
     let dir = c.root.join("01-a/u");
     let mut unit = store::load_unit(&dir).unwrap();
@@ -6301,6 +6328,10 @@ fn an_ended_attempt_names_the_move_its_outcome_allows() {
             (
                 "01-a/u/built".to_owned(),
                 "cm advance 01-a/u/built pr-open --pr '<pr-url>' --sha '<head-sha>'".to_owned()
+            ),
+            (
+                "01-a/u/late".to_owned(),
+                "cm attempt 01-a/u/late".to_owned()
             ),
             (
                 "01-a/u/lost".to_owned(),
@@ -6325,7 +6356,7 @@ fn an_ended_attempt_names_the_move_its_outcome_allows() {
             file: None,
         },
     );
-    assert_eq!(ended(&c).len(), 2);
+    assert_eq!(ended(&c).len(), 3);
     assert!(!ended(&c).iter().any(|(target, _)| target == "01-a/u/lost"));
 }
 
@@ -6504,6 +6535,44 @@ fn a_release_no_merged_step_deploys_is_owed_its_deploy_under_the_dial() {
         Evidence::default(),
     );
     assert_eq!(owed(&c)[0].0, "00-release/gadget/2.0.0");
+    // A code PR in the released repository that waits on the tag consumes it, deploys nothing,
+    // and is never the line's target; a homelab PR waiting on it is the deploy.
+    for (step, lane, pr) in [
+        (
+            "01-a/u/gadget-consumer",
+            Lane::Codex,
+            "https://github.com/o/gadget/pull/9",
+        ),
+        (
+            "01-a/u/gadget-homelab",
+            Lane::Coordinator,
+            "https://github.com/xrl/rpi-homelab/pull/5",
+        ),
+    ] {
+        assert!(declare(&old, &c, step, lane, &["tag:gadget@2.0.0"]).ok());
+        set_track(
+            &old,
+            &c,
+            step,
+            Phase::Merged,
+            Evidence {
+                pr: Some(pr.into()),
+                sha: Some("a".repeat(40)),
+                ..Evidence::default()
+            },
+        );
+        if step.ends_with("consumer") {
+            assert_eq!(
+                owed(&c),
+                [(
+                    "00-release/gadget/2.0.0".to_owned(),
+                    "2026-11-22T08:00Z".to_owned(),
+                    "tools/cloud-env/deploy.sh 00-release/gadget/2.0.0".to_owned()
+                )]
+            );
+        }
+    }
+    assert!(owed(&c).is_empty());
 }
 
 #[cfg(unix)]
