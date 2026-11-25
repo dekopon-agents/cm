@@ -4118,3 +4118,40 @@ fn review_wait_does_not_match_an_outer_round_through_a_malformed_inner_campaign(
         }
     }
 }
+
+#[test]
+fn a_known_red_note_is_journaled_only_with_the_merge_it_explains() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host, true);
+    accepted(&host, &c);
+    let head = c.head();
+    let red = FakeForge {
+        state: PullState::Merged,
+        ..red_at_head(&head, "failure", "failure")
+    };
+    assert!(known_red(&host, &c, &red, &head, "red by design", "build").ok());
+    let item = cm::ledger::QueueItem {
+        title: "Hold the merges",
+        context: "A release is in review.",
+        question: "May merged steps move?",
+        recommendation: "Wait for the review.",
+    };
+    let queued = cm::ledger::owner_queue_add(&host, &c.root, &item).unwrap();
+    assert!(queued.ok(), "{:?}", queued.violations);
+    let journal = || fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    let before = journal();
+    for now in [
+        "2026-10-26T08:05:00Z",
+        "2026-10-26T08:10:00Z",
+        "2026-10-26T08:15:00Z",
+        "2026-10-26T08:20:00Z",
+    ] {
+        let held = sync(&at(now), &red, &c.root).unwrap();
+        assert_eq!(rules(&held), ["owner-queue-unread"], "{now}");
+        assert_eq!(c.state(), Phase::PrOpen);
+    }
+    let after = journal();
+    let added = after.strip_prefix(before.as_str()).unwrap();
+    assert!(!added.contains("cm sync:"), "{added}");
+    assert!(!added.contains("known-red"), "{added}");
+}

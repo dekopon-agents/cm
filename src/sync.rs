@@ -1065,10 +1065,7 @@ impl<'a> Run<'a> {
                         head.as_ref(),
                         base.as_ref(),
                     ) {
-                        self.notes.extend(
-                            used.into_iter()
-                                .map(|line| (String::new(), format!("{line} ({target})"))),
-                        );
+                        let moves = self.moves.len();
                         self.advance(
                             &tracked.target,
                             tracked.part.as_deref(),
@@ -1079,6 +1076,13 @@ impl<'a> Run<'a> {
                                 ..Evidence::default()
                             },
                         );
+                        // An exception explains a merge; a refused advance has none to explain.
+                        if self.moves.len() > moves {
+                            self.notes.extend(
+                                used.into_iter()
+                                    .map(|line| (String::new(), format!("{line} ({target})"))),
+                            );
+                        }
                     }
                 }
                 Pull {
