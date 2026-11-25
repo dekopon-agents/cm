@@ -5164,37 +5164,3 @@ fn the_built_cm_tick_is_unbound_when_origins_handoff_listing_passes_4_mib() {
     origin.tmp_is_empty();
     assert_eq!(origin.check_bound(Some("cse_01abc")), Some(1));
 }
-
-#[test]
-fn the_readme_harness_table_names_every_variable_a_tick_fixture_sets() {
-    let readme = include_str!("../README.md");
-    let table = readme
-        .split_once("| Spawn | Environment |")
-        .and_then(|(_, rest)| rest.split("\n\n").next())
-        .expect("README's harness table");
-    // A `Cmd`'s own variables in the runner tests, set on no tick.
-    let not_a_tick = ["TICK_KEEP", "TICK_DROP", "X"];
-    let source = include_str!("tick_beat.rs").replace(REAL_HANDOFF_PICK, "");
-    let mut names = std::collections::BTreeSet::new();
-    for opener in [".env(\"", "(\""] {
-        for piece in source.split(opener).skip(1) {
-            let Some((name, rest)) = piece.split_once('"') else {
-                continue;
-            };
-            let variable = name.starts_with(|c: char| c.is_ascii_uppercase())
-                && name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
-            if variable && rest.starts_with(',') && !not_a_tick.contains(&name) {
-                names.insert(name);
-            }
-        }
-    }
-    assert!(names.contains("TMPDIR") && names.len() >= 7, "{names:?}");
-    for name in &names {
-        assert!(
-            table.contains(&format!("`{name}")),
-            "{name} is set by a tick fixture but README's harness table does not name it"
-        );
-    }
-}

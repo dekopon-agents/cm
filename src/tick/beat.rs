@@ -9,7 +9,7 @@ use serde::Deserializer as _;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
-use crate::tick::act::{ActLine, Ctx, Env, MAX_BUDGET, Outcome, Registry, Report, clip};
+use crate::tick::act::{ActLine, Ctx, Env, Outcome, Registry, Report, clip};
 use crate::tick::proc::{Cmd, Exit, KILL_AFTER, Keep, Proc, Ran, Spilled, StdoutKeep, SystemProc};
 use crate::tick::{TickError, claude_md, collect, directive, exec, gitsync, pin};
 
@@ -55,13 +55,7 @@ pub struct Beat<'a> {
 
 impl Beat<'_> {
     fn ctx<'b>(&'b self, epoch: &'b Path, budget: Duration) -> Ctx<'b> {
-        Ctx::new(self.checkout, epoch, self.proc, self.env, self.cm, budget).within(self.until())
-    }
-
-    fn until(&self) -> Instant {
-        let secs = deadline(self.env).unwrap_or(DEADLINE_SECS);
-        let left = Duration::from_secs(u64::try_from(secs).unwrap_or(0)).min(MAX_BUDGET);
-        self.started.checked_add(left).unwrap_or(self.started)
+        Ctx::new(self.checkout, epoch, self.proc, self.env, self.cm, budget)
     }
 
     fn elapsed_secs(&self) -> i64 {
@@ -918,38 +912,6 @@ mod tests {
             Some("tick: gitsync phase took 2.0 s (budget 60 s)")
         );
         assert_eq!(lines, ["synced"]);
-    }
-
-    #[test]
-    fn each_ctx_of_a_beat_is_capped_at_the_heartbeat_deadline() {
-        let proc = crate::tick::proc::FakeProc::new(|_| Ok(Ran::code(0, "")));
-        let started = Instant::now();
-        for (value, secs) in [
-            (None, 230),
-            (Some("100"), 100),
-            (Some("soon"), 230),
-            (Some("-5"), 0),
-        ] {
-            let env: Env = value
-                .map(|value| ("HEARTBEAT_DEADLINE", value))
-                .into_iter()
-                .collect();
-            let beat = Beat {
-                checkout: Path::new("."),
-                proc: &proc,
-                env: &env,
-                registry: &Registry::new(),
-                phases: &Phases::REAL,
-                cm: OsStr::new("cm"),
-                started,
-            };
-            assert_eq!(
-                beat.ctx(Path::new("store/epochs/e"), Duration::from_secs(60))
-                    .until(),
-                started + Duration::from_secs(secs),
-                "{value:?}"
-            );
-        }
     }
 
     #[test]

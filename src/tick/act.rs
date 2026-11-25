@@ -146,7 +146,6 @@ pub struct Ctx<'a> {
     pub cm: &'a OsStr,
     clock: &'a dyn Clock,
     deadline: Cell<Instant>,
-    until: Instant,
     checking: Cell<Duration>,
     timed_out: Cell<bool>,
 }
@@ -169,16 +168,9 @@ impl<'a> Ctx<'a> {
             cm,
             clock: &SystemClock,
             deadline: Cell::new(now + budget.min(MAX_BUDGET)),
-            until: now + MAX_BUDGET,
             checking: Cell::new(Duration::ZERO),
             timed_out: Cell::new(false),
         }
-    }
-
-    // The latest the bound check's time may move the deadline to: the heartbeat's own.
-    pub(crate) fn within(mut self, until: Instant) -> Self {
-        self.until = until;
-        self
     }
 
     #[cfg(test)]
@@ -186,13 +178,7 @@ impl<'a> Ctx<'a> {
         let now = clock.now();
         self.clock = clock;
         self.deadline.set(now + budget);
-        self.until = now + MAX_BUDGET;
         self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn until(&self) -> Instant {
-        self.until
     }
 
     pub(crate) fn now(&self) -> Instant {
@@ -232,12 +218,8 @@ impl<'a> Ctx<'a> {
 
     fn exempt(&self, took: Duration) {
         let deadline = self.deadline.get();
-        let cap = self.until.max(deadline);
-        self.deadline.set(
-            deadline
-                .checked_add(took)
-                .map_or(cap, |moved| moved.min(cap)),
-        );
+        self.deadline
+            .set(deadline.checked_add(took).unwrap_or(deadline));
         self.checking.set(self.checking.get().saturating_add(took));
     }
 
@@ -587,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn the_checks_of_one_phase_move_its_deadline_no_later_than_the_heartbeats() {
+    fn the_checks_of_one_phase_leave_its_budget_whole_however_many_it_runs() {
         let clock = Rc::new(Cell::new(Instant::now()));
         let start = clock.get();
         let proc = bound_children(&clock, |word, clock| {
@@ -605,35 +587,17 @@ mod tests {
             OsStr::new("cm"),
             Duration::ZERO,
         )
-        .clocked(&ticking, Duration::from_secs(60))
-        .within(start + Duration::from_secs(100));
+        .clocked(&ticking, Duration::from_secs(60));
         for _ in 0..3 {
             assert!(ctx.still_bound());
         }
         assert_eq!(clock.get(), start + Duration::from_secs(90));
         assert_eq!(
             ctx.remaining(),
-            Duration::from_secs(10),
-            "capped at the heartbeat's 100 s"
+            Duration::from_secs(60),
+            "three 30 s checks spend none of it"
         );
         assert_eq!(ctx.checking(), Duration::from_secs(90));
-
-        let spent = Ctx::new(
-            Path::new("."),
-            Path::new("store/epochs/e"),
-            &proc,
-            &env,
-            OsStr::new("cm"),
-            Duration::ZERO,
-        )
-        .clocked(&ticking, Duration::from_secs(60))
-        .within(start);
-        assert!(spent.still_bound());
-        assert_eq!(
-            spent.remaining(),
-            Duration::from_secs(30),
-            "past the heartbeat's deadline a check moves nothing"
-        );
     }
 
     #[test]
