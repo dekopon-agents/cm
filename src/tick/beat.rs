@@ -876,6 +876,106 @@ mod tests {
         assert_eq!(extract_root(env.get("TMPDIR")), Some(Path::new("/tmp")));
     }
 
+    // cm#132's r3 review: an IfDirty gitsync that starts 180 s into the tick, 50 s before the
+    // heartbeat's deadline, works 56 s and re-checks for 5 s before its push.
+    #[test]
+    fn a_late_gitsync_keeps_its_push_and_prints_no_wall_line() {
+        use crate::tick::act::{Ticking, bound_children};
+        let clock = std::rc::Rc::new(std::cell::Cell::new(Instant::now()));
+        let started = clock.get();
+        let proc = bound_children(&clock, |word, clock| {
+            (word == "fetch").then(|| {
+                clock.set(clock.get() + Duration::from_secs(5));
+                Ran::code(0, "")
+            })
+        });
+        let env: Env = [("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_1")]
+            .into_iter()
+            .collect();
+        let registry = Registry::new();
+        let beat = Beat {
+            checkout: Path::new("."),
+            proc: &proc,
+            env: &env,
+            registry: &registry,
+            phases: &Phases::REAL,
+            cm: OsStr::new("cm"),
+            started,
+        };
+        clock.set(started + Duration::from_secs(180));
+        let ticking = Ticking(clock.clone());
+        let ctx = beat
+            .ctx(Path::new("store/epochs/e"), gitsync::BUDGET)
+            .clocked(&ticking, gitsync::BUDGET);
+        let mut lines = Vec::new();
+        let wall = phase_in(
+            &ctx,
+            &mut |line| lines.push(line),
+            "gitsync",
+            gitsync::BUDGET,
+            |ctx| {
+                clock.set(clock.get() + Duration::from_secs(56));
+                assert!(ctx.still_bound());
+                let push = ctx
+                    .run(Cmd::new("git").args(["push", "-q", "origin", "main"]))
+                    .unwrap();
+                Report {
+                    lines: vec![format!("pushed: {:?}", push.exit)],
+                    failed: false,
+                }
+            },
+        );
+        assert_eq!(lines, ["pushed: Code(0)"]);
+        assert_eq!(wall, None);
+        assert!(!ctx.timed_out());
+        assert_eq!(
+            ctx.remaining(),
+            Duration::from_secs(4),
+            "60 s less 56 s of work"
+        );
+    }
+
+    #[test]
+    fn every_check_of_a_beat_is_exempt_whatever_heartbeat_deadline_says() {
+        use crate::tick::act::{Ticking, bound_children};
+        let clock = std::rc::Rc::new(std::cell::Cell::new(Instant::now()));
+        let started = clock.get();
+        let proc = bound_children(&clock, |word, clock| {
+            (word == "fetch").then(|| {
+                clock.set(clock.get() + Duration::from_secs(30));
+                Ran::code(0, "")
+            })
+        });
+        let registry = Registry::new();
+        let ticking = Ticking(clock.clone());
+        for value in ["0", "-5", "3"] {
+            let env: Env = [
+                ("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_1"),
+                ("HEARTBEAT_DEADLINE", value),
+            ]
+            .into_iter()
+            .collect();
+            let beat = Beat {
+                checkout: Path::new("."),
+                proc: &proc,
+                env: &env,
+                registry: &registry,
+                phases: &Phases::REAL,
+                cm: OsStr::new("cm"),
+                started,
+            };
+            let ctx = beat
+                .ctx(Path::new("store/epochs/e"), gitsync::BUDGET)
+                .clocked(&ticking, gitsync::BUDGET);
+            assert!(ctx.still_bound());
+            assert_eq!(
+                (ctx.remaining(), ctx.checking()),
+                (gitsync::BUDGET, Duration::from_secs(30)),
+                "{value}"
+            );
+        }
+    }
+
     #[test]
     fn a_phase_wall_leaves_out_the_bound_checks_it_ran() {
         use crate::tick::act::{Ticking, bound_children};

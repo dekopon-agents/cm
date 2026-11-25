@@ -5223,32 +5223,51 @@ fn the_built_cm_tick_with_the_real_handoff_pick_judges_origins_untransformed_fol
 }
 
 #[test]
-fn the_built_cm_tick_fails_closed_when_export_subst_or_ident_rewrites_a_bystander_on_origin() {
-    for (attribute, text) in [
-        ("export-subst", "built from $Format:%H$\n"),
-        ("ident", "$Id$\n"),
+fn the_built_cm_tick_fails_closed_when_an_attribute_rewrites_a_bystander_on_origin() {
+    let utf16le: Vec<u8> = "a note\n"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    for (attribute, bytes, smudge) in [
+        ("export-subst", b"built from $Format:%H$\n".to_vec(), None),
+        ("ident", b"$Id$\n".to_vec(), None),
+        ("filter=upper", b"a note\n".to_vec(), Some("tr a-z A-Z")),
+        ("working-tree-encoding=UTF-16LE", utf16le.clone(), None),
     ] {
         let origin = Origin::real();
-        origin.push(
-            &[
-                (
-                    ".gitattributes",
-                    &format!("{EPOCH}/handoff/notes.txt {attribute}\n"),
-                ),
-                (&format!("{EPOCH}/handoff/notes.txt"), text),
-                (
-                    &format!("{EPOCH}/handoff/{NEXT}"),
-                    &handoff("session_01abc", Some(OURS)),
-                ),
-            ],
-            "a bystander the archive rewrites, beside this lineage's newer handoff",
+        let other = origin.path("other");
+        let notes = format!("{EPOCH}/handoff/notes.txt");
+        origin.git(&other, &["pull", "-q", "--rebase", "origin", "main"]);
+        write(
+            &other.join(".gitattributes"),
+            &format!("{notes} {attribute}\n"),
         );
-        origin.git(&origin.ct(), &["fetch", "-q", "origin", "main"]);
+        fs::write(other.join(&notes), &bytes).unwrap();
+        write(
+            &other.join(EPOCH).join("handoff").join(NEXT),
+            &handoff("session_01abc", Some(OURS)),
+        );
+        origin.git(&other, &["add", "-A"]);
+        origin.git(
+            &other,
+            &[
+                "commit",
+                "-qm",
+                "a bystander the archive rewrites, beside this lineage's newer handoff",
+            ],
+        );
+        origin.git(&other, &["push", "-q", "origin", "main"]);
+        let ct = origin.ct();
+        if let Some(smudge) = smudge {
+            origin.git(&ct, &["config", "filter.upper.smudge", smudge]);
+        }
+        origin.git(&ct, &["fetch", "-q", "origin", "main"]);
+        let blob = origin.git(&ct, &["show", &format!("origin/main:{notes}")]);
         let archived = origin.archived();
         assert_ne!(
             fs::read(archived.join("handoff/notes.txt")).unwrap(),
-            text.as_bytes(),
-            "{attribute}: the archive rewrites it"
+            blob.as_bytes(),
+            "{attribute}: the archive rewrites origin's blob"
         );
         assert!(
             origin.binds(&archived),
