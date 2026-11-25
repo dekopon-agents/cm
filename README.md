@@ -578,13 +578,12 @@ A unit is `<NN-name>`, `<NN-name>/<unit>` or `<NN-name>/<unit>/<step>`, and cove
 it whole path segments at a time (`07-tick/mvp` covers `07-tick/mvp/core`, not
 `07-tick/mvp2/core`). cm reads the registry, never a lane brief. `cm next --act` does not list
 `earlier-coordinator` for a live attempt whose `coordinator` is a registered driver with a unit
-covering the step (CARD's `Actionable` count lists no `earlier-coordinator` at all, registry or
-not); `cm next` notes it instead, one unnumbered line
-and one `driver_held` item (`target`, `driver`, `driver_lane`, `generation`, `since`, `note`) with
-no `command`. `driver_held` is absent while no driver holds a step:
+covering the step; `cm next` notes it instead, one unnumbered line and one `driver_held` item
+(`target`, `driver`, `driver_lane`, `generation`, `since`, `note`) with no `command`.
+`driver_held` is absent while no driver holds a step:
 
 ```text
-note: 07-tick/mvp/core is held by session_01Df…, driver of lane tooling (generation 2, claimed 2026-11-25T06:40Z)
+note: 07-t/mvp/s is held by session_A, driver of lane ops (generation 2, claimed 2026-11-25T06:40Z)
 ```
 
 A claim by an unregistered session, or by a driver on a step outside its units, still reads
@@ -592,22 +591,27 @@ A claim by an unregistered session, or by a driver on a step outside its units, 
 fence is unchanged: a driver's token is fenced like any other, and `claim --expect` still takes an
 attempt over.
 
-`add` records a `--session` of `cse_<id>`, as the runtime reports it, as `session_<id>`, the
-label its claims carry, and a claim recorded as `cse_<id>` (an explicit `--coordinator` is stored
-as given) is that registered `session_<id>`'s. An explicit `--coordinator cse_<id>` on `add` or
-`remove` is `session_<id>` too. It refuses a lane name or session label that is not letters, digits, `.`,
-`_` and `-` (`lane-driver-lane`, `lane-driver-session`), no `--unit` or a malformed one
-(`lane-driver-units`), a registering label that is the session it registers or a registered
-driver of any lane (`lane-driver-registrar`, which names `cm lane driver remove <name>` for a
-session that drove a lane and coordinates now), and a registration identical to the lane's
-current one (`lane-driver-unchanged`). A unit with no declared unit or step under it yet is
-registered with a `warning:` line (JSON `undeclared`). A different session or units for a
-registered lane replace its driver, and the journal names the one replaced. `remove` of a lane
-with no driver is `lane-driver-unknown`. `add` and `remove` journal before they write the
-registry. A journal append that fails changes nothing (`lane-driver-journal-write`). A registry
-write that fails after it (`lane-driver-write`) leaves the registry as it was under a journal
-entry for the change, so until the re-run a removed driver still holds its claims. Both refusals
-say to re-run the same command, which journals the change again. The registering label defaults, as `attempt claim`'s does, to trimmed
+`add` records a `--session` of `cse_<id>`, as the runtime reports it, as `session_<id>`, the label
+its claims carry. Labels are compared with `cse_` mapped to `session_` on both sides: a claim
+recorded as `cse_<id>` (an explicit `--coordinator` is stored as given) is the registered
+`session_<id>`'s, and so is a registry entry written as `cse_<id>` by hand, as in a merge. An
+explicit `--coordinator` on `add` or `remove` is trimmed and mapped the same way, and the session
+running cm sees no note for its own claim in either form. `add` refuses a lane name or session label
+that is not letters, digits, `.`, `_` and `-` (`lane-driver-lane`, `lane-driver-session`), no
+`--unit` or a malformed one (`lane-driver-units`), a registering label that is the session it
+registers or a registered driver of any lane (`lane-driver-registrar`, which names `cm lane driver
+remove <name>` for a session that drove a lane and coordinates now), and a registration identical to
+the lane's current one (`lane-driver-unchanged`). A unit with no declared unit or step under it yet
+is registered with a `warning:` line (JSON `undeclared`). A different session or units for a
+registered lane replace its driver, and the journal names the one replaced. `remove` of a lane with
+no driver is `lane-driver-unknown`.
+
+`add` and `remove` journal before they write the registry. A journal append that fails journals and
+changes nothing (`lane-driver-journal-write`); re-running the same command once `JOURNAL.md` is
+writable journals the change for the first time. A registry write that fails after it
+(`lane-driver-write`) leaves the registry as it was under a journal entry for the change, so until
+the re-run a removed driver still holds its claims; re-running the same command journals the change
+again and writes it. The registering label defaults, as `attempt claim`'s does, to trimmed
 `CLAUDE_CODE_REMOTE_SESSION_ID` with `cse_` mapped to `session_`, and `--coordinator` is required
 without it. These checks catch mistakes; they are not authentication. cm trusts the labels it is
 given, and the journal names who registered or removed whom.
@@ -615,10 +619,12 @@ given, and the journal names who registered or removed whom.
 `cm next`, `cm next --act`, the `cm lane driver` verbs and `cm lint` refuse a registry cm cannot
 parse with `lane-drivers-unreadable`, which names `git checkout HEAD -- .cm/lane-drivers.json`, or
 deleting a registry that was never committed. A field cm does not know, at the top or in a driver,
-is refused the same way rather than dropped by the next `add`, since a newer cm may have written
-a registry this one cannot apply: upgrade cm. Sync's CARD count reads an unreadable registry as
-empty, so every claim reads as it would without one. cm writes the
-registry whole, so two branches that each change it conflict when merged, like cm's other
+is refused the same way rather than dropped by the next `add`, since a newer cm may have written a
+registry this one cannot apply: upgrade cm. This fails closed, so a later cm that adds a registry
+field must leave it out while unset until every session runs a cm that reads it. CARD.md's
+`Actionable` count lists no `earlier-coordinator` at all, registered driver or not, since which
+claims are earlier depends on the session asking; an unreadable registry cannot change it. cm
+writes the registry whole, so two branches that each change it conflict when merged, like cm's other
 `.cm/*.json` state: keep one side, then run `cm lane driver list` and re-run `cm lane driver add`
 for the other side's driver.
 

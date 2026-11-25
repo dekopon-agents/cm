@@ -6395,6 +6395,19 @@ fn registering_listing_and_removing_a_lane_driver_journal_who_registered_whom_an
         ),
         (
             &[
+                "w",
+                "--session",
+                "cse_w",
+                "--unit",
+                "07-t",
+                "--coordinator",
+                " cse_w",
+            ],
+            "lane-driver-registrar",
+            "a driver never registers itself",
+        ),
+        (
+            &[
                 "other",
                 "--session",
                 "session_other",
@@ -6449,7 +6462,17 @@ fn registering_listing_and_removing_a_lane_driver_journal_who_registered_whom_an
         journal(&c)
     );
 
-    let (code, removed) = current_json(&c, &["lane", "driver", "remove", "tooling"]);
+    let (code, removed) = current_json(
+        &c,
+        &[
+            "lane",
+            "driver",
+            "remove",
+            "tooling",
+            "--coordinator",
+            " cse_other",
+        ],
+    );
     assert_eq!(code, Some(0), "{removed}");
     assert!(
         removed["journal"]
@@ -6457,7 +6480,7 @@ fn registering_listing_and_removing_a_lane_driver_journal_who_registered_whom_an
             .unwrap()
             .ends_with(" — lane driver remove tooling: session_next")
     );
-    assert!(journal(&c).ends_with("- units: 07-t/mvp, 09-z\n- removed by: session_current\n"));
+    assert!(journal(&c).ends_with("- units: 07-t/mvp, 09-z\n- removed by: session_other\n"));
     let (_, listed) = current_json(&c, &["lane", "driver", "list"]);
     assert_eq!(listed["drivers"], serde_json::json!([]));
 
@@ -6876,8 +6899,56 @@ fn a_driver_registered_as_cse_covers_its_explicit_cse_claim_and_its_env_derived_
         "{note}"
     );
 
+    let own = coordinator_cm(&c, &["--json", "next"])
+        .env("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_A")
+        .output()
+        .unwrap();
+    assert_eq!(own.status.code(), Some(0), "{own:?}");
+    let own: serde_json::Value = serde_json::from_slice(&own.stdout).unwrap();
+    assert!(own.get("driver_held").is_none(), "{own}");
+    assert_eq!(own["actionable"], serde_json::json!([]));
+
     assert_eq!(claim("2", false), ("session_A".to_owned(), 3));
     let note = held(&c);
     assert_eq!(note["driver"], "session_A");
     assert_eq!(note["generation"], 3);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_registry_entry_written_as_cse_covers_its_session_claims_and_is_guarded_as_registered() {
+    let host = Fake {
+        now: Timestamp::now(),
+    };
+    let c = campaign(&host);
+    assert!(declare(&host, &c, DRIVEN, Lane::ClaudeCloud, &[]).ok());
+    launch_for(&host, &c, DRIVEN, "session_driver");
+    fs::write(
+        c.root.join(".cm/lane-drivers.json"),
+        r#"{"drivers": {"tooling": {"session": "cse_driver", "units": ["07-t/mvp"], "at": "2026-11-25T07:00Z", "by": "session_current"}}}"#,
+    )
+    .unwrap();
+    assert_eq!(earlier_coordinators(&c), (Some(0), Vec::new()));
+    let (_, regular) = current_json(&c, &["next"]);
+    assert_eq!(
+        regular["driver_held"][0]["driver_lane"], "tooling",
+        "{regular}"
+    );
+    let (code, refused) = current_json(
+        &c,
+        &[
+            "lane",
+            "driver",
+            "add",
+            "other",
+            "--session",
+            "session_other",
+            "--unit",
+            "08-x",
+            "--coordinator",
+            "session_driver",
+        ],
+    );
+    assert_eq!(code, Some(1), "{refused}");
+    assert_eq!(refused["violations"][0]["rule"], "lane-driver-registrar");
 }

@@ -49,7 +49,7 @@ pub(crate) fn coordinator_label(given: &Option<String>) -> Option<String> {
     })
 }
 
-fn session_label(value: &str) -> String {
+pub(crate) fn session_label(value: &str) -> String {
     match value.strip_prefix("cse_") {
         Some(id) => format!("session_{id}"),
         None => value.to_owned(),
@@ -551,12 +551,14 @@ impl Drivers {
     }
 
     pub fn driving(&self, session: &str, target: &str) -> Option<&str> {
-        // An explicit `--coordinator` is stored as given, so a claim may carry the `cse_` form.
+        // An explicit `--coordinator` is stored as given, and a hand-merged registry entry is
+        // read as written, so either side may carry the `cse_` form.
         let session = session_label(session);
         self.drivers
             .iter()
             .find(|(_, driver)| {
-                driver.session == session && driver.units.iter().any(|unit| covers(unit, target))
+                session_label(&driver.session) == session
+                    && driver.units.iter().any(|unit| covers(unit, target))
             })
             .map(|(lane, _)| lane.as_str())
     }
@@ -564,7 +566,7 @@ impl Drivers {
     fn lane_of(&self, session: &str) -> Option<&str> {
         self.drivers
             .iter()
-            .find(|(_, driver)| driver.session == session)
+            .find(|(_, driver)| session_label(&driver.session) == session)
             .map(|(lane, _)| lane.as_str())
     }
 }
@@ -651,7 +653,7 @@ pub fn driver_add(
     let path = registry_path();
     let session = session_label(session);
     let session = session.as_str();
-    let by = session_label(by);
+    let by = session_label(by.trim());
     let by = by.as_str();
     let mut violations = Vec::new();
     check_lane(lane, &mut violations);
@@ -798,7 +800,7 @@ pub fn driver_add(
 
 pub fn driver_remove(host: &dyn Host, root: &Path, lane: &str, by: &str) -> Result<Outcome> {
     let path = registry_path();
-    let by = session_label(by);
+    let by = session_label(by.trim());
     let by = by.as_str();
     let mut violations = Vec::new();
     check_lane(lane, &mut violations);

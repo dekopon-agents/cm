@@ -799,7 +799,9 @@ fn driver_held(
         })
         .filter_map(|(full, step)| {
             let attempt = active_attempt(step)?;
-            if inputs.coordinator.as_deref() == Some(attempt.coordinator.as_str()) {
+            if inputs.coordinator.as_deref()
+                == Some(crate::attempt::session_label(&attempt.coordinator).as_str())
+            {
                 return None;
             }
             let driven = inputs.drivers.driving(&attempt.coordinator, &full)?;
