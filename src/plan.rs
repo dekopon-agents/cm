@@ -2548,12 +2548,8 @@ pub(crate) fn block_condition(text: &str, unit: &str) -> Result<String, String> 
         return Ok(text.into());
     }
     if let Some(number) = text.strip_prefix("owner-queue:") {
-        let n: u64 = number
-            .parse()
-            .map_err(|_| "owner-queue condition needs a positive item number")?;
-        if n == 0 || !number.bytes().all(|b| b.is_ascii_digit()) {
-            return Err("owner-queue condition needs a positive item number".into());
-        }
+        let n = crate::ledger::queue_item_number(number)
+            .ok_or("owner-queue condition needs a positive item number")?;
         return Ok(format!("owner-queue:{n}"));
     }
     match After::parse(text, unit)? {
@@ -2569,13 +2565,10 @@ pub(crate) fn block_met(root: &Path, units: &Units, unit: &str, condition: &str)
     }
 
     if let Some(number) = condition.strip_prefix("owner-queue:") {
-        return fs::read_to_string(root.join("OWNER-QUEUE.md")).is_ok_and(|text| {
-            !crate::markdown::headings(&text).iter().any(|h| {
-                h.level == 2
-                    && h.text
-                        .split_once(". ")
-                        .is_some_and(|(n, _)| n.parse::<u64>().ok() == number.parse::<u64>().ok())
-            })
+        // No item number names nothing to wait for, never a met condition.
+        return crate::ledger::queue_item_number(number).is_some_and(|number| {
+            root.join("OWNER-QUEUE.md").is_file()
+                && !crate::ledger::open_items(root).contains(&number)
         });
     }
     After::parse(condition, unit).is_ok_and(|after| gate(units, &after).met())

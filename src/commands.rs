@@ -1849,7 +1849,7 @@ pub(crate) fn advance_held(
     if let Phase::Blocked(reason) = to
         && let Some(number) = reason
             .strip_prefix("until:owner-queue:")
-            .and_then(|number| number.parse::<u32>().ok())
+            .and_then(crate::ledger::queue_item_number)
         && held.is_none_or(|held| held.pending != number)
         && !crate::ledger::open_items(root).contains(&number)
     {

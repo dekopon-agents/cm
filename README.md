@@ -350,7 +350,8 @@ the tag it was declared with (`release-tag`), and its `pr-open --pr` must be in 
 `cm advance <step> blocked:until:<condition>` records a checkable block. Conditions
 are the state gates from `--after` (`<step>`, `pr-open:<step>`, `tag:<line>@<version>`,
 `deployed:<line>@<version>`), plus `epoch:WORKING` and `owner-queue:<n>` (item
-heading removed from OWNER-QUEUE.md). A block on `owner-queue:<n>` refuses unless item n is open
+heading removed from OWNER-QUEUE.md). `<n>` is a positive item number within `u32`, parsed by one parser for
+headings, conditions, checks and lint. A block on `owner-queue:<n>` refuses unless item n is open
 now (`owner-queue-not-open`); file the question and block in one command with
 `cm owner-queue add … --block <step>`. `cm next` lists satisfied blocks under
 `unblock now` (`unblock_now` in JSON), with a numbered

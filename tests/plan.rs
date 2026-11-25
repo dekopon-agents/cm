@@ -8333,3 +8333,45 @@ fn an_owner_queue_block_names_an_open_item_and_add_block_files_and_blocks_in_one
         ]
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn an_owner_queue_number_past_u32_is_refused_by_the_one_item_parser() {
+    let host = at("2026-11-25T02:00:00Z");
+    let c = campaign(&host);
+    assert!(declare(&host, &c, "01-a/u/park", Lane::Codex, &[]).ok());
+    let refused = commands::advance(
+        &host,
+        &c.root,
+        &parse_target("01-a/u/park", true).unwrap(),
+        &Phase::Blocked("until:owner-queue:4294967296".into()),
+        &Evidence::default(),
+        None,
+        None,
+    );
+    assert!(
+        refused
+            .unwrap_err()
+            .to_string()
+            .contains("positive item number")
+    );
+    assert_eq!(state(&c, "01-a/u/park"), Phase::Drafted);
+    // State written by hand with such a number does not even load: the one parser refuses it.
+    set_track(
+        &host,
+        &c,
+        "01-a/u/park",
+        Phase::Blocked("until:owner-queue:4294967296".into()),
+        Evidence::default(),
+    );
+    let linted = lint(&c.root).unwrap();
+    assert!(
+        linted
+            .violations
+            .iter()
+            .any(|v| v.rule == "state-parse" && v.message.contains("positive item number")),
+        "{:?}",
+        linted.violations
+    );
+    assert!(plan::next_at(&c.root, None, None, host.now).is_err());
+}

@@ -387,13 +387,19 @@ fn item_number(text: &str) -> Option<u32> {
     text.split_once(". ")?.0.parse().ok()
 }
 
-/// A second-level OWNER-QUEUE.md heading in cm's `N. <title>` form: N digits, at least 1.
-fn item_heading(text: &str) -> Option<u32> {
-    let (number, title) = text.split_once(". ")?;
-    (number.bytes().all(|b| b.is_ascii_digit()) && !title.trim().is_empty())
-        .then(|| number.parse().ok())
+/// An owner-queue item number: ASCII digits naming a positive `u32`. The one parser for queue
+/// headings, `owner-queue:N` block conditions, their checks and their lint.
+pub(crate) fn queue_item_number(text: &str) -> Option<u32> {
+    (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| text.parse::<u32>().ok())
         .flatten()
         .filter(|number| *number > 0)
+}
+
+/// A second-level OWNER-QUEUE.md heading in cm's `N. <title>` form.
+fn item_heading(text: &str) -> Option<u32> {
+    let (number, title) = text.split_once(". ")?;
+    queue_item_number(number).filter(|_| !title.trim().is_empty())
 }
 
 /// The numbers of the items open in OWNER-QUEUE.md.
@@ -477,10 +483,21 @@ pub(crate) fn lint_owner_queue_items(root: &Path, units: &crate::plan::Units) ->
                 let crate::state::Phase::Blocked(reason) = &track.state else {
                     continue;
                 };
-                let Some(number) = reason
-                    .strip_prefix("until:owner-queue:")
-                    .and_then(|number| number.parse::<u32>().ok())
-                else {
+                let Some(text) = reason.strip_prefix("until:owner-queue:") else {
+                    continue;
+                };
+                let target = part.map_or_else(
+                    || format!("{unit_name}/{name}"),
+                    |part| format!("{unit_name}/{name}#{part}"),
+                );
+                let Some(number) = queue_item_number(text) else {
+                    out.push(Violation::new(
+                        &target,
+                        "owner-queue-dangling",
+                        format!(
+                            "blocked:{reason} names no item: `{text}` is not a positive item number"
+                        ),
+                    ));
                     continue;
                 };
                 let since = crate::plan::instant(&track.since);
@@ -490,10 +507,6 @@ pub(crate) fn lint_owner_queue_items(root: &Path, units: &crate::plan::Units) ->
                     Some(at) => format!("item {number} was closed at {at}, before the block"),
                     None => format!("item {number} was never filed"),
                 };
-                let target = part.map_or_else(
-                    || format!("{unit_name}/{name}"),
-                    |part| format!("{unit_name}/{name}#{part}"),
-                );
                 out.push(Violation::new(
                     &target,
                     "owner-queue-dangling",
