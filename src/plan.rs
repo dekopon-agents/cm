@@ -14,7 +14,10 @@ use crate::limits;
 use crate::lint::unit_dirs;
 use crate::outcome::{Outcome, Violation};
 use crate::render::next_item;
-use crate::state::{After, Attempt, Finish, Lane, Phase, Release, Step, Track, UnitState};
+use crate::state::{
+    After, Attempt, AttemptOutcome, Finish, Lane, Phase, RELEASES, Release, Step, Track, UnitState,
+    Work,
+};
 use crate::store::{self, Target, relative, state_path};
 
 pub type Units = BTreeMap<String, UnitState>;
@@ -275,6 +278,24 @@ impl Candidate<'_> {
         quota.filter(|_| self.lane() == Some(Lane::Codex) && self.ready())
     }
 
+    /// The one predicate for `cm next`'s launchable list and the `launchable-not-launched` action:
+    /// ready, the campaign not paused and no Codex quota hold on its dispatch.
+    fn launchable(&self, paused: bool, quota: Option<&str>) -> bool {
+        !paused && self.ready() && self.dispatch_hold(quota).is_none()
+    }
+
+    /// The newest of the step's own stamp and its gate targets' stamps: when it became launchable.
+    fn launchable_since(&self) -> &str {
+        std::iter::once(self.step.track.since.as_str())
+            .chain(
+                self.gates
+                    .iter()
+                    .filter_map(|gate| gate.track.as_ref().map(|track| track.since.as_str())),
+            )
+            .max_by_key(|since| instant(since))
+            .unwrap_or_default()
+    }
+
     fn waiting_json(&self, root: &Path, quota: Option<&str>) -> Value {
         let mut value = self.to_json(root);
         let mut on = self.waits_on();
@@ -368,6 +389,10 @@ pub(crate) struct ActionInputs {
     coordinator: Option<String>,
     stall_limits: limits::StallLimits,
     turn_commands: limits::TurnCommands,
+    paused: bool,
+    codex_quota: Option<String>,
+    release_after_hours: Option<f64>,
+    deploy_after_hours: Option<f64>,
 }
 
 impl ActionInputs {
@@ -377,7 +402,18 @@ impl ActionInputs {
             coordinator: crate::attempt::coordinator_label(&None),
             stall_limits: limits::StallLimits::read(root),
             turn_commands: limits::TurnCommands::read(root),
+            paused: paused(root).unwrap_or(true),
+            codex_quota: limits::codex_pause(),
+            release_after_hours: limits::read(root).and_then(|limits| limits.release_after_hours),
+            deploy_after_hours: limits::read(root).and_then(|limits| limits.deploy_after_hours),
         }
+    }
+
+    /// The Codex quota hold as `cm next` applies it: none while paused, which already holds all.
+    fn quota(&self) -> Option<&str> {
+        (!self.paused)
+            .then_some(self.codex_quota.as_deref())
+            .flatten()
     }
 }
 
@@ -500,20 +536,36 @@ pub(crate) fn stall_line(stall: &Stall) -> String {
 #[serde(into = "&'static str")]
 enum ActionKind {
     TurnEnded,
-    PrOpenUnreviewed,
+    ReviewOwed,
     MissingKickoff,
     StalledAttempt,
     EarlierCoordinator,
+    LaunchableNotLaunched,
+    AttemptEnded,
+    MergedUnreleased,
+    UnblockNow,
+    ExpiredWatch,
+    MergeReady,
+    StaleBlock,
+    ReleasedUndeployed,
 }
 
 impl From<ActionKind> for &'static str {
     fn from(kind: ActionKind) -> Self {
         match kind {
             ActionKind::TurnEnded => "turn-ended",
-            ActionKind::PrOpenUnreviewed => "pr-open-unreviewed",
+            ActionKind::ReviewOwed => "review-owed",
             ActionKind::MissingKickoff => "missing-kickoff",
             ActionKind::StalledAttempt => "stalled-attempt",
             ActionKind::EarlierCoordinator => "earlier-coordinator",
+            ActionKind::LaunchableNotLaunched => "launchable-not-launched",
+            ActionKind::AttemptEnded => "attempt-ended",
+            ActionKind::MergedUnreleased => "merged-unreleased",
+            ActionKind::UnblockNow => "unblock-now",
+            ActionKind::ExpiredWatch => "expired-watch",
+            ActionKind::MergeReady => "merge-ready",
+            ActionKind::StaleBlock => "stale-block",
+            ActionKind::ReleasedUndeployed => "released-undeployed",
         }
     }
 }
@@ -522,9 +574,28 @@ impl ActionKind {
     fn act_priority(self) -> u8 {
         match self {
             Self::TurnEnded => 0,
-            Self::PrOpenUnreviewed => 1,
-            Self::MissingKickoff | Self::StalledAttempt | Self::EarlierCoordinator => 2,
+            Self::ReviewOwed => 1,
+            Self::MissingKickoff
+            | Self::StalledAttempt
+            | Self::EarlierCoordinator
+            | Self::LaunchableNotLaunched
+            | Self::AttemptEnded
+            | Self::MergedUnreleased
+            | Self::UnblockNow
+            | Self::ExpiredWatch
+            | Self::MergeReady
+            | Self::StaleBlock
+            | Self::ReleasedUndeployed => 2,
         }
+    }
+
+    /// Kinds whose line `cm next` already prints as its own item (next, unblock now, watch); their
+    /// actions stay in the JSON `actionable` list without a second numbered line.
+    fn printed_by_next(self) -> bool {
+        matches!(
+            self,
+            Self::LaunchableNotLaunched | Self::UnblockNow | Self::ExpiredWatch
+        )
     }
 }
 
@@ -536,6 +607,16 @@ struct Action {
     since: String,
     waiting_count: usize,
     command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lane: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ci_green: Option<bool>,
     #[serde(skip)]
     description: String,
 }
@@ -555,6 +636,11 @@ impl Action {
             since: since.to_owned(),
             waiting_count: 0,
             command,
+            lane: None,
+            pr: None,
+            head: None,
+            base: None,
+            ci_green: None,
             description,
         }
     }
@@ -607,6 +693,426 @@ fn waiting_counts(root: &Path, units: &Units, actions: &mut [Action]) {
     }
 }
 
+/// A launched step with no PR whose last attempt has ended: the coordinator owes the next move.
+/// It cannot overlap `turn-ended` or `stalled-attempt`, which need a live attempt.
+fn attempt_ended(target: &str, step: &Step) -> Option<Action> {
+    if step.track.state != Phase::Launched
+        || step.lane == Some(Lane::Mac)
+        || step.track.evidence.pr.is_some()
+        || step.parts.values().any(|part| part.evidence.pr.is_some())
+    {
+        return None;
+    }
+    let attempt = step.attempt.as_ref()?;
+    let ended = attempt.ended.as_ref()?;
+    let word = shell_word(target);
+    let command = if ended.outcome == AttemptOutcome::Unknown {
+        let lane = attempt.lane.or(step.lane).map_or("'<lane>'", Lane::name);
+        format!("cm attempt {word} restart --lane {lane}")
+    } else {
+        let part = if step.parts.is_empty() {
+            ""
+        } else {
+            " --part '<part>'"
+        };
+        match step.finish(Release::of_target(target).is_some()) {
+            Finish::Evidence => format!("cm advance {word} done --evidence '<evidence-file>'"),
+            Finish::Shipped | Finish::Rollout => {
+                format!("cm advance {word} pr-open --pr '<pr-url>' --sha '<head-sha>'{part}")
+            }
+        }
+    };
+    Some(Action::new(
+        ActionKind::AttemptEnded,
+        target,
+        &ended.at,
+        command,
+        format!(
+            "attempt {} ended {} at {}, no PR",
+            attempt.id, ended.outcome, ended.at
+        ),
+    ))
+}
+
+/// A PR whose observed head has green CI and a merge gate with no gaps: it can merge now.
+fn merge_ready(
+    root: &Path,
+    target: &str,
+    part: Option<&str>,
+    pr: &str,
+    observed: Option<&Observed>,
+    since: &str,
+) -> Option<Action> {
+    let observed = observed?;
+    let head = observed.head.as_deref()?;
+    if observed.ci_head.as_deref() != Some(head) || observed.ci_green != Some(true) {
+        return None;
+    }
+    let parsed = store::parse_target(target, true).ok()?;
+    let cleared = crate::verdict::merge_gaps(root, &parsed, part, Some(pr), head, None).ok()?;
+    if !cleared.gaps.is_empty() {
+        return None;
+    }
+    let part_flag = part
+        .map(|part| format!(" --part {}", shell_word(part)))
+        .unwrap_or_default();
+    Some(Action::new(
+        ActionKind::MergeReady,
+        target,
+        since,
+        format!(
+            "cm advance {} merged --pr {} --sha '<merge-sha>'{part_flag}",
+            shell_word(target),
+            shell_word(pr)
+        ),
+        format!(
+            "merge {pr} at {}: the gate holds and CI is green, then record the merge",
+            head.chars().take(12).collect::<String>()
+        ),
+    ))
+}
+
+/// A free-text block older than 24 hours: lint's `block-stale`, without its journal-mention
+/// silencer. An `until:` block names a machine condition and is `unblock-now` once it holds.
+pub(crate) fn stale_block(step: &Step, now: Timestamp) -> Option<&str> {
+    let Phase::Blocked(reason) = &step.track.state else {
+        return None;
+    };
+    (!reason.starts_with("until:")
+        && instant(&step.track.since)
+            .is_some_and(|since| now.duration_since(since).as_secs() > 24 * 3600))
+    .then_some(reason.as_str())
+}
+
+fn reached(step: &Step, phase: &Phase) -> bool {
+    step.track.resting() != &Phase::Superseded
+        && step
+            .track
+            .resting()
+            .rank()
+            .zip(phase.rank())
+            .is_some_and(|(at, needed)| at >= needed)
+}
+
+/// One `released-undeployed` action per deploy that a line's newest release waits on, once it
+/// has waited past `deploy_after_hours`. A release is deployed when a step gated on its tag, or a
+/// later one of its line, has merged (a pin ends at its merge). Lines that no step deploys stay
+/// quiet, as do lines whose deploy is in flight or already launchable. Off without the dial and
+/// while paused.
+struct Undeployed<'a> {
+    line: String,
+    release: Release,
+    target: String,
+    step: &'a Step,
+    /// The steps gated on this release's tag or a later one of its line.
+    covering: Vec<(Release, String, &'a Step)>,
+    /// The released versions of the line no merged deploy covers.
+    waiting: usize,
+}
+
+/// Each line's newest release that no step gated on its tag, or a later one, has merged.
+fn undeployed_releases(units: &Units) -> Vec<Undeployed<'_>> {
+    let mut deployers: BTreeMap<String, Vec<(Release, String, &Step)>> = BTreeMap::new();
+    let mut newest: BTreeMap<String, (Release, String, &Step)> = BTreeMap::new();
+    for (target, step) in steps(units) {
+        if let Some(release) = Release::of_target(&target) {
+            if reached(step, &Phase::Released)
+                && newest
+                    .get(&release.line)
+                    .is_none_or(|(known, _, _)| known.version < release.version)
+            {
+                newest.insert(release.line.clone(), (release, target, step));
+            }
+            continue;
+        }
+        for after in &step.after {
+            if let After::Tag(release) | After::Deployed(release) = after {
+                deployers.entry(release.line.clone()).or_default().push((
+                    release.clone(),
+                    target.clone(),
+                    step,
+                ));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (line, (release, target, step)) in newest {
+        let Some(deploys) = deployers.get(&line) else {
+            continue;
+        };
+        let covering: Vec<(Release, String, &Step)> = deploys
+            .iter()
+            .filter(|(gate, _, _)| gate.version >= release.version)
+            .cloned()
+            .collect();
+        if reached(step, &Phase::Deployed)
+            || covering
+                .iter()
+                .any(|(_, _, step)| reached(step, &Phase::Merged))
+        {
+            continue;
+        }
+        let waiting = steps(units)
+            .filter(|(target, step)| {
+                Release::of_target(target).is_some_and(|other| {
+                    other.line == line
+                        && reached(step, &Phase::Released)
+                        && !deploys.iter().any(|(gate, _, deployer)| {
+                            gate.version >= other.version && reached(deployer, &Phase::Merged)
+                        })
+                })
+            })
+            .count();
+        out.push(Undeployed {
+            line,
+            release,
+            target,
+            step,
+            covering,
+            waiting,
+        });
+    }
+    out
+}
+
+fn deploy_holds(root: &Path, units: &Units, inputs: &ActionInputs) -> Vec<Action> {
+    let Some(limit) = inputs.deploy_after_hours else {
+        return Vec::new();
+    };
+    if inputs.paused {
+        return Vec::new();
+    }
+    let quota = inputs.quota();
+    let mut held: BTreeMap<String, (String, Vec<String>, String, usize)> = BTreeMap::new();
+    for Undeployed {
+        line,
+        release,
+        target: release_target,
+        step: release_step,
+        covering,
+        waiting,
+    } in undeployed_releases(units)
+    {
+        if covering
+            .iter()
+            .any(|(_, _, step)| matches!(step.track.resting(), Phase::Launched | Phase::PrOpen))
+        {
+            continue;
+        }
+        let Some(since) = instant(&release_step.track.since) else {
+            continue;
+        };
+        let hours = inputs.now.duration_since(since).as_secs_f64() / 3600.0;
+        if hours <= limit {
+            continue;
+        }
+        let drafted = covering
+            .iter()
+            .filter(|(_, _, step)| step.track.resting() == &Phase::Drafted)
+            .min_by_key(|(gate, target, _)| (gate.version, target.clone()));
+        let (key, command) = match drafted {
+            Some((_, target, step)) => {
+                let candidate = Candidate {
+                    target: target.clone(),
+                    step,
+                    gates: gates(root, units, step),
+                    kickoff: kickoff(root, target),
+                };
+                if candidate.step.track.state == Phase::Drafted
+                    && candidate.lane() != Some(Lane::Mac)
+                    && candidate.launchable(inputs.paused, quota)
+                {
+                    continue;
+                }
+                (target.clone(), waiting_command(root, target))
+            }
+            None => (
+                release_target.clone(),
+                format!("tools/cloud-env/deploy.sh {release_target}"),
+            ),
+        };
+        let entry = held
+            .entry(key)
+            .or_insert_with(|| (release_step.track.since.clone(), Vec::new(), command, 0));
+        if instant(&release_step.track.since) < instant(&entry.0) {
+            entry.0.clone_from(&release_step.track.since);
+        }
+        entry.1.push(format!("{line}@{}", release.version));
+        entry.3 += waiting;
+    }
+    held.into_iter()
+        .map(|(target, (since, releases, command, waiting))| {
+            let mut action = Action::new(
+                ActionKind::ReleasedUndeployed,
+                &target,
+                &since,
+                command,
+                format!(
+                    "{} released, not deployed (> {limit}h)",
+                    releases.join(", ")
+                ),
+            );
+            action.waiting_count = waiting;
+            action
+        })
+        .collect()
+}
+
+/// One `merged-unreleased` action per repository with a release line whose oldest merge has
+/// waited past `release_after_hours` for a release. Off without the dial and while paused; quiet
+/// while a release of that line is in flight or a drafted one is launchable, which already has
+/// its own line.
+type ReleaseLines<'a> = BTreeMap<String, Vec<(String, &'a Step, Release)>>;
+
+/// Each release line's merged, unreleased steps with their merge stamps: the merged tracks of
+/// steps that release with their repository, as sync's `released` reads them.
+fn unreleased_merges(
+    units: &Units,
+) -> (ReleaseLines<'_>, BTreeMap<String, BTreeMap<String, &str>>) {
+    let mut lines: ReleaseLines = BTreeMap::new();
+    for (target, step) in steps(units) {
+        if let Some(release) = Release::of_target(&target) {
+            lines
+                .entry(release.line.clone())
+                .or_default()
+                .push((target, step, release));
+        }
+    }
+    let mut held: BTreeMap<String, BTreeMap<String, &str>> = BTreeMap::new();
+    for (target, step) in steps(units) {
+        if step.work == Work::Rollout || Release::of_target(&target).is_some() {
+            continue;
+        }
+        let tracks: Vec<&Track> = if step.parts.is_empty() {
+            vec![&step.track]
+        } else {
+            step.parts.values().collect()
+        };
+        for track in tracks
+            .into_iter()
+            .filter(|track| track.state == Phase::Merged)
+        {
+            let Some(repo) = track.evidence.pr.as_deref().and_then(GithubRepo::of_pr) else {
+                continue;
+            };
+            let Some(line) = lines
+                .iter()
+                .filter(|(_, releases)| {
+                    releases
+                        .iter()
+                        .any(|(_, step, release)| step.ships_from(release, &repo))
+                })
+                .map(|(line, _)| line.as_str())
+                .min_by_key(|line| (*line != repo.name(), *line))
+            else {
+                continue;
+            };
+            let merged = track.evidence.merged_at.as_deref().unwrap_or(&track.since);
+            let oldest = held
+                .entry(line.to_owned())
+                .or_default()
+                .entry(target.clone())
+                .or_insert(merged);
+            if instant(merged) < instant(oldest) {
+                *oldest = merged;
+            }
+        }
+    }
+    (lines, held)
+}
+
+fn release_holds(root: &Path, units: &Units, inputs: &ActionInputs) -> Vec<Action> {
+    let Some(limit) = inputs.release_after_hours else {
+        return Vec::new();
+    };
+    if inputs.paused {
+        return Vec::new();
+    }
+    let (lines, held) = unreleased_merges(units);
+    let quota = inputs.quota();
+    let mut out = Vec::new();
+    for (line, merges) in held {
+        let line = line.as_str();
+        let releases = &lines[line];
+        if releases.iter().any(|(_, step, _)| {
+            matches!(
+                step.track.resting(),
+                Phase::Launched | Phase::PrOpen | Phase::Merged
+            )
+        }) {
+            continue;
+        }
+        let Some((since, oldest)) = merges
+            .values()
+            .filter_map(|merged| Some((*merged, instant(merged)?)))
+            .min_by_key(|(_, at)| *at)
+        else {
+            continue;
+        };
+        let hours = inputs.now.duration_since(oldest).as_secs_f64() / 3600.0;
+        if hours <= limit {
+            continue;
+        }
+        let drafted = releases
+            .iter()
+            .filter(|(_, step, _)| step.track.resting() == &Phase::Drafted)
+            .min_by_key(|(_, _, release)| release.version);
+        let (target, command) = match drafted {
+            Some((target, step, _)) => {
+                let candidate = Candidate {
+                    target: target.clone(),
+                    step,
+                    gates: gates(root, units, step),
+                    kickoff: kickoff(root, target),
+                };
+                if candidate.step.track.state == Phase::Drafted
+                    && candidate.lane() != Some(Lane::Mac)
+                    && candidate.launchable(inputs.paused, quota)
+                {
+                    continue;
+                }
+                (target.clone(), waiting_command(root, target))
+            }
+            None => {
+                let newest = releases
+                    .iter()
+                    .max_by_key(|(_, _, release)| release.version);
+                let mut command = format!(
+                    "cm init {RELEASES}/{line}/'<version>' --lane {}",
+                    newest
+                        .and_then(|(_, step, _)| step.lane)
+                        .unwrap_or(Lane::Coordinator)
+                        .name()
+                );
+                for after in newest
+                    .map(|(target, _, _)| target)
+                    .into_iter()
+                    .chain(merges.keys())
+                {
+                    command.push_str(&format!(" --after {}", shell_word(after)));
+                }
+                command.push_str(" --kickoff-file '<kickoff-file>'");
+                (format!("{RELEASES}/{line}"), command)
+            }
+        };
+        let count = merges.len();
+        let mut action = Action::new(
+            ActionKind::MergedUnreleased,
+            &target,
+            since,
+            command,
+            format!(
+                "{count} merged {} unreleased on line {line}, oldest {:.1}h > {limit}h",
+                if count == 1 { "step" } else { "steps" },
+                (hours * 10.0).round() / 10.0
+            ),
+        );
+        action.waiting_count = count;
+        out.push(action);
+    }
+    out
+}
+
 fn actionable(
     root: &Path,
     units: &Units,
@@ -620,8 +1126,23 @@ fn actionable(
         .iter()
         .filter_map(|row| row.pr.as_deref())
         .collect();
+    let seen: BTreeMap<String, Observed> = store::read_json(&pulls_path(root)).unwrap_or_default();
     let mut actions = Vec::new();
+    let releasing = release_holds(root, units, inputs);
+    let deploying = deploy_holds(root, units, inputs);
     for candidate in candidates(root, units) {
+        if candidate.launchable(inputs.paused, inputs.quota()) {
+            actions.push(Action::new(
+                ActionKind::LaunchableNotLaunched,
+                &candidate.target,
+                candidate.launchable_since(),
+                launch_command(&candidate.target, candidate.lane(), candidate.finish()),
+                format!(
+                    "launchable in lane {}, not launched",
+                    candidate.lane().map_or("—", Lane::name)
+                ),
+            ));
+        }
         if candidate.step.track.state == Phase::Drafted
             && candidate.kickoff.is_none()
             && candidate.gates.iter().all(Gate::met)
@@ -636,6 +1157,41 @@ fn actionable(
         }
     }
     for (target, step) in steps(units) {
+        if let Some(action) = attempt_ended(&target, step) {
+            actions.push(action);
+        }
+        if let Some(reason) = stale_block(step, inputs.now) {
+            actions.push(Action::new(
+                ActionKind::StaleBlock,
+                &target,
+                &step.track.since,
+                unblock_command(&target, false),
+                format!("blocked:{reason} for more than 24 h with no machine condition"),
+            ));
+        }
+        for watch in step.unresolved_watches(root) {
+            if watch.status(inputs.now, root) != crate::state::WatchStatus::Expired {
+                continue;
+            }
+            actions.push(Action::new(
+                ActionKind::ExpiredWatch,
+                &target,
+                &watch.deadline,
+                format!(
+                    "cm watch {} resolve {} --evidence '<watch-evidence-file>'",
+                    shell_word(&target),
+                    watch.id
+                ),
+                format!(
+                    "watch #{} expired: unresolved ({}, deadline {}); or `cm watch {} withdraw {} --reason '<reason>'`",
+                    watch.id,
+                    watch.signal,
+                    watch.deadline,
+                    shell_word(&target),
+                    watch.id
+                ),
+            ));
+        }
         if let Some(attempt) = active_attempt(step)
             && inputs
                 .coordinator
@@ -682,26 +1238,81 @@ fn actionable(
             let Some(pr) = track.evidence.pr.as_deref() else {
                 return;
             };
-            if track.state != Phase::PrOpen
-                || verdict_prs.contains(pr)
+            if track.state != Phase::PrOpen {
+                return;
+            }
+            let name = part.map_or_else(|| target.clone(), |part| format!("{target}#{part}"));
+            let observed = seen.get(pr).filter(|observed| observed.target == name);
+            let head = observed
+                .and_then(|observed| observed.head.as_deref())
+                .or(track.evidence.sha.as_deref());
+            let on_step: Vec<&crate::verdict::Recorded> = verdicts
+                .reviews
+                .iter()
+                .filter(|review| review.step == target && review.part.as_deref() == part)
+                .collect();
+            let at_head: Vec<&&crate::verdict::Recorded> = on_step
+                .iter()
+                .filter(|review| head.is_some_and(|head| review.at_head(head)))
+                .collect();
+            let reviewed_since = at_head
+                .iter()
+                .map(|review| review.at.as_str())
+                .chain([track.since.as_str()])
+                .max_by_key(|at| instant(at))
+                .unwrap_or_default();
+            if let Some(action) = merge_ready(root, &target, part, pr, observed, reviewed_since) {
+                actions.push(action);
+            }
+            let detail = part.map_or_else(
+                || format!("PR {pr}"),
+                |part| format!("part {part}, PR {pr}"),
+            );
+            let head_word = head.map_or_else(
+                || "its head".to_owned(),
+                |head| head.chars().take(12).collect(),
+            );
+            let (since, command, detail) = if let Some(fix) = at_head
+                .iter()
+                .filter(|review| !review.unresolved().is_empty())
+                .max_by_key(|review| review.number)
+            {
+                (
+                    fix.at.clone(),
+                    format!(
+                        "cm attention --pr {} --worker '<worker-session>' --coordinator '<coordinator-session>'",
+                        shell_word(pr)
+                    ),
+                    format!(
+                        "{detail}: {} is FIX REQUIRED at {head_word} and no newer head",
+                        fix.id()
+                    ),
+                )
+            } else if !at_head.is_empty()
+                || (head.is_none() && verdict_prs.contains(pr))
                 || reviews
                     .as_ref()
                     .is_some_and(|rows| crate::review::reviewed(rows, pr, &target))
                 || crate::review::wait_marker(root, pr).is_some_and(|mark| mark.is_file())
             {
                 return;
-            }
-            let detail = part.map_or_else(
-                || format!("PR {pr}"),
-                |part| format!("part {part}, PR {pr}"),
-            );
-            let mut action = Action::new(
-                ActionKind::PrOpenUnreviewed,
-                &target,
-                &track.since,
-                format!("cm brief {}", shell_word(&target)),
-                detail,
-            );
+            } else {
+                // A head after a verdict is owed its review from that verdict on, not from pr-open.
+                let since = on_step
+                    .iter()
+                    .filter(|review| review.pr.as_deref() == Some(pr))
+                    .map(|review| review.at.as_str())
+                    .chain([track.since.as_str()])
+                    .max_by_key(|at| instant(at))
+                    .unwrap_or_default()
+                    .to_owned();
+                (
+                    since,
+                    format!("cm brief {}", shell_word(&target)),
+                    format!("{detail}: no verdict at {head_word}"),
+                )
+            };
+            let mut action = Action::new(ActionKind::ReviewOwed, &target, &since, command, detail);
             action.part = part.map(str::to_owned);
             actions.push(action);
         };
@@ -728,7 +1339,45 @@ fn actionable(
             ),
         )
     }));
+    for item in unblock_now(root, units, None) {
+        let condition = item["condition"].as_str().unwrap_or_default();
+        actions.push(Action::new(
+            ActionKind::UnblockNow,
+            item["target"].as_str().unwrap_or_default(),
+            item["since"].as_str().unwrap_or_default(),
+            item["command"].as_str().unwrap_or_default().to_owned(),
+            format!("{condition} holds"),
+        ));
+    }
     waiting_counts(root, units, &mut actions);
+    actions.extend(releasing);
+    actions.extend(deploying);
+    for action in &mut actions {
+        let Some(step) = step(units, &action.target) else {
+            continue;
+        };
+        action.lane = step.lane.map(Lane::name);
+        let track = match action.part.as_deref() {
+            Some(part) => step.parts.get(part),
+            None => Some(&step.track),
+        };
+        let Some(pr) = track.and_then(|track| track.evidence.pr.clone()) else {
+            continue;
+        };
+        let name = action.part.as_deref().map_or_else(
+            || action.target.clone(),
+            |part| format!("{}#{part}", action.target),
+        );
+        let observed = seen.get(&pr).filter(|observed| observed.target == name);
+        action.head = observed
+            .and_then(|observed| observed.head.clone())
+            .or_else(|| track.and_then(|track| track.evidence.sha.clone()));
+        action.base = observed.and_then(|observed| observed.base.clone());
+        action.ci_green = observed
+            .filter(|observed| observed.ci_head.is_some() && observed.ci_head == action.head)
+            .and_then(|observed| observed.ci_green);
+        action.pr = Some(pr);
+    }
     actions.sort_by(|a, b| {
         (Reverse(a.waiting_count), &a.target, &a.part, a.kind).cmp(&(
             Reverse(b.waiting_count),
@@ -761,7 +1410,10 @@ fn action_scope(
 }
 
 fn append_actions(outcome: &mut Outcome, number: &mut usize, actions: &[Action]) {
-    for action in actions {
+    for action in actions
+        .iter()
+        .filter(|action| !action.kind.printed_by_next())
+    {
         outcome.line(next_item(number, &action.summary(), &action.command));
     }
     outcome.field("actionable", json!(actions));
@@ -823,6 +1475,9 @@ pub struct Observed {
     pub ci_head: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_base: Option<String>,
+    /// Whether every check run and status was green when CI completed at `ci_head`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_green: Option<bool>,
     pub target: String,
     pub at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -980,7 +1635,7 @@ pub(crate) fn review_wait_line(wait: &Value) -> String {
 
 pub struct Next {
     pub paused: bool,
-    pub ready: Vec<(String, Option<Lane>, Finish)>,
+    pub launchable: Vec<(String, Option<Lane>, Finish)>,
     pub waiting: Vec<(String, Vec<String>)>,
 }
 
@@ -1023,12 +1678,12 @@ pub(crate) fn unblock_command(target: &str, condition_met: bool) -> String {
 pub fn summary(root: &Path, units: &Units) -> Next {
     let paused = paused(root).unwrap_or(true);
     let quota = limits::codex_pause();
-    let mut ready = Vec::new();
+    let mut launchable = Vec::new();
     let mut waiting = Vec::new();
     for candidate in candidates(root, units) {
         let quota_hold = candidate.dispatch_hold(quota.as_deref());
-        if !paused && candidate.ready() && quota_hold.is_none() {
-            ready.push((
+        if candidate.launchable(paused, quota.as_deref()) {
+            launchable.push((
                 candidate.target.clone(),
                 candidate.lane(),
                 candidate.finish(),
@@ -1041,7 +1696,7 @@ pub fn summary(root: &Path, units: &Units) -> Next {
     }
     Next {
         paused,
-        ready,
+        launchable,
         waiting,
     }
 }
@@ -1272,16 +1927,12 @@ pub fn next_at(
     let ready: Vec<&Candidate> = all
         .iter()
         .filter(in_lane)
-        .filter(|candidate| {
-            !paused && candidate.ready() && candidate.dispatch_hold(quota).is_none()
-        })
+        .filter(|candidate| candidate.launchable(paused, quota))
         .collect();
     let waiting: Vec<&Candidate> = all
         .iter()
         .filter(in_lane)
-        .filter(|candidate| {
-            paused || !candidate.ready() || candidate.dispatch_hold(quota).is_some()
-        })
+        .filter(|candidate| !candidate.launchable(paused, quota))
         .collect();
     if paused {
         outcome.line("paused: nothing is next while LIMITS.toml has `paused = true`");

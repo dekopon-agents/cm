@@ -24,3 +24,8 @@ pr_ci_deadline_min = 8
 
 # cm next and cm sync flag a launched codex-lane step with no PR once its attempt is older.
 codex_stall_hours = 2
+
+# cm next --act lists a release line once its oldest unreleased merge is older than this. Absent, off.
+# release_after_hours = 4
+# cm next --act lists a line's newest release once it waits this long for its rollout. Absent, off.
+# deploy_after_hours = 4

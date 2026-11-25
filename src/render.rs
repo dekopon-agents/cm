@@ -472,8 +472,8 @@ pub(crate) fn card_with_rate_limit(
             }
         }
     };
-    let ready: Vec<String> = next
-        .ready
+    let launchable: Vec<String> = next
+        .launchable
         .iter()
         .map(|(target, lane, finish)| {
             next_item(
@@ -550,7 +550,7 @@ pub(crate) fn card_with_rate_limit(
             "",
         ),
     }
-    section(&mut out, "Next", &ready, "Nothing is launchable.");
+    section(&mut out, "Next", &launchable, "Nothing is launchable.");
     section(&mut out, "Waiting", &waiting, "Nothing waits.");
     section(&mut out, "In flight", &flight, "Nothing is in flight.");
     section(&mut out, "Blocked", &blocked, "Nothing is blocked.");

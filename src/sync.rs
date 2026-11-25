@@ -45,6 +45,7 @@ struct PullRead {
 #[derive(Clone, Default)]
 struct OpenChecks {
     completed: bool,
+    green: bool,
     etags: BTreeMap<String, String>,
 }
 
@@ -444,10 +445,15 @@ impl<'a> Run<'a> {
         cached(&mut self.reads.open_checks, key, self.forge, |forge| {
             let mut etags = BTreeMap::new();
             let checks = forge.checks_conditional(repo, head, previous, &mut etags)?;
-            let completed = checks.is_some_and(|checks| {
+            let completed = checks.as_ref().is_some_and(|checks| {
                 !checks.is_empty() && checks.iter().all(CheckState::completed)
             });
-            Ok(OpenChecks { completed, etags })
+            let green = checks.as_deref().is_some_and(ci_green);
+            Ok(OpenChecks {
+                completed,
+                green,
+                etags,
+            })
         })
     }
 
@@ -872,6 +878,7 @@ impl<'a> Run<'a> {
                     let previous = self.seen.get(&url).filter(|seen| seen.target == target);
                     let mut ci_head = previous.and_then(|seen| seen.ci_head.clone());
                     let mut ci_base = previous.and_then(|seen| seen.ci_base.clone());
+                    let mut ci_green = previous.and_then(|seen| seen.ci_green);
                     if let (Some(head), Some(base), Some(repo)) = (&head, &base, GithubRepo::of_pr(&url))
                         && ci_head.as_deref() != Some(head.as_str())
                     {
@@ -884,6 +891,7 @@ impl<'a> Run<'a> {
                             if checks.completed {
                                 ci_head = Some(head.to_string());
                                 ci_base = Some(base.to_string());
+                                ci_green = Some(checks.green);
                             }
                         }
                     }
@@ -893,6 +901,7 @@ impl<'a> Run<'a> {
                             base: base.map(|base| base.to_string()),
                             ci_head,
                             ci_base,
+                            ci_green,
                             target: target.clone(),
                             at: cached_at.unwrap_or_else(|| self.at.clone()),
                             head: head.map(|head| head.to_string()),

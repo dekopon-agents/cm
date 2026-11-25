@@ -177,9 +177,9 @@ fn next_and_card_number_actions_with_the_same_commands() {
             0,
             "cm watch 01-a/u/WATCH resolve 1 --evidence '<watch-evidence-file>'",
         ),
-        ("actionable", 0, "cm brief 01-a/u/DIRTY"),
+        ("printed", 0, "cm brief 01-a/u/DIRTY"),
         (
-            "actionable",
+            "printed",
             1,
             "cm amend 01-a/u/NO-KICKOFF --kickoff-file '<kickoff-file>'",
         ),
@@ -193,8 +193,34 @@ fn next_and_card_number_actions_with_the_same_commands() {
         })
         .collect();
     assert_eq!(numbered.len(), expected.len(), "{text}");
+    // `cm next` prints each action it does not already list as a next, unblock or watch item.
+    let actions = json["actionable"].as_array().unwrap();
+    let kinds = |kind: &str| {
+        actions
+            .iter()
+            .filter(|action| action["kind"] == kind)
+            .map(|action| action["target"].as_str().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        kinds("launchable-not-launched"),
+        ["01-a/u/READY", "01-a/u/LOCAL"]
+    );
+    assert_eq!(kinds("unblock-now"), ["01-a/u/BLOCKED"]);
+    let printed: Vec<_> = actions
+        .iter()
+        .filter(|action| {
+            !["launchable-not-launched", "unblock-now", "expired-watch"]
+                .contains(&action["kind"].as_str().unwrap())
+        })
+        .collect();
     for (n, (field, index, command)) in expected.iter().enumerate() {
-        assert_eq!(json[*field][*index]["command"], *command);
+        let item = if *field == "printed" {
+            printed[*index]
+        } else {
+            &json[*field][*index]
+        };
+        assert_eq!(item["command"], *command);
         assert!(numbered[n].starts_with(&format!("{}. ", n + 1)), "{text}");
         assert!(numbered[n].ends_with(&format!(" — `{command}`")), "{text}");
     }
@@ -5258,7 +5284,7 @@ fn next_act_orders_coordinator_actions_and_matches_the_card_until_they_clear() {
     assert_eq!(
         order,
         [
-            ("pr-open-unreviewed", 3),
+            ("review-owed", 3),
             ("missing-kickoff", 2),
             ("stalled-attempt", 1),
             ("earlier-coordinator", 0),
@@ -5340,7 +5366,7 @@ esac"#
         STALL,
         Some(&stall_claim),
         Act::End {
-            outcome: cm::state::AttemptOutcome::Complete,
+            outcome: cm::state::AttemptOutcome::Unknown,
             file: None,
         },
     );
@@ -5352,6 +5378,47 @@ esac"#
         Act::Claim {
             coordinator: "session_current".into(),
             expect: 1,
+        },
+    );
+    // The written kickoff makes the packet launchable, and the ended attempt owes its restart.
+    let owed = coordinator_cm(&c, &["next", "--act", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(owed.status.code(), Some(1), "{owed:?}");
+    let owed: serde_json::Value = serde_json::from_slice(&owed.stdout).unwrap();
+    let owed: Vec<_> = owed["actionable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|action| {
+            (
+                action["kind"].as_str().unwrap().to_owned(),
+                action["command"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        owed,
+        [
+            (
+                "launchable-not-launched".to_owned(),
+                format!("cm launch {PACKET}")
+            ),
+            (
+                "attempt-ended".to_owned(),
+                format!("cm attempt {STALL} restart --lane claude-cloud")
+            ),
+        ]
+    );
+    launch_for(&host, &c, PACKET, "session_current");
+    attempt_action(
+        &host,
+        &c,
+        STALL,
+        Some(&stall_claim),
+        Act::Restart {
+            lane: Lane::ClaudeCloud,
+            file: None,
         },
     );
     let clear = coordinator_cm(&c, &["next", "--act"]).output().unwrap();
@@ -5657,8 +5724,14 @@ fn pauses_explain_dispatch_holds_without_becoming_actions() {
     let refused: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
     assert_eq!(refused["violations"][0], named["violations"][0]);
     assert_eq!(state(&c, codex), Phase::Drafted);
-    let act = quota(&["next", "--act"]);
-    assert!(act.status.success() && act.stdout.is_empty(), "{act:?}");
+    // The held Codex step is no action; the cloud step the hold does not touch is launchable.
+    let act = quota(&["next", "--act", "--json"]);
+    assert_eq!(act.status.code(), Some(1), "{act:?}");
+    let act: serde_json::Value = serde_json::from_slice(&act.stdout).unwrap();
+    let act = act["actionable"].as_array().unwrap();
+    assert_eq!(act.len(), 1, "{act:?}");
+    assert_eq!(act[0]["kind"], "launchable-not-launched");
+    assert_eq!(act[0]["target"], cloud);
 
     let launched = quota(&["launch", cloud]);
     assert!(launched.status.success(), "{launched:?}");
@@ -5923,7 +5996,7 @@ esac
         lines
             .next()
             .unwrap()
-            .starts_with("pr-open-unreviewed 01-a/u/with-pr:")
+            .starts_with("review-owed 01-a/u/with-pr:")
     );
     assert!(
         lines
@@ -5940,7 +6013,7 @@ esac
         act["actionable"][0]["command"],
         "turn-logs no-pr --turn-id latest-turn"
     );
-    assert_eq!(act["actionable"][3]["kind"], "pr-open-unreviewed");
+    assert_eq!(act["actionable"][3]["kind"], "review-owed");
 
     fs::write(reader.with_extension("fail-running"), "").unwrap();
     let failed_after_running = sync(&now, &forge, &c.root).unwrap();
@@ -6081,4 +6154,462 @@ echo '{"done":true,"successful":true,"turn_status":"completed"}'
                 .all(|action| action["kind"] != "turn-ended")
         );
     }
+}
+
+fn actions_of(c: &Campaign, now: Timestamp, kind: &str) -> Vec<(String, String, String)> {
+    plan::next_at(&c.root, None, None, now).unwrap().fields["actionable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|action| action["kind"] == kind)
+        .map(|action| {
+            (
+                action["target"].as_str().unwrap().to_owned(),
+                action["since"].as_str().unwrap().to_owned(),
+                action["command"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// Moves a step's track by hand, with its history line, for states no fixture forge produces.
+fn set_track(host: &Fake, c: &Campaign, target: &str, to: Phase, evidence: Evidence) {
+    let (unit, name) = target.rsplit_once('/').unwrap();
+    let dir = c.root.join(unit);
+    let mut state = store::load_unit(&dir).unwrap();
+    let track = &mut state.steps.get_mut(name).unwrap().track;
+    let from = std::mem::replace(&mut track.state, to.clone());
+    track.since = cm::host::stamp(host.now);
+    track.evidence = evidence;
+    state.history.push(cm::state::Move {
+        at: track.since.clone(),
+        target: target.to_owned(),
+        from,
+        to,
+        evidence: Evidence::default(),
+    });
+    commands::write_unit(&dir, &state).unwrap();
+}
+
+fn add_limit(c: &Campaign, line: &str) {
+    let path = c.root.join("LIMITS.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    fs::write(path, format!("{text}\n{line}\n")).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn launchable_steps_are_actions_on_the_predicate_next_lists_them_by() {
+    let old = at("2026-11-22T10:00:00Z");
+    let later = at("2026-11-22T12:00:00Z");
+    let now = at("2026-11-22T13:00:00Z").now;
+    let c = campaign(&old);
+    assert!(declare(&old, &c, "01-a/u/gate", Lane::Pi, &[]).ok());
+    assert!(
+        declare(
+            &old,
+            &c,
+            "01-a/u/next",
+            Lane::ClaudeCloud,
+            &["pr-open:gate"]
+        )
+        .ok()
+    );
+    assert!(declare(&old, &c, "01-a/u/mac", Lane::Mac, &[]).ok());
+    for step in ["01-a/u/gate", "01-a/u/next", "01-a/u/mac"] {
+        kickoff(&c, step);
+    }
+    let listed = |c: &Campaign| {
+        let next = plan::next_at(&c.root, None, None, now).unwrap();
+        next.fields["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["target"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let launchable = actions_of(&c, now, "launchable-not-launched");
+    assert_eq!(
+        launchable,
+        [(
+            "01-a/u/gate".to_owned(),
+            "2026-11-22T10:00Z".to_owned(),
+            "cm launch 01-a/u/gate --worktree '<worktree-path>'".to_owned()
+        )]
+    );
+    assert_eq!(listed(&c), ["01-a/u/gate"]);
+    // The gate cleared two hours after the step was declared: it is launchable from then.
+    open_pr(&later, &c, "01-a/u/gate", "https://github.com/o/r/pull/1");
+    assert_eq!(
+        actions_of(&c, now, "launchable-not-launched"),
+        [(
+            "01-a/u/next".to_owned(),
+            "2026-11-22T12:00Z".to_owned(),
+            "cm launch 01-a/u/next".to_owned()
+        )]
+    );
+    assert_eq!(listed(&c), ["01-a/u/next"]);
+    launch_for(&later, &c, "01-a/u/next", "session_current");
+    assert!(actions_of(&c, now, "launchable-not-launched").is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_ended_attempt_names_the_move_its_outcome_allows() {
+    use cm::attempt::Act;
+    use cm::state::AttemptOutcome;
+
+    let old = at("2026-11-22T10:00:00Z");
+    let now = at("2026-11-22T11:00:00Z").now;
+    let c = campaign(&old);
+    let mut claims = BTreeMap::new();
+    for (step, work, outcome) in [
+        ("01-a/u/lost", Work::Code, AttemptOutcome::Unknown),
+        ("01-a/u/built", Work::Code, AttemptOutcome::Complete),
+        ("01-a/u/opened", Work::Code, AttemptOutcome::Complete),
+        ("01-a/u/study", Work::Study, AttemptOutcome::Complete),
+    ] {
+        assert!(declare_work(&old, &c, step, Lane::ClaudeCloud, &[], work).ok());
+        let claim = launch_for(&old, &c, step, "session_current");
+        attempt_action(
+            &old,
+            &c,
+            step,
+            Some(&claim),
+            Act::End {
+                outcome,
+                file: None,
+            },
+        );
+        claims.insert(step, claim);
+    }
+    // An attempt that ended complete with its PR recorded owes nothing here.
+    let dir = c.root.join("01-a/u");
+    let mut unit = store::load_unit(&dir).unwrap();
+    unit.steps.get_mut("opened").unwrap().track.evidence.pr =
+        Some("https://github.com/o/r/pull/3".into());
+    commands::write_unit(&dir, &unit).unwrap();
+    let ended = |c: &Campaign| {
+        actions_of(c, now, "attempt-ended")
+            .into_iter()
+            .map(|(target, _, command)| (target, command))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ended(&c),
+        [
+            (
+                "01-a/u/built".to_owned(),
+                "cm advance 01-a/u/built pr-open --pr '<pr-url>' --sha '<head-sha>'".to_owned()
+            ),
+            (
+                "01-a/u/lost".to_owned(),
+                "cm attempt 01-a/u/lost restart --lane claude-cloud".to_owned()
+            ),
+            (
+                "01-a/u/study".to_owned(),
+                "cm advance 01-a/u/study done --evidence '<evidence-file>'".to_owned()
+            ),
+        ]
+    );
+    for kind in ["turn-ended", "stalled-attempt"] {
+        assert!(actions_of(&c, now, kind).is_empty(), "{kind}");
+    }
+    attempt_action(
+        &old,
+        &c,
+        "01-a/u/lost",
+        Some(&claims["01-a/u/lost"]),
+        Act::Restart {
+            lane: Lane::ClaudeCloud,
+            file: None,
+        },
+    );
+    assert_eq!(ended(&c).len(), 2);
+    assert!(!ended(&c).iter().any(|(target, _)| target == "01-a/u/lost"));
+}
+
+#[test]
+fn a_release_lines_old_merges_are_one_action_under_the_dial() {
+    let old = at("2026-11-22T08:00:00Z");
+    let now = at("2026-11-22T16:00:00Z").now;
+    let c = campaign(&old);
+    assert!(
+        declare_release(
+            &old,
+            &c,
+            "00-release/widget/1.0.0",
+            "o/widget",
+            "v{version}"
+        )
+        .ok()
+    );
+    set_track(
+        &old,
+        &c,
+        "00-release/widget/1.0.0",
+        Phase::Released,
+        Evidence {
+            tag: Some("v1.0.0".into()),
+            ..Evidence::default()
+        },
+    );
+    for (step, pr) in [
+        ("01-a/u/one", "https://github.com/o/widget/pull/1"),
+        ("01-a/u/two", "https://github.com/o/widget/pull/2"),
+        (
+            "01-a/u/homelab",
+            "https://github.com/xrl/rpi-homelab/pull/3",
+        ),
+        ("01-a/u/trail", "https://github.com/o/campaign-trail/pull/4"),
+    ] {
+        assert!(declare(&old, &c, step, Lane::Codex, &[]).ok());
+        set_track(
+            &old,
+            &c,
+            step,
+            Phase::Merged,
+            Evidence {
+                pr: Some(pr.into()),
+                sha: Some("a".repeat(40)),
+                merged_at: Some("2026-11-22T09:00:00Z".into()),
+                ..Evidence::default()
+            },
+        );
+    }
+    let held = |c: &Campaign| actions_of(c, now, "merged-unreleased");
+    assert!(held(&c).is_empty(), "the dial is absent");
+    add_limit(&c, "release_after_hours = 10");
+    assert!(held(&c).is_empty(), "the merges are 7 h old");
+    let limits = fs::read_to_string(c.root.join("LIMITS.toml")).unwrap();
+    fs::write(
+        c.root.join("LIMITS.toml"),
+        limits.replace("release_after_hours = 10", "release_after_hours = 4"),
+    )
+    .unwrap();
+    let next = plan::next_at(&c.root, None, None, now).unwrap();
+    let actions: Vec<_> = next.fields["actionable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|action| action["kind"] == "merged-unreleased")
+        .collect();
+    assert_eq!(
+        actions.len(),
+        1,
+        "one line for the widget line, none for the others"
+    );
+    assert_eq!(actions[0]["target"], "00-release/widget");
+    assert_eq!(actions[0]["waiting_count"], 2);
+    assert_eq!(actions[0]["since"], "2026-11-22T09:00:00Z");
+    assert_eq!(
+        actions[0]["command"],
+        "cm init 00-release/widget/'<version>' --lane pi --after 00-release/widget/1.0.0 --after 01-a/u/one --after 01-a/u/two --kickoff-file '<kickoff-file>'"
+    );
+    let paused = limits.replace("paused = false", "paused = true");
+    fs::write(c.root.join("LIMITS.toml"), &paused).unwrap();
+    assert!(held(&c).is_empty(), "nothing launches while paused");
+    fs::write(
+        c.root.join("LIMITS.toml"),
+        limits.replace("release_after_hours = 10", "release_after_hours = 4"),
+    )
+    .unwrap();
+    // Declaring the cut names it; launching it puts the release in flight.
+    assert!(
+        declare_release(
+            &old,
+            &c,
+            "00-release/widget/1.1.0",
+            "o/widget",
+            "v{version}"
+        )
+        .ok()
+    );
+    assert_eq!(
+        held(&c),
+        [(
+            "00-release/widget/1.1.0".to_owned(),
+            "2026-11-22T09:00:00Z".to_owned(),
+            "cm amend 00-release/widget/1.1.0 --kickoff-file '<kickoff-file>'".to_owned()
+        )]
+    );
+    set_track(
+        &old,
+        &c,
+        "00-release/widget/1.1.0",
+        Phase::Launched,
+        Evidence::default(),
+    );
+    assert!(held(&c).is_empty());
+}
+
+#[test]
+fn a_release_no_merged_step_deploys_is_owed_its_deploy_under_the_dial() {
+    let old = at("2026-11-22T08:00:00Z");
+    let now = at("2026-11-22T16:00:00Z").now;
+    let c = campaign(&old);
+    for (release, repo) in [
+        ("00-release/widget/1.0.0", "o/widget"),
+        ("00-release/gadget/1.0.0", "o/gadget"),
+        ("00-release/gadget/2.0.0", "o/gadget"),
+        ("00-release/lone/1.0.0", "o/lone"),
+    ] {
+        assert!(declare_release(&old, &c, release, repo, "v{version}").ok());
+        set_track(&old, &c, release, Phase::Released, Evidence::default());
+    }
+    for (pin, gate) in [
+        ("01-a/u/widget-pin", "tag:widget@1.0.0"),
+        ("01-a/u/gadget-pin", "tag:gadget@1.0.0"),
+    ] {
+        assert!(declare_work(&old, &c, pin, Lane::Coordinator, &[gate], Work::Rollout).ok());
+    }
+    set_track(
+        &old,
+        &c,
+        "01-a/u/gadget-pin",
+        Phase::Merged,
+        Evidence::default(),
+    );
+    let owed = |c: &Campaign| actions_of(c, now, "released-undeployed");
+    assert!(owed(&c).is_empty(), "the dial is absent");
+    add_limit(&c, "deploy_after_hours = 4");
+    // gadget 2.0.0 has no deploy step; lone has never been deployed by any step.
+    assert_eq!(
+        owed(&c),
+        [
+            (
+                "00-release/gadget/2.0.0".to_owned(),
+                "2026-11-22T08:00Z".to_owned(),
+                "tools/cloud-env/deploy.sh 00-release/gadget/2.0.0".to_owned()
+            ),
+            (
+                "01-a/u/widget-pin".to_owned(),
+                "2026-11-22T08:00Z".to_owned(),
+                "cm amend 01-a/u/widget-pin --kickoff-file '<kickoff-file>'".to_owned()
+            ),
+        ]
+    );
+    // A launchable deploy is already its own line; a merged pin is the deploy.
+    kickoff(&c, "01-a/u/widget-pin");
+    assert_eq!(owed(&c).len(), 1);
+    assert_eq!(
+        actions_of(&c, now, "launchable-not-launched")[0].0,
+        "01-a/u/widget-pin"
+    );
+    set_track(
+        &old,
+        &c,
+        "01-a/u/widget-pin",
+        Phase::Merged,
+        Evidence::default(),
+    );
+    assert_eq!(owed(&c)[0].0, "00-release/gadget/2.0.0");
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_blocks_held_unblocks_and_expired_watches_owe_their_moves() {
+    let old = at("2026-11-21T10:00:00Z");
+    let recent = at("2026-11-22T11:00:00Z");
+    let now = at("2026-11-22T12:00:00Z").now;
+    let c = campaign(&old);
+    for step in ["01-a/u/stuck", "01-a/u/fresh", "01-a/u/held", "01-a/u/gate"] {
+        assert!(declare(&old, &c, step, Lane::Pi, &[]).ok());
+    }
+    assert!(
+        advance(
+            &old,
+            &c,
+            "01-a/u/stuck",
+            "blocked:waiting-on-a-person",
+            Evidence::default()
+        )
+        .ok()
+    );
+    assert!(
+        advance(
+            &recent,
+            &c,
+            "01-a/u/fresh",
+            "blocked:waiting-on-a-person",
+            Evidence::default()
+        )
+        .ok()
+    );
+    assert!(
+        advance(
+            &old,
+            &c,
+            "01-a/u/held",
+            "blocked:until:pr-open:gate",
+            Evidence::default()
+        )
+        .ok()
+    );
+    assert_eq!(
+        actions_of(&c, now, "stale-block"),
+        [(
+            "01-a/u/stuck".to_owned(),
+            "2026-11-21T10:00Z".to_owned(),
+            "cm unblock 01-a/u/stuck --evidence '<unblock-evidence-file>'".to_owned()
+        )]
+    );
+    assert!(actions_of(&c, now, "unblock-now").is_empty());
+    kickoff(&c, "01-a/u/gate");
+    open_pr(&old, &c, "01-a/u/gate", "https://github.com/o/r/pull/1");
+    assert_eq!(
+        actions_of(&c, now, "unblock-now"),
+        [(
+            "01-a/u/held".to_owned(),
+            "2026-11-21T10:00Z".to_owned(),
+            "cm unblock 01-a/u/held".to_owned()
+        )]
+    );
+    let answered = c.root.join("01-a/u/stuck/evidence/answered.md");
+    fs::create_dir_all(answered.parent().unwrap()).unwrap();
+    fs::write(&answered, "the person answered\n").unwrap();
+    for (step, file) in [
+        ("01-a/u/stuck", Some(answered.as_path())),
+        ("01-a/u/held", None),
+    ] {
+        let back =
+            commands::unblock(&recent, &c.root, &parse_target(step, false).unwrap(), file).unwrap();
+        assert!(back.ok(), "{:?}", back.violations);
+    }
+    assert!(actions_of(&c, now, "stale-block").is_empty());
+    assert!(actions_of(&c, now, "unblock-now").is_empty());
+
+    const PROBE: &str = "01-a/u/probe";
+    assert!(declare_work(&old, &c, PROBE, Lane::ClaudeCloud, &[], Work::Study).ok());
+    launch_for(&old, &c, PROBE, "session_current");
+    let added = cm::holds::watch_add(
+        &old,
+        &c.root,
+        &parse_target(PROBE, true).unwrap(),
+        "log:broker.decision",
+        "2026-11-21T12:00Z",
+    )
+    .unwrap();
+    assert!(added.ok(), "{:?}", added.violations);
+    assert_eq!(
+        actions_of(&c, now, "expired-watch"),
+        [(
+            PROBE.to_owned(),
+            "2026-11-21T12:00Z".to_owned(),
+            format!("cm watch {PROBE} resolve 1 --evidence '<watch-evidence-file>'")
+        )]
+    );
+    let seen = c.root.join(PROBE).join("evidence/seen.md");
+    fs::create_dir_all(seen.parent().unwrap()).unwrap();
+    fs::write(&seen, "the decision span arrived\n").unwrap();
+    let resolved = cm::holds::watch_resolve(
+        &recent,
+        &c.root,
+        &parse_target(PROBE, true).unwrap(),
+        1,
+        &seen,
+    )
+    .unwrap();
+    assert!(resolved.ok(), "{:?}", resolved.violations);
+    assert!(actions_of(&c, now, "expired-watch").is_empty());
 }

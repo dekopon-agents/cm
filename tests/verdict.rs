@@ -4089,3 +4089,83 @@ fn review_wait_does_not_match_an_outer_round_through_a_malformed_inner_campaign(
         }
     }
 }
+
+#[test]
+fn review_owed_and_merge_ready_follow_the_observed_head_and_its_verdicts() {
+    let host = at("2026-10-25T00:00Z");
+    let c = campaign(&host, true);
+    let owed = |c: &Campaign| -> Vec<(String, String)> {
+        plan::next_at(&c.root, None, None, host.now())
+            .unwrap()
+            .fields["actionable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|action| {
+                ["review-owed", "merge-ready"].contains(&action["kind"].as_str().unwrap())
+            })
+            .map(|action| {
+                (
+                    action["kind"].as_str().unwrap().to_owned(),
+                    action["command"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let brief = ("review-owed".to_owned(), format!("cm brief {STEP}"));
+    assert_eq!(owed(&c), std::slice::from_ref(&brief));
+    let fix = c.report(
+        "r1",
+        &c.head(),
+        &["F1 | contract | introduced | src/lib.rs:40 | the refusal drops its reason"],
+        "FIX REQUIRED",
+    );
+    assert!(record(&host, &c, &fix, "astra").ok());
+    assert_eq!(
+        owed(&c),
+        [(
+            "review-owed".to_owned(),
+            format!(
+                "cm attention --pr {PR} --worker '<worker-session>' --coordinator '<coordinator-session>'"
+            )
+        )]
+    );
+    // The worker's new head, observed green by sync, is owed its own review.
+    git(&c.repo, &["commit", "-q", "--allow-empty", "-m", "fix"]);
+    let mut forge = FakeForge::open(&c.head(), &[("test", "success")]);
+    forge.campaign = Some(c.root.clone());
+    forge.base = Some("b".repeat(40));
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    let seen: serde_json::Value = store::read_json(&plan::pulls_path(&c.root)).unwrap();
+    assert_eq!(seen[PR]["ci_green"], true);
+    assert_eq!(owed(&c), std::slice::from_ref(&brief));
+    accepted(&host, &c);
+    let next = plan::next_at(&c.root, None, None, host.now()).unwrap();
+    let ready = next.fields["actionable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["kind"] == "merge-ready")
+        .unwrap()
+        .clone();
+    assert_eq!(ready["lane"], "codex");
+    assert_eq!(ready["pr"], PR);
+    assert_eq!(ready["head"], c.head());
+    assert_eq!(ready["base"], "b".repeat(40));
+    assert_eq!(ready["ci_green"], true);
+    assert_eq!(
+        owed(&c),
+        [(
+            "merge-ready".to_owned(),
+            format!("cm advance {STEP} merged --pr {PR} --sha '<merge-sha>'")
+        )]
+    );
+    // A red head is owed its review and is not merge-ready.
+    git(&c.repo, &["commit", "-q", "--allow-empty", "-m", "again"]);
+    forge.head = c.head();
+    forge.checks = vec![("test", "failure")];
+    sync(&host, &forge, &c.root).unwrap();
+    let seen: serde_json::Value = store::read_json(&plan::pulls_path(&c.root)).unwrap();
+    assert_eq!(seen[PR]["ci_green"], false);
+    assert_eq!(owed(&c), [brief]);
+}
