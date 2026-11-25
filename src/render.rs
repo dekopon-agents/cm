@@ -394,9 +394,11 @@ pub fn card(
     let mut out = format!(
         "# {name} card\n\nRendered by `cm sync` from cm state after reading GitHub; the next sync overwrites it.\n\n"
     );
-    let (count, oldest) = crate::plan::action_summary(root, units, now);
-    let oldest = oldest.as_deref().unwrap_or("—");
-    out.push_str(&format!("Actionable: {count} (oldest: {oldest})\n\n"));
+    for line in crate::plan::card_lines(root, units, now, next.launchable.len()) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push('\n');
     if next.paused {
         out.push_str("**Paused:** LIMITS.toml has `paused = true`; nothing launches.\n\n");
     }
@@ -471,8 +473,8 @@ pub fn card(
             }
         }
     };
-    let ready: Vec<String> = next
-        .ready
+    let launchable: Vec<String> = next
+        .launchable
         .iter()
         .map(|(target, lane, finish)| {
             next_item(
@@ -537,7 +539,7 @@ pub fn card(
             "",
         ),
     }
-    section(&mut out, "Next", &ready, "Nothing is launchable.");
+    section(&mut out, "Next", &launchable, "Nothing is launchable.");
     section(&mut out, "Waiting", &waiting, "Nothing waits.");
     section(&mut out, "In flight", &flight, "Nothing is in flight.");
     section(&mut out, "Blocked", &blocked, "Nothing is blocked.");

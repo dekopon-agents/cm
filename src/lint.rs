@@ -431,17 +431,18 @@ fn lint_holds(root: &Path, unit: &UnitState, seen: &mut Seen, out: &mut Vec<Viol
         {
             seen.warnings.push(format!("release-artifacts-undeclared: {target} declares no artifacts; cm amend {target} --artifact <spec>"));
         }
-        if let Phase::Blocked(reason) = &step.track.state
-            && !reason.starts_with("until:")
-            && crate::plan::instant(&step.track.since)
-                .is_some_and(|since| seen.now.duration_since(since).as_secs() > 24 * 3600)
-        {
+        if let Some(reason) = crate::plan::stale_block(step, seen.now) {
             let mentioned = latest_mention(&seen.mentions, &target)
                 .zip(crate::plan::instant(&step.track.since))
                 .is_some_and(|(at, since)| at > since);
             if !mentioned {
                 seen.warnings.push(format!("block-stale: {target} has been blocked:{reason} for more than 24 h with no later journal title naming it"));
             }
+        }
+        if !step.track.state.is_final()
+            && let Ok(kickoff) = fs::read_to_string(root.join(&target).join("kickoff.md"))
+        {
+            out.extend(crate::plan::weight_violation(&target, &kickoff));
         }
         match undeclared_parts(root, &target, step) {
             Ok(found) => seen.warnings.extend(
@@ -868,6 +869,7 @@ pub fn lint_at(start: &Path, now: jiff::Timestamp) -> Result<Outcome> {
     for dir in &units {
         violations.extend(lint_unit(&root, dir, &mut seen));
     }
+    violations.extend(crate::ledger::lint_owner_queue_items(&root, &seen.units));
     for item in crate::plan::stale_bases(&root, &seen.units) {
         seen.warnings.push(crate::plan::stale_base_line(&item));
     }

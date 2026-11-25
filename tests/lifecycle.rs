@@ -146,7 +146,7 @@ fn init_never_overwrites_and_adopts_what_lints_clean() {
     fs::write(root.join("RESUME.md"), &resume).unwrap();
     fs::write(
         root.join("OWNER-QUEUE.md"),
-        "# Owner queue\n\n## Pick one\n\nAnswer:\n",
+        "# Owner queue\n\n## 1. Pick one\n\nAnswer:\n",
     )
     .unwrap();
     let journal = "# Journal\n\n## 2026-09-28 and 29: planning\n\n- old prose\n";
@@ -160,7 +160,7 @@ fn init_never_overwrites_and_adopts_what_lints_clean() {
     assert_eq!(fs::read_to_string(root.join("RESUME.md")).unwrap(), resume);
     assert_eq!(
         fs::read_to_string(root.join("OWNER-QUEUE.md")).unwrap(),
-        "# Owner queue\n\n## Pick one\n\nAnswer:\n"
+        "# Owner queue\n\n## 1. Pick one\n\nAnswer:\n"
     );
     let state = store::load_campaign(root).unwrap();
     assert_eq!(state.adopted, vec!["RESUME.md", "JOURNAL.md"]);
@@ -168,7 +168,7 @@ fn init_never_overwrites_and_adopts_what_lints_clean() {
 
     fs::write(
         root.join("OWNER-QUEUE.md"),
-        "# Owner queue\n\n## Pick one\n\nContext: two paths.\n\nRecommendation: the first\n\nAnswer:\n",
+        "# Owner queue\n\n## 1. Pick one\n\nContext: two paths.\n\nRecommendation: the first\n\nAnswer:\n",
     )
     .unwrap();
     let outcome = commands::init(&host, root).unwrap();
@@ -370,7 +370,7 @@ fn merged_non_release_steps_refuse_a_descendant_merge_sha() {
     let c = campaign(&host);
     let (repo, first) = repo(c.root.parent().unwrap());
     let step = "01-first/alpha/BUILD";
-    c.merged_step(&host, step, Lane::Coordinator, &repo, &first);
+    c.merged_step(&host, step, Lane::Pi, &repo, &first);
     git(
         &repo,
         &["commit", "-q", "--allow-empty", "-m", "second merge"],
@@ -883,7 +883,7 @@ fn lint_lists_every_violation_in_one_run() {
     fs::write(c.root.join("LIMITS.toml"), limits).unwrap();
     fs::write(
         c.root.join("OWNER-QUEUE.md"),
-        "# Owner queue\n\n## Pick one\n\nContext: two paths.\n\nRecommendation: yes\n",
+        "# Owner queue\n\n## 1. Pick one\n\nContext: two paths.\n\nRecommendation: yes\n",
     )
     .unwrap();
 
@@ -1303,7 +1303,7 @@ fn close_seals_the_campaign() {
     );
     fs::write(
         c.root.join("OWNER-QUEUE.md"),
-        "# Owner queue\n\n## Pick one\n\nContext: two paths.\n\nRecommendation: yes\n\nAnswer:\n",
+        "# Owner queue\n\n## 1. Pick one\n\nContext: two paths.\n\nRecommendation: yes\n\nAnswer:\n",
     )
     .unwrap();
 
@@ -1899,19 +1899,46 @@ fn coordinator_pr_steps_keep_their_ladder_and_gates() {
     let gate = cm::plan::gate(&units, &After::PrOpen(step.into()));
     assert_eq!(gate.needs(), Phase::PrOpen);
     assert!(gate.met());
+    // A coordinator-written PR takes the merge gate like any model lane's; this one waives it.
+    let refused = advance(
+        &host,
+        &c,
+        step,
+        "merged",
+        Evidence {
+            sha: Some(sha.clone()),
+            ..Evidence::default()
+        },
+    );
     assert!(
-        advance(
-            &host,
-            &c,
-            step,
-            "merged",
-            Evidence {
+        refused.violations.iter().any(|v| v.rule == "merge-gate"),
+        "{:?}",
+        refused.violations
+    );
+    let waiver = c.root.join("waiver.md");
+    fs::write(&waiver, "Merging without review for this fixture.\n").unwrap();
+    let merged = commands::advance_gated(
+        &host,
+        &c.root,
+        &target(step),
+        commands::Advance {
+            to: &Phase::Merged,
+            given: &Evidence {
                 sha: Some(sha),
                 ..Evidence::default()
-            }
-        )
-        .ok()
-    );
+            },
+            file: None,
+            repo: None,
+            part: None,
+            by: &[],
+        },
+        &commands::MergeGate {
+            waiver: Some(waiver),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(merged.ok(), "{:?}", merged.violations);
     for (keep_pr, keep_sha) in [(true, false), (false, true), (true, true)] {
         let mut units = cm::plan::load_units(&c.root).unwrap();
         let evidence = &mut units

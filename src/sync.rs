@@ -81,7 +81,10 @@ struct PullRead {
 
 #[derive(Clone, Default)]
 struct OpenChecks {
+    /// GitHub answered 304 for every page: nothing changed since the stored ETags.
+    unchanged: bool,
     completed: bool,
+    green: bool,
     etags: BTreeMap<String, String>,
 }
 
@@ -652,10 +655,16 @@ impl<'a> Run<'a> {
             move |forge| {
                 let mut etags = BTreeMap::new();
                 let checks = forge.checks_conditional(&repo, &head, &previous, &mut etags)?;
-                let completed = checks.is_some_and(|checks| {
+                let completed = checks.as_ref().is_some_and(|checks| {
                     !checks.is_empty() && checks.iter().all(CheckState::completed)
                 });
-                Ok(OpenChecks { completed, etags })
+                let green = checks.as_deref().is_some_and(ci_green);
+                Ok(OpenChecks {
+                    unchanged: checks.is_none(),
+                    completed,
+                    green,
+                    etags,
+                })
             },
         )
     }
@@ -732,7 +741,7 @@ impl<'a> Run<'a> {
         head: Option<&CommitSha>,
         base: Option<&CommitSha>,
     ) -> Option<Vec<String>> {
-        if step.lane != Some(Lane::Codex) {
+        if !crate::commands::merge_gated(target.split('#').next().unwrap_or(target), step) {
             return Some(Vec::new());
         }
         let Some(head) = head else {
@@ -1114,6 +1123,7 @@ impl<'a> Run<'a> {
                     let previous = self.seen.get(&url).filter(|seen| seen.target == target);
                     let mut ci_head = previous.and_then(|seen| seen.ci_head.clone());
                     let mut ci_base = previous.and_then(|seen| seen.ci_base.clone());
+                    let mut ci_green = previous.and_then(|seen| seen.ci_green);
                     // GitHub answers `unknown` while it computes mergeability: keep what was
                     // stored for the same head and base rather than write it twice.
                     let mergeable_state = match (&mergeable_state, previous) {
@@ -1126,21 +1136,46 @@ impl<'a> Run<'a> {
                         }
                         _ => mergeable_state,
                     };
+                    // Checks are read on every sync, conditionally: a check registered later or a
+                    // rerun at the same head changes what `ci_green` says about it. A check
+                    // page's ETag belongs to its own head's URL: a 304 says that page is
+                    // unchanged whatever `.cm/pulls.json` holds.
+                    // Finished CI at the same head is re-read with each full PR read (at least
+                    // every 30 minutes), so a quiet sync that GitHub answered 304 reads nothing;
+                    // CI not known green (pending, or a failed read) is read on every sync.
                     if let (Some(head), Some(base), Some(repo)) = (&head, &base, GithubRepo::of_pr(&url))
-                        && ci_head.as_deref() != Some(head.as_str())
+                        && (ci_head.as_deref() != Some(head.as_str())
+                            || cached_at.is_none()
+                            || ci_green.is_none())
                     {
-                        // A check page's ETag belongs to its own head's URL: a 304 says that
-                        // page is unchanged whatever `.cm/pulls.json` holds.
                         let validators = previous
                             .filter(|seen| seen.head.as_deref() == Some(head.as_str()))
                             .and_then(|_| self.last_read.get(&url))
                             .map(|read| read.etags.clone())
                             .unwrap_or_default();
-                        if let Some(Ok(checks)) = self.open_checks(&repo, head, &validators) {
-                            etags.extend(checks.etags);
-                            if checks.completed {
-                                ci_head = Some(head.to_string());
-                                ci_base = Some(base.to_string());
+                        let read = self.open_checks(&repo, head, &validators);
+                        if matches!(read, Some(Err(_))) {
+                            // An unread CI is unknown, never the last green.
+                            ci_green = None;
+                        }
+                        if let Some(Ok(checks)) = read {
+                            if checks.unchanged {
+                                for (page, tag) in validators {
+                                    etags.entry(page).or_insert(tag);
+                                }
+                            } else {
+                                etags.extend(checks.etags.clone());
+                                if checks.completed {
+                                    // CI ran against the base it saw then: a re-read at the same
+                                    // head keeps that base, so a moved base stays visible.
+                                    if ci_head.as_deref() != Some(head.as_str()) {
+                                        ci_head = Some(head.to_string());
+                                        ci_base = Some(base.to_string());
+                                    }
+                                    ci_green = Some(checks.green);
+                                } else {
+                                    ci_green = None;
+                                }
                             }
                         }
                     }
@@ -1153,6 +1188,7 @@ impl<'a> Run<'a> {
                         base: base.map(|base| base.to_string()),
                         ci_head,
                         ci_base,
+                        ci_green,
                         target: target.clone(),
                         at: cached_at.unwrap_or_else(|| self.at.clone()),
                         head: head.map(|head| head.to_string()),
@@ -1666,7 +1702,11 @@ fn run_sync(
             track.state == Phase::PrOpen && track.evidence.pr.as_deref() == Some(url.as_str())
         });
         if failed && current {
-            open.entry(url).or_insert(observed);
+            // The PR went unread, so its CI is unknown now: keep the rest, never the green.
+            open.entry(url).or_insert(plan::Observed {
+                ci_green: None,
+                ..observed
+            });
         }
     }
     let mut last_read = std::mem::take(&mut run.read_now);

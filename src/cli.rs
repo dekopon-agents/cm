@@ -81,7 +81,7 @@ enum Commands {
         #[arg(long, value_name = "F")]
         kickoff_file: Option<PathBuf>,
     },
-    /// List the declared steps whose `--after` is met, or, given one, refuse it unless it is next.
+    /// List the launchable steps (drafted, `--after` met, kickoff written, no pause or quota hold), or, given one, refuse it unless it is next.
     Next {
         /// <NN-name>/<unit>/<step>: check this step only.
         #[arg(value_parser = step_target)]
@@ -89,7 +89,7 @@ enum Commands {
         /// Only steps in this lane.
         #[arg(long)]
         lane: Option<Lane>,
-        /// Print only coordinator actions. Exit 1 when any remain.
+        /// Print only coordinator actions, launchable steps among them. Exit 1 when any remain.
         #[arg(long)]
         act: bool,
     },
@@ -171,9 +171,12 @@ enum Commands {
     },
     /// Change a drafted or launched step's declaration. Release --github/--tag/--artifact/--drop-artifact also allow pr-open or merged. --part alone also amends a step that moved on.
     Amend {
-        /// <NN-name>/<unit>/<step>
-        #[arg(value_parser = step_target)]
+        /// <NN-name>/<unit>/<step>, or <NN-name>/<unit> with --priority
+        #[arg(value_parser = any_target)]
         target: Target,
+        /// A unit's priority: `now` sorts its lines first in `cm next`, `--act` and CARD.
+        #[arg(long, value_enum)]
+        priority: Option<crate::state::Priority>,
         /// The step ships no PR and finishes with `cm advance <step> done --evidence <path>`.
         #[arg(long)]
         study: bool,
@@ -677,6 +680,9 @@ enum QueueAct {
         question: String,
         #[arg(long)]
         recommendation: String,
+        /// Also block this step on the new item (`blocked:until:owner-queue:N`), in the same write.
+        #[arg(long, value_name = "STEP", value_parser = step_target)]
+        block: Option<Target>,
     },
     /// Journal the answer and remove the numbered item.
     Answer {
@@ -912,11 +918,23 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
         }
         Commands::Next { target, lane, act } => {
             if *act {
-                let (outcome, actionable) =
-                    crate::plan::next_act(&root()?, target.as_ref(), *lane, host.now())?;
+                let forge = crate::forge::Gh::default();
+                let (outcome, actionable) = crate::plan::next_act(
+                    &root()?,
+                    target.as_ref(),
+                    *lane,
+                    host.now(),
+                    Some(&forge),
+                )?;
                 return Ok((outcome, ExitCode::from(u8::from(actionable))));
             }
-            crate::plan::next_at(&root()?, target.as_ref(), *lane, host.now())
+            crate::plan::next_with(
+                &root()?,
+                target.as_ref(),
+                *lane,
+                host.now(),
+                Some(&crate::forge::Gh::default()),
+            )
         }
         Commands::Sync { budget_secs } => crate::sync::sync_with(
             host,
@@ -965,6 +983,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
         }
         Commands::Amend {
             target,
+            priority,
             study,
             lane,
             after,
@@ -995,6 +1014,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                     github: github.clone(),
                     tag: tag.clone(),
                 },
+                priority: *priority,
             },
         ),
         Commands::Attempt { target, claim, act } => {
@@ -1174,8 +1194,9 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                     context,
                     question,
                     recommendation,
+                    block,
                 },
-        } => crate::ledger::owner_queue_add(
+        } => crate::ledger::owner_queue_add_blocking(
             host,
             &root()?,
             &crate::ledger::QueueItem {
@@ -1184,6 +1205,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                 question,
                 recommendation,
             },
+            block.as_ref(),
         ),
         Commands::OwnerQueue {
             act: QueueAct::Answer { number, body_file },
