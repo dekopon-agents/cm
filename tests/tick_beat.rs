@@ -2152,6 +2152,7 @@ fn the_built_cm_tick_run_through_a_symlink_reads_from_the_resolved_binary() {
             format!("{}:{}:/usr/bin:/bin", link.display(), harness.bin.display()),
         )
         .env("HOME", harness.ct.path())
+        .env("TMPDIR", harness.tmpdir())
         .env("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_01abc")
         .current_dir(harness.ct.path())
         .args(["--json", "tick"])
