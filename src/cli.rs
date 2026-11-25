@@ -1391,6 +1391,22 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
     Ok((outcome, exit))
 }
 
+fn serialized_len(json: &serde_json::Value) -> usize {
+    struct Count(usize);
+    impl Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let _ = serde_json::to_writer(&mut count, json);
+    count.0
+}
+
 fn name(command: &Commands) -> &'static str {
     match command {
         Commands::Attention { .. } => "attention",
@@ -1461,13 +1477,14 @@ pub fn main() -> ExitCode {
     match outcome {
         Ok((outcome, exit)) => {
             if cli.json && matches!(cli.command, Commands::Tick { .. }) {
-                // A closed stdout must not turn a tick whose moves ran into a panic.
-                let text = outcome.to_json(command).to_string();
+                // A closed stdout must not turn a tick whose moves ran into a panic. The object is
+                // streamed, never copied into one string: only its length is needed for a limit.
+                let json = outcome.to_json(command);
                 let mut stdout = std::io::stdout().lock();
                 if FileSizeLimit::of(&stdout)
-                    .is_none_or(|limit| limit.fits(&stdout, text.len() + 1))
+                    .is_none_or(|limit| limit.fits(&stdout, serialized_len(&json) + 1))
                 {
-                    let _ = writeln!(stdout, "{text}");
+                    let _ = writeln!(stdout, "{json}");
                 }
             } else if cli.json {
                 println!("{}", outcome.to_json(command));

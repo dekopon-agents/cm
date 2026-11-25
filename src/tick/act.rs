@@ -213,7 +213,7 @@ impl<'a> Ctx<'a> {
         match self.run(cmd) {
             Ok(ran) if ran.exit.success() => Ok(ran),
             Ok(ran) if ran.exit == Exit::TooLarge => Err(format!(
-                "cm {sub} printed more than {} MiB and was killed",
+                "cm {sub}'s output was too large to keep in memory ({} MiB at most) and it was killed",
                 WHOLE_CAP >> 20
             )),
             Ok(ran) => Err(format!("cm {sub} failed: {}", last_line(&ran))),
@@ -397,7 +397,7 @@ mod tests {
         );
         assert_eq!(
             ctx.cm("brief", &[]).unwrap_err(),
-            "cm brief printed more than 64 MiB and was killed"
+            "cm brief's output was too large to keep in memory (64 MiB at most) and it was killed"
         );
         assert_eq!(
             ctx.cm("review", &[]).unwrap_err(),

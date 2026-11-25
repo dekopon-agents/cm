@@ -2571,9 +2571,14 @@ fn the_built_cm_tick_stops_writing_a_stdout_file_at_the_file_size_limit() {
             &format!("cm sync {}", "0".repeat(1200)),
         )
     };
+    // The third line would fit after the first; once the second did not, nothing more is written.
     let harness = Harness::new(
         1,
-        &act(vec![wide("01-a/u/a"), wide("01-a/u/b"), wide("01-a/u/c")]),
+        &act(vec![
+            wide("01-a/u/a"),
+            wide("01-a/u/b"),
+            line("stale-block", "01-a/u/c", "cm sync c"),
+        ]),
         PICK_OK,
     );
     let all = harness
@@ -2816,4 +2821,50 @@ fn the_built_cm_tick_reads_empty_and_relative_path_entries_from_where_it_started
         assert_eq!(fs::canonicalize(used).unwrap(), runs, "{path}");
         assert_eq!(json["lines"], json!(PRINTED), "{path}: {json}");
     }
+}
+
+#[test]
+fn the_built_cm_tick_checks_every_spill_write_against_the_file_size_limit() {
+    let harness = Harness::new(1, "", PICK_OK);
+    write_big_list(&harness.ct.path().join("next.json"));
+    // Room for the first write, the 64 MiB held so far, but not for the rest of the list.
+    let limit_kib = (WHOLE_CAP >> 10) + 1_024;
+    let output = harness
+        .limited("cse_01abc", &format!("ulimit -f {limit_kib}"))
+        .args(["tick", "--cm", "cm"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let efbig = std::io::Error::from_raw_os_error(27);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "heartbeat: cm --json next --act's list was too large to keep in memory and could not be stored in {}: {efbig}; no act line was read\n",
+            std::env::temp_dir().display()
+        )
+    );
+}
+
+#[test]
+fn the_built_cm_tick_streams_its_json_object_without_a_second_copy() {
+    // The lines and the object built from them fit; a further copy of the object as text,
+    // about 73 MB here, does not.
+    let limit = floor_kib() + 187 * 1_024;
+    let harness = Harness::new(1, "", PICK_OK);
+    write_big_list(&harness.ct.path().join("next.json"));
+    let output = harness
+        .limited("cse_01abc", &format!("ulimit -v {limit}"))
+        .args(["--json", "tick", "--cm", "cm"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let lines = json["lines"].as_array().unwrap();
+    assert_eq!(lines.len(), BIG_LIST);
+    assert_eq!(lines[BIG_LIST - 1], big_line(BIG_LIST - 1));
 }
