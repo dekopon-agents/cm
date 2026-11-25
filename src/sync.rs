@@ -516,7 +516,7 @@ impl<'a> Run<'a> {
         head: Option<&CommitSha>,
         base: Option<&CommitSha>,
     ) -> Option<Vec<String>> {
-        if step.lane != Some(Lane::Codex) {
+        if !crate::commands::merge_gated(step) {
             return Some(Vec::new());
         }
         let Some(head) = head else {

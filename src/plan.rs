@@ -1516,6 +1516,11 @@ pub(crate) fn next_act(
         outcome.line(format!("{} — `{}`", action.summary(), action.command));
     }
     outcome.field("actionable", json!(actions));
+    // Executors hold `merge-ready` while the owner has unread queue items, as merges refuse then.
+    outcome.field(
+        "owner_queue_unread",
+        json!(crate::ledger::unread_owner_queue(root)?),
+    );
     Ok((outcome, !actions.is_empty()))
 }
 

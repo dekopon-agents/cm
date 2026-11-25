@@ -68,13 +68,8 @@ struct FakeForge {
 impl FakeForge {
     fn assert_unlocked(&self) {
         if let Some(root) = &self.campaign {
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .open(root.join(store::CM_DIR).join(store::LOCK))
-                .unwrap();
             assert!(
-                rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-                    .is_ok(),
+                forge_fixture::lock_free(root),
                 "forge read held the campaign lock"
             );
         }
@@ -3830,7 +3825,7 @@ fn invalid_missing_and_unreadable_queues_do_not_invent_new_merge_refusals() {
         let c = campaign(&host, true);
         let dir = c.root.join("01-a/u");
         let mut unit = store::load_unit(&dir).unwrap();
-        unit.steps.get_mut("S1").unwrap().lane = Some(Lane::ClaudeCloud);
+        unit.steps.get_mut("S1").unwrap().lane = Some(Lane::Pi);
         commands::write_unit(&dir, &unit).unwrap();
         let path = c.root.join("OWNER-QUEUE.md");
         match kind {
@@ -4408,4 +4403,66 @@ fn every_model_lane_needs_astra_and_a_claude_verdict_at_the_head() {
     // A lane no model builds in needs any one verdict.
     assert!(!verdict::model_lane(Some(Lane::Owner)));
     assert!(!verdict::model_lane(Some(Lane::Pi)));
+}
+
+#[test]
+fn every_model_lane_refuses_a_merge_without_astra_and_claude_at_the_head() {
+    for lane in [
+        Lane::Codex,
+        Lane::ClaudeCloud,
+        Lane::Fable,
+        Lane::Coordinator,
+    ] {
+        let host = at("2026-10-26T08:00:00Z");
+        let c = campaign(&host, true);
+        let head = c.head();
+        let dir = c.root.join(target().unit);
+        let mut unit = store::load_unit(&dir).unwrap();
+        unit.steps.get_mut("S1").unwrap().lane = Some(lane);
+        commands::write_unit(&dir, &unit).unwrap();
+        let green = FakeForge::open(&head, &[("test", "success")]);
+        let gate = MergeGate {
+            forge: Some(&green),
+            ..MergeGate::default()
+        };
+        let accept = c.report("astra-review-7", &head, &[], "ACCEPT");
+        c.receipt("astra-review-7", &head, "gpt-6-astra", "xhigh");
+        assert!(record(&host, &c, &accept, "astra").ok());
+        let refused = c.merge(&host, &gate);
+        assert_eq!(rules(&refused), ["merge-gate"], "{lane:?}");
+        assert!(
+            refused.violations[0].message.contains("no Claude review"),
+            "{lane:?}: {:?}",
+            refused.violations
+        );
+        assert_eq!(c.state(), Phase::PrOpen);
+        claude_accept(&host, &c, &head);
+        let merged = c.merge(&host, &gate);
+        assert!(merged.ok(), "{lane:?}: {:?}", merged.violations);
+        assert_eq!(c.state(), Phase::Merged);
+    }
+}
+
+#[test]
+fn next_act_json_carries_the_unread_owner_queue_for_the_merge_hold() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host, true);
+    let act = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("-C")
+            .arg(&c.root)
+            .args(["--json", "next", "--act"])
+            .env_remove("CM_CODEX_WEEKLY_PCT")
+            .output()
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    assert_eq!(act()["owner_queue_unread"], serde_json::json!([]));
+    review_fixture::new_owner_item(&host, &c.root, "Choose a setting");
+    let unread = act()["owner_queue_unread"].clone();
+    assert_eq!(unread.as_array().unwrap().len(), 1, "{unread}");
+    assert!(
+        unread[0].as_str().unwrap().contains("Choose a setting"),
+        "{unread}"
+    );
 }

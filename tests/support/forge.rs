@@ -19,18 +19,25 @@ pub struct FakeForge {
     pub containment_queries: RefCell<Vec<(String, String, String)>>,
 }
 
+/// Whether the campaign lock is free. A lock held by the read under test never frees, since its
+/// holder waits on this read; a child another test thread forks can inherit this thread's lock
+/// file for the moment before its exec, so a busy lock is retried briefly before it counts.
+pub fn lock_free(root: &std::path::Path) -> bool {
+    let path = root.join(cm::store::CM_DIR).join(cm::store::LOCK);
+    for _ in 0..50 {
+        let lock = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        if rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
 impl FakeForge {
     fn artifact_query(&self, key: &str) {
         if let Some(root) = &self.root {
-            let lock = std::fs::OpenOptions::new()
-                .write(true)
-                .open(root.join(cm::store::CM_DIR).join(cm::store::LOCK))
-                .unwrap();
-            assert!(
-                rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-                    .is_ok(),
-                "publication read held the campaign lock"
-            );
+            assert!(lock_free(root), "publication read held the campaign lock");
         }
         self.artifact_queries.borrow_mut().push(key.to_owned());
     }

@@ -816,15 +816,26 @@ fn release_metadata_amends_at_pr_open_and_merged_but_stops_at_released() {
     assert!(launch(&host, &c, step).ok());
     let (checkout, sha) = repo(c.root.parent().unwrap());
     let unit_dir = c.root.join("00-release/widget");
+    // The prep PR's merge gate is waived: release metadata is the subject here.
+    let waiver = c.root.join("waiver.md");
+    fs::write(&waiver, "Release metadata fixture.\n").unwrap();
     let move_to = |phase: &Phase, evidence: Evidence| {
-        let outcome = commands::advance(
+        let outcome = commands::advance_gated(
             &host,
             &c.root,
             &target(step),
-            phase,
-            &evidence,
-            None,
-            Some(&checkout),
+            commands::Advance {
+                to: phase,
+                given: &evidence,
+                file: None,
+                repo: Some(&checkout),
+                part: None,
+                by: &[],
+            },
+            &commands::MergeGate {
+                waiver: (*phase == Phase::Merged).then(|| waiver.clone()),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert!(outcome.ok(), "{:?}", outcome.violations);
