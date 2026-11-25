@@ -170,9 +170,12 @@ enum Commands {
     },
     /// Change a drafted or launched step's declaration. Release --github/--tag/--artifact/--drop-artifact also allow pr-open or merged. --part alone also amends a step that moved on.
     Amend {
-        /// <NN-name>/<unit>/<step>
-        #[arg(value_parser = step_target)]
+        /// <NN-name>/<unit>/<step>, or <NN-name>/<unit> with --priority
+        #[arg(value_parser = any_target)]
         target: Target,
+        /// A unit's priority: `now` sorts its lines first in `cm next`, `--act` and CARD.
+        #[arg(long, value_enum)]
+        priority: Option<crate::state::Priority>,
         /// The step ships no PR and finishes with `cm advance <step> done --evidence <path>`.
         #[arg(long)]
         study: bool,
@@ -958,6 +961,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
         }
         Commands::Amend {
             target,
+            priority,
             study,
             lane,
             after,
@@ -988,6 +992,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                     github: github.clone(),
                     tag: tag.clone(),
                 },
+                priority: *priority,
             },
         ),
         Commands::Attempt { target, claim, act } => {

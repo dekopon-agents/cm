@@ -4228,6 +4228,7 @@ fn review_owed_and_merge_ready_follow_the_observed_head_and_its_verdicts() {
         .unwrap()
         .clone();
     assert_eq!(ready["lane"], "codex");
+    assert_eq!(ready["weight"], "complex");
     assert_eq!(ready["pr"], PR);
     assert_eq!(ready["head"], c.head());
     assert_eq!(ready["base"], "b".repeat(40));

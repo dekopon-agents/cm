@@ -368,6 +368,40 @@ impl Track {
     }
 }
 
+/// A unit's place in the order of `cm next` and CARD: `now` units' lines sort first.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Priority {
+    Now,
+    #[default]
+    Whenever,
+}
+
+impl Priority {
+    pub fn name(self) -> &'static str {
+        match self {
+            Priority::Now => "now",
+            Priority::Whenever => "whenever",
+        }
+    }
+
+    fn is_whenever(&self) -> bool {
+        *self == Priority::Whenever
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
@@ -1300,6 +1334,8 @@ pub struct UnitState {
     pub unit: String,
     #[serde(flatten)]
     pub track: Track,
+    #[serde(default, skip_serializing_if = "Priority::is_whenever")]
+    pub priority: Priority,
     #[serde(default)]
     pub steps: BTreeMap<String, Step>,
     #[serde(default)]
@@ -1313,6 +1349,7 @@ impl UnitState {
             kind: Kind::Unit,
             unit: unit.to_owned(),
             track: Track::new(at),
+            priority: Priority::Whenever,
             steps: BTreeMap::new(),
             history: Vec::new(),
         }

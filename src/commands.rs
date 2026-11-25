@@ -2670,6 +2670,7 @@ pub struct Amendment {
     pub parts: Vec<String>,
     pub kickoff: Option<String>,
     pub ships: Ships,
+    pub priority: Option<crate::state::Priority>,
 }
 
 fn add_parts(
@@ -2776,13 +2777,45 @@ pub fn amend(
         return Ok(Outcome::refused(violations));
     };
     let Some(step_name) = target.step.as_deref() else {
+        let Some(priority) = amendment.priority else {
+            violations.push(Violation::new(
+                &full,
+                "amend-target",
+                "`cm amend` takes a step, or a unit with --priority",
+            ));
+            return Ok(Outcome::refused(violations));
+        };
+        if unit.priority == priority {
+            violations.push(Violation::new(
+                &full,
+                "amend-empty",
+                format!("{full} already has priority {}", priority.name()),
+            ));
+        }
+        if !violations.is_empty() {
+            return Ok(Outcome::refused(violations));
+        }
+        let change = format!("priority {} → {}", unit.priority.name(), priority.name());
+        unit.priority = priority;
+        write_unit(&root.join(&target.unit), &unit)?;
+        let at = stamp(host.now());
+        let heading = record(root, &at, &format!("amend {full}"), &format!("{change}\n"))?;
+        let mut outcome = Outcome::default();
+        outcome.line(format!("amended {full}"));
+        outcome.line(change.clone());
+        outcome.field("target", full);
+        outcome.field("changes", vec![change]);
+        outcome.field("journal", heading);
+        return Ok(outcome);
+    };
+    if amendment.priority.is_some() {
         violations.push(Violation::new(
             &full,
             "amend-target",
-            "`cm amend` takes a step",
+            "--priority amends a unit, not a step",
         ));
         return Ok(Outcome::refused(violations));
-    };
+    }
     let units = plan::load_units(root)?;
     let Some(step) = unit.steps.get(step_name).cloned() else {
         violations.push(step_unknown(&full));
