@@ -146,10 +146,14 @@ fn tick(ct: &Ct, proc: &dyn Proc, env: &Env, registry: &Registry) -> Vec<String>
 }
 
 fn frame_calls<'a>(log: &'a [String], wanted: &[&str]) -> Vec<&'a str> {
-    log.iter()
-        .map(String::as_str)
-        .filter(|call| wanted.contains(call))
-        .collect()
+    // A filled phase may make the same call (gitsync reads the branch too): keep the first.
+    let mut seen = Vec::new();
+    for call in log.iter().map(String::as_str) {
+        if wanted.contains(&call) && !seen.contains(&call) {
+            seen.push(call);
+        }
+    }
+    seen
 }
 
 fn tick_with(
@@ -502,7 +506,10 @@ fn a_phase_that_fails_or_whose_child_times_out_prints_its_wall_time() {
         "heartbeat: cm 9.9.9 (setup.sh's pin) could not be fetched or installed; still running cm 0.16.0"
     );
     assert!(is_wall_line(&out[1], "pin"), "{out:?}");
-    assert!(out[1].ends_with("(budget 60 s)"), "{out:?}");
+    assert!(
+        out[1].ends_with(&format!("(budget {} s)", cm::tick::pin::BUDGET.as_secs())),
+        "{out:?}"
+    );
     assert!(is_wall_line(&out[2], "directive"), "{out:?}");
     let slow = proc
         .calls()
@@ -1322,7 +1329,7 @@ impl Harness {
         script(
             &bin.join("git"),
             &format!(
-                "echo \"git $*\" >> '{}'\n[ \"$1\" = rev-parse ] && echo main\nexit 0\n",
+                "echo \"git $*\" >> '{}'\ncase $1 in rev-parse|symbolic-ref|branch) echo main ;; esac\nexit 0\n",
                 log.display()
             ),
         );
@@ -2029,4 +2036,91 @@ fn a_line_without_a_target_prints_it_empty_as_jq_did() {
         tick(&ct, &proc, &bound_env(), &Registry::new()),
         ["stale-block : cm sync", "review-owed #api: cm brief x"]
     );
+}
+
+#[test]
+fn the_built_cm_tick_exits_0_when_its_json_stdout_is_closed_or_full() {
+    let harness = Harness::new(0, &act(lines()), PICK_OK);
+    harness
+        .ct
+        .write("store/epochs/second/EPOCH.md", "status: PLANNING\n");
+    let run = |args: &[&str], stdout: std::process::Stdio| {
+        let output = harness
+            .command("cse_01abc")
+            .args(args)
+            .stdout(stdout)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("panicked"),
+            "{args:?}: {output:?}"
+        );
+    };
+    for args in [
+        &["--json", "tick", "--cm", "cm"][..],
+        &["tick", "--cm", "cm"][..],
+    ] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        run(args, writer.into());
+        let full = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        run(args, full.into());
+    }
+}
+
+fn slow_failing_next(ran: Ran) -> FakeProc {
+    let answers = Answers::new(0, "");
+    FakeProc::new(move |cmd| {
+        Ok(if cmd.program_name() == "cm" {
+            std::thread::sleep(Duration::from_secs(6));
+            ran.clone()
+        } else {
+            answers.answer(cmd)
+        })
+    })
+}
+
+#[test]
+fn a_failed_cm_next_past_the_act_budget_is_still_its_one_line() {
+    let ct = Ct::new();
+    let proc = slow_failing_next(Ran::code(2, "").with_stderr("boom\n"));
+    let env = env(&[
+        ("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_01abc"),
+        ("HEARTBEAT_DEADLINE", "0"),
+    ]);
+    assert_eq!(
+        tick(&ct, &proc, &env, &Registry::new()),
+        ["heartbeat: cm --json next --act exited 2 without an actionable list: boom"]
+    );
+}
+
+#[test]
+fn a_cm_next_killed_past_the_act_budget_is_still_its_one_line() {
+    let ct = Ct::new();
+    let proc = slow_failing_next(Ran::timed_out());
+    let env = env(&[
+        ("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_01abc"),
+        ("HEARTBEAT_DEADLINE", "0"),
+    ]);
+    assert_eq!(
+        tick(&ct, &proc, &env, &Registry::new()),
+        ["heartbeat: cm --json next --act ran past 30 s and was killed"]
+    );
+}
+
+#[test]
+fn a_list_read_past_the_act_budget_still_prints_the_wall_time() {
+    let ct = Ct::new();
+    let proc = slow_failing_next(Ran::code(0, act(Vec::new())));
+    let env = env(&[
+        ("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_01abc"),
+        ("HEARTBEAT_DEADLINE", "0"),
+    ]);
+    let out = tick(&ct, &proc, &env, &Registry::new());
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(is_wall_line(&out[0], "act"), "{out:?}");
 }

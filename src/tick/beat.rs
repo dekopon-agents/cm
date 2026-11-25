@@ -114,10 +114,11 @@ pub fn run(beat: &Beat, out: &mut dyn FnMut(String)) {
     let started = Instant::now();
     let left = u64::try_from(deadline.saturating_sub(beat.elapsed_secs())).unwrap_or(0);
     let budget = Duration::from_secs(left).saturating_add(KILL_AFTER);
-    // A failed `cm next` has printed its own line, so the act phase's wall time is printed only
-    // past its budget.
+    // A failed `cm next` prints only its own line, never the act phase's wall time.
     let act = act(beat, epoch, &bound, deadline, out);
-    wall_time(out, "act", started.elapsed(), budget, false);
+    if !act.failed {
+        wall_time(out, "act", started.elapsed(), budget, false);
+    }
     if act.ran {
         phase(beat, epoch, out, "gitsync", gitsync::BUDGET, |ctx| {
             (phases.gitsync)(ctx, gitsync::Mode::IfDirty)
@@ -208,7 +209,13 @@ fn wall_time(
 
 struct Act {
     ran: bool,
+    failed: bool,
 }
+
+const READ_FAILED: Act = Act {
+    ran: false,
+    failed: true,
+};
 
 fn act(
     beat: &Beat,
@@ -230,21 +237,21 @@ fn act(
                 "heartbeat: cm --json next --act ran past {} s and was killed",
                 FRAME_CAP.as_secs()
             ));
-            return Act { ran: false };
+            return READ_FAILED;
         }
         Ok(ran) if ran.exit == Exit::TooLarge => {
             out(format!(
                 "heartbeat: cm --json next --act printed more than {} MiB and was killed; no act line was read",
                 WHOLE_CAP >> 20
             ));
-            return Act { ran: false };
+            return READ_FAILED;
         }
         Ok(ran) => ran,
         Err(error) => {
             out(format!(
                 "heartbeat: cm --json next --act could not run: {error}"
             ));
-            return Act { ran: false };
+            return READ_FAILED;
         }
     };
     let status = next.exit.shell_status();
@@ -253,14 +260,20 @@ fn act(
         .filter(|act| act.get("actionable").is_some_and(Value::is_array) && status <= 1);
     let Some(list) = list else {
         if status == 0 && next.stdout.iter().all(|byte| *byte == b'\n') {
-            return Act { ran: false };
+            return Act {
+                ran: false,
+                failed: false,
+            };
         }
         out(format!(
             "heartbeat: cm --json next --act exited {status} without an actionable list: {}",
             first_line(&next.stderr, 300)
         ));
-        return Act { ran: false };
+        return READ_FAILED;
     };
+    // The list can be tens of MiB: free the raw output and move the lines out, never copy them.
+    drop(next);
+    let mut list = list;
     let unread = list
         .get("owner_queue_unread")
         .and_then(Value::as_array)
@@ -270,8 +283,15 @@ fn act(
             "owner-queue: {unread} unread item(s); read OWNER-QUEUE.md and run cm owner-queue read before any merge or review"
         ));
     }
-    let lines = list["actionable"].as_array().cloned().unwrap_or_default();
-    let mut act = Act { ran: false };
+    let lines = match list.get_mut("actionable").map(Value::take) {
+        Some(Value::Array(lines)) => lines,
+        _ => Vec::new(),
+    };
+    drop(list);
+    let mut act = Act {
+        ran: false,
+        failed: false,
+    };
     if lines.is_empty() {
         return act;
     }
@@ -480,6 +500,14 @@ mod tests {
             )),
             Some(format!(
                 "heartbeat: malformed coordinator handoff: {dir}/c.md (missing-fields=prompt bad-fields=stamp_sha,stamp_entry); fix its Handoff: line"
+            ))
+        );
+        assert_eq!(
+            malformed(&format!(
+                "refused missing-fields=stamp_sha,stamp_entry {dir}/c.md"
+            )),
+            Some(format!(
+                "heartbeat: malformed coordinator handoff: {dir}/c.md (missing-fields=stamp_sha,stamp_entry); fix its Handoff: line"
             ))
         );
         assert_eq!(

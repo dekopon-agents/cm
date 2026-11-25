@@ -1438,7 +1438,10 @@ pub fn main() -> ExitCode {
     });
     match outcome {
         Ok((outcome, exit)) => {
-            if cli.json {
+            if cli.json && matches!(cli.command, Commands::Tick { .. }) {
+                // A closed stdout must not turn a tick whose moves ran into a panic.
+                let _ = writeln!(std::io::stdout(), "{}", outcome.to_json(command));
+            } else if cli.json {
                 println!("{}", outcome.to_json(command));
             } else {
                 for violation in &outcome.violations {
