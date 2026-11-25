@@ -1166,11 +1166,9 @@ impl<'a> Run<'a> {
                         at: cached_at.unwrap_or_else(|| self.at.clone()),
                         head: head.map(|head| head.to_string()),
                         mergeable_state,
-                        etags,
                     };
-                    let etags = observed.etags.clone();
-                    // A read that saw no new fact keeps the stored observation, its stamp and
-                    // validators included, so `.cm/pulls.json` changes only with a fact.
+                    // A read that saw no new fact keeps the stored observation and its stamp, so
+                    // `.cm/pulls.json` changes only with a fact.
                     let observed = self
                         .seen
                         .get(&url)

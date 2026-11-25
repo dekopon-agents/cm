@@ -825,3 +825,13 @@ fn a_sync_that_stops_with_an_error_times_the_phase_that_failed() {
         );
     }
 }
+
+#[test]
+fn validators_live_only_in_the_ignored_read_memo() {
+    let (c, _, _) = epoch();
+    let tracked = fs::read_to_string(cm::plan::pulls_path(&c.root)).unwrap();
+    assert!(tracked.contains(OPEN_PR), "{tracked}");
+    assert!(!tracked.contains("etags"), "{tracked}");
+    let memo = fs::read_to_string(c.root.join(".cm").join(cm::sync::PULLS_READ)).unwrap();
+    assert!(memo.contains("etags"), "{memo}");
+}

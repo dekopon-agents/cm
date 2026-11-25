@@ -1924,6 +1924,12 @@ esac
             fs::read_to_string(&args_path).unwrap(),
         )
     };
+    // The validators live beside the tracked observation, in the ignored read memo.
+    let validators = || {
+        let memo: serde_json::Value =
+            store::read_json(&c.root.join(".cm").join(cm::sync::PULLS_READ)).unwrap();
+        serde_json::from_value::<BTreeMap<String, String>>(memo[pr]["etags"].clone()).unwrap()
+    };
     let pull = "repos/o/r/pulls/1";
     let runs = "repos/o/r/commits/head/check-runs?per_page=100&page=";
     let status = "repos/o/r/commits/head/status?per_page=100&page=1";
@@ -1931,7 +1937,7 @@ esac
     let (outcome, first, args) = observe("first", "2026-10-17T08:00:00Z");
     assert!(outcome.ok(), "{:?}", outcome.violations);
     assert_eq!(
-        first.etags,
+        validators(),
         BTreeMap::from([
             (pull.to_owned(), "W/\"old-pull\"".to_owned()),
             (format!("{runs}2"), "\"runs-two\"".to_owned()),
@@ -1960,7 +1966,7 @@ esac
     assert_eq!(aged.ci_base.as_deref(), Some("new"));
     assert_eq!(aged.mergeable_state, Some("clean".to_owned().into()));
     assert_eq!(
-        aged.etags,
+        validators(),
         BTreeMap::from([(pull.to_owned(), "\"new-pull\"".to_owned())])
     );
     assert_eq!(

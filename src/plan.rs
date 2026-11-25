@@ -833,8 +833,6 @@ pub struct Observed {
     pub head: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mergeable_state: Option<MergeableState>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub etags: BTreeMap<String, String>,
 }
 
 pub const PULLS: &str = "pulls.json";
