@@ -97,8 +97,9 @@ struct FakeForge {
 impl FakeForge {
     fn assert_unlocked(&self) {
         if let Some(root) = &self.campaign {
-            assert!(
-                forge_fixture::lock_free(root),
+            assert_eq!(
+                forge_fixture::lock_holder(root),
+                None,
                 "forge read held the campaign lock"
             );
         }
@@ -403,6 +404,13 @@ fn target() -> store::Target {
 
 fn record(host: &Fake, c: &Campaign, report: &Path, reviewer: &str) -> Outcome {
     verdict::record(host, &c.root, &target(), report, Some(reviewer), None).unwrap()
+}
+
+#[test]
+#[should_panic(expected = "no lock file to watch at")]
+fn the_lock_probe_has_no_answer_for_a_campaign_without_a_lock_file() {
+    let dir = tempfile::tempdir().unwrap();
+    forge_fixture::lock_holder(&dir.path().join("typo"));
 }
 
 #[test]

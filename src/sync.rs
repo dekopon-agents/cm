@@ -1681,6 +1681,12 @@ fn run_sync(
     if !found.is_empty() {
         return Ok(Outcome::refused(found));
     }
+    let unreadable_path = root.join(store::CM_DIR).join(UNREADABLE_NOTIFIED);
+    let published: BTreeSet<String> = if unreadable_path.exists() {
+        store::read_json(&unreadable_path)?
+    } else {
+        BTreeSet::new()
+    };
     let mut run = Run::new(
         root,
         Access::Cached,
@@ -1772,8 +1778,6 @@ fn run_sync(
         }
     }
     // A publication already journaled as unreadable, and unreadable since, is not news.
-    let unreadable_path = root.join(store::CM_DIR).join(UNREADABLE_NOTIFIED);
-    let published: BTreeSet<String> = store::read_json(&unreadable_path).unwrap_or_default();
     let news = run
         .notes
         .iter()
@@ -1811,9 +1815,9 @@ fn run_sync(
     let standing: BTreeSet<String> = published
         .iter()
         .filter(|note| {
-            run.unread_publications
-                .iter()
-                .any(|target| note.starts_with(&format!("- unknown {target}: ")))
+            note.strip_prefix("- unknown ")
+                .and_then(|rest| rest.split_once(": "))
+                .is_some_and(|(target, _)| run.unread_publications.contains(target))
         })
         .chain(&run.unreadable)
         .cloned()

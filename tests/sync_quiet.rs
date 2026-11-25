@@ -1144,42 +1144,64 @@ fn journal_tail(root: &Path) -> String {
 #[test]
 fn a_publication_left_unread_keeps_its_note_journaled_once() {
     use publication_fixture as p;
-    // Each stops the publication read between two syncs that find the crate still unreadable.
-    type Stop = fn(&mut forge_fixture::FakeForge);
-    let stops: [(&str, Stop); 4] = [
-        ("tag read fails", |forge| {
+    type Stop = fn(&Campaign, &mut forge_fixture::FakeForge);
+    let stops: [(&str, Stop); 7] = [
+        ("tag read fails", |_, forge| {
             forge.broken.insert(format!("exists:{}", p::TAG));
         }),
-        ("compare fails", |forge| {
+        ("compare fails", |_, forge| {
             forge.broken.insert(p::TAG.into());
         }),
-        ("tag absent", |forge| {
+        ("tag absent", |_, forge| {
             forge.tags.clear();
         }),
-        ("tag lacks the merge", |forge| {
+        ("tag lacks the merge", |_, forge| {
             forge.tags.values_mut().for_each(BTreeSet::clear);
+        }),
+        ("merge sha removed", |c, _| {
+            let mut unit = p::unit(c);
+            let step = unit.steps.get_mut("1.4.0").unwrap();
+            step.track.evidence.sha = None;
+            commands::write_unit(&c.root.join("00-release/widget"), &unit).unwrap();
+        }),
+        ("prep PR removed", |c, _| {
+            let mut unit = p::unit(c);
+            let step = unit.steps.get_mut("1.4.0").unwrap();
+            step.track.evidence.pr = None;
+            commands::write_unit(&c.root.join("00-release/widget"), &unit).unwrap();
+        }),
+        ("another --github", |c, _| {
+            let mut unit = p::unit(c);
+            let step = unit.steps.get_mut("1.4.0").unwrap();
+            step.github = Some("o/other".parse().unwrap());
+            commands::write_unit(&c.root.join("00-release/widget"), &unit).unwrap();
         }),
     ];
     for (stop, apply) in stops {
         let c = p::campaign(&at("2026-10-17T08:00:00Z"), Phase::Merged, &p::ARTIFACTS);
         let marker = c.root.join(".cm/unreadable-notified.json");
+        let shipped = p::unit(&c);
         let unreadable = || {
             let mut forge = p::present();
             forge.broken.insert("crate:acme-sdk".into());
             forge
         };
-        let mut stopped = unreadable();
-        apply(&mut stopped);
         let mut entries = Vec::new();
         let mut markers = Vec::new();
-        for (now, forge, reads_publication) in [
-            ("2026-10-17T08:00:00Z", unreadable(), true),
-            ("2026-10-17T08:05:00Z", stopped, false),
-            ("2026-10-17T08:10:00Z", unreadable(), true),
+        for (now, stopped) in [
+            ("2026-10-17T08:00:00Z", false),
+            ("2026-10-17T08:05:00Z", true),
+            ("2026-10-17T08:10:00Z", false),
         ] {
+            let mut forge = unreadable();
+            if stopped {
+                apply(&c, &mut forge);
+            } else {
+                commands::write_unit(&c.root.join("00-release/widget"), &shipped).unwrap();
+            }
             let out = readers::both(&at(now), &forge, &c.root).unwrap();
             let queries = forge.artifact_queries.lock().unwrap();
-            assert_eq!(!queries.is_empty(), reads_publication, "{stop} at {now}");
+            assert_eq!(queries.is_empty(), stopped, "{stop} at {now}");
             entries.push(out.fields.contains_key("journal"));
             markers.push(fs::read_to_string(&marker).unwrap());
         }
@@ -1189,5 +1211,88 @@ fn a_publication_left_unread_keeps_its_note_journaled_once() {
             "{stop}: {markers:?}"
         );
         assert!(markers[0].contains("crate:acme-sdk"), "{}", markers[0]);
+    }
+}
+
+#[test]
+fn a_release_that_leaves_merged_drops_its_unreadable_note() {
+    use publication_fixture as p;
+    let c = p::campaign(&at("2026-10-17T08:00:00Z"), Phase::Merged, &p::ARTIFACTS);
+    let target = parse_target(p::STEP, true).unwrap();
+    let marker = c.root.join(".cm/unreadable-notified.json");
+    let notes = || -> BTreeSet<String> { store::read_json(&marker).unwrap() };
+    let mut unreadable = p::present();
+    unreadable.broken.insert("crate:acme-sdk".into());
+    let synced = |now: &str| {
+        let out = sync(&at(now), &unreadable, &c.root).unwrap();
+        out.fields.get("journal").map(|_| journal_tail(&c.root))
+    };
+    let first = synced("2026-10-17T08:00:00Z").unwrap();
+    assert_eq!(notes().len(), 1, "{:?}", notes());
+    let blocked = commands::advance(
+        &at("2026-10-17T08:01:00Z"),
+        &c.root,
+        &target,
+        &Phase::Blocked("registry".into()),
+        &Evidence::default(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(blocked.ok(), "{:?}", blocked.violations);
+    assert_eq!(synced("2026-10-17T08:05:00Z"), None);
+    assert_eq!(notes(), BTreeSet::new());
+    let evidence = c.root.join("registry.md");
+    fs::write(&evidence, "The registry answers again.\n").unwrap();
+    let unblocked = commands::unblock(
+        &at("2026-10-17T08:06:00Z"),
+        &c.root,
+        &target,
+        Some(&evidence),
+    )
+    .unwrap();
+    assert!(unblocked.ok(), "{:?}", unblocked.violations);
+    let again = synced("2026-10-17T08:10:00Z").unwrap();
+    let body = |entry: &str| entry.lines().skip(2).collect::<Vec<_>>().join("\n");
+    assert_eq!(body(&again), body(&first), "{first}\n{again}");
+    assert_eq!(notes().len(), 1, "{:?}", notes());
+    let released = p::advance(&at("2026-10-17T08:11:00Z"), &c, &p::present(), false, false);
+    assert!(released.ok(), "{:?}", released.violations);
+    assert_eq!(synced("2026-10-17T08:15:00Z"), None);
+    assert_eq!(notes(), BTreeSet::new());
+}
+
+#[test]
+fn an_unreadable_notified_marker_cm_cannot_parse_refuses_the_sync_naming_it() {
+    use publication_fixture as p;
+    let texts = ["", "[\"- unknown", "{\"schema\":2,\"notes\":[]}", "[1]"];
+    for (text, locked) in texts
+        .into_iter()
+        .flat_map(|text| [(text, true), (text, false)])
+    {
+        let c = p::campaign(&at("2026-10-17T08:00:00Z"), Phase::Merged, &p::ARTIFACTS);
+        let marker = c.root.join(".cm/unreadable-notified.json");
+        fs::write(&marker, text).unwrap();
+        let lock = c.root.join(".cm/lock");
+        if !locked {
+            fs::remove_file(&lock).unwrap();
+        }
+        let mut before = c.files();
+        let mut forge = p::present();
+        forge.broken.insert("crate:acme-sdk".into());
+        let error = readers::both(&at("2026-10-17T08:05:00Z"), &forge, &c.root).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with(&format!("parsing {}: ", marker.display())),
+            "{text:?}: {message}"
+        );
+        before
+            .entry(lock.strip_prefix(&c.root).unwrap().to_owned())
+            .or_default();
+        assert_eq!(
+            c.files(),
+            before,
+            "{text:?}, lock file there before: {locked}"
+        );
     }
 }

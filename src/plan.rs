@@ -1395,7 +1395,7 @@ fn actionable(
             && inputs
                 .coordinator
                 .as_deref()
-                .is_some_and(|label| label != attempt.coordinator)
+                .is_some_and(|label| label != crate::attempt::session_label(&attempt.coordinator))
             && inputs
                 .drivers
                 .driving(&attempt.coordinator, &target)
