@@ -5,10 +5,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use cm::tick::act::{Ctx, Env, Report};
+use cm::tick::TickError;
+use cm::tick::act::{Ctx, Env, MAX_BUDGET, Report};
 use cm::tick::gitsync::{self, Mode};
-use cm::tick::proc::{FakeProc, Proc, SystemProc};
+use cm::tick::proc::{Cmd, FakeProc, Proc, Ran, SystemProc};
 use cm::tick::{claude_md, directive, pin};
+
+#[allow(dead_code)]
+mod support;
 
 const SLUG: &str = "eleemosynary-mnemosyne";
 const EPOCH: &str = "store/epochs/eleemosynary-mnemosyne";
@@ -40,8 +44,42 @@ fn write(path: &Path, text: &str) {
 }
 
 fn script(path: &Path, body: &str) {
-    write(path, &format!("#!/bin/sh\n{body}"));
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    support::write_executable(path, &format!("#!/bin/sh\n{body}"));
+}
+
+// A cm the pin phase staged in this process can still be open for writing in a sibling test's
+// fork that has not exec'd yet, so a run of it can meet ETXTBSY until that fork moves on.
+fn spawn(cmd: &Cmd) -> cm::tick::Result<Ran> {
+    for _ in 0..100 {
+        match SystemProc.run(cmd) {
+            Err(TickError::Spawn { source, .. })
+                if source.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
+    SystemProc.run(cmd)
+}
+
+// A loaded runner can hold any phase a whole second past its budget, which adds the frame's
+// `tick: <phase> phase took …` line, so built-binary output is compared without those lines and
+// the phases they name are returned beside it.
+fn printed(stdout: &[u8]) -> (Vec<String>, Vec<String>) {
+    let mut lines = Vec::new();
+    let mut walls = Vec::new();
+    for line in String::from_utf8(stdout.to_vec()).unwrap().lines() {
+        match line
+            .strip_prefix("tick: ")
+            .and_then(|rest| rest.split_once(" phase took "))
+        {
+            Some((phase, _)) => walls.push(phase.to_owned()),
+            None => lines.push(line.to_owned()),
+        }
+    }
+    (lines, walls)
 }
 
 fn names(dir: &Path) -> Vec<String> {
@@ -153,14 +191,16 @@ impl Scratch {
         self.git(&other, &["push", "-q", "origin", "main"]);
     }
 
-    // The real runner with this scratch root's environment; pauses are recorded, not slept.
+    // The real runner with this scratch root's environment under what the command sets itself;
+    // pauses are recorded, not slept.
     fn proc(&self) -> FakeProc {
         let env = self.child_env();
         FakeProc::new(move |cmd| {
             let cmd = env
                 .iter()
+                .filter(|(key, _)| !cmd.env.iter().any(|(set, _)| set == key))
                 .fold(cmd.clone(), |cmd, (key, value)| cmd.env(key, value));
-            SystemProc.run(&cmd)
+            spawn(&cmd)
         })
     }
 
@@ -186,7 +226,7 @@ impl Scratch {
     }
 
     fn sync(&self, proc: &FakeProc, mode: Mode) -> Report {
-        self.phase(proc, Path::new("cm"), gitsync::BUDGET, |ctx| {
+        self.phase(proc, Path::new("cm"), MAX_BUDGET, |ctx| {
             gitsync::sync(ctx, mode)
         })
     }
@@ -377,43 +417,52 @@ fn a_rebase_that_conflicts_is_aborted_each_try_and_leaves_the_checkout_as_it_was
 }
 
 #[test]
-fn a_pull_the_budget_cuts_mid_rebase_is_aborted_and_the_tree_is_left_as_it_was() {
+fn a_pull_killed_mid_rebase_is_aborted_with_the_tree_as_it_was_and_the_next_try_pushes() {
     let scratch = Scratch::new();
     let ct = scratch.ct();
     write(&ct.join(EPOCH).join("NOTES.md"), "local, unpushed\n");
     scratch.git(&ct, &["add", "-A"]);
     scratch.git(&ct, &["commit", "-qm", "local"]);
-    let local = scratch.head(&ct);
     scratch.push_from_other("STATE.md", "other\n");
     script(&ct.join(".git/hooks/pre-commit"), "exit 1\n");
+    // The rebase's first checkout kills the pull's whole process group, as a budget cut would.
     script(
         &ct.join(".git/hooks/post-checkout"),
-        "[ -e \"$TICK_FIXTURE/rebasing\" ] && exit 0\ntouch \"$TICK_FIXTURE/rebasing\"\nexec sleep 3600\n",
+        "[ -e \"$TICK_FIXTURE/killed\" ] && exit 0\ntouch \"$TICK_FIXTURE/killed\"\nkill -TERM 0\n",
     );
     write(&ct.join(EPOCH).join("CARD.md"), "card, in the autostash\n");
-    let proc = scratch.proc();
-    let report = scratch.phase(&proc, Path::new("cm"), Duration::from_secs(5), |ctx| {
-        gitsync::sync(ctx, Mode::Always)
+    let proc = FakeProc::new({
+        let base = scratch.proc();
+        let ct = ct.clone();
+        move |cmd| {
+            if cmd.line() == "git rebase --abort" {
+                assert!(
+                    ct.join(".git/rebase-merge").exists(),
+                    "the pull died mid-rebase"
+                );
+            }
+            base.run(cmd)
+        }
     });
-    assert!(
-        scratch.path().join("rebasing").exists(),
-        "the pull reached the rebase before the budget cut it"
+    let report = scratch.sync(&proc, Mode::Always);
+    assert_eq!(report.lines, [COMMIT_FAILED]);
+    assert!(scratch.path().join("killed").exists());
+    assert_eq!(
+        proc.log().into_iter().skip(4).collect::<Vec<_>>(),
+        [
+            "git pull -q --rebase --autostash origin main",
+            "git rebase --abort",
+            "git pull -q --rebase --autostash origin main",
+            "git push -q origin main",
+        ]
     );
-    assert_eq!(report.lines, [COMMIT_FAILED, SYNC_FAILED]);
-    let calls = proc.log();
-    let count = |call: &str| calls.iter().filter(|line| *line == call).count();
-    assert_eq!(count("git pull -q --rebase --autostash origin main"), 1);
-    assert_eq!(count("git rebase --abort"), 1);
-    assert!(
-        proc.pauses().is_empty(),
-        "no try starts once the budget is spent"
-    );
+    assert_eq!(proc.pauses(), [Duration::from_secs(2)]);
     assert!(!ct.join(".git/rebase-merge").exists());
     assert_eq!(
         scratch.git(&ct, &["rev-parse", "--abbrev-ref", "HEAD"]),
         "main\n"
     );
-    assert_eq!(scratch.head(&ct), local);
+    assert_eq!(scratch.origin_log(), ["local", "other: STATE.md", "start"]);
     assert_eq!(scratch.status(), format!(" M {EPOCH}/CARD.md\n"));
     assert_eq!(
         fs::read_to_string(ct.join(EPOCH).join("CARD.md")).unwrap(),
@@ -444,7 +493,21 @@ impl Pinned {
             ),
         );
         fs::create_dir_all(root.join("nocm").join(folder)).unwrap();
-        for (tarball, from) in [("release.tar.gz", "release"), ("nocm.tar.gz", "nocm")] {
+        let staged = |name: &str| root.join(name).join(folder).join("cm");
+        fs::create_dir_all(staged("devnull").parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("/dev/null", staged("devnull")).unwrap();
+        script(&staged("other"), &fake_cm("9.9.9", "{\"actionable\": []}"));
+        script(&staged("empty"), "");
+        fs::write(staged("empty"), "").unwrap();
+        fs::create_dir_all(staged("false").parent().unwrap()).unwrap();
+        fs::copy("/bin/false", staged("false")).unwrap();
+        fs::create_dir_all(staged("linked").parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(staged("release"), staged("linked")).unwrap();
+        script(&staged("failing"), &format!("echo 'cm {PINNED}'\nexit 1\n"));
+        for from in [
+            "release", "nocm", "devnull", "other", "empty", "false", "linked", "failing",
+        ] {
+            let tarball = format!("{from}.tar.gz");
             let tar = Command::new("tar")
                 .arg("-czf")
                 .arg(root.join(tarball))
@@ -474,11 +537,15 @@ impl Pinned {
 
     fn run(&self) -> Report {
         let proc = self.scratch.proc();
-        self.scratch.phase(&proc, &self.cm, pin::BUDGET, pin::run)
+        self.scratch.phase(&proc, &self.cm, MAX_BUDGET, pin::run)
     }
 
     fn version(&self) -> String {
-        let output = Command::new(&self.cm).arg("--version").output().unwrap();
+        let output = Command::new("sh")
+            .arg(&self.cm)
+            .arg("--version")
+            .output()
+            .unwrap();
         String::from_utf8(output.stdout).unwrap()
     }
 
@@ -529,7 +596,7 @@ fn a_stale_pin_is_fetched_unpacked_and_renamed_over_the_running_cm() {
     assert_eq!(
         pinned
             .scratch
-            .phase(&proc, &pinned.cm, pin::BUDGET, pin::run),
+            .phase(&proc, &pinned.cm, MAX_BUDGET, pin::run),
         Report::default()
     );
     assert_eq!(
@@ -640,7 +707,7 @@ impl Directives {
         let proc = FakeProc::new(|cmd| panic!("no child runs: {}", cmd.line()));
         let report = self
             .scratch
-            .phase(&proc, Path::new("cm"), directive::BUDGET, directive::run);
+            .phase(&proc, Path::new("cm"), MAX_BUDGET, directive::run);
         assert!(proc.calls().is_empty());
         report
     }
@@ -828,10 +895,12 @@ fn the_built_cm_tick_syncs_refreshes_its_pin_lists_directives_and_imports_the_ru
     );
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        format!(
-            "{LISTED}\nattempt-ended 01-a/u/c: from the pinned cm\nrules: now imported from tools/cloud-env/COORDINATOR.md; read it\n"
-        )
+        printed(&output.stdout).0,
+        [
+            LISTED,
+            "attempt-ended 01-a/u/c: from the pinned cm",
+            "rules: now imported from tools/cloud-env/COORDINATOR.md; read it"
+        ]
     );
     assert_eq!(scratch.origin_log()[0], "chore(mnemosyne): heartbeat sync");
     assert_eq!(scratch.status(), "");
@@ -854,64 +923,81 @@ fn a_claude_md_import_that_cannot_be_written_is_one_line_and_keeps_the_old_rules
     let claude = scratch.boot_time_claude_md();
     let old = fs::read(&claude).unwrap();
     let folder = scratch.path().join("home/.claude");
-    // A folder that refuses a staged file sends an unprivileged tick to the in-place write.
-    for mode in [0o755, 0o555] {
-        fs::set_permissions(&folder, fs::Permissions::from_mode(mode)).unwrap();
-        let output = scratch.tick(
-            Some("ulimit -f 0"),
-            &[
-                OsStr::new("--cm"),
-                OsStr::new("cm"),
-                OsStr::new("--checkout"),
-                scratch.ct().as_os_str(),
-            ],
-        );
-        fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(output.status.code(), Some(0), "{mode:o}: {output:?}");
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let lines: Vec<&str> = stdout.lines().collect();
-        assert_eq!(lines.len(), 2, "{mode:o}: {stdout}");
-        assert_eq!(
-            lines[0],
-            format!(
-                "heartbeat: could not write the COORDINATOR.md import to {}",
-                claude.display()
-            )
-        );
-        assert!(
-            lines[1].starts_with("tick: claude-md phase took ")
-                && lines[1].ends_with(" s (budget 5 s)"),
-            "{mode:o}: {stdout}"
-        );
-        assert_eq!(fs::read(&claude).unwrap(), old, "{mode:o}");
-        assert_eq!(names(&folder), ["CLAUDE.md"], "{mode:o}");
+    let import = claude_md::IMPORT.len() + 1;
+    let fsize = |bytes: usize| format!("prlimit --pid $$ --fsize={bytes}:{bytes}");
+    let link = scratch.path().join("home/rules");
+    // A second link sends any tick to the in-place write; a folder that refuses a staged file
+    // sends an unprivileged one there too.
+    for (mode, linked) in [(0o755, false), (0o555, false), (0o755, true)] {
+        if linked {
+            fs::hard_link(&claude, &link).unwrap();
+        }
+        for (limit, fits) in [
+            ("ulimit -f 0".to_owned(), false),
+            (fsize(import - 1), false),
+            (fsize(import), true),
+        ] {
+            fs::write(&claude, &old).unwrap();
+            fs::set_permissions(&folder, fs::Permissions::from_mode(mode)).unwrap();
+            let output = scratch.tick(
+                Some(&limit),
+                &[
+                    OsStr::new("--cm"),
+                    OsStr::new("cm"),
+                    OsStr::new("--checkout"),
+                    scratch.ct().as_os_str(),
+                ],
+            );
+            fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+            let case = format!("{mode:o}, linked {linked}, {limit}");
+            assert_eq!(output.status.code(), Some(0), "{case}: {output:?}");
+            let (lines, walls) = printed(&output.stdout);
+            assert_eq!(names(&folder), ["CLAUDE.md"], "{case}");
+            if fits {
+                assert_eq!(
+                    lines,
+                    ["rules: now imported from tools/cloud-env/COORDINATOR.md; read it"],
+                    "{case}"
+                );
+                assert_eq!(
+                    fs::read_to_string(&claude).unwrap(),
+                    format!("{}\n", claude_md::IMPORT),
+                    "{case}"
+                );
+                continue;
+            }
+            assert_eq!(
+                lines,
+                [format!(
+                    "heartbeat: could not write the COORDINATOR.md import to {}",
+                    claude.display()
+                )],
+                "{case}"
+            );
+            assert!(walls.contains(&"claude-md".to_owned()), "{case}: {walls:?}");
+            assert_eq!(fs::read(&claude).unwrap(), old, "{case}");
+        }
+        if linked {
+            assert_eq!(
+                fs::read_to_string(&link).unwrap(),
+                format!("{}\n", claude_md::IMPORT),
+                "the last case fits, written in place through both links"
+            );
+            fs::remove_file(&link).unwrap();
+        }
     }
 }
 
 #[test]
 fn a_pin_past_the_file_size_limit_keeps_the_running_cm_and_the_tick_alive() {
     let fetched = Pinned::released();
-    let linked = Pinned::new("cp \"$TICK_FIXTURE/linked.tar.gz\" \"$3\"");
-    let root = linked.scratch.path();
-    let folder = ASSET.trim_end_matches(".tar.gz");
-    fs::write(root.join("big"), vec![b'#'; 1 << 20]).unwrap();
-    fs::create_dir_all(root.join("linked").join(folder)).unwrap();
-    std::os::unix::fs::symlink(
-        root.join("big"),
-        root.join("linked").join(folder).join("cm"),
-    )
-    .unwrap();
-    let tar = Command::new("tar")
-        .arg("-czf")
-        .arg(root.join("linked.tar.gz"))
-        .arg("-C")
-        .arg(root.join("linked"))
-        .arg(folder)
-        .status()
-        .unwrap();
-    assert!(tar.success());
-    // At 0 the fetch child dies writing the tarball; at 64 KiB the tarball and its link fit and
-    // only the copy into the staged cm would not.
+    // The fetch links a 1 MiB file where the unpacked cm goes, writing no byte of it, so only the
+    // copy into the staged cm is past the limit.
+    let linked = Pinned::new(
+        "cp \"$TICK_FIXTURE/nocm.tar.gz\" \"$3\" && mkdir -p cm-0.17.1-x86_64-unknown-linux-musl && ln \"$TICK_FIXTURE/big\" cm-0.17.1-x86_64-unknown-linux-musl/cm",
+    );
+    fs::write(linked.scratch.path().join("big"), vec![b'#'; 1 << 20]).unwrap();
+    // At 0 the fetch child dies writing the tarball; at 64 KiB everything but that copy fits.
     for (pinned, limit) in [(&fetched, "ulimit -f 0"), (&linked, "ulimit -f 64")] {
         pinned.scratch.fake_git();
         let output = pinned.scratch.tick(
@@ -924,20 +1010,15 @@ fn a_pin_past_the_file_size_limit_keeps_the_running_cm_and_the_tick_alive() {
             ],
         );
         assert_eq!(output.status.code(), Some(0), "{limit}: {output:?}");
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let lines: Vec<&str> = stdout.lines().collect();
+        let (lines, walls) = printed(&output.stdout);
         assert_eq!(
-            lines[0],
-            format!(
+            lines,
+            [format!(
                 "heartbeat: cm {PINNED} (setup.sh's pin) could not be fetched or installed; still running cm 0.0.1"
-            ),
+            )],
             "{limit}"
         );
-        assert!(
-            lines[1].starts_with("tick: pin phase took "),
-            "{limit}: {stdout}"
-        );
-        assert_eq!(lines.len(), 2, "{limit}: {stdout}");
+        assert!(walls.contains(&"pin".to_owned()), "{limit}: {walls:?}");
         assert_eq!(pinned.version(), "cm 0.0.1\n");
         assert_eq!(names(&pinned.scratch.path().join("bin")), ["cm", "git"]);
         assert_eq!(
@@ -945,4 +1026,84 @@ fn a_pin_past_the_file_size_limit_keeps_the_running_cm_and_the_tick_alive() {
             Vec::<String>::new()
         );
     }
+}
+
+#[test]
+fn a_journal_line_of_ten_thousand_pickups_is_read_in_a_128_mib_address_space() {
+    let scratch = Scratch::new();
+    scratch.fake_git();
+    script(
+        &scratch.path().join("bin/cm"),
+        "echo '{\"actionable\": []}'\n",
+    );
+    let epoch = scratch.ct().join(EPOCH);
+    write(
+        &epoch.join("handoff/coordinator-2026-11-24T2030Z.md"),
+        &handoff(STAMP),
+    );
+    let marker = "— Directive picked up: ";
+    write(
+        &epoch.join("JOURNAL.md"),
+        &format!(
+            "## {STAMP} — stamp\n## 2026-11-25T04:05Z — Owner directive: picked last\n{OPEN}{}2026-11-25T04:05Z — Owner directive: picked last\n",
+            marker.repeat(10_000)
+        ),
+    );
+    let output = scratch.tick(
+        Some("ulimit -v 131072"),
+        &[
+            OsStr::new("--cm"),
+            OsStr::new("cm"),
+            OsStr::new("--checkout"),
+            scratch.ct().as_os_str(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(printed(&output.stdout).0, [LISTED]);
+}
+
+#[test]
+fn a_staged_cm_that_does_not_run_and_name_the_pin_is_never_installed() {
+    for tarball in ["devnull", "linked", "other", "empty", "false", "failing"] {
+        let pinned = Pinned::new(&format!("cp \"$TICK_FIXTURE/{tarball}.tar.gz\" \"$3\""));
+        pinned.left_alone(pinned.run());
+    }
+}
+
+#[test]
+fn a_fetch_killed_mid_way_leaves_neither_our_folder_nor_setup_sh_s_own() {
+    let pinned = Pinned::new("mktemp -d > \"$TICK_FIXTURE/made\"; kill -TERM 0");
+    pinned.left_alone(pinned.run());
+    let made = fs::read_to_string(pinned.scratch.path().join("made")).unwrap();
+    let made = Path::new(made.trim_end());
+    assert!(
+        made.starts_with(pinned.scratch.path().join("tmp")),
+        "{}",
+        made.display()
+    );
+    assert!(!made.exists());
+}
+
+#[test]
+fn a_panic_while_the_staged_cm_is_checked_leaves_no_staging_behind() {
+    let pinned = Pinned::released();
+    let base = pinned.scratch.proc();
+    let proc = FakeProc::new(move |cmd| {
+        if cmd.program_name().starts_with(".cm-pin-") {
+            panic!("checking the staged cm");
+        }
+        base.run(cmd)
+    });
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pinned
+            .scratch
+            .phase(&proc, &pinned.cm, MAX_BUDGET, pin::run)
+    }));
+    assert!(panicked.is_err());
+    assert_eq!(pinned.version(), "cm 0.0.1\n");
+    assert_eq!(names(&pinned.scratch.path().join("bin")), ["cm"]);
+    assert_eq!(
+        names(&pinned.scratch.path().join("tmp")),
+        Vec::<String>::new()
+    );
 }

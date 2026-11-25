@@ -1,10 +1,11 @@
 use std::fs::{File, Permissions};
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
 use crate::tick::act::{Ctx, Report};
+use crate::tick::beat::FRAME_CAP;
 use crate::tick::claude_md::within_size_limit;
 use crate::tick::proc::{Cmd, Keep};
 
@@ -70,16 +71,23 @@ fn running(ctx: &Ctx) -> String {
         )
         .map(|ran| ran.stdout_text())
         .unwrap_or_default();
-    let words: Vec<&str> = version
-        .split('\n')
-        .map(|line| {
-            line.split([' ', '\t'])
-                .filter(|word| !word.is_empty())
-                .nth(1)
-                .unwrap_or_default()
-        })
-        .collect();
-    words.join("\n").trim_end_matches('\n').to_owned()
+    second_words(&version)
+}
+
+// awk's `{ print $2 }` under `$(...)`: each line's second blank-separated word, trailing newlines
+// dropped.
+fn second_words(text: &str) -> String {
+    let mut words = String::new();
+    for line in text.split('\n') {
+        let word = line
+            .split([' ', '\t'])
+            .filter(|word| !word.is_empty())
+            .nth(1)
+            .unwrap_or_default();
+        words.push_str(word);
+        words.push('\n');
+    }
+    words.trim_end_matches('\n').to_owned()
 }
 
 fn install(ctx: &Ctx, pin: &Pin) -> bool {
@@ -97,9 +105,14 @@ fn install(ctx: &Ctx, pin: &Pin) -> bool {
         return false;
     };
     let asset = tmp.path().join(name);
+    // setup.sh's own temporary folders land in ours too, so a fetch the budget kills leaves none.
     let step = |cmd: Cmd| {
-        ctx.run(cmd.cwd(tmp.path()).keep(Keep::Tail, Keep::Tail))
-            .is_ok_and(|ran| ran.exit.success())
+        ctx.run(
+            cmd.cwd(tmp.path())
+                .env("TMPDIR", tmp.path())
+                .keep(Keep::Tail, Keep::Tail),
+        )
+        .is_ok_and(|ran| ran.exit.success())
     };
     let fetched = step(
         Cmd::new("bash")
@@ -111,7 +124,7 @@ fn install(ctx: &Ctx, pin: &Pin) -> bool {
         .path()
         .join(name.strip_suffix(".tar.gz").unwrap_or(name))
         .join("cm");
-    fetched && replace(&unpacked, target).is_ok()
+    fetched && replace(ctx, &unpacked, target, &pin.version).is_ok()
 }
 
 fn plain_name(name: &str) -> bool {
@@ -119,9 +132,14 @@ fn plain_name(name: &str) -> bool {
 }
 
 // Staged beside the cm and renamed over it, so a running cm keeps its old file and a failure at
-// any step leaves the installed cm as it was.
-fn replace(from: &Path, target: &Path) -> std::io::Result<()> {
-    let dir = target.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+// any step leaves the installed cm as it was. The staged copy must be a regular file that runs
+// and names the pin before it replaces anything.
+fn replace(ctx: &Ctx, from: &Path, target: &Path, version: &str) -> std::io::Result<()> {
+    let refused = || std::io::Error::from(ErrorKind::InvalidData);
+    if !std::fs::symlink_metadata(from)?.is_file() {
+        return Err(refused());
+    }
+    let dir = target.parent().ok_or(ErrorKind::InvalidInput)?;
     let mut staged = tempfile::Builder::new()
         .prefix(".cm-pin-")
         .tempfile_in(dir)?;
@@ -132,9 +150,24 @@ fn replace(from: &Path, target: &Path) -> std::io::Result<()> {
     staged
         .as_file()
         .set_permissions(Permissions::from_mode(0o755))?;
-    staged.as_file().sync_all()?;
+    let staged = staged.into_temp_path();
+    if !names_the_pin(ctx, &staged, version) {
+        return Err(refused());
+    }
     staged.persist(target).map_err(|error| error.error)?;
     Ok(())
+}
+
+// Its own cap, as the frame's children have: the phase budget may be spent by a slow fetch.
+fn names_the_pin(ctx: &Ctx, staged: &Path, version: &str) -> bool {
+    let check = Cmd::new(staged)
+        .arg("--version")
+        .cwd(ctx.checkout)
+        .timeout(FRAME_CAP)
+        .keep(Keep::Head, Keep::Tail);
+    ctx.proc
+        .run(&check)
+        .is_ok_and(|ran| ran.exit.success() && second_words(&ran.stdout_text()) == version)
 }
 
 #[cfg(test)]
@@ -247,21 +280,51 @@ mod tests {
 
     #[test]
     fn two_cm_pins_install_nothing_and_say_so() {
-        let proc = answering("cm|0.17.1|a.tar.gz\ncm|0.17.2|b.tar.gz\n", "cm 0.17.0\n");
-        let report = ctx_run(&proc, "/bin/cm", run);
-        assert_eq!(
-            report.lines,
-            [
-                "heartbeat: cm 0.17.1 (setup.sh's pin) could not be fetched or installed; still running cm 0.17.0"
-            ]
+        for rows in [
+            "cm|0.17.1|a.tar.gz\ncm|0.17.2|b.tar.gz\n",
+            "cm|0.17.1|a.tar.gz\ncm|0.17.1|a.tar.gz\n",
+        ] {
+            let proc = answering(rows, "cm 0.17.0\n");
+            let report = ctx_run(&proc, "/bin/cm", run);
+            assert_eq!(
+                report.lines,
+                [
+                    "heartbeat: cm 0.17.1 (setup.sh's pin) could not be fetched or installed; still running cm 0.17.0"
+                ],
+                "{rows:?}"
+            );
+            assert!(report.failed);
+            assert!(
+                !proc
+                    .log()
+                    .iter()
+                    .any(|call| call.contains("--fetch-pinned"))
+            );
+        }
+    }
+
+    #[test]
+    fn the_staged_cm_is_run_with_its_own_cap_even_when_the_budget_is_spent() {
+        let proc = FakeProc::new(|cmd| Ok(Ran::code(0, format!("cm {}\n", cmd.argv.len()))));
+        let env = Env::default();
+        let spent = Ctx::new(
+            Path::new("/ct"),
+            Path::new("store/epochs/e"),
+            &proc,
+            &env,
+            OsStr::new("/bin/cm"),
+            Duration::ZERO,
         );
-        assert!(report.failed);
-        assert!(
-            !proc
-                .log()
-                .iter()
-                .any(|call| call.contains("--fetch-pinned"))
-        );
+        assert!(names_the_pin(&spent, Path::new("/bin/.cm-pin-x"), "2"));
+        assert!(!names_the_pin(
+            &spent,
+            Path::new("/bin/.cm-pin-x"),
+            "0.17.1"
+        ));
+        let check = proc.calls().pop().unwrap();
+        assert_eq!(check.line(), ".cm-pin-x --version");
+        assert_eq!(check.timeout, Duration::from_secs(30));
+        assert_eq!(check.cwd.as_deref(), Some(Path::new("/ct")));
     }
 
     #[test]
