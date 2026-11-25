@@ -7874,3 +7874,89 @@ fn a_script_pin_is_merge_ready_on_clean_green_ci_and_owes_no_review() {
         ]
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_pi_or_undeclared_lane_pr_is_merge_ready_after_one_verdict() {
+    let host = at("2026-11-25T08:00:00Z");
+    let c = campaign(&host);
+    let mut heads = BTreeMap::new();
+    let mut seen = BTreeMap::new();
+    assert!(declare(&host, &c, "01-a/u/local", Lane::Pi, &[]).ok());
+    for (step, pr) in [
+        ("01-a/u/local", "https://github.com/o/r/pull/3"),
+        ("01-a/u/loose", "https://github.com/o/r/pull/4"),
+    ] {
+        kickoff(&c, step);
+        open_pr(&host, &c, step, pr);
+        let head = plan::track(&plan::load_units(&c.root).unwrap(), step)
+            .unwrap()
+            .evidence
+            .sha
+            .clone()
+            .unwrap();
+        heads.insert(pr.to_owned(), head.clone());
+        seen.insert(
+            pr.to_owned(),
+            plan::Observed {
+                base: Some("b".repeat(40)),
+                ci_head: Some(head.clone()),
+                ci_base: Some("b".repeat(40)),
+                ci_green: Some(true),
+                target: step.to_owned(),
+                at: "2026-11-25T08:00Z".into(),
+                head: Some(head),
+                mergeable_state: Some("clean".to_owned().into()),
+            },
+        );
+    }
+    store::write_json(&plan::pulls_path(&c.root), &seen).unwrap();
+    let forge = GreenPulls(heads.clone());
+    let kinds = || {
+        plan::next_with(&c.root, None, None, host.now, Some(&forge))
+            .unwrap()
+            .fields["actionable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|action| {
+                ["merge-ready", "review-owed"].contains(&action["kind"].as_str().unwrap())
+            })
+            .map(|action| {
+                (
+                    action["kind"].as_str().unwrap().to_owned(),
+                    action["target"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let owed = |step: &str| ("review-owed".to_owned(), step.to_owned());
+    let ready = |step: &str| ("merge-ready".to_owned(), step.to_owned());
+    assert_eq!(kinds(), [owed("01-a/u/local"), owed("01-a/u/loose")]);
+    // One cleared verdict, from any reviewer, is all a lane no model writes in needs: no Astra
+    // receipt binds it.
+    for (step, pr) in [
+        ("01-a/u/local", "https://github.com/o/r/pull/3"),
+        ("01-a/u/loose", "https://github.com/o/r/pull/4"),
+    ] {
+        let head = &heads[pr];
+        let report = c.root.join(format!("{step}/evidence/review.md"));
+        fs::create_dir_all(report.parent().unwrap()).unwrap();
+        fs::write(
+            &report,
+            format!("# Review\n\nRead.\n\n```cm-review\nhead: {head}\n```\n\nACCEPT\n"),
+        )
+        .unwrap();
+        let recorded = cm::verdict::record(
+            &host,
+            &c.root,
+            &parse_target(step, true).unwrap(),
+            &report,
+            Some("claude"),
+            None,
+        )
+        .unwrap();
+        assert!(recorded.ok(), "{step}: {:?}", recorded.violations);
+    }
+    assert_eq!(kinds(), [ready("01-a/u/local"), ready("01-a/u/loose")]);
+}

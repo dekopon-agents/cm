@@ -4739,3 +4739,32 @@ fn reviews_recorded_before_parts_can_be_recorded_again_for_a_part() {
     .unwrap();
     assert_eq!(rules(&twice), ["review-duplicate"]);
 }
+
+#[test]
+fn a_report_recorded_before_pr_open_is_not_recorded_again_as_another_family() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host, false);
+    let head = c.head();
+    let astra = c.report("astra-review-7", &head, &[], "ACCEPT");
+    assert!(record(&host, &c, &astra, "astra").ok());
+    let opened = commands::advance(
+        &host,
+        &c.root,
+        &target(),
+        &Phase::PrOpen,
+        &Evidence {
+            pr: Some(PR.into()),
+            sha: Some(head.clone()),
+            ..Evidence::default()
+        },
+        None,
+        Some(&c.repo),
+    )
+    .unwrap();
+    assert!(opened.ok(), "{:?}", opened.violations);
+    // The review recorded with no PR stands for this one: the same report is no Claude verdict.
+    assert_eq!(
+        rules(&record(&host, &c, &astra, "claude")),
+        ["review-duplicate"]
+    );
+}

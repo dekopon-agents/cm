@@ -800,7 +800,10 @@ pub fn record(
         // one part never serves another.
         && let Some(again) = verdicts.reviews.iter().find(|review| {
             review.step == full
-                && (review.part.is_some() || (review.part.as_deref() == part && review.pr == pr))
+                && (review.part.is_some()
+                    || (review.part.as_deref() == part
+                        // A review recorded before pr-open names no PR: it stands for this one.
+                        && (review.pr.is_none() || pr.is_none() || review.pr == pr)))
                 && fs::read_to_string(root.join(review.report.as_str()))
                     .ok()
                     .as_ref()
@@ -1881,8 +1884,14 @@ pub fn merge_gaps(
             .ok()
             .and_then(|unit| unit.steps.get(target.step.as_deref()?)?.lane),
     );
+    // (a)'s Astra receipt binds model lanes only; any other lane needs any one cleared review.
     let gaps_at = |at: &str| -> Vec<String> {
-        astra_gap(root, target, &verdicts, pr, at, part)
+        let astra = if model {
+            astra_gap(root, target, &verdicts, pr, at, part)
+        } else {
+            Vec::new()
+        };
+        astra
             .into_iter()
             .chain(review_gap(
                 &verdicts,
