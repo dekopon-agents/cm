@@ -147,8 +147,9 @@ Children:
 
 - A kill of `cm tick` itself does not reach a running child's own group, so the Stop hook must bound `cm tick` by session.
 - A spill write that blocks (a frozen filesystem under `TMPDIR`) holds the capture, and so its timeout, until the write returns.
-- `--json` holds every line to print one object, so its memory grows with the list; text output does not.
-- `RLIMIT_CPU` is not caught: past it the kernel's SIGXCPU ends the tick, as it ended heartbeat.sh.
+- Each act line is parsed and its text formatted whole, in text and `--json` output alike: when memory for one line cannot be had, Rust's allocation abort ends the tick (exit 134) with no output from that line on. Only the list's 64 MiB hold moves to a file when memory runs out; `cm next` prints lines of a few kilobytes, a few megabytes at most.
+- `--json` holds every line to print one object after the loop, so its memory grows with the list (text output does not): memory short of a few times the list's size ends the tick with the same allocation abort (exit 134), after the moves have run and before the object is printed.
+- `RLIMIT_CPU` is not caught: past the soft limit the kernel's SIGXCPU ends the tick (exit 152), past the hard limit SIGKILL, as either ended heartbeat.sh; moves already made stand.
 
 ## Ideas
 
