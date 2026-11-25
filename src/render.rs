@@ -7,6 +7,9 @@ use crate::state::{
     Lane, Phase, Release, Step, Track, UnitState, Version, Watch, WatchStatus, Work,
 };
 
+// The clock reaches CARD.md only through threshold comparisons like this one.
+const WITHDRAWN_WATCH_SHOWN: jiff::SignedDuration = jiff::SignedDuration::from_hours(24);
+
 fn cell(text: &str) -> String {
     text.replace('|', "\\|").replace('\n', " ")
 }
@@ -248,9 +251,7 @@ fn watch_summary(root: &std::path::Path, now: Timestamp, units: &Units) -> Vec<S
                         else {
                             continue;
                         };
-                        if at > now
-                            || now.duration_since(at) > jiff::SignedDuration::from_secs(24 * 3600)
-                        {
+                        if at > now || now.duration_since(at) > WITHDRAWN_WATCH_SHOWN {
                             continue;
                         }
                         (2, Some(at))

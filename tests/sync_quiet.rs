@@ -873,3 +873,41 @@ fn an_unreadable_publication_is_journaled_once_while_it_stays_unreadable() {
         "{added}"
     );
 }
+
+#[test]
+fn the_card_changes_with_the_clock_only_across_a_threshold() {
+    let host = at("2026-10-26T04:00:00Z");
+    let c = campaign(&host);
+    declare(&host, &c, "01-a/u/check", &[], Ships::default());
+    let target = parse_target("01-a/u/check", true).unwrap();
+    let added = cm::holds::watch_add(
+        &host,
+        &c.root,
+        &target,
+        "log:withdrawn",
+        "2026-11-30T06:00Z",
+    );
+    assert!(added.unwrap().ok());
+    let withdrawn = cm::holds::watch_withdraw(
+        &at("2026-10-26T07:00:00Z"),
+        &c.root,
+        &target,
+        1,
+        "wrong signal",
+    );
+    assert!(withdrawn.unwrap().ok());
+    let units = cm::plan::load_units(&c.root).unwrap();
+    let next = cm::plan::summary(&c.root, &units);
+    let card = |now: &str| cm::render::card(&c.root, at(now).now, "c", &units, &next);
+    // A withdrawn watch shows for 24 hours; within that window, and after it, time changes nothing.
+    let shown = card("2026-10-26T07:00:01Z");
+    assert!(shown.contains("withdrawn-recent 1"), "{shown}");
+    for now in ["2026-10-26T12:00:00Z", "2026-10-27T07:00:00Z"] {
+        assert_eq!(card(now), shown, "{now}");
+    }
+    let gone = card("2026-10-27T07:00:01Z");
+    assert!(gone.contains("withdrawn-recent 0"), "{gone}");
+    for now in ["2026-10-27T08:00:00Z", "2026-10-29T07:00:00Z"] {
+        assert_eq!(card(now), gone, "{now}");
+    }
+}
