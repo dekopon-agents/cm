@@ -686,20 +686,18 @@ fn gh_reads_run_at_once() {
             &format!("https://github.com/o/r/pull/{number}"),
         );
     }
-    // Each PR read waits, up to five seconds, until another read is in flight beside it.
+    // A barrier: each PR read leaves a lasting arrival marker and waits, up to ten seconds, for
+    // all four; read one at a time, the first would wait out the deadline alone.
     let gh = support::FakeGh::new(
         r#"if [ "$2" = rate_limit ]; then echo rate_limit >>"$FAKE_GH/calls"; exit 1; fi
-touch "$FAKE_GH/in.$$"
-tries=100
-while :; do
-    seen=$(ls "$FAKE_GH" | grep -c '^in\.')
-    if [ "$seen" -ge 2 ] || [ "$tries" -eq 0 ]; then break; fi
+touch "$FAKE_GH/arrived.$$"
+tries=200
+while [ "$(ls "$FAKE_GH" | grep -c '^arrived\.')" -lt 4 ] && [ "$tries" -gt 0 ]; do
     tries=$((tries - 1))
     sleep 0.05
 done
-echo "$seen" >>"$FAKE_GH/overlap"
+ls "$FAKE_GH" | grep -c '^arrived\.' >>"$FAKE_GH/overlap"
 echo pull >>"$FAKE_GH/calls"
-rm "$FAKE_GH/in.$$"
 echo '{"state":"open","merged":false,"head":{"sha":"0000000000000000000000000000000000000000"}}'
 "#,
     );
@@ -710,13 +708,7 @@ echo '{"state":"open","merged":false,"head":{"sha":"0000000000000000000000000000
     let synced = sync_with(&host, Reader::Concurrent(&forge), &c.root, BUDGET).unwrap();
     assert!(synced.ok(), "{:?}", synced.violations);
     let overlap = fs::read_to_string(gh.fixture().join("overlap")).unwrap();
-    assert_eq!(overlap.lines().count(), 4, "{overlap}");
-    assert!(
-        overlap
-            .lines()
-            .all(|seen| seen.parse::<usize>().unwrap() >= 2),
-        "a read ran alone: {overlap}"
-    );
+    assert_eq!(overlap, "4\n4\n4\n4\n", "a read passed the barrier alone");
     // The quota sample follows the reads, so its `used` counts them.
     let calls = fs::read_to_string(gh.fixture().join("calls")).unwrap();
     assert_eq!(calls, "pull\npull\npull\npull\nrate_limit\n");
