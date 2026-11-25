@@ -44,12 +44,17 @@ pub(crate) fn coordinator_label(given: &Option<String>) -> Option<String> {
         if value.is_empty() {
             None
         } else {
-            Some(match value.strip_prefix("cse_") {
-                Some(id) => format!("session_{id}"),
-                None => value.to_owned(),
-            })
+            Some(session_label(value))
         }
     })
+}
+
+/// A remote session id as cm records it: a leading `cse_` becomes `session_`.
+fn session_label(value: &str) -> String {
+    match value.strip_prefix("cse_") {
+        Some(id) => format!("session_{id}"),
+        None => value.to_owned(),
+    }
 }
 
 fn launch_metadata(kind: &str) -> bool {
@@ -533,14 +538,23 @@ pub fn covers(prefix: &str, target: &str) -> bool {
 }
 
 impl Drivers {
-    /// No file registers no driver; a file cm cannot parse is an error.
-    pub fn load(root: &Path) -> Result<Self> {
+    /// No file registers no driver; a file cm cannot read or parse is `lane-drivers-unreadable`,
+    /// which names how to restore it.
+    pub fn read(root: &Path) -> std::result::Result<Self, Violation> {
         let path = drivers_path(root);
-        if path.exists() {
-            store::read_json(&path)
-        } else {
-            Ok(Self::default())
+        if !path.exists() {
+            return Ok(Self::default());
         }
+        store::read_json(&path).map_err(|error| {
+            Violation::new(
+                registry_path(),
+                "lane-drivers-unreadable",
+                format!(
+                    "{error:#}; restore it with `git checkout HEAD -- {}`, then `cm lane driver list` and `cm lane driver add` any driver it lacks",
+                    registry_path()
+                ),
+            )
+        })
     }
 
     /// The lane whose registered driver is `session` with a unit covering `target`.
@@ -610,6 +624,8 @@ pub fn driver_add(
     by: &str,
 ) -> Result<Outcome> {
     let path = registry_path();
+    let session = session_label(session);
+    let session = session.as_str();
     let mut violations = Vec::new();
     check_lane(lane, &mut violations);
     if !is_name(session) {
@@ -657,13 +673,19 @@ pub fn driver_add(
         return Ok(Outcome::refused(violations));
     }
     let (_lock, mut violations) = crate::ledger::guard(root)?;
-    let mut drivers = Drivers::load(root)?;
+    let mut drivers = match Drivers::read(root) {
+        Ok(drivers) => drivers,
+        Err(violation) => {
+            violations.push(violation);
+            return Ok(Outcome::refused(violations));
+        }
+    };
     if let Some(driven) = drivers.lane_of(by) {
         violations.push(Violation::new(
             &path,
             "lane-driver-registrar",
             format!(
-                "`{by}` drives lane `{driven}`: only the coordinator registers a driver; run `cm lane driver add` from the coordinator's session"
+                "`{by}` is registered as the driver of lane `{driven}`, and only the coordinator registers a driver: if this session is the coordinator now, `cm lane driver remove {driven}` first; otherwise run `cm lane driver add` from the coordinator's session"
             ),
         ));
     }
@@ -692,8 +714,20 @@ pub fn driver_add(
         by: by.to_owned(),
     };
     drivers.drivers.insert(lane.to_owned(), driver.clone());
-    std::fs::create_dir_all(root.join(CM_DIR))?;
-    store::write_json(&drivers_path(root), &drivers)?;
+    let units = crate::plan::load_units(root)?;
+    let undeclared: Vec<&String> = driver
+        .units
+        .iter()
+        .filter(|prefix| {
+            !units.iter().any(|(unit, state)| {
+                covers(prefix, unit)
+                    || state
+                        .steps
+                        .keys()
+                        .any(|step| covers(prefix, &format!("{unit}/{step}")))
+            })
+        })
+        .collect();
     let mut body = format!(
         "- session: {session}\n- units: {}\n- registered by: {by}\n",
         units_line(&driver.units)
@@ -710,14 +744,23 @@ pub fn driver_add(
         ));
         line.push_str(&format!("; replaces {}", old.session));
     }
+    // Journal first, as the owner-queue read does: no registry write goes unjournaled.
     let journal = crate::ledger::journal_line(
         root,
         &at,
         &format!("lane driver add {lane}: {session}"),
         &body,
     )?;
+    std::fs::create_dir_all(root.join(CM_DIR))?;
+    store::write_json(&drivers_path(root), &drivers)?;
     let mut outcome = Outcome::default();
     outcome.line(line);
+    for prefix in &undeclared {
+        outcome.line(format!(
+            "warning: no declared unit or step is under {prefix} yet; it covers steps declared there later"
+        ));
+    }
+    outcome.field("undeclared", serde_json::to_value(&undeclared)?);
     outcome.field("lane", lane);
     outcome.field("driver", serde_json::to_value(&driver)?);
     outcome.field("replaced", serde_json::to_value(&replaced)?);
@@ -736,7 +779,13 @@ pub fn driver_remove(host: &dyn Host, root: &Path, lane: &str, by: &str) -> Resu
         return Ok(Outcome::refused(violations));
     }
     let (_lock, mut violations) = crate::ledger::guard(root)?;
-    let mut drivers = Drivers::load(root)?;
+    let mut drivers = match Drivers::read(root) {
+        Ok(drivers) => drivers,
+        Err(violation) => {
+            violations.push(violation);
+            return Ok(Outcome::refused(violations));
+        }
+    };
     let Some(driver) = drivers.drivers.remove(lane) else {
         let registered = if drivers.drivers.is_empty() {
             "none is registered".to_owned()
@@ -764,7 +813,6 @@ pub fn driver_remove(host: &dyn Host, root: &Path, lane: &str, by: &str) -> Resu
         return Ok(Outcome::refused(violations));
     }
     let at = stamp(host.now());
-    store::write_json(&drivers_path(root), &drivers)?;
     let journal = crate::ledger::journal_line(
         root,
         &at,
@@ -774,6 +822,7 @@ pub fn driver_remove(host: &dyn Host, root: &Path, lane: &str, by: &str) -> Resu
             units_line(&driver.units)
         ),
     )?;
+    store::write_json(&drivers_path(root), &drivers)?;
     let mut outcome = Outcome::default();
     outcome.line(format!(
         "lane {lane}: removed driver {} for {}",
@@ -788,7 +837,10 @@ pub fn driver_remove(host: &dyn Host, root: &Path, lane: &str, by: &str) -> Resu
 
 /// `cm lane driver list`: the registered drivers, by lane name.
 pub fn driver_list(root: &Path) -> Result<Outcome> {
-    let drivers = Drivers::load(root)?;
+    let drivers = match Drivers::read(root) {
+        Ok(drivers) => drivers,
+        Err(violation) => return Ok(Outcome::refused(vec![violation])),
+    };
     let mut outcome = Outcome::default();
     let mut items = Vec::new();
     for (lane, driver) in &drivers.drivers {

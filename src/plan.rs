@@ -375,12 +375,13 @@ impl ActionInputs {
     /// Sync's reading: like an unreadable review ledger, an unreadable lane-driver registry is not
     /// refused there; it registers no driver, so every claim reads as it would without one.
     pub(crate) fn read(root: &Path, now: Timestamp) -> Self {
-        Self::with_drivers(root, now, Drivers::load(root).unwrap_or_default())
+        Self::with_drivers(root, now, Drivers::read(root).unwrap_or_default())
     }
 
-    /// `cm next`'s reading, which refuses an unreadable lane-driver registry.
-    pub(crate) fn load(root: &Path, now: Timestamp) -> Result<Self> {
-        Ok(Self::with_drivers(root, now, Drivers::load(root)?))
+    /// `cm next`'s reading, which refuses an unreadable lane-driver registry with the violation
+    /// that names how to restore it.
+    pub(crate) fn load(root: &Path, now: Timestamp) -> Result<Self, Violation> {
+        Ok(Self::with_drivers(root, now, Drivers::read(root)?))
     }
 
     fn with_drivers(root: &Path, now: Timestamp, drivers: Drivers) -> Self {
@@ -822,11 +823,14 @@ fn driver_held(
         .collect()
 }
 
+/// Absent while no driver holds a step, so `cm next` reads as it did before drivers existed.
 fn append_held(outcome: &mut Outcome, held: &[Value]) {
     for item in held {
         outcome.line(item["note"].as_str().unwrap_or_default());
     }
-    outcome.field("driver_held", held);
+    if !held.is_empty() {
+        outcome.field("driver_held", held);
+    }
 }
 
 pub(crate) fn action_summary(
@@ -858,7 +862,10 @@ pub(crate) fn next_act(
         Vec::new()
     } else {
         let units = load_units(root)?;
-        let inputs = ActionInputs::load(root, now)?;
+        let inputs = match ActionInputs::load(root, now) {
+            Ok(inputs) => inputs,
+            Err(violation) => return Ok((Outcome::refused(vec![violation]), true)),
+        };
         let stalled = stalls(&units, &inputs);
         let verdicts = crate::verdict::load(root)?;
         action_scope(
@@ -1130,6 +1137,10 @@ pub fn next_at(
         Ok(paused) => paused,
         Err(violations) => return Ok(Outcome::refused(violations)),
     };
+    let inputs = match ActionInputs::load(root, now) {
+        Ok(inputs) => inputs,
+        Err(violation) => return Ok(Outcome::refused(vec![violation])),
+    };
     let units = load_units(root)?;
     let all = candidates(root, &units);
     let mut outcome = Outcome::default();
@@ -1164,7 +1175,6 @@ pub fn next_at(
     }
     outcome.field("review_waits", review_waits);
     let verdicts = crate::verdict::load(root)?;
-    let inputs = ActionInputs::load(root, now)?;
     let stalled = stalls(&units, &inputs);
     let actions = action_scope(
         actionable(root, &units, &inputs, &stalled, &verdicts),
