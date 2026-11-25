@@ -141,6 +141,7 @@ Children:
   - `Head` keeps the first 4 MiB;
   - `Tail` keeps the last 4 MiB.
 - `Ran` holds the exit (`Code`, `Signal`, `TimedOut` or `TooLarge`), stdout and stderr, whether each was truncated, a spilled stdout, and the wall time.
+- Stdout and stderr are always pipes, read until every process holding them has closed them, so output a descendant prints after the leader exits is kept, and a descendant holding them open keeps the child running until its timeout.
 - Each child runs in a process group of its own. At its timeout the group gets TERM, then up to 5 s for every member to finish (even after the leader exits), then KILL.
 
 **Limit:** a kill of `cm tick` itself does not reach a running child's own group, so the Stop hook must bound `cm tick` by session.

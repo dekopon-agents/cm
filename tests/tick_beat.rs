@@ -1399,11 +1399,16 @@ fn a_valid_act_list_above_64_mib_prints_every_line() {
 
 const BIG_LIST: usize = 70_000;
 
-// A `cm` printing a valid list of BIG_LIST lines, more than 64 MiB, generated as it is printed.
-fn big_list() -> String {
+// The command printing a valid list of BIG_LIST lines, more than 64 MiB, generated as it is
+// printed.
+fn big_list_awk() -> String {
     format!(
-        "awk 'BEGIN {{ printf \"{{\\\"ok\\\":true,\\\"actionable\\\":[\"; for (i = 0; i < {BIG_LIST}; i++) {{ if (i) printf \",\"; printf \"{{\\\"kind\\\":\\\"stale-block\\\",\\\"target\\\":\\\"01-a/u/s%07d\\\",\\\"command\\\":\\\"cm sync %01000d\\\"}}\", i, i }} printf \"]}}\" }}'\nexit 1\n"
+        "awk 'BEGIN {{ printf \"{{\\\"ok\\\":true,\\\"actionable\\\":[\"; for (i = 0; i < {BIG_LIST}; i++) {{ if (i) printf \",\"; printf \"{{\\\"kind\\\":\\\"stale-block\\\",\\\"target\\\":\\\"01-a/u/s%07d\\\",\\\"command\\\":\\\"cm sync %01000d\\\"}}\", i, i }} printf \"]}}\" }}'"
     )
+}
+
+fn big_list() -> String {
+    format!("{}\nexit 1\n", big_list_awk())
 }
 
 fn big_line(n: usize) -> String {
@@ -1423,6 +1428,95 @@ fn a_descendant_holding_stdout_open_runs_until_the_timeout_then_goes_with_the_gr
         gone_within(&pid, Duration::from_secs(2)),
         "child {pid} survived"
     );
+}
+
+#[test]
+fn a_list_a_descendant_prints_after_the_leader_and_stderr_are_gone_is_read_whole() {
+    for big in [false, true] {
+        let ct = Ct::new();
+        let bin = ct.path().join("bin");
+        let list = ct.path().join("next.json");
+        fs::write(&list, act(lines())).unwrap();
+        let print = if big {
+            big_list_awk()
+        } else {
+            format!("cat '{}'", list.display())
+        };
+        let cm = script(
+            &bin.join("cm"),
+            &format!("exec 2>&-\n( sleep 1; {print} ) &\nexit 0\n"),
+        );
+        script(&bin.join("git"), "echo main\n");
+        let mut out = Vec::new();
+        beat::run(
+            &Beat {
+                checkout: ct.path(),
+                proc: &Bin(bin.clone()),
+                env: &Env::default(),
+                registry: &Registry::new(),
+                phases: &QUIET,
+                cm: cm.as_os_str(),
+                started: Instant::now(),
+            },
+            &mut |line| out.push(line),
+        );
+        let off = "heartbeat: executors off (no CLAUDE_CODE_REMOTE_SESSION_ID, so no lineage); every act line below is yours";
+        assert_eq!(out.first().map(String::as_str), Some(off), "big: {big}");
+        if big {
+            assert_eq!(out.len(), 1 + BIG_LIST);
+            for (n, line) in out[1..].iter().enumerate() {
+                assert_eq!(*line, big_line(n));
+            }
+        } else {
+            assert_eq!(out[1..], PRINTED);
+        }
+    }
+}
+
+#[test]
+fn a_spilling_capture_times_out_and_kills_a_descendant_that_outlives_the_leader() {
+    for big in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let print = if big {
+            big_list_awk()
+        } else {
+            "echo {}".to_owned()
+        };
+        let leaves = script(
+            &dir.path().join("leaves"),
+            &format!(
+                "exec 2>&-\n( {print}; sleep 60 ) &\necho $! > '{}'\nexit 0\n",
+                pid_file.display()
+            ),
+        );
+        // Long enough for the big list to be printed and spilled before the timeout.
+        let timeout = Duration::from_millis(if big { 8000 } else { 200 });
+        let started = Instant::now();
+        let ran = spawn(
+            &Cmd::new(&leaves)
+                .keep(Keep::Spill, Keep::Head)
+                .timeout(timeout),
+        )
+        .unwrap();
+        assert_eq!(ran.exit, Exit::TimedOut, "big: {big}");
+        assert!(started.elapsed() >= timeout, "big: {big}");
+        assert!(
+            started.elapsed() < timeout + Duration::from_secs(8),
+            "big: {big}"
+        );
+        assert_eq!(
+            matches!(ran.stdout_spill, Some(Spilled::Stored(_))),
+            big,
+            "big: {big}: {:?}",
+            ran.stdout_spill
+        );
+        let pid = read_pid(&pid_file);
+        assert!(
+            gone_within(&pid, Duration::from_secs(2)),
+            "big: {big}: descendant {pid} survived"
+        );
+    }
 }
 
 struct Harness {
