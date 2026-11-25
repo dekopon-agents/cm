@@ -89,7 +89,7 @@ error. `review wait` additionally uses 3 for its deadline and 4 for unreadable c
 
 ## cm tick
 
-`cm tick` (`src/tick/`) is tools/cloud-env/heartbeat.sh in Rust. A tick runs these steps in order:
+`cm tick` (`src/tick/`) is tools/cloud-env/heartbeat.sh in Rust, and like it acts on what `cm next --act` emits. Until the `next --act` work in #122 and #123 lands, that is only `turn-ended`, `pr-open-unreviewed`, `missing-kickoff`, `stalled-attempt` and `earlier-coordinator` lines and no `owner_queue_unread`, so no executor key matches and the owner-queue hold never fires. A tick runs these steps in order:
 
 1. Choose the epoch, stopping before any child runs unless exactly one is live.
 2. `gitsync` (`Mode::Always`), `pin`, then `directive`.
@@ -99,7 +99,7 @@ error. `review wait` additionally uses 3 for its deadline and 4 for unreadable c
 6. `gitsync` (`Mode::IfDirty`) when an executor ran.
 7. `claude_md`.
 
-**Contract for the sibling cards.** Each card fills only its own files: the function body, and that file's `#[cfg(test)]` module, which it replaces. It keeps the file's `pub const BUDGET` (a phase) or `pub const KEY` and unit struct (an executor). Core's tests do not depend on any stub.
+**Contract for the sibling cards.** Each card fills only its own files: the function body, and that file's `#[cfg(test)]` module, which it replaces. It keeps the file's `pub const BUDGET` (a phase) or `pub const KEY` and unit struct (an executor). Core's unit tests and the in-process tests in `tests/tick_beat.rs` run no-op phases and a test-local registry, so they depend on no stub. The tests there that run the built binary (`the_built_cm_tick_*` and `a_killed_cm_tick_leaves_no_spilled_list_behind`) run `Phases::REAL`, with a fake `git` (it prints `main` for `rev-parse`, `symbolic-ref` and `branch`, nothing otherwise, and exits 0) and a fake `cm` on `PATH`, `HOME` set to the checkout, no other environment and no network, and they compare stdout line by line, most of them exactly: a card whose phase prints or fails in that harness must adjust those tests as well as its own files.
 
 | Card | Files |
 |---|---|
@@ -147,8 +147,8 @@ Children:
 
 - A kill of `cm tick` itself does not reach a running child's own group, so the Stop hook must bound `cm tick` by session.
 - A spill write that blocks (a frozen filesystem under `TMPDIR`) holds the capture, and so its timeout, until the write returns.
-- Each act line is parsed and its text formatted whole, in text and `--json` output alike: when memory for one line cannot be had, Rust's allocation abort ends the tick (exit 134) with no output from that line on. Only the list's 64 MiB hold moves to a file when memory runs out; `cm next` prints lines of a few kilobytes, a few megabytes at most.
-- `--json` holds every line, and the object built from them, to stream one object after the loop (never a second copy as text), so its memory grows with the list (text output does not): memory short of a few times the list's size ends the tick with the same allocation abort (exit 134), after the moves have run and before the object is printed.
+- Each act line is parsed and its text formatted whole, in text and `--json` output alike: when memory for one line cannot be had, Rust's allocation abort ends the tick (exit 134): neither that line's move nor a later one runs, and nothing from that line on is printed (under `--json`, nothing at all). Only the list's 64 MiB hold moves to a file when memory runs out; `cm next` prints lines of a few kilobytes, a few megabytes at most.
+- `--json` holds every line, and the object built from them, to stream one object after the loop (never a second copy as text), so its memory grows with the list (text output does not): memory short of a few times the list's size ends the tick with the same allocation abort (exit 134), during the loop or after it: moves from that point on are not run, moves already made stand, and no object is printed.
 - A `cm next` that floods its stdout fills the spill in `TMPDIR` until its 30 s cap and the 5 s grace after it, so a runaway producer can write gigabytes before it is killed.
 - `RLIMIT_CPU` is not caught: past the soft limit the kernel's SIGXCPU ends the tick (exit 152), past the hard limit SIGKILL, as either ended heartbeat.sh; moves already made stand.
 

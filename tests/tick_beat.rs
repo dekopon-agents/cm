@@ -2829,8 +2829,11 @@ fn the_built_cm_tick_checks_every_spill_write_against_the_file_size_limit() {
     write_big_list(&harness.ct.path().join("next.json"));
     // Room for the first write, the 64 MiB held so far, but not for the rest of the list.
     let limit_kib = (WHOLE_CAP >> 10) + 1_024;
+    let tmpdir = harness.ct.path().join("spill");
+    fs::create_dir(&tmpdir).unwrap();
     let output = harness
         .limited("cse_01abc", &format!("ulimit -f {limit_kib}"))
+        .env("TMPDIR", &tmpdir)
         .args(["tick", "--cm", "cm"])
         .output()
         .unwrap();
@@ -2840,7 +2843,7 @@ fn the_built_cm_tick_checks_every_spill_write_against_the_file_size_limit() {
         String::from_utf8(output.stdout).unwrap(),
         format!(
             "heartbeat: cm --json next --act's list was too large to keep in memory and could not be stored in {}: {efbig}; no act line was read\n",
-            std::env::temp_dir().display()
+            tmpdir.display()
         )
     );
 }
