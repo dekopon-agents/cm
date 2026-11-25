@@ -418,7 +418,7 @@ Use underscores in lane names, as in `claude_cloud_stall_hours`.
 Set both `codex_turn_reader` and `codex_turn_logs` in LIMITS.toml to enable Codex turn reads.
 Use `claude_cloud_turn_reader` and `claude_cloud_turn_logs` for Claude Cloud. Each value is
 an argv array. cm substitutes `{thread}` and `{turn}` in arguments and expands leading `~/`.
-The reader runs outside the campaign lock with a 15-second deadline through stdout completion.
+The reader runs outside the campaign lock, one at a time and never beside sync's GitHub reads, with a 15-second deadline through stdout completion.
 It returns `done`, `successful`, and `turn_status` as JSON, with optional `completed_at` and
 `pr_url`. A PR URL from the reader must match the step’s repository and, when a branch was
 recorded at launch, GitHub must report that branch as the PR head. Sync reports unparseable

@@ -834,6 +834,11 @@ impl<'a> Run<'a> {
     }
 
     fn observe_turns(&mut self) {
+        // A turn reader is an operator's command cm cannot vouch for as read-only: it runs in
+        // the read walk, one at a time, never beside other reads.
+        if self.planning() {
+            return;
+        }
         for (target, step) in self.steps_at(&Phase::Launched) {
             let Some(attempt) = step
                 .attempt

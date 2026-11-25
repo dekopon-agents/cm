@@ -911,3 +911,87 @@ fn the_card_changes_with_the_clock_only_across_a_threshold() {
         assert_eq!(card(now), gone, "{now}");
     }
 }
+
+#[test]
+fn turn_readers_run_one_at_a_time() {
+    use cm::attempt::{Act, attempt};
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let act = |target: &str, claim: Option<&str>, act: Act| {
+        let target = parse_target(target, true).unwrap();
+        let out = attempt(&host, &c.root, &target, claim, &act).unwrap();
+        assert!(out.ok(), "{:?}", out.violations);
+    };
+    for name in ["one", "two", "three"] {
+        let target = format!("01-a/u/{name}");
+        let declared = commands::declare(
+            &host,
+            &c.root.join(&target),
+            &Declaration {
+                lane: Some(Lane::Codex),
+                ..Declaration::default()
+            },
+        )
+        .unwrap();
+        assert!(declared.ok(), "{:?}", declared.violations);
+        fs::write(c.root.join(&target).join("kickoff.md"), "Go.\n").unwrap();
+        let launched = commands::launch_remote(
+            &host,
+            &c.root,
+            &parse_target(&target, true).unwrap(),
+            None,
+            &commands::Remote {
+                coordinator: Some("session_one".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(launched.ok(), "{:?}", launched.violations);
+        let claim = launched.fields["attempt"]["claim"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for (kind, id) in [("thread", name), ("turn", "latest")] {
+            let begin = Act::Begin { kind: kind.into() };
+            act(&target, Some(&claim), begin);
+            let record = Act::Record {
+                kind: kind.into(),
+                id: id.into(),
+            };
+            act(&target, Some(&claim), record);
+        }
+    }
+    // An operator's reader may do more than read: sync runs it alone.
+    let scratch = tempfile::tempdir().unwrap();
+    let reader = scratch.path().join("reader");
+    support::write_executable(
+        &reader,
+        &format!(
+            r#"#!/bin/sh
+touch "{dir}/in.$$"
+sleep 0.2
+ls "{dir}" | grep -c '^in\.' >>"{dir}/overlap"
+rm "{dir}/in.$$"
+echo '{{"done":false,"successful":false,"turn_status":"inProgress"}}'
+"#,
+            dir = scratch.path().display()
+        ),
+    );
+    let limits = c.root.join("LIMITS.toml");
+    let argv = serde_json::json!([reader, "{thread}", "{turn}"]);
+    let text = fs::read_to_string(&limits).unwrap();
+    fs::write(
+        &limits,
+        format!("{text}\ncodex_turn_reader = {argv}\ncodex_turn_logs = [\"logs\"]\n"),
+    )
+    .unwrap();
+    let gh = support::FakeGh::new("exit 1\n");
+    let forge = cm::forge::Gh {
+        program: gh.program(),
+        timeout: Duration::from_secs(30),
+    };
+    let synced = sync_with(&host, Reader::Concurrent(&forge), &c.root, BUDGET).unwrap();
+    assert!(synced.ok(), "{:?}", synced.violations);
+    let overlap = fs::read_to_string(scratch.path().join("overlap")).unwrap();
+    assert_eq!(overlap, "1\n1\n1\n");
+}
