@@ -1,10 +1,11 @@
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
 use crate::tick::act::{ActLine, Ctx, Executor, Outcome, last_line};
-use crate::tick::exec::review_owed::{is_sha, py_lines, py_space, truthy};
+use crate::tick::exec::review_owed::{
+    is_sha, py_lines, py_space, truthy, unbroken, universal_newlines, write_within_limit,
+};
 use crate::tick::proc::Cmd;
 
 pub const KEY: &str = "launchable-not-launched.codex";
@@ -20,8 +21,8 @@ pub struct CodexDispatch;
 impl Executor for CodexDispatch {
     fn run(&self, line: &ActLine, ctx: &Ctx) -> Outcome {
         match dispatch(line, ctx) {
-            Ok(lines) => Outcome::Done(lines),
-            Err(reason) => Outcome::Failed(reason),
+            Ok(lines) => Outcome::Done(lines.into_iter().map(unbroken).collect()),
+            Err(reason) => Outcome::Failed(unbroken(reason)),
         }
     }
 }
@@ -34,8 +35,8 @@ fn dispatch(line: &ActLine, ctx: &Ctx) -> Result<Vec<String>, String> {
     let kickoff = ctx.epoch.join(target).join("kickoff.md");
     let brief = std::fs::read(ctx.checkout.join(&kickoff))
         .map_err(|_| format!("no {}", kickoff.display()))?;
-    let brief =
-        String::from_utf8(brief).map_err(|_| format!("{} is not UTF-8 text", kickoff.display()))?;
+    let brief = String::from_utf8(universal_newlines(&brief))
+        .map_err(|_| format!("{} is not UTF-8 text", kickoff.display()))?;
     if names_parts(&brief) {
         return Err(
             "the kickoff names Parts:; declare them with cm amend --part and dispatch by hand"
@@ -118,7 +119,7 @@ fn dispatch(line: &ActLine, ctx: &Ctx) -> Result<Vec<String>, String> {
         )
         .map_err(|error| {
             format!(
-                "{error}; thread {thread} was created but not recorded; inspect it before any retry"
+                "thread {thread} was created but not recorded; inspect it before any retry: {error}"
             )
         })?;
     }
@@ -128,10 +129,14 @@ fn dispatch(line: &ActLine, ctx: &Ctx) -> Result<Vec<String>, String> {
             Some(Value::String(stage)) => stage.clone(),
             Some(other) => other.to_string(),
         };
-        return Err(format!(
-            "jobs create stopped at {stage} ({last}); thread {} recorded; inspect it before any retry",
-            thread.unwrap_or("none")
-        ));
+        return Err(match thread {
+            Some(thread) => format!(
+                "thread {thread} recorded, but jobs create stopped at {stage}; inspect it before any retry: {last}"
+            ),
+            None => format!(
+                "no thread recorded: jobs create stopped at {stage}; check for a job before any retry: {last}"
+            ),
+        });
     }
     let thread = thread.unwrap_or("unknown");
     let echoed = |name: &str| {
@@ -198,7 +203,7 @@ fn prompt_file(ctx: &Ctx, prompt: &str) -> Result<tempfile::NamedTempFile, Strin
         .suffix(".md")
         .tempfile_in(&dir)
         .map_err(failed)?;
-    file.write_all(prompt.as_bytes()).map_err(failed)?;
+    write_within_limit(file.as_file_mut(), prompt.as_bytes()).map_err(failed)?;
     Ok(file)
 }
 

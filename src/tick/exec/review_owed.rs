@@ -1,11 +1,12 @@
 use std::ffi::{OsStr, OsString};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::tick::act::{ActLine, Ctx, Executor, Outcome, last_line};
-use crate::tick::proc::{Cmd, Exit};
+use crate::tick::proc::{Cmd, Exit, FileSizeLimit};
 
 pub const KEY: &str = "review-owed";
 
@@ -18,8 +19,8 @@ pub struct ReviewOwed;
 impl Executor for ReviewOwed {
     fn run(&self, line: &ActLine, ctx: &Ctx) -> Outcome {
         match review(line, ctx) {
-            Ok(lines) => Outcome::Done(lines),
-            Err(reason) => Outcome::Failed(reason),
+            Ok(lines) => Outcome::Done(lines.into_iter().map(unbroken).collect()),
+            Err(reason) => Outcome::Failed(unbroken(reason)),
         }
     }
 }
@@ -86,12 +87,17 @@ fn review(line: &ActLine, ctx: &Ctx) -> Result<Vec<String>, String> {
     }
     let name = pull.repo.split_once('/').map_or("", |(_, name)| name);
     let out = evidence.join(format!("astra-{name}-{}-r{round}", pull.number));
-    let brief = ctx.cm("brief", &[target])?.stdout;
+    let brief = universal_newlines(&ctx.cm("brief", &[target])?.stdout);
     let brief_md = out.join("brief.md");
     fs::create_dir_all(ctx.checkout.join(&out))
         .map_err(|error| format!("cannot create {}: {error}", out.display()))?;
-    fs::write(ctx.checkout.join(&brief_md), brief)
-        .map_err(|error| format!("cannot write {}: {error}", brief_md.display()))?;
+    let written = File::create(ctx.checkout.join(&brief_md))
+        .and_then(|mut file| write_within_limit(&mut file, &brief));
+    if let Err(error) = written {
+        let _ = fs::remove_file(ctx.checkout.join(&brief_md));
+        let _ = fs::remove_dir(ctx.checkout.join(&out));
+        return Err(format!("cannot write {}: {error}", brief_md.display()));
+    }
     let ci = if line.json.get("ci_green").is_some_and(truthy) {
         "green"
     } else {
@@ -182,7 +188,7 @@ fn gates(ctx: &Ctx, evidence: &Path, repo: &str, number: u64) -> Vec<Gate> {
     gates
 }
 
-// What the glob `*` lists, so no dot names; a directory that cannot be read lists nothing.
+// Unlike act.d's pathlib glob, dot names are skipped: none is an out-dir astra-review.sh made.
 pub(crate) fn listed(dir: &Path) -> Vec<OsString> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
@@ -201,8 +207,45 @@ pub(crate) fn request(dir: &Path) -> Option<Value> {
     request.is_object().then_some(request)
 }
 
+// The Astra gate: not a shadow, and not a start voided by `-void` in its folder's name.
 pub(crate) fn gating(name: &OsStr, request: &Value) -> bool {
-    request["requested"]["model"] == GATE_MODEL && !name.to_string_lossy().contains("-shadow-")
+    let name = name.to_string_lossy();
+    request["requested"]["model"] == GATE_MODEL
+        && !name.contains("-shadow-")
+        && !name.contains("-void")
+}
+
+// A write past RLIMIT_FSIZE would raise SIGXFSZ, which ends the tick before the write can fail.
+pub(crate) fn write_within_limit(file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+    if FileSizeLimit::of(&*file).is_some_and(|limit| !limit.fits(&*file, bytes.len())) {
+        return Err(rustix::io::Errno::FBIG.into());
+    }
+    file.write_all(bytes)
+}
+
+// Python's text reads (`read_text()`, `text=True`): `\r\n` and a lone `\r` read as `\n`.
+pub(crate) fn universal_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut text = Vec::with_capacity(bytes.len());
+    let mut bytes = bytes.iter().peekable();
+    while let Some(&byte) = bytes.next() {
+        if byte == b'\r' {
+            bytes.next_if_eq(&&b'\n');
+            text.push(b'\n');
+        } else {
+            text.push(byte);
+        }
+    }
+    text
+}
+
+// cm tick splits what an executor leaves at each `\n` and prints only a failure's last line, so a
+// line break inside a folder name or a child's text is escaped here, as it would be printed.
+pub(crate) fn unbroken(line: String) -> String {
+    if line.contains('\n') {
+        line.replace('\n', "\\n")
+    } else {
+        line
+    }
 }
 
 pub(crate) fn is_sha(text: &str) -> bool {
@@ -249,12 +292,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_gate_is_the_astra_model_outside_a_shadow_folder() {
+    fn a_gate_is_the_astra_model_outside_a_shadow_or_voided_folder() {
         let astra = json!({"requested": {"model": "gpt-6-astra", "effort": "xhigh"}});
         let gating = |name: &str, request: &Value| gating(OsStr::new(name), request);
         assert!(gating("astra-r1", &astra));
         assert!(gating("astra-note-r3", &astra));
         assert!(!gating("astra-r1-shadow-gpt-6.2-sol-xhigh", &astra));
+        assert!(!gating("astra-r-77-r1-void-truncated-brief", &astra));
+        assert!(!gating("astra-note-r2-void", &astra));
         assert!(!gating(
             "astra-r1",
             &json!({"requested": {"model": "gpt-6.2-astra"}})
@@ -291,6 +336,14 @@ mod tests {
         );
         assert_eq!(last_text_line("\n \x0c\u{a0}\n"), None);
         assert_eq!(last_text_line(""), None);
+    }
+
+    #[test]
+    fn newlines_read_as_python_reads_text_and_a_line_break_is_escaped() {
+        assert_eq!(universal_newlines(b"a\r\nb\rc\n\r\r\n"), b"a\nb\nc\n\n\n");
+        assert_eq!(universal_newlines(b"\xff\r"), b"\xff\n");
+        assert_eq!(unbroken("a\nb\rc".to_owned()), "a\\nb\rc");
+        assert_eq!(unbroken("plain".to_owned()), "plain");
     }
 
     #[test]

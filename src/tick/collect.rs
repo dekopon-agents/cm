@@ -6,13 +6,23 @@ use crate::tick::exec::review_owed::{self, gating, listed, request};
 
 pub const BUDGET: Duration = Duration::from_secs(30);
 
-// Review-latency U4: a verdict is recorded at the next turn end, not when someone polls for it.
 pub fn run(ctx: &Ctx) -> Report {
     let mut lines = Vec::new();
     for dir in uncollected(ctx) {
         let collected = review_owed::collect(ctx, &dir);
-        // The budget cut it: the phase's wall-time line says so, and the next tick retries.
+        // A report.md marks a gate collected, so one the cut left behind is never collected
+        // again by a tick, even when cm has not recorded its verdict.
         if ctx.timed_out() {
+            let then = if ctx.checkout.join(&dir).join("report.md").exists() {
+                "after it wrote report.md, so no later tick collects it; run it again by hand"
+            } else {
+                "before it wrote report.md; the next tick runs it again"
+            };
+            lines.push(format!(
+                "astra-review.sh collect {}: cut at the collect phase's {} s budget {then}",
+                dir.display(),
+                BUDGET.as_secs()
+            ));
             break;
         }
         if let Err(line) = collected {

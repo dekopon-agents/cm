@@ -23,6 +23,7 @@ const KICKOFF: &str = "repo: dekopon-agents/vm-runner
 Before anything else, read https://raw.githubusercontent.com/xrl/agents/<STEERING-SHA>/steering/GPT.md.
 
 - Lane: codex-cloud (gpt-6.2-sol xhigh), size XS, repo dekopon-agents/vm-runner.
+- Steering: <STEERING-SHA>.
 ";
 const PICK_OK: &str = "ok store/epochs/ep/handoff/coordinator-2026-11-25T1700Z.md\n";
 
@@ -451,7 +452,7 @@ fn a_create_that_never_started_a_turn_fails_with_the_thread_recorded() {
     assert_eq!(
         outcome,
         Outcome::Failed(format!(
-            "jobs create stopped at thread-created ({}); thread t-9 recorded; inspect it before any retry",
+            "thread t-9 recorded, but jobs create stopped at thread-created; inspect it before any retry: {}",
             json!({"receipt": {"stage": "thread-created", "thread_id": "t-9"}})
         ))
     );
@@ -461,13 +462,27 @@ fn a_create_that_never_started_a_turn_fails_with_the_thread_recorded() {
     assert_eq!(fixture.calls("python3 "), Vec::<String>::new());
 
     let fixture = Fixture::new();
+    fixture.fake_uv(&[json!({"stage": "thread-created", "thread_id": "t-8"})], 0);
+    let outcome = fixture.codex(&[]);
+    assert!(
+        failed_with(
+            &outcome,
+            "thread t-8 recorded, but jobs create stopped at thread-created;"
+        ),
+        "a create that exits 0 short of turn-admitted is no dispatch: {outcome:?}"
+    );
+    assert_eq!(fixture.calls("python3 "), Vec::<String>::new());
+
+    let fixture = Fixture::new();
     fixture.fake_uv(&admitted(), 2);
     let outcome = fixture.codex(&[]);
     assert!(
-        failed_with(&outcome, "jobs create stopped at turn-admitted ("),
+        failed_with(
+            &outcome,
+            "thread t-1 recorded, but jobs create stopped at turn-admitted;"
+        ),
         "an admitted turn from a create that exited nonzero still fails: {outcome:?}"
     );
-    assert!(failed_with(&outcome, "thread t-1 recorded"));
 
     let fixture = Fixture::new();
     fixture.fake_uv(&[], 1);
@@ -475,11 +490,41 @@ fn a_create_that_never_started_a_turn_fails_with_the_thread_recorded() {
     assert_eq!(
         outcome,
         Outcome::Failed(
-            "jobs create stopped at no receipt (exit 1); thread none recorded; inspect it before any retry"
+            "no thread recorded: jobs create stopped at no receipt; check for a job before any retry: exit 1"
                 .to_owned()
         )
     );
     assert_eq!(fixture.calls("cm attempt").len(), 1, "only begin thread");
+}
+
+#[test]
+fn a_kickoff_is_read_with_python_s_newlines_so_a_cr_only_parts_line_still_refuses() {
+    let fixture = Fixture::new();
+    write(
+        &fixture.step_dir().join("kickoff.md"),
+        "Lane: codex-cloud (gpt-6.2-sol xhigh)\rParts: api, worker\r",
+    );
+    assert_eq!(
+        fixture.codex(&[]),
+        Outcome::Failed(
+            "the kickoff names Parts:; declare them with cm amend --part and dispatch by hand"
+                .to_owned()
+        )
+    );
+    assert_eq!(fixture.calls(""), Vec::<String>::new());
+
+    let fixture = Fixture::new();
+    write(
+        &fixture.step_dir().join("kickoff.md"),
+        &KICKOFF.replace('\n', "\r\n"),
+    );
+    fixture.fake_uv(&admitted(), 0);
+    assert_eq!(fixture.codex(&[]), nothing());
+    assert_eq!(
+        fs::read_to_string(fixture.root().join("prompt")).unwrap(),
+        KICKOFF.replace("<STEERING-SHA>", &steering()),
+        "the prompt holds the kickoff as Python read it"
+    );
 }
 
 #[test]
@@ -611,7 +656,7 @@ esac
     );
     assert_eq!(
         fixture.codex(&[]),
-        Outcome::Failed("cm attempt failed: error: stale claim; thread t-1 was created but not recorded; inspect it before any retry".to_owned())
+        Outcome::Failed("thread t-1 was created but not recorded; inspect it before any retry: cm attempt failed: error: stale claim".to_owned())
     );
     assert_eq!(fixture.calls("python3 "), Vec::<String>::new());
 }
@@ -793,7 +838,6 @@ fn a_fix_routing_line_is_always_printed() {
     assert_eq!(fixture.calls(""), Vec::<String>::new());
 }
 
-// U2 (owner, 2026-11-25T06:37Z): the Claude review starts with Astra at every weight.
 #[test]
 fn every_weight_prints_the_parallel_claude_review_when_astra_starts() {
     for weight in [
@@ -902,6 +946,173 @@ fn review_owed_fails_on_a_step_cm_has_no_state_or_pr_for_and_on_a_brief_it_canno
     assert_eq!(fixture.calls("astra "), Vec::<String>::new());
 }
 
+fn other_repo_gate(fixture: &Fixture, name: &str, head: &str, round: u64) -> PathBuf {
+    let dir = fixture.evidence().join(name);
+    let request = json!({"mode": "pr", "repo": "dekopon-agents/other", "pr": 77, "head": head,
+        "round": round, "requested": {"model": "gpt-6-astra", "effort": "xhigh"}});
+    write(&dir.join("request.json"), &request.to_string());
+    dir
+}
+
+fn with_report(dir: PathBuf, verdict: &str) -> PathBuf {
+    write(&dir.join("report.md"), &format!("F1\n\n{verdict}\n"));
+    write(&dir.join("cm-record.txt"), "ok\n");
+    dir
+}
+
+#[test]
+fn round_n_follows_the_highest_round_of_this_repos_pr_and_takes_its_findings() {
+    let fixture = Fixture::new();
+    let current = sha('e');
+    fixture.observe(&current);
+    with_report(
+        fixture.gate("astra-r1", &head(), 77, "gpt-6-astra", "pr", 1),
+        "FIX REQUIRED",
+    );
+    with_report(
+        fixture.gate("astra-r3", &sha('9'), 77, "gpt-6-astra", "pr", 3),
+        "FIX REQUIRED",
+    );
+    with_report(
+        other_repo_gate(&fixture, "astra-other-77-r5", &current, 5),
+        "ACCEPT",
+    );
+    let outcome = fixture.review(json!({}));
+    assert!(
+        matches!(&outcome, Outcome::Done(lines) if lines[0].contains("astra-vm-runner-77-r4); start the Claude review")),
+        "another repository's PR 77 at this head is no gate: {outcome:?}"
+    );
+    let start = fixture.calls("astra ").pop().unwrap();
+    assert!(
+        start.ends_with(&format!(
+            "astra-vm-runner-77-r4 --round 4 --ci unknown --prev-head {} --findings {EPOCH}/{STEP}/evidence/astra-r3/report.md",
+            sha('9')
+        )),
+        "round 4, after rounds 1 and 3, with round 3's head and findings: {start}"
+    );
+}
+
+#[test]
+fn a_voided_gate_at_the_head_is_not_the_current_gate() {
+    let fixture = Fixture::new();
+    with_report(
+        fixture.gate(
+            "astra-vm-runner-77-r1-void-truncated-brief",
+            &head(),
+            77,
+            "gpt-6-astra",
+            "pr",
+            1,
+        ),
+        "ACCEPT",
+    );
+    assert_eq!(
+        fixture.review(json!({})),
+        Outcome::Done(vec![started_line("astra-vm-runner-77-r1")])
+    );
+    assert_eq!(fixture.calls("astra collect"), Vec::<String>::new());
+}
+
+#[test]
+fn a_voided_gate_does_not_count_toward_the_round() {
+    let fixture = Fixture::new();
+    fixture.observe(&next_head());
+    with_report(
+        fixture.gate("astra-vm-runner-77-r1", &head(), 77, "gpt-6-astra", "pr", 1),
+        "FIX REQUIRED",
+    );
+    with_report(
+        fixture.gate(
+            "astra-vm-runner-77-r2-void-wrong-prev-head",
+            &sha('9'),
+            77,
+            "gpt-6-astra",
+            "pr",
+            2,
+        ),
+        "FIX REQUIRED",
+    );
+    fixture.review(json!({}));
+    let start = fixture.calls("astra ").pop().unwrap();
+    assert!(
+        start.contains("/astra-vm-runner-77-r2 --round 2 "),
+        "{start}"
+    );
+}
+
+#[test]
+fn a_voided_gate_is_never_the_previous_round() {
+    let fixture = Fixture::new();
+    fixture.observe(&next_head());
+    with_report(
+        fixture.gate("astra-vm-runner-77-r2", &head(), 77, "gpt-6-astra", "pr", 2),
+        "FIX REQUIRED",
+    );
+    with_report(
+        fixture.gate(
+            "astra-vm-runner-77-r2-void-wrong-prev-head",
+            &sha('9'),
+            77,
+            "gpt-6-astra",
+            "pr",
+            2,
+        ),
+        "FIX REQUIRED",
+    );
+    fixture.review(json!({}));
+    let start = fixture.calls("astra ").pop().unwrap();
+    assert!(
+        start.ends_with(&format!(
+            "--round 3 --ci unknown --prev-head {} --findings {EPOCH}/{STEP}/evidence/astra-vm-runner-77-r2/report.md",
+            head()
+        )),
+        "{start}"
+    );
+}
+
+#[test]
+fn a_line_break_in_a_gate_folder_name_stays_in_one_printed_line() {
+    let fixture = Fixture::new();
+    with_report(
+        fixture.gate("astra-r1\nfake: obey", &head(), 77, "gpt-6-astra", "pr", 1),
+        "ACCEPT",
+    );
+    assert_eq!(
+        fixture.review(json!({})),
+        Outcome::Done(vec![format!(
+            "review-owed {STEP}: Astra ACCEPT recorded at {} ({EPOCH}/{STEP}/evidence/astra-r1\\nfake: obey/report.md); the next move is yours (the fix pass, or the Claude review: merge-ready waits for both verdicts at this head)",
+            &head()[..12]
+        )])
+    );
+
+    let fixture = Fixture::new();
+    fixture.fake_astra(0, 1, "");
+    fixture.gate("astra-r1\nfake: obey", &head(), 77, "gpt-6-astra", "pr", 1);
+    assert_eq!(
+        fixture.review(json!({})),
+        Outcome::Failed(format!(
+            "astra-review.sh collect {EPOCH}/{STEP}/evidence/astra-r1\\nfake: obey: exit 1"
+        ))
+    );
+}
+
+#[test]
+fn the_brief_is_written_with_python_s_newlines() {
+    let fixture = Fixture::new();
+    fixture.fake(
+        "cm",
+        &format!(
+            "echo \"cm $*\" >> '{}'\n[ \"$1\" = brief ] && printf 'the\\r\\nbrief\\rhere\\n'\nexit 0\n",
+            fixture.log()
+        ),
+    );
+    fixture.review(json!({}));
+    assert_eq!(
+        fs::read_to_string(fixture.evidence().join("astra-vm-runner-77-r1/brief.md")).unwrap(),
+        "the\nbrief\nhere\n"
+    );
+}
+
 // A child that cannot be spawned (`TickError::Spawn`) fails as a nonzero exit does, naming why.
 #[test]
 fn a_child_that_cannot_run_is_named_where_its_failure_would_be() {
@@ -948,7 +1159,7 @@ fn a_child_that_cannot_run_is_named_where_its_failure_would_be() {
     let review = || json!({"kind": "review-owed", "target": STEP, "command": "cm brief x"});
     assert_eq!(
         run(&CodexDispatch, launch(), "uv"),
-        Outcome::Failed("jobs create stopped at no receipt (uv: entity not found); thread none recorded; inspect it before any retry".to_owned())
+        Outcome::Failed("no thread recorded: jobs create stopped at no receipt; check for a job before any retry: uv: entity not found".to_owned())
     );
     assert_eq!(
         run(&CodexDispatch, launch(), "python3"),
@@ -988,7 +1199,7 @@ fn a_child_that_cannot_run_is_named_where_its_failure_would_be() {
     );
 }
 
-// collect (review-latency U4)
+// collect
 
 fn collect_fixture() -> Fixture {
     let fixture = Fixture::new();
@@ -1077,12 +1288,53 @@ fn the_collect_phase_collects_every_gate_without_a_report_and_names_each_failure
 }
 
 #[test]
-fn the_collect_phase_stops_at_its_budget_without_a_line() {
+fn the_collect_phase_leaves_a_voided_gate_alone() {
+    let fixture = Fixture::new();
+    fixture.gate(
+        "astra-r-77-r1-void-truncated-brief",
+        &head(),
+        77,
+        "gpt-6-astra",
+        "pr",
+        1,
+    );
+    let proc = FakeProc::new(|_| Ok(Ran::code(0, "")));
+    assert_eq!(
+        collect_phase(&fixture, &proc, collect::BUDGET),
+        Report::default()
+    );
+    assert!(proc.calls().is_empty(), "{:?}", proc.log());
+}
+
+#[test]
+fn the_collect_phase_names_the_out_dir_its_budget_cut_and_stops() {
+    let first = format!("{EPOCH}/{STEP}/evidence/astra-note-r1");
     let fixture = collect_fixture();
     let proc = FakeProc::new(|_| Ok(Ran::timed_out()));
     assert_eq!(
         collect_phase(&fixture, &proc, Duration::from_secs(5)),
-        Report::default()
+        Report {
+            lines: vec![format!(
+                "astra-review.sh collect {first}: cut at the collect phase's 30 s budget before it wrote report.md; the next tick runs it again"
+            )],
+            failed: false
+        }
+    );
+    assert_eq!(proc.calls().len(), 1, "{:?}", proc.log());
+
+    let proc = FakeProc::new(|cmd: &Cmd| {
+        let dir = cmd.cwd.as_ref().unwrap().join(&cmd.argv[2]);
+        fs::write(dir.join("report.md"), "ACCEPT\n").unwrap();
+        Ok(Ran::timed_out())
+    });
+    assert_eq!(
+        collect_phase(&fixture, &proc, Duration::from_secs(5)),
+        Report {
+            lines: vec![format!(
+                "astra-review.sh collect {first}: cut at the collect phase's 30 s budget after it wrote report.md, so no later tick collects it; run it again by hand"
+            )],
+            failed: false
+        }
     );
     assert_eq!(proc.calls().len(), 1, "{:?}", proc.log());
 
@@ -1095,30 +1347,9 @@ fn the_collect_phase_stops_at_its_budget_without_a_line() {
     assert!(proc.calls().is_empty());
 }
 
-// The built binary, with fake cm, git, uv, python3, codex_cloud.py and astra-review.sh.
-
-fn built_tick(fixture: &Fixture, next: &Value) -> String {
-    write(&fixture.root().join("next.json"), &next.to_string());
-    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
-        .env_clear()
-        .env("PATH", format!("{}:/usr/bin:/bin", fixture.bin().display()))
-        .env("HOME", fixture.home())
-        .env("TMPDIR", fixture.root().join("tmp"))
-        .env("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_01abc")
-        .env("CODEX_CLOUD_ENVIRONMENT_ID", "acct~env")
-        .env("CODEX_CLOUD_PY", fixture.root().join("codex_cloud.py"))
-        .args(["tick", "--cm", "cm", "--checkout"])
-        .arg(fixture.ct())
-        .current_dir(fixture.root())
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert!(output.stderr.is_empty(), "{output:?}");
-    String::from_utf8(output.stdout).unwrap()
-}
-
-#[test]
-fn the_built_cm_tick_dispatches_starts_astra_and_collects_at_a_later_tick() {
+// The built binary, with fake cm, git, uv, python3, codex_cloud.py and astra-review.sh; `cm brief`
+// prints <root>/brief.txt.
+fn built_fixture() -> Fixture {
     let fixture = Fixture::new();
     write(
         &fixture.epoch().join("EPOCH.md"),
@@ -1142,13 +1373,14 @@ fn the_built_cm_tick_dispatches_starts_astra_and_collects_at_a_later_tick() {
             .join("08-egress/shopping-vm/new-flag/kickoff.md"),
         KICKOFF,
     );
+    write(&fixture.root().join("brief.txt"), "the brief\n");
     fixture.fake(
         "cm",
         &format!(
             "echo \"cm $*\" >> '{log}'
 case \"$1\" in
   --json) cat '{root}/next.json' ;;
-  brief) echo 'the brief' ;;
+  brief) cat '{root}/brief.txt' ;;
   launch) printf '%s' '{launched}' > '{state}' ;;
 esac
 exit 0
@@ -1180,15 +1412,46 @@ exit 0
             fixture.log()
         ),
     );
-    let line = |kind: &str, target: &str, extra: Value| {
-        let mut line = json!({"kind": kind, "target": target, "since": "2026-11-25T01:00Z", "command": format!("cm x {target}")});
-        line.as_object_mut()
-            .unwrap()
-            .extend(extra.as_object().unwrap().clone());
-        line
-    };
-    let review = line("review-owed", STEP, json!({"weight": "complex"}));
-    let launch = line(
+    fixture
+}
+
+fn act_line(kind: &str, target: &str, extra: Value) -> Value {
+    let mut line = json!({"kind": kind, "target": target, "since": "2026-11-25T01:00Z", "command": format!("cm x {target}")});
+    line.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    line
+}
+
+// Through bash, as tick_beat.rs runs the built cm under a resource limit (`:` for none).
+fn built_tick(fixture: &Fixture, next: &Value, limit: &str) -> String {
+    write(&fixture.root().join("next.json"), &next.to_string());
+    let output = Command::new("bash")
+        .env_clear()
+        .env("PATH", format!("{}:/usr/bin:/bin", fixture.bin().display()))
+        .env("HOME", fixture.home())
+        .env("TMPDIR", fixture.root().join("tmp"))
+        .env("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_01abc")
+        .env("CODEX_CLOUD_ENVIRONMENT_ID", "acct~env")
+        .env("CODEX_CLOUD_PY", fixture.root().join("codex_cloud.py"))
+        .arg("-c")
+        .arg(format!("{limit}; exec \"$0\" \"$@\""))
+        .arg(env!("CARGO_BIN_EXE_cm"))
+        .args(["tick", "--cm", "cm", "--checkout"])
+        .arg(fixture.ct())
+        .current_dir(fixture.root())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn the_built_cm_tick_dispatches_starts_astra_and_collects_at_a_later_tick() {
+    let fixture = built_fixture();
+    let review = act_line("review-owed", STEP, json!({"weight": "complex"}));
+    let launch = act_line(
         "launchable-not-launched",
         "08-egress/shopping-vm/new-flag",
         json!({}),
@@ -1198,6 +1461,7 @@ exit 0
     let first = built_tick(
         &fixture,
         &json!({"ok": true, "actionable": [launch, review.clone()]}),
+        ":",
     );
     assert_eq!(
         first,
@@ -1232,7 +1496,7 @@ exit 0
 
     fixture.fake_astra(0, 0, "ACCEPT {}");
     let calls = fs::read_to_string(fixture.root().join("calls")).unwrap();
-    let second = built_tick(&fixture, &json!({"ok": true, "actionable": [review]}));
+    let second = built_tick(&fixture, &json!({"ok": true, "actionable": [review]}), ":");
     assert_eq!(
         second,
         format!(
@@ -1259,4 +1523,49 @@ exit 0
         fs::read_to_string(fixture.ct().join(&out).join("report.md")).unwrap(),
         "findings\n\nACCEPT\n"
     );
+}
+
+#[test]
+fn the_built_cm_tick_fails_a_prompt_or_brief_past_the_file_size_limit_and_goes_on() {
+    let fixture = built_fixture();
+    let new = "08-egress/shopping-vm/new-flag";
+    write(
+        &fixture.epoch().join(new).join("kickoff.md"),
+        &format!("{KICKOFF}{}\n", "x".repeat(8192)),
+    );
+    write(&fixture.root().join("brief.txt"), &"y".repeat(8192));
+    let next = json!({"ok": true, "actionable": [
+        act_line("launchable-not-launched", new, json!({})),
+        act_line("review-owed", STEP, json!({})),
+        act_line("missing-kickoff", "08-egress/shopping-vm/later", json!({})),
+    ]});
+    let efbig = std::io::Error::from_raw_os_error(27);
+    let out = format!("{EPOCH}/{STEP}/evidence/astra-vm-runner-77-r1");
+    assert_eq!(
+        built_tick(&fixture, &next, "ulimit -f 4"),
+        format!(
+            "launchable-not-launched {new}: cm x {new} [tick/launchable-not-launched.codex failed: cannot write the prompt file in {}: {efbig}; nothing dispatched]
+review-owed {STEP}: cm x {STEP} [tick/review-owed failed: cannot write {out}/brief.md: {efbig}]
+missing-kickoff 08-egress/shopping-vm/later: cm x 08-egress/shopping-vm/later
+",
+            fixture.root().join("tmp").display()
+        )
+    );
+    assert!(fixture.tmp_is_empty(), "the prompt file is removed");
+    assert!(
+        !fixture.ct().join(&out).exists(),
+        "no brief and no out-dir are left"
+    );
+    assert_eq!(fixture.calls("cm launch"), Vec::<String>::new());
+    assert_eq!(fixture.calls("astra "), Vec::<String>::new());
+
+    assert_eq!(
+        built_tick(&fixture, &next, "ulimit -f 64"),
+        format!(
+            "{}\nmissing-kickoff 08-egress/shopping-vm/later: cm x 08-egress/shopping-vm/later\n",
+            started_line("astra-vm-runner-77-r1")
+        ),
+        "the same tick without the limit dispatches and starts Astra"
+    );
+    assert_eq!(fixture.calls("cm launch").len(), 1);
 }
