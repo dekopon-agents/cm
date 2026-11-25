@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -101,7 +101,12 @@ pub struct Env(BTreeMap<String, String>);
 
 impl Env {
     pub fn system() -> Self {
-        Env(std::env::vars_os()
+        Env::from_os(std::env::vars_os())
+    }
+
+    pub(crate) fn from_os(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
+        Env(vars
+            .into_iter()
             .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
             .collect())
     }
@@ -126,13 +131,27 @@ impl<K: Into<String>, V: Into<String>> FromIterator<(K, V)> for Env {
 
 pub const MAX_BUDGET: Duration = Duration::from_secs(24 * 60 * 60);
 
+pub trait Clock {
+    fn now(&self) -> Instant;
+}
+
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
 pub struct Ctx<'a> {
     pub checkout: &'a Path,
     pub epoch: &'a Path,
     pub proc: &'a dyn Proc,
     pub env: &'a Env,
     pub cm: &'a OsStr,
-    deadline: Instant,
+    clock: &'a dyn Clock,
+    deadline: Cell<Instant>,
+    checking: Cell<Duration>,
     timed_out: Cell<bool>,
 }
 
@@ -145,15 +164,30 @@ impl<'a> Ctx<'a> {
         cm: &'a OsStr,
         budget: Duration,
     ) -> Self {
+        let now = Instant::now();
         Ctx {
             checkout,
             epoch,
             proc,
             env,
             cm,
-            deadline: Instant::now() + budget.min(MAX_BUDGET),
+            clock: &SystemClock,
+            deadline: Cell::new(now + budget.min(MAX_BUDGET)),
+            checking: Cell::new(Duration::ZERO),
             timed_out: Cell::new(false),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clocked(mut self, clock: &'a dyn Clock, budget: Duration) -> Self {
+        let now = clock.now();
+        self.clock = clock;
+        self.deadline.set(now + budget);
+        self
+    }
+
+    pub(crate) fn now(&self) -> Instant {
+        self.clock.now()
     }
 
     pub fn epoch_dir(&self) -> PathBuf {
@@ -168,11 +202,34 @@ impl<'a> Ctx<'a> {
     }
 
     pub fn remaining(&self) -> Duration {
-        self.deadline.saturating_duration_since(Instant::now())
+        self.deadline
+            .get()
+            .saturating_duration_since(self.clock.now())
     }
 
     pub fn timed_out(&self) -> bool {
         self.timed_out.get()
+    }
+
+    // gitsync calls this after each pull, so nothing of an earlier check is kept. The check's
+    // time, whatever its answer and also when it panics, is not the calling phase's.
+    pub fn still_bound(&self) -> bool {
+        let _exempt = Exempt {
+            ctx: self,
+            started: self.clock.now(),
+        };
+        crate::tick::beat::bound(self.checkout, self.epoch, self.proc, self.env)
+    }
+
+    fn exempt(&self, took: Duration) {
+        let deadline = self.deadline.get();
+        self.deadline
+            .set(deadline.checked_add(took).unwrap_or(deadline));
+        self.checking.set(self.checking.get().saturating_add(took));
+    }
+
+    pub(crate) fn checking(&self) -> Duration {
+        self.checking.get()
     }
 
     pub fn run(&self, mut cmd: Cmd) -> Result<Ran> {
@@ -261,6 +318,18 @@ impl<'a> Ctx<'a> {
             url: url.to_owned(),
             observed,
         })
+    }
+}
+
+struct Exempt<'c, 'a> {
+    ctx: &'c Ctx<'a>,
+    started: Instant,
+}
+
+impl Drop for Exempt<'_, '_> {
+    fn drop(&mut self) {
+        let took = self.ctx.clock.now().saturating_duration_since(self.started);
+        self.ctx.exempt(took);
     }
 }
 
@@ -369,10 +438,202 @@ pub struct Report {
     pub failed: bool,
 }
 
+// A clock that moves only when a test moves it, and the bound check's children answering
+// bound, with `answer` taking over any command it returns a `Ran` for.
+#[cfg(test)]
+pub(crate) struct Ticking(pub std::rc::Rc<Cell<Instant>>);
+
+#[cfg(test)]
+impl Clock for Ticking {
+    fn now(&self) -> Instant {
+        self.0.get()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn bound_children(
+    clock: &std::rc::Rc<Cell<Instant>>,
+    answer: impl Fn(&str, &Cell<Instant>) -> Option<Ran> + 'static,
+) -> crate::tick::proc::FakeProc {
+    let clock = clock.clone();
+    crate::tick::proc::FakeProc::new(move |cmd| {
+        let word = match cmd.program_name().as_str() {
+            "git" => cmd.argv[1].to_string_lossy().into_owned(),
+            program => program.to_owned(),
+        };
+        Ok(
+            answer(&word, &clock).unwrap_or_else(|| match word.as_str() {
+                "rev-parse" => Ran::code(0, "main\n"),
+                "sh" => Ran::code(0, "ok store/epochs/e/handoff/coordinator-1.md\n"),
+                _ => Ran::code(0, ""),
+            }),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::rc::Rc;
+
+    fn session() -> Env {
+        [("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_1")]
+            .into_iter()
+            .collect()
+    }
+
+    fn later(clock: &Cell<Instant>, by: u64) {
+        clock.set(clock.get() + Duration::from_secs(by));
+    }
+
+    #[test]
+    fn a_check_longer_than_the_budget_spends_none_of_it() {
+        let clock = Rc::new(Cell::new(Instant::now()));
+        let proc = bound_children(&clock, |word, clock| {
+            (word == "fetch").then(|| {
+                later(clock, 62);
+                Ran::code(0, "")
+            })
+        });
+        let (env, ticking) = (session(), Ticking(clock.clone()));
+        let ctx = Ctx::new(
+            Path::new("."),
+            Path::new("store/epochs/e"),
+            &proc,
+            &env,
+            OsStr::new("cm"),
+            Duration::ZERO,
+        )
+        .clocked(&ticking, Duration::from_secs(1));
+        assert!(ctx.still_bound());
+        assert_eq!(ctx.remaining(), Duration::from_secs(1));
+        assert_eq!(ctx.checking(), Duration::from_secs(62));
+        let push = ctx
+            .run(Cmd::new("git").args(["push", "-q", "origin", "main"]))
+            .unwrap();
+        assert_eq!((push.exit, ctx.timed_out()), (Exit::Code(0), false));
+    }
+
+    #[test]
+    fn a_check_that_fails_is_cut_or_panics_is_exempt_too() {
+        let clock = Rc::new(Cell::new(Instant::now()));
+        let (env, ticking) = (session(), Ticking(clock.clone()));
+        let budget = Duration::from_secs(60);
+        let ctx_for = |proc| {
+            Ctx::new(
+                Path::new("."),
+                Path::new("store/epochs/e"),
+                proc,
+                &env,
+                OsStr::new("cm"),
+                Duration::ZERO,
+            )
+            .clocked(&ticking, budget)
+        };
+
+        let refused = bound_children(&clock, |word, clock| {
+            (word == "sh").then(|| {
+                later(clock, 5);
+                Ran::code(1, "refused superseded x\n")
+            })
+        });
+        let ctx = ctx_for(&refused);
+        assert!(!ctx.still_bound());
+        assert_eq!(
+            (ctx.remaining(), ctx.checking()),
+            (budget, Duration::from_secs(5))
+        );
+
+        let cut = bound_children(&clock, |word, clock| {
+            (word == "fetch").then(|| {
+                later(clock, 30);
+                Ran::timed_out()
+            })
+        });
+        let ctx = ctx_for(&cut);
+        assert!(ctx.still_bound(), "a fetch cut at its cap counts as bound");
+        assert_eq!(
+            (ctx.remaining(), ctx.checking()),
+            (budget, Duration::from_secs(30))
+        );
+
+        let panics = bound_children(&clock, |word, clock| {
+            (word == "fetch").then(|| {
+                later(clock, 5);
+                panic!("fetch bug")
+            })
+        });
+        let ctx = ctx_for(&panics);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.still_bound()));
+        assert!(caught.is_err());
+        assert_eq!(
+            (ctx.remaining(), ctx.checking()),
+            (budget, Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn the_checks_of_one_phase_leave_its_budget_whole_however_many_it_runs() {
+        let clock = Rc::new(Cell::new(Instant::now()));
+        let start = clock.get();
+        let proc = bound_children(&clock, |word, clock| {
+            (word == "fetch").then(|| {
+                later(clock, 30);
+                Ran::timed_out()
+            })
+        });
+        let (env, ticking) = (session(), Ticking(clock.clone()));
+        let ctx = Ctx::new(
+            Path::new("."),
+            Path::new("store/epochs/e"),
+            &proc,
+            &env,
+            OsStr::new("cm"),
+            Duration::ZERO,
+        )
+        .clocked(&ticking, Duration::from_secs(60));
+        for _ in 0..3 {
+            assert!(ctx.still_bound());
+        }
+        assert_eq!(clock.get(), start + Duration::from_secs(90));
+        assert_eq!(
+            ctx.remaining(),
+            Duration::from_secs(60),
+            "three 30 s checks spend none of it"
+        );
+        assert_eq!(ctx.checking(), Duration::from_secs(90));
+    }
+
+    // cm#132's fresh reader: an IfDirty gitsync 31 s into its 60 s, past the heartbeat's own
+    // deadline, re-checks for 30 s; capping the check's move there timed its push out.
+    #[test]
+    fn a_check_late_in_a_phase_leaves_the_push_after_it_its_budget() {
+        let clock = Rc::new(Cell::new(Instant::now()));
+        let proc = bound_children(&clock, |word, clock| {
+            (word == "fetch").then(|| {
+                later(clock, 30);
+                Ran::code(0, "")
+            })
+        });
+        let (env, ticking) = (session(), Ticking(clock.clone()));
+        let ctx = Ctx::new(
+            Path::new("."),
+            Path::new("store/epochs/e"),
+            &proc,
+            &env,
+            OsStr::new("cm"),
+            Duration::ZERO,
+        )
+        .clocked(&ticking, Duration::from_secs(60));
+        later(&clock, 31);
+        assert!(ctx.still_bound());
+        let push = ctx
+            .run(Cmd::new("git").args(["push", "-q", "origin", "main"]))
+            .unwrap();
+        assert_eq!((push.exit, ctx.timed_out()), (Exit::Code(0), false));
+        assert_eq!(ctx.remaining(), Duration::from_secs(29));
+    }
 
     #[test]
     fn a_cm_cut_at_the_whole_cap_is_named_not_by_its_cut_last_line() {

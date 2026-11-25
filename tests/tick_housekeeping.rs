@@ -32,11 +32,33 @@ fn journal() -> String {
 }
 
 fn handoff(stamp: &str) -> String {
+    handoff_by("session_01abc", stamp, "")
+}
+
+fn handoff_by(lineage: &str, stamp: &str, more: &str) -> String {
     format!(
-        "# Coordinator handoff\n\nHandoff: epoch={SLUG} role=coordinator lineage=session_x written=2026-11-24T20:30:00+00:00 prompt=p.md stamp_sha={} stamp_entry={stamp}\n",
+        "# Coordinator handoff\n\nHandoff: epoch={SLUG} role=coordinator lineage={lineage} written=2026-11-24T20:30:00+00:00 prompt=p.md stamp_sha={} stamp_entry={stamp}{more}\n",
         "7".repeat(40)
     )
 }
+
+const OURS: &str = "coordinator-2026-11-24T2030Z.md";
+
+// handoff-pick.sh's chain rule over the folder it is given, as tests/tick_beat.rs fakes it: a
+// coordinator-*.md that no other names in `supersedes=` is a head; this lineage's head is ok,
+// else the other heads are another lineage's.
+const HANDOFF_PICK: &str = r#"dir=$1/handoff
+other=
+for f in "$dir"/coordinator-*.md; do
+  [ -f "$f" ] || continue
+  name=${f##*/}
+  if grep -q "^Handoff: .* supersedes=$name\$" "$dir"/coordinator-*.md; then continue; fi
+  if grep -q "^Handoff: .* lineage=$4 " "$f"; then echo "ok $1/handoff/$name"; exit 0; fi
+  other="$other $1/handoff/$name"
+done
+if [ -n "$other" ]; then echo "missing other-lineage$other"; else echo missing; fi
+exit 3
+"#;
 
 fn write(path: &Path, text: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -94,7 +116,8 @@ fn names(dir: &Path) -> Vec<String> {
 // Every write stays under the scratch root, children included: HOME, GIT_CONFIG_GLOBAL and
 // TMPDIR point into it, whatever the runner's own are, and fixture scripts find it as
 // $TICK_FIXTURE. Its name holds an apostrophe and a space, so every run checks that no path is
-// quoted into a script or a command line.
+// quoted into a script or a command line. Its campaign binds this session, `cse_01abc`: the
+// first commit holds this lineage's handoff and the fake handoff-pick.sh.
 struct Scratch {
     root: tempfile::TempDir,
 }
@@ -124,6 +147,8 @@ impl Scratch {
         );
         write(&ct.join(EPOCH).join("CARD.md"), "card\n");
         write(&ct.join(EPOCH).join("JOURNAL.md"), &journal());
+        write(&ct.join(EPOCH).join("handoff").join(OURS), &handoff("none"));
+        write(&ct.join("tools/cloud-env/handoff-pick.sh"), HANDOFF_PICK);
         scratch.git(&ct, &["add", "-A"]);
         scratch.git(&ct, &["commit", "-qm", "start"]);
         scratch.git(&ct, &["push", "-q", "origin", "main"]);
@@ -206,10 +231,14 @@ impl Scratch {
 
     fn env(&self) -> Env {
         let root = self.path();
-        [("HOME", root.join("home")), ("TMPDIR", root.join("tmp"))]
-            .into_iter()
-            .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
-            .collect()
+        [
+            ("HOME", root.join("home").into_os_string()),
+            ("TMPDIR", root.join("tmp").into_os_string()),
+            ("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_01abc".into()),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
+        .collect()
     }
 
     fn phase<T>(

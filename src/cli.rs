@@ -409,7 +409,8 @@ enum Commands {
         act: Option<FollowupAct>,
     },
     #[command(
-        about = "The coordinator's routine moves once, as heartbeat.sh made them: choose the one PLANNING or WORKING epoch, then run each `cm --json next --act` line's executor in the bound coordinator, or print the line. Prints only lines left for the model; exits 0 whenever it ran"
+        about = "The coordinator's routine moves once, as heartbeat.sh made them: choose the one PLANNING or WORKING epoch, then run each `cm --json next --act` line's executor in the bound coordinator, or print the line. Prints only lines left for the model; exits 0 whenever it ran",
+        long_about = "The coordinator's routine moves once, as heartbeat.sh made them: choose the one PLANNING or WORKING epoch, then, in the bound coordinator only, run each `cm --json next --act` line's executor or print the line. Prints only lines left for the model, and nothing past the epoch choice in any other session; exits 0 whenever the loop ran"
     )]
     Tick {
         #[arg(
@@ -425,6 +426,11 @@ enum Commands {
             help = "The cm that `cm next --act` and the executors' cm calls run; defaults to this executable. A bare name is looked up on PATH"
         )]
         cm: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Only answer whether this session is the bound coordinator, for the Stop hook: print nothing and exit 0 if it is, 1 if not or when there is not exactly one live epoch. Runs git and handoff-pick.sh, never cm"
+        )]
+        check_bound: bool,
     },
     /// Report every violation in the campaign folder; exit 1 when there is any.
     Lint {
@@ -1368,7 +1374,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             act: Some(FollowupAct::Close { id, by }),
             ..
         } => crate::verdict::close_followup(host, &root()?, id, by),
-        Commands::Tick { checkout, cm } => {
+        Commands::Tick { checkout, cm, .. } => {
             let mut lines = Vec::new();
             let mut stdout = std::io::stdout().lock();
             let limit = FileSizeLimit::of(&stdout);
@@ -1481,6 +1487,18 @@ pub fn main() -> ExitCode {
                 "cm tick chooses its own epoch: name the checkout with --checkout, not -C",
             )
             .exit();
+    }
+    if let Commands::Tick {
+        checkout,
+        check_bound: true,
+        ..
+    } = &cli.command
+    {
+        return if crate::tick::beat::cli_check(checkout) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        };
     }
     let command = name(&cli.command);
     let outcome = run(&cli, &System).or_else(|error| {
