@@ -869,14 +869,18 @@ one `merge-gate` violation per gap, unless at the PR's head (GitHub's, via `gh a
 A clean update from the base branch needs no new review, only green CI on the new head: (a) and
 (b) may hold instead at an earlier reviewed head H1 when every commit on the first-parent chain
 from H1 to the head is a merge whose second parent is on the base branch (GitHub's base tip, else
-`origin/HEAD`) and whose `git show --remerge-diff` is empty. When the base tip already contains
+`origin/HEAD`) and whose `git show --remerge-diff` is empty. That diff shows every submodule
+(`--ignore-submodules=none`), so a merge that also moves a submodule `.gitmodules` or config
+marks ignored is no clean update. When the base tip already contains
 the head (the PR has merged into it), no merge can be told apart from the PR's own commits, so
 the walk does not run. A merge that resolved conflicts, or
 any other commit, needs its own review. The rule only skips a review nobody did: the walk stops
 at the first commit, from the head back, that has a recorded review or a finished receipt, and
 that commit must clear (a) and (b) itself; an earlier ACCEPT never outweighs it. The walk runs in `--repo` or the step's worktree (for
 `cm sync`, the worktree only), which must hold those commits and the base tip; without one, (a)
-and (b) must hold at the head itself.
+and (b) must hold at the head itself. In that checkout an abbreviated `--head` stands for the
+commit it names; a prefix that names no commit, or that a ref of the same name shadows, takes no
+walk.
 
 A merge from the base branch whose parents conflict, and whose remerge diff touches only the
 files they conflict in, may instead stand on resolution reviews recorded at it with `cm review
@@ -892,7 +896,9 @@ this way. A resolution review is never an ACCEPT of the head, and its receipt ne
 the head: without a checkout, (a) and (b) must hold at the merge itself, and a review of the head
 recorded at the merge governs it. Any commit after the merge needs its own review, and so does
 the merge once it is amended. The journal entry of the `merged` move names each merge the walk
-passed this way.
+passed this way. A file/directory conflict, where git moves the file aside as `x~<label>`, cannot
+stand on resolution reviews: the two listings name the moved file differently, so recording its
+resolution is refused.
 
 When cm cannot read the PR or its checks from GitHub, (c) refuses unless `--ci-verified <path>`
 names a campaign file showing green CI; the head is then `--head`, else the SHA recorded at

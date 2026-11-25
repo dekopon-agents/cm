@@ -2151,7 +2151,20 @@ fn merge_from_base(repo: &Path, commit: &str, base: &str) -> Result<Merge, Clean
             base: base.to_owned(),
         });
     }
-    match git_out(repo, &["show", "--remerge-diff", "--format=", commit]) {
+    // A submodule `.gitmodules` or config marks ignored is still a change the merge made.
+    match git_out(
+        repo,
+        &[
+            "show",
+            "--remerge-diff",
+            "--format=",
+            "--ignore-submodules=none",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            commit,
+        ],
+    ) {
         Some(diff) => Ok(Merge {
             first: first.to_owned(),
             second: second.to_owned(),
@@ -2159,6 +2172,21 @@ fn merge_from_base(repo: &Path, commit: &str, base: &str) -> Result<Merge, Clean
         }),
         None => Err(unreadable()),
     }
+}
+
+fn named_commit(repo: &Path, named: &str) -> Option<String> {
+    let full = git_out(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{named}^{{commit}}"),
+        ],
+    )?;
+    full.to_ascii_lowercase()
+        .starts_with(&named.to_ascii_lowercase())
+        .then_some(full)
 }
 
 fn git_bytes(repo: &Path, args: &[&str]) -> Option<Vec<u8>> {
@@ -2221,6 +2249,10 @@ fn beyond_resolution(repo: &Path, commit: &str, merge: &Merge) -> Option<String>
             "--format=",
             "--name-only",
             "--no-renames",
+            "--ignore-submodules=none",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
             "-z",
             commit,
         ],
@@ -2303,7 +2335,20 @@ fn gate(
             .chain(review_gap(&verdicts, &step, at, pr, part, model))
             .collect()
     };
-    let gaps = gaps_at(head, model);
+    // In a checkout the requested head, often an abbreviation, is matched as the commit it names;
+    // one a ref of that name shadows, or none at all, takes no walk.
+    let resolved = lineage.and_then(|lineage| named_commit(lineage.repo, head));
+    let head_at = resolved.as_deref().unwrap_or(head);
+    let shown = if verdicts
+        .reviews
+        .iter()
+        .any(|review| review.step == step && review.kind == ReviewKind::Resolution)
+    {
+        head_at
+    } else {
+        head
+    };
+    let gaps = gaps_at(shown, model);
     // The clean-update rule only skips a review nobody did: a review recorded at a commit, or a
     // finished receipt for it, binds there and is never outweighed by an earlier ACCEPT. A
     // resolution review and its receipt bind only as the cover for their merge on the walk.
@@ -2347,7 +2392,10 @@ fn gate(
         ));
         gaps
     };
-    let Some(lineage) = lineage.filter(|_| !gaps.is_empty() && !reviewed_at(head)) else {
+    let Some((lineage, mut at)) = lineage
+        .zip(resolved.clone())
+        .filter(|_| !gaps.is_empty() && !reviewed_at(head_at))
+    else {
         return Ok(Cleared {
             gaps,
             reviewed: None,
@@ -2357,17 +2405,6 @@ fn gate(
     };
     let repo = lineage.repo;
     let base = lineage.base.unwrap_or("origin/HEAD");
-    let Some(mut at) = git_out(
-        repo,
-        &["rev-parse", "--verify", &format!("{head}^{{commit}}")],
-    ) else {
-        return Ok(Cleared {
-            gaps,
-            reviewed: None,
-            stop: None,
-            resolved: Vec::new(),
-        });
-    };
     let mut gaps = gaps;
     let mut resolved = Vec::new();
     let mut why = CleanUpdateError::TooLong { limit: MAX_UPDATES };
