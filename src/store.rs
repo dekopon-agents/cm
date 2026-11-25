@@ -144,13 +144,11 @@ pub fn load_unit(dir: &Path) -> Result<UnitState> {
     Ok(state)
 }
 
-/// Replace `path` with `bytes` unless it is already a regular file holding exactly them, so an
-/// unchanged render leaves the file, its mtime and git untouched.
+// An unchanged render leaves the file, its mtime and git alone.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     write_changed(path, bytes).map(drop)
 }
 
-/// [`write_atomic`], reporting whether it wrote.
 pub fn write_changed(path: &Path, bytes: &[u8]) -> Result<bool> {
     if unchanged(path, bytes) {
         return Ok(false);
@@ -234,8 +232,7 @@ pub fn lock(root: &Path) -> Result<Lock> {
     Ok(Lock { _file: file })
 }
 
-/// List `name` in `.cm/.gitignore`, which `lock` writes, so a runtime file cm keeps there stays
-/// out of git; a campaign whose ignore file predates it gains the line once.
+// A campaign whose ignore file predates `name` gains the line once.
 pub fn ignore(root: &Path, name: &str) -> Result<()> {
     let path = root.join(CM_DIR).join(".gitignore");
     let mut text = match fs::read_to_string(&path) {

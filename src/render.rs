@@ -296,7 +296,7 @@ fn watch_summary(root: &std::path::Path, now: Timestamp, units: &Units) -> Vec<S
     rows
 }
 
-/// `cm next`'s reviewer-wait line without its elapsed seconds, which change on every render.
+// Without `cm next`'s elapsed seconds, which change on every render.
 fn review_wait_card_line(wait: &serde_json::Value) -> String {
     let part = wait["part"]
         .as_str()
@@ -384,9 +384,6 @@ pub(crate) fn status_lines(
     out
 }
 
-/// CARD.md, a function of campaign facts alone: `now` only decides which clock-driven facts hold
-/// (a stall, an expired watch), and no line carries the render time, a duration since it or what
-/// one sync moved (the journal and sync's output carry the moves).
 pub fn card(
     root: &std::path::Path,
     now: Timestamp,

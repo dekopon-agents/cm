@@ -26,13 +26,10 @@ use crate::store::{self, lock, parse_target, write_atomic};
 
 pub const CARD: &str = "CARD.md";
 
-/// The default for `cm sync --budget-secs`: a sync slower than this prints its phase times.
 pub const BUDGET: Duration = Duration::from_secs(30);
 
-/// Forge reads in flight at once when the forge can be shared across threads.
 const READERS: usize = 8;
 
-/// Planning walks before the read walk makes what is still missing one read at a time.
 const PLAN_ROUNDS: usize = 5;
 
 pub struct Moved {
@@ -47,13 +44,11 @@ type TurnQuery = (String, String, String, Vec<String>);
 
 const PULL_MAX_AGE: jiff::SignedDuration = jiff::SignedDuration::from_mins(30);
 
-/// `.cm/pulls-read.json`, kept out of git: when sync last read each open PR in full and the
-/// validators it holds, so a quiet sync's reads change no tracked file.
+// Ignored by git, so a quiet sync's reads change no tracked file.
 pub const PULLS_READ: &str = "pulls-read.json";
 
-/// The last full read of an open PR, the ETags to send with the next, and the observation those
-/// ETags validate: a 304 restores that observation, so the ETags are sent only while
-/// `.cm/pulls.json` holds it.
+// A 304 restores the stored observation, so ETags go out only while `.cm/pulls.json` holds the
+// one they validated.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct LastRead {
     at: String,
@@ -100,7 +95,6 @@ struct Reads {
     publications:
         BTreeMap<(Vec<String>, GithubRepo, TagName, Version), Read<crate::forge::Publication>>,
     completed_checks: BTreeMap<(GithubRepo, CommitSha, Vec<String>), Read<Vec<CheckState>>>,
-    /// Reads made, by kind, for the phase report.
     made: BTreeMap<&'static str, usize>,
 }
 
@@ -118,32 +112,22 @@ impl Reads {
     }
 }
 
-/// Stores one finished read in the cache that wanted it.
 type Store = Box<dyn FnOnce(&mut Reads) + Send>;
-/// A read a planning walk missed, made later and possibly on another thread.
 type Job = Box<dyn FnOnce(&dyn Forge) -> Store + Send>;
 
-/// What a walk does on a cache miss.
 #[derive(Clone, Copy)]
 enum Access<'a> {
-    /// Read the forge now, one call at a time.
     Read(&'a dyn Forge),
-    /// Record the read as a job and carry on as if it were unavailable.
     Plan,
-    /// Nothing: the walk under the lock applies only what the reads saw.
     Cached,
 }
 
-/// How `sync_with` reaches the forge.
 #[derive(Clone, Copy)]
 pub enum Reader<'a> {
-    /// Every read in walk order, one at a time.
     Serial(&'a dyn Forge),
-    /// Up to eight independent reads at once before the walk, which then makes only what is left.
     Concurrent(&'a (dyn Forge + Sync)),
 }
 
-/// Wall time per sync phase, printed when a sync fails or runs past its budget.
 struct Phases {
     start: Instant,
     current: Option<(&'static str, Instant, String)>,
@@ -236,7 +220,6 @@ struct Run<'a> {
     violations: Vec<Violation>,
     open: BTreeMap<String, plan::Observed>,
     seen: BTreeMap<String, plan::Observed>,
-    /// `.cm/pulls-read.json` as this walk found it, and as this walk leaves it.
     last_read: BTreeMap<String, LastRead>,
     read_now: BTreeMap<String, LastRead>,
     now: jiff::Timestamp,
@@ -265,8 +248,6 @@ impl Tracked {
     }
 }
 
-/// Two observations of an open PR that differ at most in when and with which validators they
-/// were read.
 fn same_facts(a: &plan::Observed, b: &plan::Observed) -> bool {
     a.target == b.target
         && a.head == b.head
@@ -324,8 +305,6 @@ impl<'a> Run<'a> {
         matches!(self.access, Access::Plan)
     }
 
-    /// A read through the cache. On a miss it reads now, records a job for later, or gives
-    /// nothing, by the walk's access.
     fn read<K, T>(
         &mut self,
         kind: &'static str,
@@ -1555,9 +1534,7 @@ pub(crate) fn render_resume(root: &Path, units: &Units, closed: bool) -> Result<
     Ok(())
 }
 
-/// Make every read a planning walk wants, `READERS` at a time, and walk again with the answers
-/// until a walk wants nothing new, so the read walk finds its reads cached. Planning walks change
-/// nothing on disk; a read they missed, the read walk makes itself.
+// Planning walks change nothing on disk; a read they miss, the read walk makes itself.
 fn prefetch(
     root: &Path,
     forge: &(dyn Forge + Sync),
@@ -1608,13 +1585,10 @@ fn perform(jobs: Vec<Job>, forge: &(dyn Forge + Sync)) -> Vec<Store> {
     done.into_inner().expect("read results")
 }
 
-/// `cm sync` with one read at a time and the default budget.
 pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> {
     sync_with(host, Reader::Serial(forge), root, BUDGET)
 }
 
-/// `cm sync`. A sync that fails, or takes longer than `budget`, reports each phase's wall time:
-/// as output lines and the `timing` field, or on stderr when it stops with an error.
 pub fn sync_with(
     host: &dyn Host,
     reader: Reader<'_>,

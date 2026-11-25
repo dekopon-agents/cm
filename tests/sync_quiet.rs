@@ -1,6 +1,3 @@
-//! A `cm sync` that finds no new fact writes nothing; one that finds a fact writes only the
-//! files that fact changes.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
@@ -59,8 +56,7 @@ fn at(now: &str) -> Fake {
 const OPEN_PR: &str = "https://github.com/o/r/pull/1";
 const MERGED_PR: &str = "https://github.com/o/r/pull/2";
 
-/// GitHub as a forge that can be shared across threads: an unchanged pull answers its stored
-/// validator with a 304, as GitHub does, and every read is logged.
+// Like GitHub, an unchanged pull answers its stored validator with a 304.
 #[derive(Default)]
 struct Github {
     pulls: Mutex<BTreeMap<String, Pull>>,
@@ -192,7 +188,6 @@ fn advance(host: &Fake, c: &Campaign, target: &str, to: Phase, evidence: Evidenc
     assert!(moved.ok(), "{:?}", moved.violations);
 }
 
-/// Opens a PR for `target` and returns its recorded head.
 fn open_pr(host: &Fake, c: &Campaign, worktree: &Path, target: &str, pr: &str) -> String {
     let launched = commands::launch(
         host,
@@ -221,9 +216,6 @@ fn state(c: &Campaign, target: &str) -> Phase {
         .clone()
 }
 
-/// A small committed epoch shaped like a live one: a released tag, an open PR that waits on CI
-/// and review, a merged step its release does not contain, a step waiting on the open one, a
-/// blocked reviewer and RESUME.md's generated status, after one sync that moved the merged step.
 fn epoch() -> (Campaign, Github, String) {
     let host = at("2026-10-17T08:00:00Z");
     let c = campaign(&host);
@@ -304,7 +296,6 @@ fn commit(c: &Campaign) {
     git(&c.root, &["commit", "-q", "-m", "sync"]);
 }
 
-/// The paths `git status` would show: changed, removed or new.
 fn status(c: &Campaign) -> Vec<String> {
     let changed: BTreeSet<String> = git(
         &c.root,
@@ -322,11 +313,8 @@ fn status(c: &Campaign) -> Vec<String> {
     changed.into_iter().collect()
 }
 
-/// The untracked runtime files cm keeps under `.cm/`.
 const RUNTIME: [&str; 2] = [".cm/lock", ".cm/pulls-read.json"];
 
-/// Every file of the campaign but git's own and cm's untracked runtime files, with its bytes and
-/// mtime.
 fn files(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
     fn visit(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, (Vec<u8>, SystemTime)>) {
         for entry in fs::read_dir(dir).unwrap() {
@@ -349,7 +337,7 @@ fn files(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
     out
 }
 
-/// Backdate every file so that any rewrite, even of the same bytes, shows in its mtime.
+// So that any rewrite, even of the same bytes, shows in the mtime.
 fn backdate(root: &Path) {
     let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     for path in files(root).keys() {
@@ -552,7 +540,6 @@ fn a_concurrent_sync_makes_the_reads_and_writes_of_a_serial_one() {
     assert_eq!(strip(files(&twin)), strip(files(&c.root)));
 }
 
-/// What `.cm/pulls.json` and the open step's unit hold for the open PR's head.
 fn heads(c: &Campaign) -> (Option<String>, Option<String>) {
     let pulls: BTreeMap<String, cm::plan::Observed> =
         store::read_json(&cm::plan::pulls_path(&c.root)).unwrap();

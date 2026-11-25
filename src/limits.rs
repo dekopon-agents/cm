@@ -198,7 +198,7 @@ pub(crate) fn codex_pause() -> Option<String> {
         .map(|used| format!("Codex dispatch held: weekly usage {used}% reached the 85% pause"))
 }
 
-/// The hold as CARD.md shows it: without the usage percent, which moves with every sample.
+// CARD.md's hold: the usage percent moves with every sample.
 pub(crate) fn codex_pause_held() -> Option<String> {
     codex_weekly_held()
         .map(|_| "Codex dispatch held: weekly usage reached the 85% pause".to_owned())

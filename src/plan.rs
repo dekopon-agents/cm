@@ -1022,7 +1022,6 @@ pub(crate) fn unblock_command(target: &str, condition_met: bool) -> String {
     }
 }
 
-/// What CARD.md lists as next and waiting.
 pub fn summary(root: &Path, units: &Units) -> Next {
     let paused = paused(root).unwrap_or(true);
     let quota = limits::codex_pause_held();
