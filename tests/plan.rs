@@ -7805,14 +7805,27 @@ fn a_script_pin_is_merge_ready_on_clean_green_ci_and_owes_no_review() {
     let c = campaign(&host);
     let mut heads = BTreeMap::new();
     let mut seen = BTreeMap::new();
-    for (step, pr) in [
-        ("01-a/u/pin", "https://github.com/xrl/rpi-homelab/pull/1"),
+    for (step, pr, lane, work) in [
+        (
+            "01-a/u/pin",
+            "https://github.com/xrl/rpi-homelab/pull/1",
+            Lane::Coordinator,
+            Work::Rollout,
+        ),
         (
             "01-a/u/publish",
             "https://github.com/xrl/rpi-homelab/pull/2",
+            Lane::Coordinator,
+            Work::Rollout,
+        ),
+        (
+            "01-a/u/local",
+            "https://github.com/o/r/pull/3",
+            Lane::Pi,
+            Work::Code,
         ),
     ] {
-        assert!(declare_work(&host, &c, step, Lane::Coordinator, &[], Work::Rollout).ok());
+        assert!(declare_work(&host, &c, step, lane, &[], work).ok());
         kickoff(&c, step);
         open_pr(&host, &c, step, pr);
         let head = plan::track(&plan::load_units(&c.root).unwrap(), step)
@@ -7850,10 +7863,12 @@ fn a_script_pin_is_merge_ready_on_clean_green_ci_and_owes_no_review() {
             )
         })
         .collect();
-    // The pin merges on CI alone, as the gate exempts it; the config rollout is owed its reviews.
+    // The pin merges on CI alone; the config rollout is owed its reviews, and so is a PR from a
+    // lane no model writes in, which needs any one verdict.
     assert_eq!(
         kinds,
         [
+            ("review-owed".to_owned(), "01-a/u/local".to_owned()),
             ("merge-ready".to_owned(), "01-a/u/pin".to_owned()),
             ("review-owed".to_owned(), "01-a/u/publish".to_owned()),
         ]

@@ -1646,9 +1646,12 @@ pub struct Advance<'a> {
 /// `fable` and `coordinator` lanes (owner, 2026-11-25). Only a deploy script's pin, a rollout
 /// named `…/pin` or `…/deploy`, is exempt; a config rollout is model-written and gated.
 pub(crate) fn merge_gated(target: &str, step: &Step) -> bool {
-    let script_pin =
-        step.work == Work::Rollout && (target.ends_with("/pin") || target.ends_with("/deploy"));
-    crate::verdict::model_lane(step.lane) && !script_pin
+    crate::verdict::model_lane(step.lane) && !script_pin(target, step)
+}
+
+/// A deploy script's pin: a rollout named `…/pin` or `…/deploy`, merged on clean, green CI alone.
+pub(crate) fn script_pin(target: &str, step: &Step) -> bool {
+    step.work == Work::Rollout && (target.ends_with("/pin") || target.ends_with("/deploy"))
 }
 
 pub fn advance_gated(

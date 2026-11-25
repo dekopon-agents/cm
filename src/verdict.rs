@@ -795,8 +795,12 @@ pub fn record(
         ));
     }
     if let Some((_, text)) = &block
+        // A report is recorded once per step, except that one recorded before the step had parts
+        // may be recorded again for a part, so its receipt can bind there; a report recorded for
+        // one part never serves another.
         && let Some(again) = verdicts.reviews.iter().find(|review| {
             review.step == full
+                && (review.part.is_some() || (review.part.as_deref() == part && review.pr == pr))
                 && fs::read_to_string(root.join(review.report.as_str()))
                     .ok()
                     .as_ref()

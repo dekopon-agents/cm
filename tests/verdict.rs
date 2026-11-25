@@ -4689,3 +4689,53 @@ fn an_explicit_accept_is_stated_as_well_as_computed() {
     claude_accept(&host, &c, &head);
     assert!(gaps().is_empty(), "{:?}", gaps());
 }
+
+#[test]
+fn reviews_recorded_before_parts_can_be_recorded_again_for_a_part() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host, true);
+    accepted(&host, &c);
+    let head = c.head();
+    let amendment = commands::Amendment {
+        parts: vec!["one".into(), "two".into()],
+        ..Default::default()
+    };
+    assert!(
+        commands::amend(&host, &c.root, &target(), &amendment)
+            .unwrap()
+            .ok()
+    );
+    let gaps = || {
+        verdict::merge_gaps(&c.root, &target(), Some("one"), Some(PR), &head, None)
+            .unwrap()
+            .gaps
+    };
+    // The step's reviews from before it had parts bind no part, so its receipt stays unbound.
+    assert!(!gaps().is_empty());
+    let astra = c.root.join(STEP).join("evidence/astra-review-7/report.md");
+    let claude = c.root.join(format!("drafts/claude-{head}.md"));
+    for (report, reviewer) in [(&astra, "astra"), (&claude, "claude")] {
+        let again = verdict::record(
+            &host,
+            &c.root,
+            &target(),
+            report,
+            Some(reviewer),
+            Some("one"),
+        )
+        .unwrap();
+        assert!(again.ok(), "{:?}", again.violations);
+    }
+    assert!(gaps().is_empty(), "{:?}", gaps());
+    // Within one PR and part a report is still recorded once.
+    let twice = verdict::record(
+        &host,
+        &c.root,
+        &target(),
+        &astra,
+        Some("astra"),
+        Some("one"),
+    )
+    .unwrap();
+    assert_eq!(rules(&twice), ["review-duplicate"]);
+}

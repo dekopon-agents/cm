@@ -1300,9 +1300,9 @@ fn actionable(
             if track.state != Phase::PrOpen {
                 return;
             }
-            // The merge gate's own exemption: a step it does not gate (a script's pin, a lane
-            // no model writes in) owes no review and merges on clean, green CI alone.
-            let gated = crate::commands::merge_gated(&target, step);
+            // Only a script's pin owes no review and merges on clean, green CI alone; every
+            // other step, a lane no model writes in included, needs its verdicts.
+            let gated = !crate::commands::script_pin(&target, step);
             let name = part.map_or_else(|| target.clone(), |part| format!("{target}#{part}"));
             let observed = seen.get(pr).filter(|observed| observed.target == name);
             let head = observed
