@@ -267,24 +267,25 @@ pub(crate) fn bound(checkout: &Path, epoch: &Path, proc: &dyn Proc, env: &Env) -
     if !added.stdout_truncated && !added.stdout.split(|byte| *byte == 0).any(coordinator) {
         return true;
     }
-    // mktemp's choice of folder, except that a relative TMPDIR, which heartbeat.sh resolved in
-    // the checkout, is refused: the extract is never made inside the checkout's tree.
-    let tmpdir = env.non_empty("TMPDIR").map_or(Path::new("/tmp"), Path::new);
-    if !tmpdir.is_absolute() {
+    let Some(root) = extract_root(env.get("TMPDIR")) else {
         return false;
-    }
-    let Ok(tmp) = tempfile::Builder::new()
-        .prefix("cm-tick-")
-        .tempdir_in(tmpdir)
-    else {
+    };
+    let Ok(tmp) = tempfile::Builder::new().prefix("cm-tick-").tempdir_in(root) else {
         return false;
     };
     let dir = tmp.path();
     let tar = dir.join("h.tar");
+    // Only origin's own attributes may change the copy, never this checkout's eol settings.
     let archived = succeeded(
         Cmd::new("git")
-            .arg("archive")
-            .arg("-o")
+            .args([
+                "-c",
+                "core.autocrlf=false",
+                "-c",
+                "core.eol=lf",
+                "archive",
+                "-o",
+            ])
             .arg(&tar)
             .arg("origin/main")
             .arg(&handoff),
@@ -314,6 +315,15 @@ pub(crate) fn bound(checkout: &Path, epoch: &Path, proc: &dyn Proc, env: &Env) -
         !ran.stdout_truncated && extract_is_origins(&succeeded, dir, &ran.stdout)
     });
     whole && picked(&dir.join(epoch))
+}
+
+// mktemp's folder for TMPDIR, /tmp when it is unset or empty, except that a relative TMPDIR,
+// which heartbeat.sh resolved in the checkout, is refused: the extract is never made there.
+fn extract_root(tmpdir: Option<&str>) -> Option<&Path> {
+    let root = tmpdir
+        .filter(|dir| !dir.is_empty())
+        .map_or(Path::new("/tmp"), Path::new);
+    root.is_absolute().then_some(root)
 }
 
 const HASH_ARGV_BYTES: usize = 128 << 10;
@@ -837,6 +847,19 @@ mod tests {
 
     fn printed(wall: Duration, budget: Duration, failed: bool) -> Vec<String> {
         wall_line("pin", wall, budget, failed).into_iter().collect()
+    }
+
+    #[test]
+    fn the_extract_goes_where_mktemp_would_make_it_but_never_in_the_checkout() {
+        let tmp = Some(Path::new("/tmp"));
+        assert_eq!(extract_root(None), tmp);
+        assert_eq!(extract_root(Some("")), tmp);
+        for dir in ["/var/tmp/x", "/no/such/folder", "/etc/passwd"] {
+            assert_eq!(extract_root(Some(dir)), Some(Path::new(dir)), "{dir}");
+        }
+        for relative in ["tmp", ".", "../tmp", " /tmp"] {
+            assert_eq!(extract_root(Some(relative)), None, "{relative:?}");
+        }
     }
 
     #[test]

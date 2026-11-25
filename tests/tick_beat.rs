@@ -124,10 +124,7 @@ impl Answers {
     }
 
     fn answer(&self, cmd: &Cmd) -> Ran {
-        match (
-            cmd.program_name().as_str(),
-            cmd.argv.get(1).and_then(|arg| arg.to_str()),
-        ) {
+        match (cmd.program_name().as_str(), sub(cmd)) {
             ("cm", Some("--json")) => self.next.clone(),
             ("git", Some("rev-parse")) => Ran::code(0, self.branch.clone()),
             ("git", Some("fetch")) => self.fetch.clone(),
@@ -187,6 +184,36 @@ fn frame_calls<'a>(log: &'a [String], wanted: &[&str]) -> Vec<&'a str> {
     seen
 }
 
+// git's subcommand, past any `-c name=value` before it; any other program's first argument.
+fn sub(cmd: &Cmd) -> Option<&str> {
+    let mut args = cmd.argv[1..].iter().map(|arg| arg.to_str());
+    if cmd.program_name() != "git" {
+        return args.next().flatten();
+    }
+    while let Some(arg) = args.next() {
+        if arg != Some("-c") {
+            return arg;
+        }
+        args.next();
+    }
+    None
+}
+
+// The tick's own Env with TMPDIR in the fixture, so no in-process tick makes a folder elsewhere.
+fn in_fixture(dir: &Path, env: &Env) -> Env {
+    let tmpdir = dir.join("tick-tmp");
+    fs::create_dir_all(&tmpdir).unwrap();
+    let mut pairs: Vec<(String, String)> = ["CLAUDE_CODE_REMOTE_SESSION_ID", "HEARTBEAT_DEADLINE"]
+        .into_iter()
+        .filter_map(|name| Some((name.to_owned(), env.get(name)?.to_owned())))
+        .collect();
+    let tmpdir = env
+        .get("TMPDIR")
+        .map_or_else(|| tmpdir.to_str().unwrap().to_owned(), str::to_owned);
+    pairs.push(("TMPDIR".to_owned(), tmpdir));
+    pairs.into_iter().collect()
+}
+
 fn tick_with(
     ct: &Ct,
     proc: &dyn Proc,
@@ -195,10 +222,11 @@ fn tick_with(
     phases: &Phases,
 ) -> Vec<String> {
     let mut out = Vec::new();
+    let env = in_fixture(ct.path(), env);
     let beat = Beat {
         checkout: ct.path(),
         proc,
-        env,
+        env: &env,
         registry,
         phases,
         cm: OsStr::new("cm"),
@@ -729,12 +757,7 @@ fn executors_run_only_in_the_bound_coordinator() {
             &bound_env(),
         );
         assert_eq!((out, ran), acts());
-        assert!(
-            !proc
-                .log()
-                .iter()
-                .any(|call| call.starts_with("git archive"))
-        );
+        assert!(!proc.log().iter().any(|call| call.contains(" archive -o ")));
     }
 
     let handoff = "store/epochs/eleemosynary-mnemosyne/handoff";
@@ -745,7 +768,7 @@ fn executors_run_only_in_the_bound_coordinator() {
     let read_origin = |proc: &FakeProc| {
         proc.log()
             .iter()
-            .filter(|call| call.starts_with("git archive") || call.starts_with("tar "))
+            .filter(|call| call.contains(" archive -o ") || call.starts_with("tar "))
             .count()
     };
     let (out, ran, proc) = run(
@@ -1264,7 +1287,7 @@ fn a_timed_out_executor_is_killed_with_its_process_group() {
         &Beat {
             checkout: ct.path(),
             proc: &Bin(bin.clone()),
-            env: &env,
+            env: &in_fixture(ct.path(), &env),
             registry: &registry,
             phases: &QUIET,
             cm: cm.as_os_str(),
@@ -1543,7 +1566,7 @@ fn a_valid_act_list_above_64_mib_prints_every_line() {
         &Beat {
             checkout: ct.path(),
             proc: &Bin(bin.clone()),
-            env: &bound_env(),
+            env: &in_fixture(ct.path(), &bound_env()),
             registry: &Registry::new(),
             phases: &QUIET,
             cm: cm.as_os_str(),
@@ -1641,7 +1664,7 @@ fn a_list_a_descendant_prints_after_the_leader_and_stderr_are_gone_is_read_whole
             &Beat {
                 checkout: ct.path(),
                 proc: &Bin(bin.clone()),
-                env: &bound_env(),
+                env: &in_fixture(ct.path(), &bound_env()),
                 registry: &Registry::new(),
                 phases: &QUIET,
                 cm: cm.as_os_str(),
@@ -2089,7 +2112,7 @@ fn a_valid_act_list_above_4_mib_prints_every_line() {
         &Beat {
             checkout: ct.path(),
             proc: &Bin(bin.clone()),
-            env: &bound_env(),
+            env: &in_fixture(ct.path(), &bound_env()),
             registry: &Registry::new(),
             phases: &QUIET,
             cm: cm.as_os_str(),
@@ -2132,7 +2155,7 @@ fn a_first_line_answer_is_read_from_its_head_whatever_follows() {
         &Beat {
             checkout: ct.path(),
             proc: &Bin(bin.clone()),
-            env: &bound_env(),
+            env: &in_fixture(ct.path(), &bound_env()),
             registry: &registry,
             phases: &QUIET,
             cm: cm.as_os_str(),
@@ -2876,7 +2899,7 @@ fn an_epoch_store_that_cannot_be_read_is_named_not_counted_as_none() {
             &Beat {
                 checkout,
                 proc: &proc,
-                env: &bound_env(),
+                env: &in_fixture(checkout, &bound_env()),
                 registry: &Registry::new(),
                 phases: &QUIET,
                 cm: OsStr::new("cm"),
@@ -3115,7 +3138,9 @@ fn an_unbound_session_prints_nothing_and_runs_only_the_bound_check() {
         ran
     };
     let [rev, pick, fetch, diff] = BOUND_CHECK;
-    let archive = format!("git archive -o <tmp>/h.tar origin/main {handoff}");
+    let archive = format!(
+        "git -c core.autocrlf=false -c core.eol=lf archive -o <tmp>/h.tar origin/main {handoff}"
+    );
     let tar = "tar -x -C <tmp> -f <tmp>/h.tar";
     let origin_pick = format!(
         "sh tools/cloud-env/handoff-pick.sh <tmp>/{EPOCH} coordinator --lineage session_01abc --max-age-hours 24"
@@ -3346,6 +3371,18 @@ fn an_unbound_session_prints_nothing_and_runs_only_the_bound_check() {
             read[..7].to_vec(),
         ),
         (
+            "a listing entry with no tab before its path",
+            Answers {
+                listing: Ran::code(
+                    0,
+                    format!("100644 blob {} {handoff}/x.md\0", "a".repeat(40)),
+                ),
+                ..on_origin()
+            },
+            bound_env(),
+            read[..7].to_vec(),
+        ),
+        (
             "a file origin lists that the extract lacks, as export-ignore drops one",
             Answers {
                 listing: Ran::code(
@@ -3393,12 +3430,12 @@ fn an_unbound_session_prints_nothing_and_runs_only_the_bound_check() {
         let calls = proc.calls();
         let tmp = calls
             .iter()
-            .find(|call| call.argv[..2] == ["git", "archive"])
-            .map(|call| Path::new(&call.argv[3]).parent().unwrap().to_owned());
+            .find(|call| call.program_name() == "git" && sub(call) == Some("archive"))
+            .map(|call| Path::new(&call.argv[7]).parent().unwrap().to_owned());
         if let Some(tmp) = &tmp {
             assert!(
-                tmp.starts_with("/tmp"),
-                "{case}: no TMPDIR is /tmp: {tmp:?}"
+                tmp.starts_with(ct.path().join("tick-tmp")),
+                "{case}: the extract is made in the fixture: {tmp:?}"
             );
             assert!(!tmp.exists(), "{case}: {tmp:?} is removed");
         }
@@ -3481,7 +3518,7 @@ fn the_frame_re_checks_after_each_gitsync_and_stops_once_a_successor_appears() {
         let reads = proc
             .log()
             .iter()
-            .filter(|call| call.starts_with("git archive"))
+            .filter(|call| call.contains(" archive -o "))
             .count();
         match appears {
             Some(Mode::Always) => {
@@ -3543,14 +3580,22 @@ fn the_frame_re_checks_after_each_gitsync_and_stops_once_a_successor_appears() {
 fn check_bound_answers_for_the_one_live_epoch_only() {
     let ct = Ct::new();
     let proc = Answers::new(0, "").proc();
-    assert!(beat::check(ct.path(), &proc, &bound_env()));
+    assert!(beat::check(
+        ct.path(),
+        &proc,
+        &in_fixture(ct.path(), &bound_env())
+    ));
     assert_eq!(
         proc.log(),
         BOUND_CHECK,
         "the bound check alone: no cm, no phase"
     );
     let proc = Answers::new(0, "").proc();
-    assert!(!beat::check(ct.path(), &proc, &Env::default()));
+    assert!(!beat::check(
+        ct.path(),
+        &proc,
+        &in_fixture(ct.path(), &Env::default())
+    ));
     assert_eq!(proc.log(), [BOUND_CHECK[0]]);
 
     ct.write(
@@ -3563,7 +3608,10 @@ fn check_bound_answers_for_the_one_live_epoch_only() {
     std::os::unix::fs::symlink("epochs", unreadable.path().join("store/epochs")).unwrap();
     for checkout in [ct.path(), empty.path(), unreadable.path()] {
         let proc = Answers::new(0, "").proc();
-        assert!(!beat::check(checkout, &proc, &bound_env()), "{checkout:?}");
+        assert!(
+            !beat::check(checkout, &proc, &in_fixture(checkout, &bound_env())),
+            "{checkout:?}"
+        );
         assert!(proc.log().is_empty(), "{checkout:?}");
     }
 }
@@ -4188,7 +4236,7 @@ fn the_built_cm_tick_stays_bound_for_a_newer_handoff_of_this_lineage_on_origin()
 }
 
 #[test]
-fn the_built_cm_tick_reads_origin_into_tmp_for_an_empty_tmpdir_and_refuses_a_relative_one() {
+fn the_built_cm_tick_refuses_a_relative_tmpdir_and_makes_nothing_in_the_checkout() {
     let origin = Origin::new();
     origin.push_handoff(NEXT, "session_01abc", Some(OURS));
     let before = origin.snapshot();
@@ -4205,17 +4253,6 @@ fn the_built_cm_tick_reads_origin_into_tmp_for_an_empty_tmpdir_and_refuses_a_rel
         }
         command.output().unwrap()
     };
-    let output = tick("", false);
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        format!("{}\n", PRINTED.join("\n"))
-    );
-    assert!(
-        origin_pick(Path::new("/tmp"), &origin.log("pick.log")[1]),
-        "{:?}",
-        origin.log("pick.log")
-    );
-    assert_eq!(tick("", true).status.code(), Some(0));
     for tmpdir in ["tmp", "."] {
         let output = tick(tmpdir, false);
         assert_eq!(output.status.code(), Some(0), "{tmpdir}: {output:?}");
@@ -4865,6 +4902,7 @@ fn the_built_cm_tick_compares_a_symlink_by_its_target_and_skips_submodules_and_m
     origin.git(&other, &["pull", "-q", "--rebase", "origin", "main"]);
     write(&other.join(&handoff).join("notes.txt"), "a note\n");
     std::os::unix::fs::symlink("notes.txt", other.join(&handoff).join("notes-latest.txt")).unwrap();
+    std::os::unix::fs::symlink("nowhere.txt", other.join(&handoff).join("gone.txt")).unwrap();
     write(&other.join(&handoff).join(NEXT), &self_handoff());
     fs::set_permissions(
         other.join(&handoff).join(NEXT),
@@ -5054,6 +5092,109 @@ fn an_extracted_entry_of_another_kind_than_origins_is_unbound() {
                 .log()
                 .iter()
                 .any(|call| call.starts_with("git hash-object"))
+        );
+    }
+}
+
+#[test]
+fn the_built_cm_tick_reads_origin_whole_whatever_the_checkouts_eol_config() {
+    let origin = Origin::real();
+    origin.push_handoff(NEXT, "session_01abc", Some(OURS));
+    let ct = origin.ct();
+    origin.git(&ct, &["config", "core.autocrlf", "true"]);
+    origin.git(&ct, &["config", "core.eol", "crlf"]);
+    origin.git(&ct, &["fetch", "-q", "origin", "main"]);
+    let archived = origin.archived();
+    assert!(
+        fs::read(archived.join("handoff").join(NEXT))
+            .unwrap()
+            .contains(&b'\r'),
+        "a plain git archive in this checkout converts to CRLF"
+    );
+    origin.acts(Some("cse_01abc"));
+    assert_eq!(origin.check_bound(Some("cse_01abc")), Some(0));
+    origin.tmp_is_empty();
+}
+
+#[test]
+fn the_built_cm_tick_is_unbound_when_origins_handoff_listing_passes_4_mib() {
+    let origin = Origin::new();
+    let other = origin.path("other");
+    let handoff = other.join(EPOCH).join("handoff");
+    origin.git(&other, &["pull", "-q", "--rebase", "origin", "main"]);
+    let pad = "x".repeat(200);
+    for n in 0..18_000 {
+        fs::write(handoff.join(format!("pr-loop-{n:05}-{pad}.md")), "").unwrap();
+    }
+    origin.git(&other, &["add", "-A"]);
+    origin.git(
+        &other,
+        &[
+            "commit",
+            "-qm",
+            "names past 4 MiB, none a coordinator handoff",
+        ],
+    );
+    origin.git(&other, &["push", "-q", "origin", "main"]);
+    let ct = origin.ct();
+    origin.git(&ct, &["fetch", "-q", "origin", "main"]);
+    let spec = format!("{EPOCH}/handoff/");
+    let added = origin.git(
+        &ct,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--diff-filter=A",
+            "HEAD",
+            "origin/main",
+            "--",
+            &spec,
+        ],
+    );
+    let listed = origin.git(&ct, &["ls-tree", "-r", "-z", "origin/main", "--", &spec]);
+    assert!(added.len() > OUTPUT_CAP && listed.len() > OUTPUT_CAP);
+    origin.silent(Some("cse_01abc"), &[]);
+    assert_eq!(
+        origin.log("pick.log"),
+        [local_pick("session_01abc")],
+        "the cut diff list goes on to origin's read, and its cut listing never reaches the pick"
+    );
+    origin.tmp_is_empty();
+    assert_eq!(origin.check_bound(Some("cse_01abc")), Some(1));
+}
+
+#[test]
+fn the_readme_harness_table_names_every_variable_a_tick_fixture_sets() {
+    let readme = include_str!("../README.md");
+    let table = readme
+        .split_once("| Spawn | Environment |")
+        .and_then(|(_, rest)| rest.split("\n\n").next())
+        .expect("README's harness table");
+    // A `Cmd`'s own variables in the runner tests, set on no tick.
+    let not_a_tick = ["TICK_KEEP", "TICK_DROP", "X"];
+    let source = include_str!("tick_beat.rs").replace(REAL_HANDOFF_PICK, "");
+    let mut names = std::collections::BTreeSet::new();
+    for opener in [".env(\"", "(\""] {
+        for piece in source.split(opener).skip(1) {
+            let Some((name, rest)) = piece.split_once('"') else {
+                continue;
+            };
+            let variable = name.starts_with(|c: char| c.is_ascii_uppercase())
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+            if variable && rest.starts_with(',') && !not_a_tick.contains(&name) {
+                names.insert(name);
+            }
+        }
+    }
+    assert!(names.contains("TMPDIR") && names.len() >= 7, "{names:?}");
+    for name in &names {
+        assert!(
+            table.contains(&format!("`{name}")),
+            "{name} is set by a tick fixture but README's harness table does not name it"
         );
     }
 }
