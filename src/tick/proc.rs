@@ -10,7 +10,14 @@
 //!
 //! Each output stream is kept by its [`Keep`]: whole (a producer's JSON; past [`WHOLE_CAP`] the
 //! child is killed and exits [`Exit::TooLarge`], never cut silently), its head (a first line) or
-//! its tail (a last line).
+//! its tail (a last line); [`Ran`] says when a head or tail dropped bytes.
+//!
+//! Limit: the tick forwards no signal, so a kill of `cm tick` itself (the Stop hook's timeout
+//! signalling the hook's own process group) does not reach a running child's group, which then
+//! runs on, bounded only by its own behaviour. Under heartbeat.sh the frame children died with
+//! the hook's group. The hook must therefore bound `cm tick` by session, not only by signalling
+//! its group. `PR_SET_PDEATHSIG` is not used: it needs an `unsafe` `pre_exec` and would reach only
+//! the direct child, not the rest of its group.
 //!
 //! [`SystemProc`] is the real runner; [`FakeProc`] answers from a closure and records every
 //! call, for tests.
@@ -56,6 +63,8 @@ pub struct Cmd {
     pub cwd: Option<PathBuf>,
     /// Variables added to the inherited environment.
     pub env: Vec<(OsString, OsString)>,
+    /// Variables removed from the inherited environment (before `env` adds).
+    pub env_remove: Vec<OsString>,
     /// Written to the child's stdin, which is then closed; `None` gives it `/dev/null`.
     pub stdin: Option<Vec<u8>>,
     /// After this the whole process group gets TERM, then KILL [`KILL_AFTER`] later.
@@ -89,6 +98,7 @@ impl Cmd {
             argv: vec![program.as_ref().to_owned()],
             cwd: None,
             env: Vec::new(),
+            env_remove: Vec::new(),
             stdin: None,
             timeout: Self::DEFAULT_TIMEOUT,
             merge_stderr: false,
@@ -116,6 +126,11 @@ impl Cmd {
     pub fn env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
         self.env
             .push((key.as_ref().to_owned(), value.as_ref().to_owned()));
+        self
+    }
+
+    pub fn env_remove(mut self, key: impl AsRef<OsStr>) -> Self {
+        self.env_remove.push(key.as_ref().to_owned());
         self
     }
 
@@ -201,6 +216,11 @@ pub struct Ran {
     pub stdout: Vec<u8>,
     /// Empty when the command merged it into stdout.
     pub stderr: Vec<u8>,
+    /// stdout dropped bytes: a [`Keep::Head`] or [`Keep::Tail`] past [`OUTPUT_CAP`], or a
+    /// [`Keep::Whole`] past [`WHOLE_CAP`] (which also exits [`Exit::TooLarge`]).
+    pub stdout_truncated: bool,
+    /// stderr dropped bytes, likewise.
+    pub stderr_truncated: bool,
     pub wall: Duration,
 }
 
@@ -211,6 +231,8 @@ impl Ran {
             exit: Exit::Code(code),
             stdout: stdout.into(),
             stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
             wall: Duration::ZERO,
         }
     }
@@ -242,6 +264,11 @@ pub trait Proc {
     /// Runs `cmd` until it exits, or until its timeout and the kill of its process group.
     /// `Err` only when it could not be started or waited for; an exit status is data.
     fn run(&self, cmd: &Cmd) -> Result<Ran>;
+
+    /// Waits, as between retries; a fake records it and returns at once.
+    fn pause(&self, pause: Duration) {
+        std::thread::sleep(pause);
+    }
 }
 
 /// The real runner.
@@ -260,8 +287,11 @@ impl Proc for SystemProc {
             return Err(fail(ErrorKind::InvalidInput.into()));
         }
         let mut command = Command::new(&program);
+        command.args(&cmd.argv[1..]);
+        for key in &cmd.env_remove {
+            command.env_remove(key);
+        }
         command
-            .args(&cmd.argv[1..])
             .envs(cmd.env.iter().map(|(key, value)| (key, value)))
             .process_group(0)
             .stdin(if cmd.stdin.is_some() {
@@ -351,10 +381,14 @@ impl Proc for SystemProc {
         } else {
             Exit::Signal(status.signal().unwrap_or(0))
         };
+        let (stdout, stdout_truncated) = out.finish();
+        let (stderr, stderr_truncated) = err.finish();
         Ok(Ran {
             exit,
-            stdout: out.finish(),
-            stderr: err.finish(),
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
             wall: started.elapsed(),
         })
     }
@@ -429,6 +463,8 @@ struct Drain {
     bytes: Vec<u8>,
     /// A [`Keep::Whole`] stream passed [`WHOLE_CAP`].
     overflowed: bool,
+    /// Bytes were dropped.
+    truncated: bool,
 }
 
 impl Drain {
@@ -441,6 +477,7 @@ impl Drain {
             keep,
             bytes: Vec::new(),
             overflowed: false,
+            truncated: false,
         })
     }
 
@@ -478,32 +515,34 @@ impl Drain {
     }
 
     fn take(&mut self, chunk: &[u8]) {
-        match self.keep {
-            Keep::Whole => {
-                let room = WHOLE_CAP.saturating_sub(self.bytes.len());
-                self.bytes
-                    .extend_from_slice(&chunk[..chunk.len().min(room)]);
-                self.overflowed |= chunk.len() > room;
-            }
-            Keep::Head => {
-                let room = OUTPUT_CAP.saturating_sub(self.bytes.len());
-                self.bytes
-                    .extend_from_slice(&chunk[..chunk.len().min(room)]);
-            }
+        let cap = match self.keep {
+            Keep::Whole => WHOLE_CAP,
+            Keep::Head => OUTPUT_CAP,
             Keep::Tail => {
                 self.bytes.extend_from_slice(chunk);
                 if self.bytes.len() > 2 * OUTPUT_CAP {
                     self.bytes.drain(..self.bytes.len() - OUTPUT_CAP);
+                    self.truncated = true;
                 }
+                return;
             }
+        };
+        let room = cap.saturating_sub(self.bytes.len());
+        self.bytes
+            .extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if chunk.len() > room {
+            self.truncated = true;
+            self.overflowed |= self.keep == Keep::Whole;
         }
     }
 
-    fn finish(mut self) -> Vec<u8> {
+    /// The bytes kept, and whether any were dropped.
+    fn finish(mut self) -> (Vec<u8>, bool) {
         if self.keep == Keep::Tail && self.bytes.len() > OUTPUT_CAP {
             self.bytes.drain(..self.bytes.len() - OUTPUT_CAP);
+            self.truncated = true;
         }
-        self.bytes
+        (self.bytes, self.truncated)
     }
 }
 
@@ -552,9 +591,11 @@ impl<'a> Feed<'a> {
 
 type Answer = dyn Fn(&Cmd) -> Result<Ran>;
 
-/// A runner for tests: answers every call from a closure and records it.
+/// A runner for tests: answers every call from a closure and records it, and records pauses
+/// without waiting.
 pub struct FakeProc {
     calls: RefCell<Vec<Cmd>>,
+    pauses: RefCell<Vec<Duration>>,
     answer: Box<Answer>,
 }
 
@@ -562,6 +603,7 @@ impl FakeProc {
     pub fn new(answer: impl Fn(&Cmd) -> Result<Ran> + 'static) -> Self {
         FakeProc {
             calls: RefCell::new(Vec::new()),
+            pauses: RefCell::new(Vec::new()),
             answer: Box::new(answer),
         }
     }
@@ -569,6 +611,11 @@ impl FakeProc {
     /// Every call so far, in order.
     pub fn calls(&self) -> Vec<Cmd> {
         self.calls.borrow().clone()
+    }
+
+    /// Every pause so far, in order.
+    pub fn pauses(&self) -> Vec<Duration> {
+        self.pauses.borrow().clone()
     }
 
     /// Every call so far as [`Cmd::line`] prints it.
@@ -581,5 +628,9 @@ impl Proc for FakeProc {
     fn run(&self, cmd: &Cmd) -> Result<Ran> {
         self.calls.borrow_mut().push(cmd.clone());
         (self.answer)(cmd)
+    }
+
+    fn pause(&self, pause: Duration) {
+        self.pauses.borrow_mut().push(pause);
     }
 }

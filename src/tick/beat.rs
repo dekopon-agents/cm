@@ -19,8 +19,9 @@
 //! check, whether or not the act list is empty (see [`malformed`]'s documentation for how it
 //! relates to the `executors off` line).
 //!
-//! A phase's wall time is printed only when the phase failed or ran a whole second past its
-//! budget: `tick: <phase> phase took <seconds> s (budget <budget> s)`. An executor or phase that
+//! A phase's wall time is printed only when a housekeeping phase failed, or any phase ran a whole
+//! second past its budget: `tick: <phase> phase took <seconds> s (budget <budget> s)`. A failed
+//! `cm next` prints only its own line, as in heartbeat.sh. An executor or phase that
 //! panics fails with the panic's message instead of ending the tick. Every other line is
 //! heartbeat.sh's, byte for byte, except that an executor is named `tick/<key>` where
 //! heartbeat.sh named its `act.d/<file>`.
@@ -101,8 +102,9 @@ impl Beat<'_> {
 }
 
 /// `cm tick`: one tick with the real children, environment and executors, each line handed to
-/// `out` as it is decided. `cm` is the program cm calls go to, by default this executable.
-pub fn cli(checkout: &Path, cm: Option<&OsStr>, out: &mut dyn FnMut(String)) {
+/// `out` as it is decided. `cm` is the program cm calls go to, by default this executable; the
+/// one used is returned.
+pub fn cli(checkout: &Path, cm: Option<&OsStr>, out: &mut dyn FnMut(String)) -> OsString {
     let started = Instant::now();
     let env = Env::system();
     let registry = exec::registry();
@@ -118,6 +120,7 @@ pub fn cli(checkout: &Path, cm: Option<&OsStr>, out: &mut dyn FnMut(String)) {
         started,
     };
     run(&beat, out);
+    cm
 }
 
 /// This executable's path, read once when the tick starts: once the pin phase installs the
@@ -161,8 +164,10 @@ pub fn run(beat: &Beat, out: &mut dyn FnMut(String)) {
     let started = Instant::now();
     let left = u64::try_from(deadline.saturating_sub(beat.elapsed_secs())).unwrap_or(0);
     let budget = Duration::from_secs(left).saturating_add(KILL_AFTER);
+    // A failed `cm next` has printed its own line, so the act phase's wall time is printed only
+    // past its budget.
     let act = act(beat, epoch, &bound, deadline, out);
-    wall_time(out, "act", started.elapsed(), budget, act.failed);
+    wall_time(out, "act", started.elapsed(), budget, false);
     if act.ran {
         phase(beat, epoch, out, "gitsync", gitsync::BUDGET, |ctx| {
             (phases.gitsync)(ctx, gitsync::Mode::IfDirty)
@@ -259,8 +264,6 @@ fn wall_time(
 struct Act {
     /// An executor ran, so its writes may need pushing.
     ran: bool,
-    /// `cm --json next --act` gave no list.
-    failed: bool,
 }
 
 /// heartbeat.sh step 4.
@@ -271,10 +274,6 @@ fn act(
     deadline: i64,
     out: &mut dyn FnMut(String),
 ) -> Act {
-    let failed = Act {
-        ran: false,
-        failed: true,
-    };
     let next = Cmd::new(beat.cm)
         .args(["--json", "next", "-C"])
         .arg(epoch)
@@ -288,21 +287,21 @@ fn act(
                 "heartbeat: cm --json next --act ran past {} s and was killed",
                 FRAME_CAP.as_secs()
             ));
-            return failed;
+            return Act { ran: false };
         }
         Ok(ran) if ran.exit == Exit::TooLarge => {
             out(format!(
                 "heartbeat: cm --json next --act printed more than {} MiB and was killed; no act line was read",
                 WHOLE_CAP >> 20
             ));
-            return failed;
+            return Act { ran: false };
         }
         Ok(ran) => ran,
         Err(error) => {
             out(format!(
                 "heartbeat: cm --json next --act could not run: {error}"
             ));
-            return failed;
+            return Act { ran: false };
         }
     };
     let status = next.exit.shell_status();
@@ -311,16 +310,13 @@ fn act(
         .filter(|act| act.get("actionable").is_some_and(Value::is_array) && status <= 1);
     let Some(list) = list else {
         if status == 0 && next.stdout.iter().all(|byte| *byte == b'\n') {
-            return Act {
-                ran: false,
-                failed: false,
-            };
+            return Act { ran: false };
         }
         out(format!(
             "heartbeat: cm --json next --act exited {status} without an actionable list: {}",
             first_line(&next.stderr, 300)
         ));
-        return failed;
+        return Act { ran: false };
     };
     let unread = list
         .get("owner_queue_unread")
@@ -332,10 +328,7 @@ fn act(
         ));
     }
     let lines = list["actionable"].as_array().cloned().unwrap_or_default();
-    let mut act = Act {
-        ran: false,
-        failed: false,
-    };
+    let mut act = Act { ran: false };
     if lines.is_empty() {
         return act;
     }

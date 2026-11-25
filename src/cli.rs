@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -1325,15 +1325,20 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
         } => crate::verdict::close_followup(host, &root()?, id, by),
         Commands::Tick { checkout, cm } => {
             let mut lines = Vec::new();
-            crate::tick::beat::cli(checkout, cm.as_deref().map(Path::as_os_str), &mut |line| {
-                if cli.json {
-                    lines.push(line);
-                } else {
-                    println!("{line}");
-                }
-            });
+            let mut stdout = std::io::stdout().lock();
+            let used =
+                crate::tick::beat::cli(checkout, cm.as_deref().map(Path::as_os_str), &mut |line| {
+                    if cli.json {
+                        lines.push(line);
+                    } else {
+                        // A closed stdout (`cm tick | true`) must not end the tick: its moves still run.
+                        let _ = writeln!(stdout, "{line}");
+                    }
+                });
+            drop(stdout);
             let mut outcome = Outcome::default();
             if cli.json {
+                outcome.field("cm", used.to_string_lossy());
                 outcome.field("lines", lines);
             }
             return Ok((outcome, ExitCode::SUCCESS));

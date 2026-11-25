@@ -10,11 +10,11 @@ use std::process::Command;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use cm::tick::TickError;
 use cm::tick::act::{ActLine, Ctx, Env, Executor, Outcome, Registry, Report};
 use cm::tick::beat::{self, Beat, Phases};
 use cm::tick::gitsync::Mode;
 use cm::tick::proc::{Cmd, Exit, FakeProc, Keep, OUTPUT_CAP, Proc, Ran, SystemProc, WHOLE_CAP};
-use cm::tick::{TickError, exec};
 use serde_json::{Value, json};
 
 const EPOCH: &str = "store/epochs/eleemosynary-mnemosyne";
@@ -23,6 +23,12 @@ const PICK_OK: &str =
 const PRINTED: [&str; 2] = [
     "launchable-not-launched 01-a/u/b: cm launch 01-a/u/b",
     "attempt-ended 01-a/u/c: cm attempt 01-a/u/c restart",
+];
+/// The frame's own calls, as the fake scripts log them, in order.
+const FRAME: [&str; 3] = [
+    "git rev-parse --abbrev-ref HEAD",
+    "handoff-pick.sh store/epochs/eleemosynary-mnemosyne coordinator --lineage session_01abc --max-age-hours 24",
+    "cm --json next -C store/epochs/eleemosynary-mnemosyne --act",
 ];
 const QUEUE_LINE: &str = "owner-queue: 1 unread item(s); read OWNER-QUEUE.md and run cm owner-queue read before any merge or review";
 
@@ -126,8 +132,34 @@ fn bound_env() -> Env {
     env(&[("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_01abc")])
 }
 
+fn quiet(_: &Ctx) -> Report {
+    Report::default()
+}
+
+fn quiet_gitsync(_: &Ctx, _: Mode) -> Report {
+    Report::default()
+}
+
+/// Phases that do nothing: the loop's tests never depend on what the housekeeping cards fill in.
+const QUIET: Phases<'static> = Phases {
+    gitsync: &quiet_gitsync,
+    pin: &quiet,
+    directive: &quiet,
+    collect: &quiet,
+    claude_md: &quiet,
+};
+
 fn tick(ct: &Ct, proc: &dyn Proc, env: &Env, registry: &Registry) -> Vec<String> {
-    tick_with(ct, proc, env, registry, &Phases::REAL)
+    tick_with(ct, proc, env, registry, &QUIET)
+}
+
+/// The entries of `log` that are one of `wanted`, in order is one of `wanted`, in order: the frame's own, whatever else the phases
+/// run.
+fn frame_calls<'a>(log: &'a [String], wanted: &[&str]) -> Vec<&'a str> {
+    log.iter()
+        .map(String::as_str)
+        .filter(|call| wanted.contains(call))
+        .collect()
 }
 
 fn tick_with(
@@ -225,7 +257,7 @@ fn nothing_to_do_prints_nothing() {
     let ct = Ct::new();
     let proc = Answers::new(0, act(Vec::new())).proc();
     assert_eq!(
-        tick(&ct, &proc, &bound_env(), &exec::registry()),
+        tick(&ct, &proc, &bound_env(), &Registry::new()),
         Vec::<String>::new()
     );
     assert_eq!(
@@ -248,7 +280,7 @@ fn nothing_to_do_prints_nothing() {
 fn actionable_lines_are_printed() {
     let ct = Ct::new();
     let proc = Answers::new(1, act(lines())).proc();
-    assert_eq!(tick(&ct, &proc, &bound_env(), &exec::registry()), PRINTED);
+    assert_eq!(tick(&ct, &proc, &bound_env(), &Registry::new()), PRINTED);
 }
 
 #[test]
@@ -549,7 +581,10 @@ fn spent_time_budget_prints_the_line_unrun() {
             )]
         );
         assert!(seen.calls().is_empty());
-        assert_eq!(proc.log()[2], format!("cm --json next -C {EPOCH} --act"));
+        assert!(
+            proc.log()
+                .contains(&format!("cm --json next -C {EPOCH} --act"))
+        );
     }
 }
 
@@ -600,9 +635,15 @@ fn executors_run_only_in_the_bound_coordinator() {
     let (out, ran, proc) = run(next(), &bound_env());
     assert_eq!((out, ran), (Vec::<String>::new(), 1));
     let calls = proc.calls();
-    assert_eq!(calls[0].line(), "git rev-parse --abbrev-ref HEAD");
+    let by = |program: &str| {
+        calls
+            .iter()
+            .find(|call| call.program_name() == program)
+            .unwrap()
+    };
+    assert_eq!(by("git").line(), "git rev-parse --abbrev-ref HEAD");
     assert_eq!(
-        calls[1].argv,
+        by("sh").argv,
         [
             "sh",
             beat::HANDOFF_PICK,
@@ -614,7 +655,7 @@ fn executors_run_only_in_the_bound_coordinator() {
             "24"
         ]
     );
-    for call in &calls[..2] {
+    for call in [by("git"), by("sh")] {
         assert_eq!(call.cwd.as_deref(), Some(ct.path()));
         assert_eq!(call.timeout, beat::FRAME_CAP);
     }
@@ -841,14 +882,10 @@ fn cm_failing_without_a_list_is_one_line() {
             ..Answers::new(0, "")
         }
         .proc();
-        tick(&ct, &proc, &bound_env(), &exec::registry())
+        tick(&ct, &proc, &bound_env(), &Registry::new())
     };
-    let failed = |ran: Ran, line: &str| {
-        let out = failing(ran);
-        assert_eq!(out.len(), 2, "{out:?}");
-        assert_eq!(out[0], line);
-        assert!(is_wall_line(&out[1], "act"), "{out:?}");
-    };
+    // Exactly the one line test_heartbeat.py asserts: no wall-time line after it.
+    let failed = |ran: Ran, line: &str| assert_eq!(failing(ran), [line]);
     failed(
         Ran::code(2, "error: no campaign\n"),
         "heartbeat: cm --json next --act exited 2 without an actionable list: ",
@@ -896,13 +933,12 @@ fn cm_failing_without_a_list_is_one_line() {
             source: std::io::ErrorKind::NotFound.into(),
         })
     });
-    let out = tick(&ct, &proc, &bound_env(), &exec::registry());
-    assert_eq!(out.len(), 2, "{out:?}");
+    let out = tick(&ct, &proc, &bound_env(), &Registry::new());
+    assert_eq!(out.len(), 1, "{out:?}");
     assert!(
         out[0].starts_with("heartbeat: cm --json next --act could not run: cm: "),
         "{out:?}"
     );
-    assert!(is_wall_line(&out[1], "act"));
 }
 
 #[test]
@@ -930,7 +966,7 @@ fn more_than_one_live_epoch_stops_before_any_effect() {
         claude_md: &phase,
     };
     assert_eq!(
-        tick_with(&ct, &proc, &bound_env(), &exec::registry(), &phases),
+        tick_with(&ct, &proc, &bound_env(), &Registry::new(), &phases),
         [
             "heartbeat: 2 PLANNING or WORKING epochs, not one; stay read-only until cm, PR and journal state are reconciled"
         ]
@@ -961,54 +997,13 @@ fn the_live_epoch_is_one_with_a_line_starting_status_planning_or_working() {
     fs::remove_file(ct.path().join("store/epochs/later/EPOCH.md")).unwrap();
     let proc = Answers::new(0, act(lines())).proc();
     assert_eq!(
-        tick(&ct, &proc, &bound_env(), &exec::registry()),
+        tick(&ct, &proc, &bound_env(), &Registry::new()),
         [
             "heartbeat: 0 PLANNING or WORKING epochs, not one; stay read-only until cm, PR and journal state are reconciled"
         ]
     );
     let empty = tempfile::tempdir().unwrap();
     assert!(beat::live_epochs(empty.path()).is_empty());
-}
-
-#[test]
-fn the_stub_executors_leave_their_lines_for_the_model() {
-    let ct = Ct::new();
-    ct.state();
-    let registry = exec::registry();
-    assert_eq!(
-        registry.keys().collect::<Vec<_>>(),
-        [
-            "launchable-not-launched.codex",
-            "merge-ready",
-            "released-undeployed",
-            "review-owed",
-            "unblock-now"
-        ]
-    );
-    let actionable = vec![
-        line("launchable-not-launched", "01-a/u/b", "cm launch 01-a/u/b"),
-        line("merge-ready", "01-a/u/c", "merge it"),
-        line("released-undeployed", "01-a/u/c", "deploy it"),
-        line("review-owed", "01-a/u/c", "cm brief 01-a/u/c"),
-        line("unblock-now", "01-a/u/d", "cm unblock 01-a/u/d"),
-    ];
-    let proc = Answers::new(1, act(actionable)).proc();
-    assert_eq!(
-        tick(&ct, &proc, &bound_env(), &registry),
-        [
-            "launchable-not-launched 01-a/u/b: cm launch 01-a/u/b",
-            "merge-ready 01-a/u/c: merge it",
-            "released-undeployed 01-a/u/c: deploy it",
-            "review-owed 01-a/u/c: cm brief 01-a/u/c",
-            "unblock-now 01-a/u/d: cm unblock 01-a/u/d"
-        ]
-    );
-    assert_eq!(
-        proc.log().len(),
-        3,
-        "cm next, git and handoff-pick.sh only: {:?}",
-        proc.log()
-    );
 }
 
 // ---- the real `Proc` ----
@@ -1117,7 +1112,7 @@ fn a_timed_out_executor_is_killed_with_its_process_group() {
             proc: &Bin(bin.clone()),
             env: &env,
             registry: &registry,
-            phases: &Phases::REAL,
+            phases: &QUIET,
             cm: cm.as_os_str(),
             started,
         },
@@ -1289,13 +1284,13 @@ fn an_act_list_too_large_to_keep_is_one_named_line() {
         ..Answers::new(0, "")
     }
     .proc();
-    let out = tick(&ct, &proc, &bound_env(), &exec::registry());
-    assert_eq!(out.len(), 2, "{out:?}");
+    let out = tick(&ct, &proc, &bound_env(), &Registry::new());
     assert_eq!(
-        out[0],
-        "heartbeat: cm --json next --act printed more than 64 MiB and was killed; no act line was read"
+        out,
+        [
+            "heartbeat: cm --json next --act printed more than 64 MiB and was killed; no act line was read"
+        ]
     );
-    assert!(is_wall_line(&out[1], "act"));
     let next = proc
         .calls()
         .into_iter()
@@ -1387,9 +1382,10 @@ impl Harness {
 
 #[test]
 fn the_built_cm_tick_runs_the_loop_with_fake_cm_and_git_on_path() {
+    // Kinds with no executor, so the stubs' cards can fill theirs without touching this test.
     let actionable = vec![
-        line("merge-ready", "01-a/u/c", "merge it"),
-        line("launchable-not-launched", "01-a/u/b", "cm launch 01-a/u/b"),
+        line("attempt-ended", "01-a/u/c", "cm attempt 01-a/u/c restart"),
+        line("missing-kickoff", "01-a/u/b", "cm amend 01-a/u/b"),
     ];
     let harness = Harness::new(1, &act(actionable.clone()), PICK_OK);
     let mac = "# Mac notes\n@~/elsewhere.md\n";
@@ -1404,16 +1400,10 @@ fn the_built_cm_tick_runs_the_loop_with_fake_cm_and_git_on_path() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "merge-ready 01-a/u/c: merge it\nlaunchable-not-launched 01-a/u/b: cm launch 01-a/u/b\n"
+        "attempt-ended 01-a/u/c: cm attempt 01-a/u/c restart\nmissing-kickoff 01-a/u/b: cm amend 01-a/u/b\n"
     );
-    assert_eq!(
-        harness.log(),
-        [
-            "git rev-parse --abbrev-ref HEAD",
-            "handoff-pick.sh store/epochs/eleemosynary-mnemosyne coordinator --lineage session_01abc --max-age-hours 24",
-            "cm --json next -C store/epochs/eleemosynary-mnemosyne --act",
-        ]
-    );
+    assert_eq!(frame_calls(&harness.log(), &FRAME), FRAME);
+    assert!(!harness.log().iter().any(|call| call.starts_with("cm sync")));
 
     assert_eq!(
         fs::read_to_string(harness.ct.path().join(".claude/CLAUDE.md")).unwrap(),
@@ -1434,7 +1424,7 @@ fn the_built_cm_tick_runs_the_loop_with_fake_cm_and_git_on_path() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "heartbeat: executors off (handoff-pick.sh for session_01abc: refused superseded x); every act line below is yours\nmerge-ready 01-a/u/c: merge it\nlaunchable-not-launched 01-a/u/b: cm launch 01-a/u/b\n"
+        "heartbeat: executors off (handoff-pick.sh for session_01abc: refused superseded x); every act line below is yours\nattempt-ended 01-a/u/c: cm attempt 01-a/u/c restart\nmissing-kickoff 01-a/u/b: cm amend 01-a/u/b\n"
     );
     let output = refused
         .command("cse_01abc")
@@ -1445,10 +1435,10 @@ fn the_built_cm_tick_runs_the_loop_with_fake_cm_and_git_on_path() {
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         json,
-        json!({"command": "tick", "ok": true, "violations": [], "lines": [
+        json!({"command": "tick", "ok": true, "violations": [], "cm": "cm", "lines": [
             "heartbeat: executors off (handoff-pick.sh for session_01abc: refused superseded x); every act line below is yours",
-            "merge-ready 01-a/u/c: merge it",
-            "launchable-not-launched 01-a/u/b: cm launch 01-a/u/b",
+            "attempt-ended 01-a/u/c: cm attempt 01-a/u/c restart",
+            "missing-kickoff 01-a/u/b: cm amend 01-a/u/b",
         ]})
     );
 }
@@ -1497,14 +1487,8 @@ fn the_built_cm_tick_prints_nothing_when_there_is_nothing_to_do() {
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stdout.is_empty(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
-    assert_eq!(
-        harness.log(),
-        [
-            "git rev-parse --abbrev-ref HEAD",
-            "handoff-pick.sh store/epochs/eleemosynary-mnemosyne coordinator --lineage session_01abc --max-age-hours 24",
-            "cm --json next -C store/epochs/eleemosynary-mnemosyne --act",
-        ]
-    );
+    assert_eq!(frame_calls(&harness.log(), &FRAME), FRAME);
+    assert!(!harness.log().iter().any(|call| call.starts_with("cm sync")));
 }
 
 #[test]
@@ -1698,8 +1682,8 @@ fn a_valid_act_list_above_4_mib_prints_every_line() {
             checkout: ct.path(),
             proc: &Bin(bin.clone()),
             env: &Env::default(),
-            registry: &exec::registry(),
-            phases: &Phases::REAL,
+            registry: &Registry::new(),
+            phases: &QUIET,
             cm: cm.as_os_str(),
             started: Instant::now(),
         },
@@ -1747,7 +1731,7 @@ fn a_first_line_answer_is_read_from_its_head_whatever_follows() {
             proc: &Bin(bin.clone()),
             env: &bound_env(),
             registry: &registry,
-            phases: &Phases::REAL,
+            phases: &QUIET,
             cm: cm.as_os_str(),
             started: Instant::now(),
         },
@@ -1769,7 +1753,7 @@ fn a_malformed_coordinator_handoff_is_named_once_whatever_the_act_list_holds() {
             ..Answers::new(1, act(actionable))
         }
         .proc();
-        tick(&ct, &proc, &bound_env(), &exec::registry())
+        tick(&ct, &proc, &bound_env(), &Registry::new())
     };
     assert_eq!(
         refused(Vec::new(), format!("refused malformed {bad}")),
@@ -1855,5 +1839,238 @@ fn a_descendant_ignoring_term_is_killed_when_the_grace_ends_though_the_leader_ex
     assert!(
         gone_within(&pid, Duration::from_secs(2)),
         "descendant {pid} survived"
+    );
+}
+
+// ---- fix round 1 (Fable r1 at 8f291da9): regression tests ----
+
+/// Fable F3: only a child the budget cut short spends it; one past its own shorter timeout is
+/// the executor's to handle.
+#[test]
+fn a_child_past_its_own_shorter_timeout_does_not_spend_the_budget() {
+    let ct = Ct::new();
+    let answers = Answers::new(1, act(vec![lines().remove(0)]));
+    let proc = FakeProc::new(move |cmd| {
+        Ok(if cmd.program_name() == "slow" {
+            Ran::timed_out()
+        } else {
+            answers.answer(cmd)
+        })
+    });
+    struct Handles;
+    impl Executor for Handles {
+        fn run(&self, _: &ActLine, ctx: &Ctx) -> Outcome {
+            let ran = ctx
+                .run(Cmd::new("slow").timeout(Duration::from_secs(1)))
+                .unwrap();
+            assert_eq!(ran.exit, Exit::TimedOut);
+            Outcome::Done(vec!["handled the slow child".into()])
+        }
+    }
+    let registry = Registry::new().with("launchable-not-launched", Handles);
+    assert_eq!(
+        tick(&ct, &proc, &bound_env(), &registry),
+        ["handled the slow child"]
+    );
+}
+
+/// Fable F2 (= Astra F3), the reviewer's repro: the leader waits on a worker that cleans up for
+/// a second on TERM and then writes a marker, as under `timeout --kill-after=5 1`.
+#[test]
+fn a_worker_cleaning_up_under_a_waiting_leader_writes_its_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("marker");
+    let worker = script(
+        &dir.path().join("worker"),
+        "trap 'sleep 1; echo cleaned > \"$1\"; exit 0' TERM\nwhile :; do sleep 0.1; done\n",
+    );
+    let leader = script(
+        &dir.path().join("leader"),
+        &format!("'{}' \"$1\" &\nwait\n", worker.display()),
+    );
+    let ran = spawn(
+        &Cmd::new(&leader)
+            .arg(&marker)
+            .timeout(Duration::from_secs(1)),
+    )
+    .unwrap();
+    assert_eq!(ran.exit, Exit::TimedOut);
+    assert_eq!(
+        fs::read_to_string(&marker).ok().as_deref(),
+        Some("cleaned\n"),
+        "wall {:?}",
+        ran.wall
+    );
+}
+
+/// Fable F5: `cm tick` run through a symlinked `cm` reads its act list from the resolved
+/// binary, which is where the pin phase installs (`ctx.cm`).
+#[test]
+fn the_built_cm_tick_run_through_a_symlink_reads_from_the_resolved_binary() {
+    let harness = Harness::new(0, &act(Vec::new()), PICK_OK);
+    let real = harness.ct.path().join("real");
+    fs::create_dir_all(&real).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_cm"), real.join("cm")).unwrap();
+    let link = harness.ct.path().join("linked");
+    fs::create_dir_all(&link).unwrap();
+    std::os::unix::fs::symlink(real.join("cm"), link.join("cm")).unwrap();
+    let epoch = harness.ct.path().join(EPOCH);
+    let init = Command::new(real.join("cm"))
+        .current_dir(&epoch)
+        .arg("init")
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    let output = Command::new(link.join("cm"))
+        .env_clear()
+        .env(
+            "PATH",
+            format!("{}:{}:/usr/bin:/bin", link.display(), harness.bin.display()),
+        )
+        .env("HOME", harness.ct.path())
+        .env("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_01abc")
+        .current_dir(harness.ct.path())
+        .args(["--json", "tick"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["cm"],
+        fs::canonicalize(real.join("cm")).unwrap().to_str().unwrap(),
+        "ctx.cm is the symlink's target"
+    );
+    assert_eq!(json["lines"], json!([]));
+}
+
+/// Fable F7: a head or tail that dropped bytes says so; a whole stream does not cut silently.
+#[test]
+fn ran_says_when_a_stream_was_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    let nine = script(
+        &dir.path().join("nine"),
+        "head -c 9437184 /dev/zero\nhead -c 9437184 /dev/zero >&2\n",
+    );
+    let ran = spawn(&Cmd::new(&nine)).unwrap();
+    assert_eq!(ran.exit, Exit::Code(0));
+    assert_eq!(ran.stdout.len(), 9 << 20, "whole by default");
+    assert!(!ran.stdout_truncated);
+    assert_eq!(ran.stderr.len(), OUTPUT_CAP);
+    assert!(ran.stderr_truncated, "stderr keeps its tail");
+    let ran = spawn(&Cmd::new(&nine).keep(Keep::Head, Keep::Head)).unwrap();
+    assert!(ran.stdout_truncated && ran.stderr_truncated);
+    let small = script(&dir.path().join("small"), "echo out\necho err >&2\n");
+    let ran = spawn(&Cmd::new(&small).keep(Keep::Head, Keep::Tail)).unwrap();
+    assert!(!ran.stdout_truncated && !ran.stderr_truncated);
+}
+
+/// Fable F9: a closed stdout (`cm tick | true`) does not end the tick with a panic.
+#[test]
+fn the_built_cm_tick_exits_0_when_its_stdout_is_closed() {
+    let harness = Harness::new(0, &act(lines()), PICK_OK);
+    harness
+        .ct
+        .write("store/epochs/second/EPOCH.md", "status: PLANNING\n");
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = harness
+        .command("cse_01abc")
+        .args(["tick", "--cm", "cm"])
+        .stdout(writer)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("panicked"),
+        "{output:?}"
+    );
+}
+
+/// The siblings' gaps: a variable removed from a child's environment, a pause that a fake does
+/// not wait, and a cm command built with stdin and `--json`.
+#[test]
+fn ctx_removes_variables_pauses_through_the_runner_and_builds_cm_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let show = script(
+        &dir.path().join("show"),
+        "echo \"keep=${TICK_KEEP-unset} drop=${TICK_DROP-unset}\"\n",
+    );
+    let ran = spawn(
+        &Cmd::new(&show)
+            .env("TICK_KEEP", "1")
+            .env("TICK_DROP", "1")
+            .env_remove("PATH")
+            .env_remove("TICK_DROP"),
+    )
+    .unwrap();
+    assert_eq!(
+        ran.stdout_text(),
+        "keep=1 drop=1\n",
+        "env adds after removes"
+    );
+    let ran = spawn(&Cmd::new(&show).env_remove("HOME").env("TICK_KEEP", "2")).unwrap();
+    assert_eq!(ran.stdout_text(), "keep=2 drop=unset\n");
+
+    let ct = Ct::new();
+    let proc = FakeProc::new(|cmd| Ok(Ran::code(0, cmd.stdin.clone().unwrap_or_default())));
+    let env = Env::default();
+    let ctx = Ctx::new(
+        ct.path(),
+        Path::new(EPOCH),
+        &proc,
+        &env,
+        OsStr::new("/bin/cm"),
+        Duration::from_secs(10),
+    );
+    let started = Instant::now();
+    ctx.pause(Duration::from_secs(2));
+    ctx.pause(Duration::from_secs(60));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a fake does not wait"
+    );
+    let pauses = proc.pauses();
+    assert_eq!(pauses[0], Duration::from_secs(2));
+    assert!(pauses[1] <= Duration::from_secs(10), "cut to the budget");
+
+    let cmd = ctx
+        .cm_cmd("evidence", &["01-a/u/b", "--name", "x", "--body-file", "-"])
+        .arg("--json")
+        .stdin("body\n");
+    assert_eq!(
+        cmd.argv,
+        [
+            "/bin/cm",
+            "evidence",
+            "-C",
+            EPOCH,
+            "01-a/u/b",
+            "--name",
+            "x",
+            "--body-file",
+            "-",
+            "--json"
+        ]
+    );
+    let ran = ctx.cm_run("evidence", cmd).unwrap();
+    assert_eq!(ran.stdout_text(), "body\n");
+}
+
+/// Fable F8: a line without a target prints it empty, as heartbeat.sh's
+/// `.target + (if .part then "#" + .part else "" end)` did.
+#[test]
+fn a_line_without_a_target_prints_it_empty_as_jq_did() {
+    let ct = Ct::new();
+    let proc = Answers::new(
+        1,
+        act(vec![
+            json!({"kind": "stale-block", "command": "cm sync"}),
+            json!({"kind": "review-owed", "part": "api", "command": "cm brief x"}),
+        ]),
+    )
+    .proc();
+    assert_eq!(
+        tick(&ct, &proc, &bound_env(), &Registry::new()),
+        ["stale-block : cm sync", "review-owed #api: cm brief x"]
     );
 }

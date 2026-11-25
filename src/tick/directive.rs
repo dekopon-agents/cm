@@ -21,3 +21,31 @@ pub fn run(ctx: &Ctx) -> Report {
     let _ = ctx;
     Report::default()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::tick::act::Env;
+    use crate::tick::proc::{FakeProc, Ran};
+
+    /// The stub's own test; the card that fills this phase replaces it.
+    #[test]
+    fn the_stub_prints_nothing_and_runs_nothing() {
+        let proc = FakeProc::new(|_| Ok(Ran::code(0, "")));
+        let env = Env::default();
+        let ctx = Ctx::new(
+            Path::new("."),
+            Path::new("store/epochs/e"),
+            &proc,
+            &env,
+            OsStr::new("cm"),
+            Duration::from_secs(1),
+        );
+        assert_eq!(run(&ctx), Report::default());
+        assert!(proc.calls().is_empty());
+    }
+}

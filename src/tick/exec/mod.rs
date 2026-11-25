@@ -20,3 +20,31 @@ pub fn registry() -> Registry {
         .with(review_owed::KEY, review_owed::ReviewOwed)
         .with(unblock_now::KEY, unblock_now::UnblockNow)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// heartbeat.sh's five `act.d/` executors, each under its own name.
+    #[test]
+    fn the_registry_holds_the_five_act_d_executors() {
+        assert_eq!(
+            registry().keys().collect::<Vec<_>>(),
+            [
+                "launchable-not-launched.codex",
+                "merge-ready",
+                "released-undeployed",
+                "review-owed",
+                "unblock-now"
+            ]
+        );
+        let registry = registry();
+        let key = |kind, lane| registry.lookup(kind, lane).map(|(key, _)| key);
+        assert_eq!(
+            key("launchable-not-launched", Some("codex")),
+            Some("launchable-not-launched.codex")
+        );
+        assert_eq!(key("launchable-not-launched", Some("claude-cloud")), None);
+        assert_eq!(key("merge-ready", Some("codex")), Some("merge-ready"));
+    }
+}

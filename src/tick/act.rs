@@ -17,7 +17,9 @@
 //!   the phase's wall time):
 //!   - [`gitsync::sync`](crate::tick::gitsync::sync)`(ctx: &Ctx, mode: gitsync::Mode) -> Report`
 //!     (heartbeat.sh step 1 with `Mode::Always`, step 5 with `Mode::IfDirty`);
-//!   - [`pin::run`](crate::tick::pin::run)`(ctx: &Ctx) -> Report` (step 2);
+//!   - [`pin::run`](crate::tick::pin::run)`(ctx: &Ctx) -> Report` (step 2; it installs the
+//!     pinned cm at `ctx.cm`, the program the act list is read from, so the act lines that
+//!     follow come from the pinned cm whether `cm` on `PATH` is a file or a symlink);
 //!   - [`directive::run`](crate::tick::directive::run)`(ctx: &Ctx) -> Report` (step 3);
 //!   - [`claude_md::run`](crate::tick::claude_md::run)`(ctx: &Ctx) -> Report` (step 6).
 //! - `07-tick/mvp/exec-codex` also fills
@@ -30,7 +32,8 @@
 //!   [`exec::registry`](crate::tick::exec::registry) registers them.
 //!
 //! The helpers here are act_lib.py's, for executors: [`ActLine::text`], [`Ctx::step_state`],
-//! [`Ctx::pull`], [`Ctx::cm`] and [`last_line`].
+//! [`Ctx::pull`], [`Ctx::cm`] and [`last_line`]; [`Ctx::cm_cmd`] and [`Ctx::cm_run`] build and run
+//! a cm command with stdin or `--json`, and [`Ctx::pause`] waits between retries.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -63,8 +66,11 @@ impl ActLine {
             .filter(|lane| !lane.is_empty())
             .map(str::to_owned);
         let lane = own.or_else(|| {
-            let target = jq_raw(json.get("target"));
-            let (unit, step) = unit_and_step(&target);
+            let target = json
+                .get("target")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let (unit, step) = unit_and_step(target);
             let state = read_json(&epoch_dir.join(unit).join(".cm/state.json"))?;
             state["steps"][step]["lane"]
                 .as_str()
@@ -79,12 +85,17 @@ impl ActLine {
         jq_raw(self.json.get("kind"))
     }
 
-    /// `.target`, plus `#<part>` when the line names a part.
+    /// `.target`, plus `#<part>` when the line names a part: heartbeat.sh's
+    /// `.target + (if .part then "#" + .part else "" end)`, where a missing target adds as empty.
     pub fn target(&self) -> String {
-        let target = jq_raw(self.json.get("target"));
+        let target = self
+            .json
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         match self.json.get("part").and_then(Value::as_str) {
             Some(part) => format!("{target}#{part}"),
-            None => target,
+            None => target.to_owned(),
         }
     }
 
@@ -233,32 +244,52 @@ impl<'a> Ctx<'a> {
     }
 
     /// Runs `cmd` in the checkout (unless it names a directory) with at most what remains of
-    /// the budget. A spent budget starts nothing and reads as a timeout.
+    /// the budget. A spent budget starts nothing and reads as a timeout. Only a child the
+    /// budget cut short spends the budget ([`Ctx::timed_out`]); one that ran past its own
+    /// shorter timeout is the caller's to handle.
     pub fn run(&self, mut cmd: Cmd) -> Result<Ran> {
         let remaining = self.remaining();
         if remaining.is_zero() {
             self.timed_out.set(true);
             return Ok(Ran::timed_out());
         }
+        let cut = remaining <= cmd.timeout;
         cmd.timeout = cmd.timeout.min(remaining);
         if cmd.cwd.is_none() {
             cmd.cwd = Some(self.checkout.to_path_buf());
         }
         let ran = self.proc.run(&cmd)?;
-        if ran.exit == Exit::TimedOut {
+        if ran.exit == Exit::TimedOut && cut {
             self.timed_out.set(true);
         }
         Ok(ran)
     }
 
-    /// act_lib.py's `cm`: runs `cm <sub> -C <epoch> <args>`; a non-zero exit is
-    /// `cm <sub> failed: <last line>`.
-    pub fn cm(&self, sub: &str, args: &[&str]) -> std::result::Result<Ran, String> {
-        let cmd = Cmd::new(self.cm)
+    /// Waits `pause`, at most what remains of the budget, through the runner (a fake does not
+    /// wait): gitsync's pause between retries.
+    pub fn pause(&self, pause: Duration) {
+        self.proc.pause(pause.min(self.remaining()));
+    }
+
+    /// The command [`Ctx::cm`] runs, `cm <sub> -C <epoch> <args>`, to give stdin, a shorter
+    /// timeout or `--json` (a global flag cm also takes after the verb) before [`Ctx::cm_run`].
+    pub fn cm_cmd(&self, sub: &str, args: &[&str]) -> Cmd {
+        Cmd::new(self.cm)
             .arg(sub)
             .arg("-C")
             .arg(self.epoch)
-            .args(args);
+            .args(args)
+    }
+
+    /// act_lib.py's `cm`: runs `cm <sub> -C <epoch> <args>`; a non-zero exit is
+    /// `cm <sub> failed: <last line>`.
+    pub fn cm(&self, sub: &str, args: &[&str]) -> std::result::Result<Ran, String> {
+        self.cm_run(sub, self.cm_cmd(sub, args))
+    }
+
+    /// Runs a cm command, normally from [`Ctx::cm_cmd`]; a non-zero exit is
+    /// `cm <sub> failed: <last line>`.
+    pub fn cm_run(&self, sub: &str, cmd: Cmd) -> std::result::Result<Ran, String> {
         match self.run(cmd) {
             Ok(ran) if ran.exit.success() => Ok(ran),
             Ok(ran) => Err(format!("cm {sub} failed: {}", last_line(&ran))),
@@ -458,7 +489,11 @@ mod tests {
             line(json!({"kind": "k", "target": "t", "part": null, "command": "c"})).text(),
             "k t: c"
         );
-        assert_eq!(line(json!({"kind": 3})).text(), "3 null: null");
+        assert_eq!(line(json!({"kind": 3})).text(), "3 : null");
+        assert_eq!(
+            line(json!({"kind": "k", "part": "p", "command": "c"})).text(),
+            "k #p: c"
+        );
     }
 
     #[test]
