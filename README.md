@@ -714,7 +714,7 @@ covering the step; `cm next` notes it instead, one unnumbered line and one `driv
 `driver_held` is absent while no driver holds a step:
 
 ```text
-note: 07-t/mvp/s is held by session_A, driver of lane ops (generation 2, claimed 2026-11-25T06:40Z)
+note: 07-tick/mvp/core is held by session_01Df…, driver of lane tooling (generation 2, claimed 2026-11-25T06:40Z)
 ```
 
 A claim by an unregistered session, or by a driver on a step outside its units, still reads
@@ -734,15 +734,17 @@ registers or a registered driver of any lane (`lane-driver-registrar`, which nam
 remove <name>` for a session that drove a lane and coordinates now), and a registration identical to
 the lane's current one (`lane-driver-unchanged`). A unit with no declared unit or step under it yet
 is registered with a `warning:` line (JSON `undeclared`). A different session or units for a
-registered lane replace its driver, and the journal names the one replaced. `remove` of a lane with
-no driver is `lane-driver-unknown`.
+registered lane replace its driver, and the journal names the one replaced. That comparison reads a
+stored entry as written: adding again, as `cse_<id>` or `session_<id>`, a driver whose entry was
+written as `cse_<id>` rewrites it as `session_<id>` and journals that it replaces `cse_<id>`.
+`remove` of a lane with no driver is `lane-driver-unknown`.
 
-`add` and `remove` journal before they write the registry. A journal append that fails journals and
-changes nothing (`lane-driver-journal-write`); re-running the same command once `JOURNAL.md` is
-writable journals the change for the first time. A registry write that fails after it
-(`lane-driver-write`) leaves the registry as it was under a journal entry for the change, so until
-the re-run a removed driver still holds its claims; re-running the same command journals the change
-again and writes it. The registering label defaults, as `attempt claim`'s does, to trimmed
+`add` and `remove` journal before they write the registry. A journal append that fails records no
+entry and changes nothing (`lane-driver-journal-write`); re-running the same command once
+`JOURNAL.md` is writable journals the change for the first time. A registry write that fails after
+it (`lane-driver-write`) leaves the registry as it was under a journal entry for the change, so
+until the re-run a removed driver still holds its claims; re-running the same command journals the
+change again and writes it. The registering label defaults, as `attempt claim`'s does, to trimmed
 `CLAUDE_CODE_REMOTE_SESSION_ID` with `cse_` mapped to `session_`, and `--coordinator` is required
 without it. These checks catch mistakes; they are not authentication. cm trusts the labels it is
 given, and the journal names who registered or removed whom.

@@ -7295,6 +7295,23 @@ fn registering_listing_and_removing_a_lane_driver_journal_who_registered_whom_an
             .ends_with(" — lane driver remove tooling: session_next")
     );
     assert!(journal(&c).ends_with("- units: 07-t/mvp, 09-z\n- removed by: session_other\n"));
+    let (code, readded) = current_json(
+        &c,
+        &[
+            "lane",
+            "driver",
+            "add",
+            "tooling",
+            "--session",
+            "session_next",
+            "--unit",
+            "07-t/mvp",
+        ],
+    );
+    assert_eq!(code, Some(0), "{readded}");
+    let (code, removed) = current_json(&c, &["lane", "driver", "remove", "tooling"]);
+    assert_eq!(code, Some(0), "{removed}");
+    assert!(journal(&c).ends_with("- units: 07-t/mvp\n- removed by: session_current\n"));
     let (_, listed) = current_json(&c, &["lane", "driver", "list"]);
     assert_eq!(listed["drivers"], serde_json::json!([]));
 
@@ -7726,6 +7743,104 @@ fn a_driver_registered_as_cse_covers_its_explicit_cse_claim_and_its_env_derived_
     let note = held(&c);
     assert_eq!(note["driver"], "session_A");
     assert_eq!(note["generation"], 3);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_session_never_sees_its_own_explicit_cse_claim_as_an_earlier_coordinator() {
+    let host = Fake {
+        now: Timestamp::now(),
+    };
+    let c = campaign(&host);
+    assert!(declare(&host, &c, DRIVEN, Lane::ClaudeCloud, &[]).ok());
+    launch_for(&host, &c, DRIVEN, "session_earlier");
+    let claimed = coordinator_cm(
+        &c,
+        &[
+            "attempt",
+            DRIVEN,
+            "claim",
+            "--expect",
+            "1",
+            "--coordinator",
+            "cse_A",
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(claimed.status.success(), "{claimed:?}");
+    let registry = c.root.join(".cm/lane-drivers.json");
+    let entry = |session: &str, unit: &str| {
+        format!(
+            r#"{{"drivers": {{"tooling": {{"session": "{session}", "units": ["{unit}"], "at": "2026-11-25T07:00Z", "by": "session_current"}}}}}}"#
+        )
+    };
+    for drivers in [
+        None,
+        Some(entry("session_A", "08-x")),
+        Some(entry("session_D", "07-t/mvp")),
+    ] {
+        match &drivers {
+            Some(text) => fs::write(&registry, text).unwrap(),
+            None => assert!(!registry.exists()),
+        }
+        for (viewer, earlier) in [("cse_A", false), ("cse_B", true)] {
+            let output = coordinator_cm(&c, &["--json", "next", "--act"])
+                .env("CLAUDE_CODE_REMOTE_SESSION_ID", viewer)
+                .output()
+                .unwrap();
+            let act: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let listed = act["actionable"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action["kind"] == "earlier-coordinator");
+            assert_eq!(listed, earlier, "{viewer} with {drivers:?}: {act}");
+            assert_eq!(output.status.code(), Some(i32::from(earlier)), "{act}");
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn re_adding_a_registry_entry_written_as_cse_rewrites_it_as_session_and_journals_the_one_replaced()
+{
+    let host = Fake {
+        now: Timestamp::now(),
+    };
+    for spelling in ["cse_driver", "session_driver"] {
+        let c = campaign(&host);
+        assert!(declare(&host, &c, DRIVEN, Lane::ClaudeCloud, &[]).ok());
+        fs::write(
+            c.root.join(".cm/lane-drivers.json"),
+            r#"{"drivers": {"tooling": {"session": "cse_driver", "units": ["07-t/mvp"], "at": "2026-11-25T07:00Z", "by": "session_current"}}}"#,
+        )
+        .unwrap();
+        let add = [
+            "lane",
+            "driver",
+            "add",
+            "tooling",
+            "--session",
+            spelling,
+            "--unit",
+            "07-t/mvp",
+        ];
+        let added = coordinator_cm(&c, &add).output().unwrap();
+        assert_eq!(added.status.code(), Some(0), "{spelling}: {added:?}");
+        assert_eq!(
+            String::from_utf8(added.stdout).unwrap(),
+            "lane tooling: driver session_driver for 07-t/mvp; replaces cse_driver\n"
+        );
+        assert!(
+            journal(&c).ends_with("- session: session_driver\n- units: 07-t/mvp\n- registered by: session_current\n- replaces: cse_driver for 07-t/mvp\n"),
+            "{}",
+            journal(&c)
+        );
+        let (code, again) = current_json(&c, &add);
+        assert_eq!(code, Some(1), "{again}");
+        assert_eq!(again["violations"][0]["rule"], "lane-driver-unchanged");
+    }
 }
 
 #[test]
