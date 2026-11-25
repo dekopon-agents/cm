@@ -80,7 +80,7 @@ error. `review wait` additionally uses 3 for its deadline and 4 for unreadable c
 | `cm evidence <NN-name>/<unit>/<step> --name NAME --body-file F [--candidate STEP[@SHA] [--harness STEP[@SHA]]]` | Writes `<step>/evidence/<NAME>.md` once from a non-empty body and journals the path. `cm advance <step> done` without `--evidence` takes the step's one evidence file when it has exactly one. `--candidate` and `--harness` pin the file to the commits it was produced against (see [Pinned evidence](#pinned-evidence)). |
 | `cm review <step> --pr URL --head SHA --model ID --effort E --verdict accept\|fix-required --findings C/F --cost USD --wall MIN [--delta FROM_SHA]`, `cm review --import` | Appends one row to the review ledger `.cm/reviews.json` and renders `REVIEW-OFF.md` from it, rows in PR order with a delta review under its PR, and journals the row. The rows a hand-written `REVIEW-OFF.md` already holds are imported once, kept cell for cell, and the text before and after the table (per-PR adjudications, rules) is kept byte for byte (`--import`, or the first `cm review`). The step must be declared (`step-unknown`); an imported delta row is the one whose `#` cell carries `Δ`. After that a hand edit is `review-hand-edit`, as for `STATE.md`. |
 | `cm review wait <step> --head SHA --reviewer KIND --deadline RFC3339 [--part NAME]` | Blocks until `.cm/verdicts.json` records the named round: step, current PR, part, reviewer and head (either verdict). Re-reads the step’s current PR and review ledger once per second without holding the campaign lock; missing ledger means empty. Exit 0 / `wait_status: recorded`, 3 / `deadline`, 4 / `unreadable`; Invalid head/reviewer arguments and unknown step/part scopes exit 2 (`refused` for scope refusals); This command alone uses strict campaign discovery: read/decode errors and invalid campaign state exit 4, including a malformed inner campaign without falling through to an outer campaign; a genuinely absent campaign exits 2. Unreadable or malformed declared unit state or review ledger also exits 4. Writes nothing. Run it as a background command to await a review instead of polling. |
-| `cm review record <step> <report-file> [--reviewer KIND] [--part NAME] [--kind resolution [--repo PATH]]` | Parses the `cm-review` block that ends the report (see [Review verdicts](#review-verdicts)), computes the verdict, copies the report to `<step>/evidence/reviews/R<n>[-KIND].md` and records the review in `.cm/verdicts.json` as `R<n>`, its findings as `R<n>.<id>`. Refuses a report with no block or a malformed one (`review-block`, one per problem, with its line), an undeclared step and a report already recorded for the step (`review-duplicate`). A report whose own verdict line disagrees with the computed one is recorded with the computed verdict and the disagreement printed and journaled. `--part` selects a declared part and its PR; it is required on multipart steps. Distinct FIX REQUIRED heads on the current PR count toward the ten-pass step cap; rising blocking counts request an independent reader and only a non-converging `fresh-opus` round blocks the step (see [Rounds](#rounds)). `--kind resolution` records a review of only the conflict resolutions of the merge at the report's head, as `"kind": "resolution"` with the merge's full SHA (see [Merge gate](#merge-gate)). It is refused (`review-resolution`) unless `--reviewer` names a reviewer of either family and, in `--repo` (else the step's worktree), `origin/HEAD` reads as the base branch's tip and the head is a two-parent merge whose second parent is on it, whose parents conflict (`git merge-tree --write-tree`), whose `git show --remerge-diff` touches only the files they conflict in, and whose first parent both families' ACCEPTs clear, on any lane. The first one stamps the campaign's `.cm/state.json` with schema 8, which a cm older than this one refuses (`upgrade cm`). |
+| `cm review record <step> <report-file> [--reviewer KIND] [--part NAME] [--kind resolution [--repo PATH]]` | Parses the `cm-review` block that ends the report (see [Review verdicts](#review-verdicts)), computes the verdict, copies the report to `<step>/evidence/reviews/R<n>[-KIND].md` and records the review in `.cm/verdicts.json` as `R<n>`, its findings as `R<n>.<id>`. Refuses a report with no block or a malformed one (`review-block`, one per problem, with its line), an undeclared step and a report already recorded for the step (`review-duplicate`). A report whose own verdict line disagrees with the computed one is recorded with the computed verdict and the disagreement printed and journaled. `--part` selects a declared part and its PR; it is required on multipart steps. Distinct FIX REQUIRED heads on the current PR count toward the ten-pass step cap; rising blocking counts request an independent reader and only a non-converging `fresh-opus` round blocks the step (see [Rounds](#rounds)). `--kind resolution` records a review of only the conflict resolutions of the merge at the report's head, as `"kind": "resolution"` with the merge's full SHA (see [Merge gate](#merge-gate)). It is refused (`review-resolution`) unless `--reviewer` names a reviewer of either family and, in `--repo` (a checkout, its `.git` directory or a bare repository; else the step's worktree), `refs/remotes/origin/HEAD` reads as the base branch's tip and the head is a two-parent merge whose second parent is on it, whose parents conflict (`git merge-tree --write-tree`, in a scratch repository over the checkout's objects), whose `git show --remerge-diff` touches only the files they conflict in, and whose first parent both families' ACCEPTs clear, on any lane. The first one stamps the campaign's `.cm/state.json` with schema 8, which a cm older than this one refuses (`upgrade cm`). |
 | `cm review resolve <step> <finding> --by <commit\|ruling-file>` | Records what resolved a blocking finding: `R<n>.<id>`, or `<id>` in the step's latest review holding it; an id whose `R<n>` is not a review number names no finding (`finding-unknown`). `--by` is a ruling file in the campaign when that path exists, else a commit SHA. A follow-up is `resolve-not-blocking`; a second resolution is `resolve-done`. |
 | `cm ruling <step> "<text>"` | Appends `- YYYY-MM-DD: <text>` to `<step>/evidence/coordinator-scope.md`, creating it with `# Scope and coordinator rulings: <step>` when it is missing, and journals the line. |
 | `cm brief <step>` | Prints the step's `kickoff.md`, then `## Coordinator scope and rulings` and the step's `evidence/coordinator-scope.md` (or a line saying none is recorded): the brief for `astra-review.sh start` and review packets. `--json` puts it in `brief`. Refuses a step with no `kickoff.md`. |
@@ -869,23 +869,31 @@ one `merge-gate` violation per gap, unless at the PR's head (GitHub's, via `gh a
 A clean update from the base branch needs no new review, only green CI on the new head: (a) and
 (b) may hold instead at an earlier reviewed head H1 when every commit on the first-parent chain
 from H1 to the head is a merge whose second parent is on the base branch (GitHub's base tip, else
-`origin/HEAD`) and whose `git show --remerge-diff` is empty. That diff is read whatever the
-configuration says: every submodule shown, no textconv or external diff driver, not relative to
-the checkout's subdirectory, so a merge that also moves a submodule `.gitmodules` or config marks
-ignored, or whose change a textconv or `diff.relative` setting would hide, is no clean update. A
-signature check that `log.showSignature` asks for still prints into that diff, so under it a
-signed merge is no clean update. Every git command the gate runs reads the history as committed:
-it ignores replace refs and any `info/grafts` file, so neither can make a merge look clean or give
-it other parents. When the base tip already contains
+the checkout's `refs/remotes/origin/HEAD`, for which no local tag or branch named `origin/HEAD`
+stands in) and whose `git show --remerge-diff` is empty, read twice. In the checkout it is read
+with every submodule shown, no textconv or external diff driver and not relative to the checkout's
+subdirectory, so a merge that also moves a submodule `.gitmodules` or config marks ignored, or
+whose change a textconv or `diff.relative` setting would hide, is no clean update; a signature
+check that `log.showSignature` asks for prints into it, so under that setting a signed merge is no
+clean update either. It is read again in a scratch repository that borrows the checkout's objects
+and has no refs, configuration or attributes, its own or the caller's environment's, so it is
+git's default merge of the two parents: a merge that only looked clean through a merge attribute
+(`merge=union`, a merge driver), committed or local, or a `merge.*` setting is no clean update.
+Every git command the gate runs ignores replace refs, any `info/grafts` file, the commit-graph and
+the multi-pack-index, including those it reads through alternates. All this only refuses more
+than before, but in one case: a clean merge that a replace ref or a graft made look conflicted, or
+like no merge, now passes. When the base tip already contains
 the head (the PR has merged into it), no merge can be told apart from the PR's own commits, so
 the walk does not run. A merge that resolved conflicts, or
 any other commit, needs its own review. The rule only skips a review nobody did: the walk stops
 at the first commit, from the head back, that has a recorded review or a finished receipt, and
-that commit must clear (a) and (b) itself; an earlier ACCEPT never outweighs it. The walk runs in `--repo` or the step's worktree (for
+that commit must clear (a) and (b) itself; an earlier ACCEPT never outweighs it. The walk runs in `--repo` (a checkout, its `.git` directory or a bare repository) or the step's worktree (for
 `cm sync`, the worktree only), which must hold those commits and the base tip; without one, (a)
-and (b) must hold at the head itself. For a step that holds a resolution review, an abbreviated
-`--head` stands for the commit it names in that checkout; a hex prefix that names no commit, or
-that a ref of the same name shadows, takes no walk. Any other step takes `--head` as given.
+and (b) must hold at the head itself. The walk starts at the commit `--head` names in that
+checkout: a hex prefix must be a prefix of that commit, and any other name must name the same
+commit as every ref of that name (under `refs/`, a tag, a branch or a remote-tracking ref), or
+the walk does not run. A step that holds a resolution review also matches receipts and reviews
+to that commit; any other step matches them to `--head` as given.
 
 A merge from the base branch whose parents conflict, and whose remerge diff touches only the
 files they conflict in, may instead stand on resolution reviews recorded at it with `cm review
@@ -895,9 +903,12 @@ Astra and a Claude reviewer have each recorded an explicit resolution ACCEPT the
 resolution reviews has an unresolved blocking finding (a resolved FIX REQUIRED is no ACCEPT), and
 every finished Astra receipt at the merge is the receipt of an Astra resolution report recorded
 there. It then goes on to the merge's first parent, which must clear with both families' ACCEPTs
-on any lane, so a later merge from the base branch walks back through an earlier one. A merge
-whose parents merge without a conflict, or whose merge also changes other files, never passes
-this way; a signature check's output never counts as such a file. A resolution review is never an ACCEPT of the head, and its receipt never meets (a) at
+on any lane, so a later merge from the base branch walks back through an earlier one. Which
+files the parents conflict in, and which files the merge changes, are both read in the scratch
+repository above, so git's default merge of the commits decides them and no merge attribute,
+driver or `merge.*` setting, committed or local, does: a `-merge` or `binary` attribute makes no
+file conflicted, a merge whose parents merge there without a conflict, or that changes other files,
+does not pass this way, and a signature check's output is no such file. A resolution review is never an ACCEPT of the head, and its receipt never meets (a) at
 the head: without a checkout, (a) and (b) must hold at the merge itself, and a review of the head
 recorded at the merge governs it. Any commit after the merge needs its own review, and so does
 the merge once it is amended. The journal entry of the `merged` move names each merge the walk
