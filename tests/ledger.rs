@@ -1229,7 +1229,7 @@ fn card(root: &Path) -> String {
         launchable: Vec::new(),
         waiting: Vec::new(),
     };
-    cm::render::card(root, Fake.now(), "c", &Default::default(), &next, &[])
+    cm::render::card(root, Fake.now(), "c", &Default::default(), &next)
 }
 
 #[test]

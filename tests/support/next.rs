@@ -34,7 +34,6 @@ impl Campaign {
                     at: "2026-10-17T08:00Z".into(),
                     head: sha.map(str::to_owned),
                     mergeable_state: None,
-                    etags: Default::default(),
                 },
             )]),
         )
@@ -196,7 +195,6 @@ impl Campaign {
                     at: "2026-10-17T08:00Z".into(),
                     head: Some("a".repeat(40)),
                     mergeable_state: Some(cm::forge::MergeableState::Dirty),
-                    etags: Default::default(),
                 },
             )]),
         )

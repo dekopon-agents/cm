@@ -14,7 +14,6 @@ use cm::outcome::Outcome;
 use cm::plan;
 use cm::state::{Evidence, Lane, Phase};
 use cm::store::{self, parse_target};
-use cm::sync::sync;
 use cm::verdict::{self, CleanUpdateError, Lineage};
 use jiff::Timestamp;
 use sha2::{Digest, Sha256};
@@ -24,6 +23,35 @@ mod support;
 
 #[path = "support/verdict.rs"]
 mod review_fixture;
+
+#[path = "support/readers.rs"]
+mod readers;
+use readers::both as sync;
+
+impl readers::Twin for FakeForge {
+    fn twin(&self, root: &Path) -> Self {
+        FakeForge {
+            campaign: self.campaign.as_ref().map(|_| root.to_path_buf()),
+            ..self.clone()
+        }
+    }
+}
+
+impl readers::Twin for forge_fixture::FakeForge {
+    fn twin(&self, root: &Path) -> Self {
+        forge_fixture::FakeForge::twin(self, root)
+    }
+}
+
+// For a `gh` script that keeps no state between calls.
+impl readers::Twin for Gh {
+    fn twin(&self, _: &Path) -> Self {
+        Gh {
+            program: self.program.clone(),
+            timeout: self.timeout,
+        }
+    }
+}
 
 struct Fake {
     now: Timestamp,
@@ -50,6 +78,7 @@ fn at(now: &str) -> Fake {
 }
 
 /// GitHub as one PR at `head` with `mergeable_state` and these checks on it; `down` fails every read.
+#[derive(Clone)]
 struct FakeForge {
     head: String,
     state: PullState,
@@ -970,7 +999,6 @@ fn a_pr_open_stale_pin_stays_visible_with_a_pending_fresh_review() {
         "campaign",
         &units,
         &plan::summary(&c.root, &units),
-        &[],
     );
     assert!(
         card.lines()
@@ -1930,14 +1958,15 @@ fn sync_holds_a_codex_merge_at_pr_open_until_its_gate_holds() {
             unit.history.last().unwrap().evidence.merged_at.as_deref(),
             merged_at
         );
-        let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+        let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
         let suffix = merged_at
             .map(|at| format!("; merged_at {at}"))
             .unwrap_or_default();
         assert_eq!(
-            card.lines()
-                .find(|line| line.starts_with("- `01-a/u/S1` pr-open → merged ")),
-            Some(format!("- `{STEP}` pr-open → merged (sha {head}{suffix})").as_str()),
+            journal
+                .lines()
+                .find(|line| line.starts_with("- 01-a/u/S1: pr-open → merged ")),
+            Some(format!("- {STEP}: pr-open → merged (sha {head}{suffix})").as_str()),
         );
         assert!(sync(&later, &merged, &c.root).unwrap().ok());
         let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
@@ -4533,4 +4562,41 @@ fn next_act_json_carries_the_unread_owner_queue_for_the_merge_hold() {
         unread[0].as_str().unwrap().contains("Choose a setting"),
         "{unread}"
     );
+}
+
+#[test]
+fn a_known_red_note_is_journaled_only_with_the_merge_it_explains() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host, true);
+    accepted(&host, &c);
+    let head = c.head();
+    let red = FakeForge {
+        state: PullState::Merged,
+        ..red_at_head(&head, "failure", "failure")
+    };
+    assert!(known_red(&host, &c, &red, &head, "red by design", "build").ok());
+    let item = cm::ledger::QueueItem {
+        title: "Hold the merges",
+        context: "A release is in review.",
+        question: "May merged steps move?",
+        recommendation: "Wait for the review.",
+    };
+    let queued = cm::ledger::owner_queue_add(&host, &c.root, &item).unwrap();
+    assert!(queued.ok(), "{:?}", queued.violations);
+    let journal = || fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    let before = journal();
+    for now in [
+        "2026-10-26T08:05:00Z",
+        "2026-10-26T08:10:00Z",
+        "2026-10-26T08:15:00Z",
+        "2026-10-26T08:20:00Z",
+    ] {
+        let held = sync(&at(now), &red, &c.root).unwrap();
+        assert_eq!(rules(&held), ["owner-queue-unread"], "{now}");
+        assert_eq!(c.state(), Phase::PrOpen);
+    }
+    let after = journal();
+    let added = after.strip_prefix(before.as_str()).unwrap();
+    assert!(!added.contains("cm sync:"), "{added}");
+    assert!(!added.contains("known-red"), "{added}");
 }

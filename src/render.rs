@@ -6,7 +6,9 @@ use crate::plan::{Next, Units};
 use crate::state::{
     Lane, Phase, Release, Step, Track, UnitState, Version, Watch, WatchStatus, Work,
 };
-use crate::sync::Moved;
+
+// The clock reaches CARD.md only through threshold comparisons like this one.
+const WITHDRAWN_WATCH_SHOWN: jiff::SignedDuration = jiff::SignedDuration::from_hours(24);
 
 fn cell(text: &str) -> String {
     text.replace('|', "\\|").replace('\n', " ")
@@ -249,9 +251,7 @@ fn watch_summary(root: &std::path::Path, now: Timestamp, units: &Units) -> Vec<S
                         else {
                             continue;
                         };
-                        if at > now
-                            || now.duration_since(at) > jiff::SignedDuration::from_secs(24 * 3600)
-                        {
+                        if at > now || now.duration_since(at) > WITHDRAWN_WATCH_SHOWN {
                             continue;
                         }
                         (2, Some(at))
@@ -294,6 +294,24 @@ fn watch_summary(root: &std::path::Path, now: Timestamp, units: &Units) -> Vec<S
         ));
     }
     rows
+}
+
+// Without `cm next`'s elapsed seconds, which change on every render.
+fn review_wait_card_line(wait: &serde_json::Value) -> String {
+    let part = wait["part"]
+        .as_str()
+        .map(|part| format!("#{part}"))
+        .unwrap_or_default();
+    let head = wait["head"]
+        .as_str()
+        .map(|head| format!(" (head {head})"))
+        .unwrap_or_default();
+    format!(
+        "reviewer blocked {}{part}: {}, since {}{head}",
+        wait["target"].as_str().unwrap_or_default(),
+        wait["reason"].as_str().unwrap_or_default(),
+        wait["since"].as_str().unwrap_or_default(),
+    )
 }
 
 pub(crate) fn next_item(number: &mut usize, description: &str, command: &str) -> String {
@@ -372,29 +390,10 @@ pub fn card(
     name: &str,
     units: &Units,
     next: &Next,
-    moves: &[Moved],
 ) -> String {
-    card_with_rate_limit(root, now, name, units, next, moves, None)
-}
-
-pub(crate) fn card_with_rate_limit(
-    root: &std::path::Path,
-    now: Timestamp,
-    name: &str,
-    units: &Units,
-    next: &Next,
-    moves: &[Moved],
-    rate_limit: Option<&str>,
-) -> String {
-    let at = crate::host::stamp(now);
-    let mut out = format!("Last run: {at}\n");
-    if let Some(line) = rate_limit {
-        out.push_str(line);
-        out.push('\n');
-    }
-    out.push_str(&format!(
-        "\n# {name} card\n\nRendered by `cm sync` from cm state after reading GitHub; the next sync overwrites it.\n\n"
-    ));
+    let mut out = format!(
+        "# {name} card\n\nRendered by `cm sync` from cm state after reading GitHub; the next sync overwrites it.\n\n"
+    );
     let (count, oldest) = crate::plan::action_summary(root, units, now);
     let oldest = oldest.as_deref().unwrap_or("—");
     out.push_str(&format!("Actionable: {count} (oldest: {oldest})\n\n"));
@@ -499,18 +498,6 @@ pub(crate) fn card_with_rate_limit(
         .iter()
         .map(|(line, command)| next_item(&mut number, line, command))
         .collect();
-    let moved: Vec<String> = moves
-        .iter()
-        .map(|moved| {
-            format!(
-                "- `{}` {} → {} ({})",
-                moved.target,
-                moved.from,
-                moved.to,
-                moved.evidence.summary()
-            )
-        })
-        .collect();
     match crate::ledger::mac_lane_open(root) {
         Ok(mac) if crate::ledger::lint_mac_lane(root).is_empty() => {
             if !mac.is_empty() {
@@ -559,7 +546,7 @@ pub(crate) fn card_with_rate_limit(
         .map(|wait| {
             next_item(
                 &mut number,
-                &crate::plan::review_wait_line(wait),
+                &review_wait_card_line(wait),
                 wait["command"].as_str().unwrap(),
             )
         })
@@ -571,6 +558,5 @@ pub(crate) fn card_with_rate_limit(
         section(&mut out, "Superseded", &superseded, "");
     }
     section(&mut out, "Watches", &watch_summary(root, now, units), "");
-    section(&mut out, "Moved this run", &moved, "No moves.");
     out
 }

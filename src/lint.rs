@@ -849,6 +849,7 @@ pub fn lint_at(start: &Path, now: jiff::Timestamp) -> Result<Outcome> {
         violations.extend(crate::ledger::lint_mac_lane(&root));
     }
     violations.extend(crate::review::lint_reviews(&root));
+    violations.extend(crate::attempt::Drivers::read(&root).err());
     violations.extend(orphan_units(&root));
     violations.extend(ignored(&root, &units));
     let mut seen = Seen {

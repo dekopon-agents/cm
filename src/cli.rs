@@ -93,7 +93,15 @@ enum Commands {
         act: bool,
     },
     /// Read PR state and release tags from GitHub (read-only `gh`), move steps pr-open → merged → released (→ deployed after their release's receipt), and render CARD.md.
-    Sync,
+    Sync {
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            default_value_t = crate::sync::BUDGET.as_secs(),
+            help = "Print each phase's wall time when the sync takes longer than this many seconds (it always does when the sync fails)"
+        )]
+        budget_secs: u64,
+    },
     /// Move EPOCH.md along OPEN → PLANNING → WORKING → CLOSED, stamping the date. Refuses a null pin.
     Epoch {
         /// planning, working or closed.
@@ -206,6 +214,13 @@ enum Commands {
         claim: Option<String>,
         #[command(subcommand)]
         act: Option<AttemptAct>,
+    },
+    #[command(
+        about = "Register the session that drives a campaign lane (LANE-<name>.md) for its units, list the registered drivers, or remove one. A live attempt a registered driver claimed on a step under its units is not `earlier-coordinator`"
+    )]
+    Lane {
+        #[command(subcommand)]
+        act: LaneAct,
     },
     /// Move a unit or step to its next state with that state's evidence.
     Advance {
@@ -520,6 +535,63 @@ enum AttemptAct {
 }
 
 #[derive(Subcommand)]
+enum LaneAct {
+    #[command(
+        about = "The sessions the coordinator registered to drive campaign lanes, recorded in `.cm/lane-drivers.json` and journaled"
+    )]
+    Driver {
+        #[command(subcommand)]
+        act: DriverAct,
+    },
+}
+
+#[derive(Subcommand)]
+enum DriverAct {
+    #[command(
+        about = "Record that --session drives lane <NAME> for the steps under each --unit, replacing the lane's earlier driver"
+    )]
+    Add {
+        #[arg(help = "The lane's name, as in LANE-<name>.md")]
+        name: String,
+        #[arg(
+            long,
+            value_name = "LABEL",
+            help = "The driver's session label, as its claims record it (e.g. session_01…)"
+        )]
+        session: String,
+        #[arg(
+            long,
+            value_name = "PREFIX",
+            help = "<NN-name>[/<unit>[/<step>]]: the driver's steps are those under it. Repeat for each"
+        )]
+        unit: Vec<String>,
+        #[arg(
+            long,
+            value_name = "LABEL",
+            required = coordinator_label(&None).is_none(),
+            help = "The coordinator registering the driver. Defaults to trimmed CLAUDE_CODE_REMOTE_SESSION_ID (cse_ becomes session_); otherwise required"
+        )]
+        coordinator: Option<String>,
+    },
+    #[command(about = "List the registered drivers by lane")]
+    List,
+    #[command(
+        about = "Remove lane <NAME>'s driver; its claims read as `earlier-coordinator` again"
+    )]
+    Remove {
+        #[arg(help = "The lane's name, as in LANE-<name>.md")]
+        name: String,
+        #[arg(
+            long,
+            value_name = "LABEL",
+            required = coordinator_label(&None).is_none(),
+            help = "The coordinator removing the driver. Defaults to trimmed CLAUDE_CODE_REMOTE_SESSION_ID (cse_ becomes session_); otherwise required"
+        )]
+        coordinator: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ReviewAct {
     /// Block until this review round is recorded or the absolute deadline passes.
     Wait {
@@ -827,7 +899,12 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             }
             crate::plan::next_at(&root()?, target.as_ref(), *lane, host.now())
         }
-        Commands::Sync => crate::sync::sync(host, &crate::forge::Gh::default(), &root()?),
+        Commands::Sync { budget_secs } => crate::sync::sync_with(
+            host,
+            crate::sync::Reader::Concurrent(&crate::forge::Gh::default()),
+            &root()?,
+            std::time::Duration::from_secs(*budget_secs),
+        ),
         Commands::Epoch {
             status,
             skill_revision,
@@ -929,6 +1006,43 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             };
             crate::attempt::attempt(host, &root()?, target, claim.as_deref(), &act)
         }
+        Commands::Lane {
+            act:
+                LaneAct::Driver {
+                    act:
+                        DriverAct::Add {
+                            name,
+                            session,
+                            unit,
+                            coordinator,
+                        },
+                },
+        } => crate::attempt::driver_add(
+            host,
+            &root()?,
+            name,
+            session,
+            unit,
+            &coordinator_label(coordinator)
+                .expect("clap requires --coordinator without a session default"),
+        ),
+        Commands::Lane {
+            act: LaneAct::Driver {
+                act: DriverAct::List,
+            },
+        } => crate::attempt::driver_list(&root()?),
+        Commands::Lane {
+            act:
+                LaneAct::Driver {
+                    act: DriverAct::Remove { name, coordinator },
+                },
+        } => crate::attempt::driver_remove(
+            host,
+            &root()?,
+            name,
+            &coordinator_label(coordinator)
+                .expect("clap requires --coordinator without a session default"),
+        ),
         Commands::Advance {
             target,
             state,
@@ -1236,7 +1350,7 @@ fn name(command: &Commands) -> &'static str {
         Commands::Close => "close",
         Commands::Init { .. } => "init",
         Commands::Next { .. } => "next",
-        Commands::Sync => "sync",
+        Commands::Sync { .. } => "sync",
         Commands::Epoch { .. } => "epoch",
         Commands::Read { .. } => "read",
         Commands::Idea { .. } => "idea",
@@ -1245,6 +1359,7 @@ fn name(command: &Commands) -> &'static str {
         Commands::Unblock { .. } => "unblock",
         Commands::Amend { .. } => "amend",
         Commands::Attempt { .. } => "attempt",
+        Commands::Lane { .. } => "lane",
         Commands::Advance { .. } => "advance",
         Commands::KnownRed { .. } => "known-red",
         Commands::Watch { .. } => "watch",
