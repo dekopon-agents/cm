@@ -856,13 +856,24 @@ fn an_unreadable_publication_is_journaled_once_while_it_stays_unreadable() {
     forge.broken.insert("crate:acme-sdk".into());
     let journal = || fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
     let before = journal();
+    let marker = c.root.join(".cm/unreadable-notified.json");
     let mut entries = Vec::new();
     for now in [
         "2026-10-17T08:00:00Z",
         "2026-10-17T08:05:00Z",
         "2026-10-17T09:00:00Z",
     ] {
+        if marker.exists() {
+            backdate(&c.root);
+        }
+        let written = marker
+            .exists()
+            .then(|| fs::metadata(&marker).unwrap().modified().unwrap());
         let out = sync(&at(now), &forge, &c.root).unwrap();
+        if let Some(written) = written {
+            let modified = fs::metadata(&marker).unwrap().modified().unwrap();
+            assert_eq!(modified, written, "{now}: the unchanged set was rewritten");
+        }
         let rules: Vec<_> = out.violations.iter().map(|v| v.rule).collect();
         assert_eq!(rules, ["sync-unknown"], "the violation stands at {now}");
         assert!(
