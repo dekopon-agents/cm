@@ -135,14 +135,17 @@ pub fn run(beat: &Beat, out: &mut dyn FnMut(String)) {
         ));
         return;
     };
+    if !bound(beat.checkout, epoch, beat.proc, beat.env) {
+        return;
+    }
     let deadline = deadline(beat.env).unwrap_or_else(|line| {
         out(line);
         DEADLINE_SECS
     });
     let phases = beat.phases;
-    phase(beat, epoch, out, "gitsync", gitsync::BUDGET, |ctx| {
-        (phases.gitsync)(ctx, gitsync::Mode::Always)
-    });
+    if !sync(beat, epoch, out, gitsync::Mode::Always) {
+        return;
+    }
     phase(beat, epoch, out, "pin", pin::BUDGET, phases.pin);
     phase(
         beat,
@@ -152,22 +155,19 @@ pub fn run(beat: &Beat, out: &mut dyn FnMut(String)) {
         directive::BUDGET,
         phases.directive,
     );
-    let bound = bound(beat, epoch, out);
-    if bound.is_ok() {
-        phase(beat, epoch, out, "collect", collect::BUDGET, phases.collect);
-    }
+    phase(beat, epoch, out, "collect", collect::BUDGET, phases.collect);
     let started = Instant::now();
     let left = u64::try_from(deadline.saturating_sub(beat.elapsed_secs())).unwrap_or(0);
     let budget = Duration::from_secs(left).saturating_add(KILL_AFTER);
     // A failed `cm next` prints only its own line, never the act phase's wall time.
-    let act = act(beat, epoch, &bound, deadline, out);
-    if !act.failed {
-        wall_time(out, "act", started.elapsed(), budget, false);
+    let act = act(beat, epoch, deadline, out);
+    if !act.failed
+        && let Some(line) = wall_line("act", started.elapsed(), budget, false)
+    {
+        out(line);
     }
-    if act.ran {
-        phase(beat, epoch, out, "gitsync", gitsync::BUDGET, |ctx| {
-            (phases.gitsync)(ctx, gitsync::Mode::IfDirty)
-        });
+    if act.ran && !sync(beat, epoch, out, gitsync::Mode::IfDirty) {
+        return;
     }
     phase(
         beat,
@@ -177,6 +177,126 @@ pub fn run(beat: &Beat, out: &mut dyn FnMut(String)) {
         claude_md::BUDGET,
         phases.claude_md,
     );
+}
+
+pub fn check(checkout: &Path, proc: &dyn Proc, env: &Env) -> bool {
+    matches!(live_epochs(checkout).as_deref(), Ok([epoch]) if bound(checkout, epoch, proc, env))
+}
+
+pub fn cli_check(checkout: &Path) -> bool {
+    let checkout = std::path::absolute(checkout).unwrap_or_else(|_| checkout.to_path_buf());
+    check(&checkout, &SystemProc, &Env::system())
+}
+
+// heartbeat.sh's is_bound. Every child runs under FRAME_CAP, never through `Ctx::run`, so the
+// check spends no phase budget and prints no wall time.
+pub(crate) fn bound(checkout: &Path, epoch: &Path, proc: &dyn Proc, env: &Env) -> bool {
+    let run = |cmd: Cmd| {
+        proc.run(
+            &cmd.cwd(checkout)
+                .timeout(FRAME_CAP)
+                .keep(Keep::Head, Keep::Tail),
+        )
+        .ok()
+    };
+    let answered = |cmd: Cmd| run(cmd).filter(|ran| ran.exit != Exit::TimedOut);
+    let succeeded = |cmd: Cmd| run(cmd).filter(|ran| ran.exit.success());
+    let branch = answered(Cmd::new("git").args(["rev-parse", "--abbrev-ref", "HEAD"]));
+    if branch
+        .is_none_or(|ran| String::from_utf8_lossy(&ran.stdout).trim_end_matches('\n') != "main")
+    {
+        return false;
+    }
+    let Some(id) = env.non_empty("CLAUDE_CODE_REMOTE_SESSION_ID") else {
+        return false;
+    };
+    let lineage = format!("session_{}", id.strip_prefix("cse_").unwrap_or(id));
+    // Age never unbinds: an unsuperseded head of any age (`stale`) is still this coordinator's.
+    let picked = |dir: &Path| {
+        let pick = Cmd::new("sh").arg(HANDOFF_PICK).arg(dir).args([
+            "coordinator",
+            "--lineage",
+            &lineage,
+            "--max-age-hours",
+            "24",
+        ]);
+        answered(pick).is_some_and(|ran| {
+            let line = first_line(&ran.stdout, ran.stdout.len());
+            line.starts_with("ok ") || line.starts_with("stale ")
+        })
+    };
+    if !picked(epoch) {
+        return false;
+    }
+    if succeeded(Cmd::new("git").args(["fetch", "-q", "origin", "main"])).is_none() {
+        return true;
+    }
+    let handoff = epoch.join("handoff");
+    let mut under = handoff.clone().into_os_string();
+    under.push("/");
+    let added = succeeded(
+        Cmd::new("git")
+            .args([
+                "diff",
+                "--name-only",
+                "-z",
+                "--diff-filter=A",
+                "HEAD",
+                "origin/main",
+                "--",
+            ])
+            .arg(under),
+    );
+    let Some(added) = added else {
+        return true;
+    };
+    let coordinator = |name: &[u8]| {
+        let file = name.rsplit(|byte| *byte == b'/').next().unwrap_or(name);
+        file.starts_with(b"coordinator-") && file.ends_with(b".md")
+    };
+    // A list cut at its head may hide a name past the cut, so it goes on to origin's own view.
+    if !added.stdout_truncated && !added.stdout.split(|byte| *byte == 0).any(coordinator) {
+        return true;
+    }
+    let Ok(tmp) = tempfile::Builder::new().prefix("cm-tick-").tempdir() else {
+        return false;
+    };
+    let dir = tmp.path();
+    let tar = dir.join("h.tar");
+    let archived = succeeded(
+        Cmd::new("git")
+            .arg("archive")
+            .arg("-o")
+            .arg(&tar)
+            .arg("origin/main")
+            .arg(&handoff),
+    )
+    .is_some()
+        && succeeded(
+            Cmd::new("tar")
+                .arg("-x")
+                .arg("-C")
+                .arg(dir)
+                .arg("-f")
+                .arg(&tar),
+        )
+        .is_some();
+    archived && picked(&dir.join(epoch))
+}
+
+// heartbeat.sh re-checks after git_sync: a successor's handoff pulled just now retires this
+// session.
+fn sync(beat: &Beat, epoch: &Path, out: &mut dyn FnMut(String), mode: gitsync::Mode) -> bool {
+    let wall = run_phase(beat, epoch, out, "gitsync", gitsync::BUDGET, |ctx| {
+        (beat.phases.gitsync)(ctx, mode)
+    });
+    if !bound(beat.checkout, epoch, beat.proc, beat.env) {
+        return false;
+    }
+    if let Some(line) = wall {
+        out(line);
+    }
+    true
 }
 
 // A path, a child's text, the act list or the environment can hold a line break or a terminal
@@ -256,6 +376,19 @@ fn phase(
     budget: Duration,
     body: impl FnOnce(&Ctx) -> Report,
 ) {
+    if let Some(line) = run_phase(beat, epoch, out, name, budget, body) {
+        out(line);
+    }
+}
+
+fn run_phase(
+    beat: &Beat,
+    epoch: &Path,
+    out: &mut dyn FnMut(String),
+    name: &str,
+    budget: Duration,
+    body: impl FnOnce(&Ctx) -> Report,
+) -> Option<String> {
     let ctx = beat.ctx(epoch, budget);
     let started = Instant::now();
     let report = contained(|| body(&ctx)).unwrap_or_else(|panic| Report {
@@ -265,29 +398,22 @@ fn phase(
     for line in report.lines {
         out(line);
     }
-    wall_time(
-        out,
+    wall_line(
         name,
         started.elapsed(),
         budget,
         report.failed || ctx.timed_out(),
-    );
+    )
 }
 
-fn wall_time(
-    out: &mut dyn FnMut(String),
-    name: &str,
-    wall: Duration,
-    budget: Duration,
-    failed: bool,
-) {
-    if failed || wall.as_secs() > budget.as_secs() {
-        out(format!(
+fn wall_line(name: &str, wall: Duration, budget: Duration, failed: bool) -> Option<String> {
+    (failed || wall.as_secs() > budget.as_secs()).then(|| {
+        format!(
             "tick: {name} phase took {:.1} s (budget {} s)",
             wall.as_secs_f64(),
             budget.as_secs()
-        ));
-    }
+        )
+    })
 }
 
 struct Act {
@@ -300,13 +426,7 @@ const READ_FAILED: Act = Act {
     failed: true,
 };
 
-fn act(
-    beat: &Beat,
-    epoch: &Path,
-    bound: &Result<(), String>,
-    deadline: i64,
-    out: &mut dyn FnMut(String),
-) -> Act {
+fn act(beat: &Beat, epoch: &Path, deadline: i64, out: &mut dyn FnMut(String)) -> Act {
     // Up to 64 MiB the list stays in memory, as heartbeat.sh held it, so it needs no disk;
     // past that it spills to a file. Either way it is read twice, whole and then line by line.
     let next = Cmd::new(beat.cm)
@@ -370,16 +490,10 @@ fn act(
             failed: false,
         };
     }
-    if let Err(why) = bound {
-        out(format!(
-            "heartbeat: executors off ({why}); every act line below is yours"
-        ));
-    }
     let lines = Lines {
         beat,
         epoch,
         epoch_dir: beat.checkout.join(epoch),
-        bound,
         unread: shape.unread,
         deadline,
     };
@@ -521,7 +635,6 @@ struct Lines<'a> {
     beat: &'a Beat<'a>,
     epoch: &'a Path,
     epoch_dir: PathBuf,
-    bound: &'a Result<(), String>,
     unread: usize,
     deadline: i64,
 }
@@ -532,12 +645,7 @@ impl Lines<'_> {
         let line = ActLine::read(json, &self.epoch_dir);
         let text = line.text();
         let kind = line.kind();
-        let found = self
-            .bound
-            .as_ref()
-            .ok()
-            .and_then(|()| beat.registry.lookup(&kind, line.lane.as_deref()));
-        let Some((name, executor)) = found else {
+        let Some((name, executor)) = beat.registry.lookup(&kind, line.lane.as_deref()) else {
             out(text);
             return false;
         };
@@ -585,72 +693,6 @@ impl Lines<'_> {
     }
 }
 
-fn bound(beat: &Beat, epoch: &Path, out: &mut dyn FnMut(String)) -> Result<(), String> {
-    // Both answers are read from their first line, so each keeps its head.
-    let frame = |cmd: Cmd| {
-        beat.proc
-            .run(
-                &cmd.cwd(beat.checkout)
-                    .timeout(FRAME_CAP)
-                    .keep(Keep::Head, Keep::Tail),
-            )
-            .map(|ran| ran.stdout)
-            .unwrap_or_default()
-    };
-    let branch = frame(Cmd::new("git").args(["rev-parse", "--abbrev-ref", "HEAD"]));
-    if String::from_utf8_lossy(&branch).trim_end_matches('\n') != "main" {
-        return Err("the checkout is not on main".to_owned());
-    }
-    let Some(id) = beat.env.non_empty("CLAUDE_CODE_REMOTE_SESSION_ID") else {
-        return Err("no CLAUDE_CODE_REMOTE_SESSION_ID, so no lineage".to_owned());
-    };
-    let lineage = format!("session_{}", id.strip_prefix("cse_").unwrap_or(id));
-    let pick = frame(Cmd::new("sh").arg(HANDOFF_PICK).arg(epoch).args([
-        "coordinator",
-        "--lineage",
-        &lineage,
-        "--max-age-hours",
-        "24",
-    ]));
-    let pick = first_line(&pick, pick.len());
-    if pick.starts_with("ok ") {
-        return Ok(());
-    }
-    if let Some(line) = malformed(&pick) {
-        out(line);
-    }
-    let pick = if pick.is_empty() { "no answer" } else { &pick };
-    Err(format!("handoff-pick.sh for {lineage}: {pick}"))
-}
-
-fn malformed(pick: &str) -> Option<String> {
-    let mut words = pick.strip_prefix("refused ")?.split_whitespace().peekable();
-    let mut fields = Vec::new();
-    if words.next_if_eq(&"malformed").is_none() {
-        while let Some(field) = words
-            .next_if(|word| word.starts_with("missing-fields=") || word.starts_with("bad-fields="))
-        {
-            fields.push(field);
-        }
-        if fields.is_empty() {
-            return None;
-        }
-    }
-    let files: Vec<&str> = words.collect();
-    if files.is_empty() {
-        return None;
-    }
-    let fields = if fields.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", fields.join(" "))
-    };
-    Some(format!(
-        "heartbeat: malformed coordinator handoff: {}{fields}; fix its Handoff: line",
-        files.join(" ")
-    ))
-}
-
 fn contained<T>(body: impl FnOnce() -> T) -> Result<T, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).map_err(|payload| {
         payload
@@ -672,9 +714,7 @@ mod tests {
     use super::*;
 
     fn printed(wall: Duration, budget: Duration, failed: bool) -> Vec<String> {
-        let mut lines = Vec::new();
-        wall_time(&mut |line| lines.push(line), "pin", wall, budget, failed);
-        lines
+        wall_line("pin", wall, budget, failed).into_iter().collect()
     }
 
     #[test]
@@ -705,57 +745,6 @@ mod tests {
                     .to_owned()
             )
         );
-    }
-
-    #[test]
-    fn malformed_names_the_files_handoff_pick_refused_as_malformed() {
-        let dir = "store/epochs/e/handoff";
-        assert_eq!(
-            malformed(&format!("refused malformed {dir}/coordinator-bad.md")),
-            Some(format!(
-                "heartbeat: malformed coordinator handoff: {dir}/coordinator-bad.md; fix its Handoff: line"
-            ))
-        );
-        assert_eq!(
-            malformed(&format!("refused malformed {dir}/a.md {dir}/b.md")),
-            Some(format!(
-                "heartbeat: malformed coordinator handoff: {dir}/a.md {dir}/b.md; fix its Handoff: line"
-            ))
-        );
-        assert_eq!(
-            malformed(&format!(
-                "refused missing-fields=prompt bad-fields=stamp_sha,stamp_entry {dir}/c.md"
-            )),
-            Some(format!(
-                "heartbeat: malformed coordinator handoff: {dir}/c.md (missing-fields=prompt bad-fields=stamp_sha,stamp_entry); fix its Handoff: line"
-            ))
-        );
-        assert_eq!(
-            malformed(&format!(
-                "refused missing-fields=stamp_sha,stamp_entry {dir}/c.md"
-            )),
-            Some(format!(
-                "heartbeat: malformed coordinator handoff: {dir}/c.md (missing-fields=stamp_sha,stamp_entry); fix its Handoff: line"
-            ))
-        );
-        assert_eq!(
-            malformed(&format!("refused bad-fields=prompt {dir}/c.md")),
-            Some(format!(
-                "heartbeat: malformed coordinator handoff: {dir}/c.md (bad-fields=prompt); fix its Handoff: line"
-            ))
-        );
-        for other in [
-            format!("refused superseded-by {dir}/x.md"),
-            format!("refused written-in-future {dir}/x.md"),
-            format!("refused wrong-epoch=old {dir}/x.md"),
-            format!("refused outside {dir}/x.md"),
-            "refused malformed".to_owned(),
-            format!("missing other-lineage {dir}/x.md"),
-            format!("ok {dir}/x.md"),
-            String::new(),
-        ] {
-            assert_eq!(malformed(&other), None, "{other}");
-        }
     }
 
     #[test]

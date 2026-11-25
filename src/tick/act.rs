@@ -175,6 +175,11 @@ impl<'a> Ctx<'a> {
         self.timed_out.get()
     }
 
+    // gitsync calls this after each pull, so nothing of an earlier check is kept.
+    pub fn still_bound(&self) -> bool {
+        crate::tick::beat::bound(self.checkout, self.epoch, self.proc, self.env)
+    }
+
     pub fn run(&self, mut cmd: Cmd) -> Result<Ran> {
         let remaining = self.remaining();
         if remaining.is_zero() {
