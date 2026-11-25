@@ -15,6 +15,10 @@
 //!    `HEARTBEAT_DEADLINE` overrides); once that is under 1 s the remaining lines are printed
 //!    unrun.
 //!
+//! When handoff-pick.sh refuses a malformed coordinator handoff, one line names it at the bound
+//! check, whether or not the act list is empty (see [`malformed`]'s documentation for how it
+//! relates to the `executors off` line).
+//!
 //! A phase's wall time is printed only when the phase failed or ran a whole second past its
 //! budget: `tick: <phase> phase took <seconds> s (budget <budget> s)`. An executor or phase that
 //! panics fails with the panic's message instead of ending the tick. Every other line is
@@ -28,7 +32,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::tick::act::{ActLine, Ctx, Env, Outcome, Registry, Report, clip};
-use crate::tick::proc::{Cmd, Exit, KILL_AFTER, Proc, SystemProc};
+use crate::tick::proc::{Cmd, Exit, KILL_AFTER, Keep, Proc, SystemProc, WHOLE_CAP};
 use crate::tick::{claude_md, collect, directive, exec, gitsync, pin};
 
 /// Seconds after the tick began past which no executor starts; `HEARTBEAT_DEADLINE` overrides.
@@ -150,7 +154,7 @@ pub fn run(beat: &Beat, out: &mut dyn FnMut(String)) {
         directive::BUDGET,
         phases.directive,
     );
-    let bound = bound(beat, epoch);
+    let bound = bound(beat, epoch, out);
     if bound.is_ok() {
         phase(beat, epoch, out, "collect", collect::BUDGET, phases.collect);
     }
@@ -276,12 +280,20 @@ fn act(
         .arg(epoch)
         .arg("--act")
         .cwd(beat.checkout)
-        .timeout(FRAME_CAP);
+        .timeout(FRAME_CAP)
+        .keep(Keep::Whole, Keep::Head);
     let next = match beat.proc.run(&next) {
         Ok(ran) if ran.exit == Exit::TimedOut => {
             out(format!(
                 "heartbeat: cm --json next --act ran past {} s and was killed",
                 FRAME_CAP.as_secs()
+            ));
+            return failed;
+        }
+        Ok(ran) if ran.exit == Exit::TooLarge => {
+            out(format!(
+                "heartbeat: cm --json next --act printed more than {} MiB and was killed; no act line was read",
+                WHOLE_CAP >> 20
             ));
             return failed;
         }
@@ -390,10 +402,15 @@ fn act(
 }
 
 /// Whether this session is the bound coordinator; when not, why.
-fn bound(beat: &Beat, epoch: &Path) -> Result<(), String> {
+fn bound(beat: &Beat, epoch: &Path, out: &mut dyn FnMut(String)) -> Result<(), String> {
+    // Both answers are read from their first line, so each keeps its head.
     let frame = |cmd: Cmd| {
         beat.proc
-            .run(&cmd.cwd(beat.checkout).timeout(FRAME_CAP))
+            .run(
+                &cmd.cwd(beat.checkout)
+                    .timeout(FRAME_CAP)
+                    .keep(Keep::Head, Keep::Tail),
+            )
             .map(|ran| ran.stdout)
             .unwrap_or_default()
     };
@@ -416,8 +433,46 @@ fn bound(beat: &Beat, epoch: &Path) -> Result<(), String> {
     if pick.starts_with("ok ") {
         return Ok(());
     }
+    if let Some(line) = malformed(&pick) {
+        out(line);
+    }
     let pick = if pick.is_empty() { "no answer" } else { &pick };
     Err(format!("handoff-pick.sh for {lineage}: {pick}"))
+}
+
+/// The line naming a coordinator handoff handoff-pick.sh refused as malformed (`refused
+/// malformed <path>…`, or `refused missing-fields=… bad-fields=… <path>`), or `None` for any
+/// other answer. heartbeat.sh printed nothing for it while the act list was empty, so the live
+/// coordinator fell silent (LANE-tooling.md §Order of work 1, amended); `cm tick` prints it once
+/// per tick at the bound check, whatever the list holds. With a non-empty list heartbeat.sh's
+/// `heartbeat: executors off (handoff-pick.sh for <lineage>: <answer>); …` line follows unchanged:
+/// this line says which file to fix, that one says the act lines are the model's.
+fn malformed(pick: &str) -> Option<String> {
+    let mut words = pick.strip_prefix("refused ")?.split_whitespace().peekable();
+    let mut fields = Vec::new();
+    if words.next_if_eq(&"malformed").is_none() {
+        while let Some(field) = words
+            .next_if(|word| word.starts_with("missing-fields=") || word.starts_with("bad-fields="))
+        {
+            fields.push(field);
+        }
+        if fields.is_empty() {
+            return None;
+        }
+    }
+    let files: Vec<&str> = words.collect();
+    if files.is_empty() {
+        return None;
+    }
+    let fields = if fields.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", fields.join(" "))
+    };
+    Some(format!(
+        "heartbeat: malformed coordinator handoff: {}{fields}; fix its Handoff: line",
+        files.join(" ")
+    ))
 }
 
 /// Runs one executor or phase so that its panic is a line, not the end of the tick; the panic
@@ -477,6 +532,49 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+
+    #[test]
+    fn malformed_names_the_files_handoff_pick_refused_as_malformed() {
+        let dir = "store/epochs/e/handoff";
+        assert_eq!(
+            malformed(&format!("refused malformed {dir}/coordinator-bad.md")),
+            Some(format!(
+                "heartbeat: malformed coordinator handoff: {dir}/coordinator-bad.md; fix its Handoff: line"
+            ))
+        );
+        assert_eq!(
+            malformed(&format!("refused malformed {dir}/a.md {dir}/b.md")),
+            Some(format!(
+                "heartbeat: malformed coordinator handoff: {dir}/a.md {dir}/b.md; fix its Handoff: line"
+            ))
+        );
+        assert_eq!(
+            malformed(&format!(
+                "refused missing-fields=prompt bad-fields=stamp_sha,stamp_entry {dir}/c.md"
+            )),
+            Some(format!(
+                "heartbeat: malformed coordinator handoff: {dir}/c.md (missing-fields=prompt bad-fields=stamp_sha,stamp_entry); fix its Handoff: line"
+            ))
+        );
+        assert_eq!(
+            malformed(&format!("refused bad-fields=prompt {dir}/c.md")),
+            Some(format!(
+                "heartbeat: malformed coordinator handoff: {dir}/c.md (bad-fields=prompt); fix its Handoff: line"
+            ))
+        );
+        for other in [
+            format!("refused superseded-by {dir}/x.md"),
+            format!("refused written-in-future {dir}/x.md"),
+            format!("refused wrong-epoch=old {dir}/x.md"),
+            format!("refused outside {dir}/x.md"),
+            "refused malformed".to_owned(),
+            format!("missing other-lineage {dir}/x.md"),
+            format!("ok {dir}/x.md"),
+            String::new(),
+        ] {
+            assert_eq!(malformed(&other), None, "{other}");
+        }
     }
 
     #[test]

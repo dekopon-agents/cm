@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use cm::tick::act::{ActLine, Ctx, Env, Executor, Outcome, Registry, Report};
 use cm::tick::beat::{self, Beat, Phases};
 use cm::tick::gitsync::Mode;
-use cm::tick::proc::{Cmd, Exit, FakeProc, Proc, Ran, SystemProc};
+use cm::tick::proc::{Cmd, Exit, FakeProc, Keep, OUTPUT_CAP, Proc, Ran, SystemProc, WHOLE_CAP};
 use cm::tick::{TickError, exec};
 use serde_json::{Value, json};
 
@@ -1224,10 +1224,90 @@ fn a_child_that_ignores_term_is_killed_after_the_grace() {
 fn a_child_flooding_its_output_is_still_stopped_at_its_timeout() {
     let dir = tempfile::tempdir().unwrap();
     let flood = script(&dir.path().join("flood"), "exec yes\n");
-    let ran = spawn(&Cmd::new(&flood).timeout(Duration::from_secs(1))).unwrap();
-    assert_eq!(ran.exit, Exit::TimedOut);
-    assert!(ran.wall < Duration::from_secs(4), "{:?}", ran.wall);
-    assert!(!ran.stdout.is_empty() && ran.stdout.len() <= cm::tick::proc::OUTPUT_CAP);
+    for keep in [Keep::Tail, Keep::Head] {
+        let ran = spawn(
+            &Cmd::new(&flood)
+                .timeout(Duration::from_secs(1))
+                .keep(keep, Keep::Tail),
+        )
+        .unwrap();
+        assert_eq!(ran.exit, Exit::TimedOut, "{keep:?}");
+        assert!(ran.wall < Duration::from_secs(4), "{:?}", ran.wall);
+        assert!(!ran.stdout.is_empty() && ran.stdout.len() <= OUTPUT_CAP);
+    }
+}
+
+#[test]
+fn a_stream_kept_whole_past_its_cap_kills_the_child_as_too_large() {
+    let dir = tempfile::tempdir().unwrap();
+    let flood = script(&dir.path().join("flood"), "exec yes\n");
+    let ran = spawn(&Cmd::new(&flood).timeout(Duration::from_secs(30))).unwrap();
+    assert_eq!(ran.exit, Exit::TooLarge);
+    assert_eq!(ran.stdout.len(), WHOLE_CAP);
+    assert!(ran.wall < Duration::from_secs(20), "{:?}", ran.wall);
+    let merged = spawn(
+        &Cmd::new(&flood)
+            .timeout(Duration::from_secs(30))
+            .merge_stderr(),
+    )
+    .unwrap();
+    assert_eq!(merged.exit, Exit::TooLarge);
+}
+
+#[test]
+fn head_keeps_the_first_bytes_and_tail_the_last() {
+    let dir = tempfile::tempdir().unwrap();
+    let long = script(
+        &dir.path().join("long"),
+        "echo first\nhead -c 6000000 /dev/zero | tr '\\0' x\necho\necho last\necho err-first >&2\nhead -c 6000000 /dev/zero | tr '\\0' y >&2\necho >&2\necho err-last >&2\n",
+    );
+    let ran = spawn(&Cmd::new(&long).keep(Keep::Head, Keep::Tail)).unwrap();
+    assert_eq!(ran.exit, Exit::Code(0));
+    assert_eq!(ran.stdout.len(), OUTPUT_CAP);
+    assert!(ran.stdout.starts_with(b"first\nxxx"));
+    assert_eq!(ran.stderr.len(), OUTPUT_CAP);
+    assert!(ran.stderr.ends_with(b"\nerr-last\n"));
+    let ran = spawn(&Cmd::new(&long).keep(Keep::Tail, Keep::Head)).unwrap();
+    assert!(ran.stdout.ends_with(b"\nlast\n"));
+    assert!(ran.stderr.starts_with(b"err-first\nyyy"));
+    let ran = spawn(&Cmd::new(&long)).unwrap();
+    assert_eq!(
+        ran.stdout.len(),
+        6_000_000 + "first\n\nlast\n".len(),
+        "whole by default"
+    );
+}
+
+#[test]
+fn an_act_list_too_large_to_keep_is_one_named_line() {
+    let ct = Ct::new();
+    let proc = Answers {
+        next: Ran {
+            exit: Exit::TooLarge,
+            ..Ran::code(0, "{\"actionable\": [")
+        },
+        ..Answers::new(0, "")
+    }
+    .proc();
+    let out = tick(&ct, &proc, &bound_env(), &exec::registry());
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert_eq!(
+        out[0],
+        "heartbeat: cm --json next --act printed more than 64 MiB and was killed; no act line was read"
+    );
+    assert!(is_wall_line(&out[1], "act"));
+    let next = proc
+        .calls()
+        .into_iter()
+        .find(|cmd| cmd.program_name() == "cm")
+        .unwrap();
+    assert_eq!(
+        (next.keep_stdout, next.keep_stderr),
+        (Keep::Whole, Keep::Head)
+    );
+    for frame in proc.calls().iter().filter(|cmd| cmd.program_name() != "cm") {
+        assert_eq!(frame.keep_stdout, Keep::Head, "{}", frame.line());
+    }
 }
 
 #[test]
@@ -1586,4 +1666,194 @@ fn the_ctx_helpers_are_act_libs() {
     assert_eq!(spent.run(Cmd::new("x")).unwrap().exit, Exit::TimedOut);
     assert!(spent.timed_out());
     assert_eq!(proc.calls().len(), 3, "a spent budget starts nothing");
+}
+
+// ---- fix round 1 (Astra r1 at 8f291da9): regression tests ----
+
+/// F1: `cm next --act`'s JSON is kept whole, past the 4 MiB a diagnostic keeps.
+#[test]
+fn a_valid_act_list_above_4_mib_prints_every_line() {
+    let ct = Ct::new();
+    let bin = ct.path().join("bin");
+    let actionable: Vec<Value> = (0..27_000)
+        .map(|n| {
+            line(
+                "launchable-not-launched",
+                &format!("01-a/u/s{n:05}"),
+                &format!("cm launch 01-a/u/s{n:05} --with-a-long-enough-tail-to-pass-four-mebibytes-x{n:05}"),
+            )
+        })
+        .collect();
+    let next = ct.path().join("next.json");
+    fs::write(&next, act(actionable.clone())).unwrap();
+    assert!(fs::metadata(&next).unwrap().len() > 4 << 20);
+    let cm = script(
+        &bin.join("cm"),
+        &format!("cat '{}'\nexit 1\n", next.display()),
+    );
+    script(&bin.join("git"), "echo main\n");
+    let mut out = Vec::new();
+    beat::run(
+        &Beat {
+            checkout: ct.path(),
+            proc: &Bin(bin.clone()),
+            env: &Env::default(),
+            registry: &exec::registry(),
+            phases: &Phases::REAL,
+            cm: cm.as_os_str(),
+            started: Instant::now(),
+        },
+        &mut |line| out.push(line),
+    );
+    assert_eq!(out.len(), 1 + actionable.len(), "{:?}", out.first());
+    assert_eq!(
+        out[0],
+        "heartbeat: executors off (no CLAUDE_CODE_REMOTE_SESSION_ID, so no lineage); every act line below is yours"
+    );
+    for (printed, json) in out[1..].iter().zip(&actionable) {
+        assert_eq!(
+            *printed,
+            format!(
+                "launchable-not-launched {}: {}",
+                json["target"].as_str().unwrap(),
+                json["command"].as_str().unwrap()
+            )
+        );
+    }
+}
+
+/// F1, swept: handoff-pick.sh's answer is its first line, kept from the head of its stdout.
+#[test]
+fn a_first_line_answer_is_read_from_its_head_whatever_follows() {
+    let ct = Ct::new();
+    let bin = ct.path().join("bin");
+    let next = ct.path().join("next.json");
+    fs::write(&next, act(vec![lines().remove(0)])).unwrap();
+    let cm = script(
+        &bin.join("cm"),
+        &format!("cat '{}'\nexit 1\n", next.display()),
+    );
+    script(&bin.join("git"), "echo main\n");
+    script(
+        &ct.path().join(beat::HANDOFF_PICK),
+        &format!("printf '{PICK_OK}'\nhead -c 5000000 /dev/zero | tr '\\0' x\n"),
+    );
+    let (executor, seen) = Record::new(done());
+    let registry = Registry::new().with("launchable-not-launched", executor);
+    let mut out = Vec::new();
+    beat::run(
+        &Beat {
+            checkout: ct.path(),
+            proc: &Bin(bin.clone()),
+            env: &bound_env(),
+            registry: &registry,
+            phases: &Phases::REAL,
+            cm: cm.as_os_str(),
+            started: Instant::now(),
+        },
+        &mut |line| out.push(line),
+    );
+    assert_eq!(out, Vec::<String>::new());
+    assert_eq!(seen.calls().len(), 1, "bound: `ok` was the first line");
+}
+
+/// F2: a malformed coordinator handoff is named once per tick, act list empty or not.
+#[test]
+fn a_malformed_coordinator_handoff_is_named_once_whatever_the_act_list_holds() {
+    let ct = Ct::new();
+    let bad = "store/epochs/eleemosynary-mnemosyne/handoff/coordinator-bad.md";
+    let named = format!("heartbeat: malformed coordinator handoff: {bad}; fix its Handoff: line");
+    let refused = |actionable: Vec<Value>, pick: String| {
+        let proc = Answers {
+            pick: Ran::code(1, format!("{pick}\n")),
+            ..Answers::new(1, act(actionable))
+        }
+        .proc();
+        tick(&ct, &proc, &bound_env(), &exec::registry())
+    };
+    assert_eq!(
+        refused(Vec::new(), format!("refused malformed {bad}")),
+        [named.as_str()]
+    );
+    assert_eq!(
+        refused(vec![lines().remove(0)], format!("refused malformed {bad}")),
+        [
+            named,
+            format!(
+                "heartbeat: executors off (handoff-pick.sh for session_01abc: refused malformed {bad}); every act line below is yours"
+            ),
+            PRINTED[0].to_owned(),
+        ]
+    );
+    assert_eq!(
+        refused(
+            Vec::new(),
+            format!("refused missing-fields=prompt bad-fields=stamp_sha {bad}")
+        ),
+        [format!(
+            "heartbeat: malformed coordinator handoff: {bad} (missing-fields=prompt bad-fields=stamp_sha); fix its Handoff: line"
+        )]
+    );
+    assert_eq!(
+        refused(Vec::new(), format!("refused superseded-by {bad}")),
+        Vec::<String>::new(),
+        "only a malformed handoff is named"
+    );
+}
+
+/// F3: after TERM the group gets its whole grace even once the leader has exited.
+#[test]
+fn a_descendant_cleaning_up_on_term_gets_the_whole_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let cleaned = dir.path().join("cleaned");
+    let tidy = script(
+        &dir.path().join("tidy"),
+        "(trap 'sleep 1; echo done > \"$1\"; exit 0' TERM; while :; do sleep 0.1; done) &\nsleep 60\n",
+    );
+    let ran = spawn(
+        &Cmd::new(&tidy)
+            .arg(&cleaned)
+            .timeout(Duration::from_secs(1)),
+    )
+    .unwrap();
+    assert_eq!(ran.exit, Exit::TimedOut);
+    assert_eq!(
+        fs::read_to_string(&cleaned).ok().as_deref(),
+        Some("done\n"),
+        "the descendant finished its cleanup; wall {:?}",
+        ran.wall
+    );
+    assert!(
+        ran.wall >= Duration::from_secs(2) && ran.wall < Duration::from_secs(5),
+        "it ended when the group did, not at the grace's end: {:?}",
+        ran.wall
+    );
+}
+
+/// F3: a descendant that ignores TERM is KILLed when the grace ends, though the leader exited.
+#[test]
+fn a_descendant_ignoring_term_is_killed_when_the_grace_ends_though_the_leader_exited() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("pid");
+    let deaf = script(
+        &dir.path().join("deaf"),
+        "(trap '' TERM; while :; do sleep 0.1; done) &\necho $! > \"$1\"\nsleep 60\n",
+    );
+    let ran = spawn(
+        &Cmd::new(&deaf)
+            .arg(&pidfile)
+            .timeout(Duration::from_secs(1)),
+    )
+    .unwrap();
+    assert_eq!(ran.exit, Exit::TimedOut);
+    assert!(
+        ran.wall >= Duration::from_secs(6) && ran.wall < Duration::from_secs(9),
+        "KILL lands when the 5 s grace ends: {:?}",
+        ran.wall
+    );
+    let pid = read_pid(&pidfile);
+    assert!(
+        gone_within(&pid, Duration::from_secs(2)),
+        "descendant {pid} survived"
+    );
 }
