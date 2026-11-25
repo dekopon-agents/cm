@@ -2995,7 +2995,12 @@ fn unsupported_formula_arguments_journal_unknown_and_leave_the_release_merged() 
                 .insert(("o/homebrew-tap".into(), "widget".into()), body);
             let out = cm::sync::sync(&host, &forge, &c.root).unwrap();
             assert_eq!(rules(&out), ["sync-unknown"], "{key}: {name}");
-            assert!(out.fields.contains_key("journal"));
+            // Journaled by this sync, or by an earlier one while it stays unreadable.
+            let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+            assert!(
+                journal.contains("\n- unknown 00-release/widget/1.4.0: "),
+                "{key}: {name}"
+            );
             assert_eq!(out.fields["moves"], serde_json::json!([]));
             assert_eq!(p::unit(&c), before);
         }

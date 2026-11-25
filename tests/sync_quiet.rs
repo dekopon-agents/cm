@@ -24,6 +24,14 @@ mod support;
 mod campaign_fixture;
 use campaign_fixture::{Campaign, campaign, git};
 
+#[allow(dead_code)]
+#[path = "support/forge.rs"]
+mod forge_fixture;
+
+#[allow(dead_code)]
+#[path = "support/publication.rs"]
+mod publication_fixture;
+
 struct Fake {
     now: Timestamp,
 }
@@ -834,4 +842,34 @@ fn validators_live_only_in_the_ignored_read_memo() {
     assert!(!tracked.contains("etags"), "{tracked}");
     let memo = fs::read_to_string(c.root.join(".cm").join(cm::sync::PULLS_READ)).unwrap();
     assert!(memo.contains("etags"), "{memo}");
+}
+
+#[test]
+fn an_unreadable_publication_is_journaled_once_while_it_stays_unreadable() {
+    use publication_fixture as p;
+    let c = p::campaign(&at("2026-10-17T08:00:00Z"), Phase::Merged, &p::ARTIFACTS);
+    let mut forge = p::present();
+    forge.broken.insert("crate:acme-sdk".into());
+    let journal = || fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    let before = journal();
+    let mut entries = Vec::new();
+    for now in [
+        "2026-10-17T08:00:00Z",
+        "2026-10-17T08:05:00Z",
+        "2026-10-17T09:00:00Z",
+    ] {
+        let out = sync(&at(now), &forge, &c.root).unwrap();
+        let rules: Vec<_> = out.violations.iter().map(|v| v.rule).collect();
+        assert_eq!(rules, ["sync-unknown"], "the violation stands at {now}");
+        entries.push(out.fields.contains_key("journal"));
+    }
+    assert_eq!(entries, [true, false, false]);
+    let added = journal();
+    let added = added.strip_prefix(before.as_str()).unwrap();
+    assert_eq!(added.matches("\n## ").count(), 1, "{added}");
+    assert_eq!(
+        added.matches("- unknown 00-release/widget/1.4.0: ").count(),
+        1,
+        "{added}"
+    );
 }

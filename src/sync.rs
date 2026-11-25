@@ -245,6 +245,7 @@ struct Run<'a> {
     heads: BTreeMap<String, String>,
     notes: Vec<(String, String)>,
     owner_unread: Vec<String>,
+    unreadable: BTreeSet<String>,
     discovery_warnings: Vec<String>,
     turn_commands: TurnCommands,
     turn_warnings: Vec<String>,
@@ -314,6 +315,7 @@ impl<'a> Run<'a> {
             heads: BTreeMap::new(),
             notes: Vec::new(),
             owner_unread,
+            unreadable: BTreeSet::new(),
             discovery_warnings: Vec::new(),
             turn_commands,
             turn_warnings,
@@ -1259,8 +1261,9 @@ impl<'a> Run<'a> {
                             ));
                         }
                         for message in read.unknown {
-                            self.notes
-                                .push((String::new(), format!("- unknown {target}: {message}")));
+                            let note = format!("- unknown {target}: {message}");
+                            self.unreadable.insert(note.clone());
+                            self.notes.push((String::new(), note));
                             self.unknown(&target, message);
                         }
                         if present {
@@ -1482,6 +1485,25 @@ fn card_name(root: &Path) -> String {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default()
     })
+}
+
+fn last_sync_entry(root: &Path) -> BTreeSet<String> {
+    let mut entry = BTreeSet::new();
+    let Ok(text) = std::fs::read_to_string(root.join(store::JOURNAL)) else {
+        return entry;
+    };
+    let mut in_sync = false;
+    for line in text.lines() {
+        if line.starts_with("## ") {
+            in_sync = journal::is_stamped(line) && line.contains(" — cm sync: ");
+            if in_sync {
+                entry.clear();
+            }
+        } else if in_sync {
+            entry.insert(line.to_owned());
+        }
+    }
+    entry
 }
 
 fn guard(root: &Path) -> Result<Vec<Violation>> {
@@ -1751,7 +1773,13 @@ fn run_sync(
             ));
         }
     }
-    if !run.moves.is_empty() || !run.notes.is_empty() {
+    // A publication still unreadable since the last sync entry journaled it is not news.
+    let journaled = last_sync_entry(root);
+    let news = run
+        .notes
+        .iter()
+        .any(|(_, note)| !run.unreadable.contains(note) || !journaled.contains(note.as_str()));
+    if !run.moves.is_empty() || news {
         let mut body: String = run
             .moves
             .iter()
