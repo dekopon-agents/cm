@@ -49,8 +49,8 @@ pub const PULLS_READ: &str = "pulls-read.json";
 
 const UNREADABLE_NOTIFIED: &str = "unreadable-notified.json";
 
-// A 304 restores the stored observation, so ETags go out only while `.cm/pulls.json` holds the
-// one they validated.
+// A PR's 304 restores the stored observation, so its ETag goes out only while `.cm/pulls.json`
+// holds the one it validated; a check page's ETag is keyed by its own head's URL.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct LastRead {
     at: String,
@@ -1694,7 +1694,7 @@ fn run_sync(
     campaign.schema = crate::state::SCHEMA;
     store::write_json(&store::state_path(root), &campaign)?;
     // The observations before the memo of their validators: a sync stopped between the two
-    // leaves validators that no longer match, which `LastRead::validates` refuses.
+    // leaves PR validators that no longer match, which `LastRead::validates` refuses.
     store::write_json(&plan::pulls_path(root), &open)?;
     let last_read_path = root.join(store::CM_DIR).join(PULLS_READ);
     if !last_read.is_empty() || last_read_path.exists() {
