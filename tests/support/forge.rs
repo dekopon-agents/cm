@@ -20,19 +20,20 @@ pub struct FakeForge {
     pub containment_queries: Mutex<Vec<(String, String, String)>>,
 }
 
-/// Whether the campaign lock is free. A lock held by the read under test never frees, since its
-/// holder waits on this read; a child another test thread forks can inherit this thread's lock
-/// file for the moment before its exec, so a busy lock is retried briefly before it counts.
-pub fn lock_free(root: &std::path::Path) -> bool {
-    let path = root.join(cm::store::CM_DIR).join(cm::store::LOCK);
-    for _ in 0..50 {
-        let lock = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        if rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok() {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    false
+// A child another test thread forks shares every lock this process holds until it execs, so a
+// busy lock is no evidence; but only `store::lock` opens the lock file, and keeps it open while it
+// holds the lock, so a descriptor of this process open on that file is.
+pub fn lock_holder(root: &Path) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let lock = std::fs::metadata(root.join(cm::store::CM_DIR).join(cm::store::LOCK)).ok()?;
+    std::fs::read_dir("/dev/fd")
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|fd| {
+            std::fs::metadata(fd)
+                .is_ok_and(|open| (open.dev(), open.ino()) == (lock.dev(), lock.ino()))
+        })
 }
 
 impl FakeForge {
@@ -54,7 +55,11 @@ impl FakeForge {
 
     fn artifact_query(&self, key: &str) {
         if let Some(root) = &self.root {
-            assert!(lock_free(root), "publication read held the campaign lock");
+            assert_eq!(
+                lock_holder(root),
+                None,
+                "publication read held the campaign lock"
+            );
         }
         self.artifact_queries.lock().unwrap().push(key.to_owned());
     }

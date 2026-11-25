@@ -97,8 +97,9 @@ struct FakeForge {
 impl FakeForge {
     fn assert_unlocked(&self) {
         if let Some(root) = &self.campaign {
-            assert!(
-                forge_fixture::lock_free(root),
+            assert_eq!(
+                forge_fixture::lock_holder(root),
+                None,
                 "forge read held the campaign lock"
             );
         }
