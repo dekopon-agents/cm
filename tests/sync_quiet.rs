@@ -1119,3 +1119,39 @@ fn journal_tail(root: &Path) -> String {
     let last = journal.rfind("\n## ").unwrap();
     journal[last..].to_owned()
 }
+
+#[test]
+fn a_failed_tag_read_keeps_an_unreadable_publication_journaled_once() {
+    use publication_fixture as p;
+    // Either tag read can fail between two syncs that find the crate still unreadable.
+    for failing in [format!("exists:{}", p::TAG), p::TAG.to_owned()] {
+        let c = p::campaign(&at("2026-10-17T08:00:00Z"), Phase::Merged, &p::ARTIFACTS);
+        let marker = c.root.join(".cm/unreadable-notified.json");
+        let unreadable = || {
+            let mut forge = p::present();
+            forge.broken.insert("crate:acme-sdk".into());
+            forge
+        };
+        let mut tag_down = unreadable();
+        tag_down.broken.insert(failing.clone());
+        let mut entries = Vec::new();
+        let mut markers = Vec::new();
+        for (now, forge) in [
+            ("2026-10-17T08:00:00Z", unreadable()),
+            ("2026-10-17T08:05:00Z", tag_down),
+            ("2026-10-17T08:10:00Z", unreadable()),
+        ] {
+            let out = sync(&at(now), &forge, &c.root).unwrap();
+            let rules: Vec<_> = out.violations.iter().map(|v| v.rule).collect();
+            assert_eq!(rules, ["sync-unknown"], "{failing} at {now}");
+            entries.push(out.fields.contains_key("journal"));
+            markers.push(fs::read_to_string(&marker).unwrap());
+        }
+        assert_eq!(entries, [true, false, false], "{failing}");
+        assert!(
+            markers.iter().all(|text| *text == markers[0]),
+            "{failing}: {markers:?}"
+        );
+        assert!(markers[0].contains("crate:acme-sdk"), "{}", markers[0]);
+    }
+}

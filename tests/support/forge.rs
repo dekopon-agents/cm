@@ -108,6 +108,9 @@ impl Forge for FakeForge {
     }
 
     fn tag_exists(&self, repo: &GithubRepo, tag: &TagName) -> Result<bool, ForgeError> {
+        if self.broken.contains(&format!("exists:{tag}")) {
+            return Err(ForgeError::Exit(Some(1)));
+        }
         Ok(self.tags.contains_key(&(repo.to_string(), tag.to_string())))
     }
 

@@ -229,6 +229,7 @@ struct Run<'a> {
     notes: Vec<(String, String)>,
     owner_unread: Vec<String>,
     unreadable: BTreeSet<String>,
+    unread_publications: BTreeSet<String>,
     discovery_warnings: Vec<String>,
     turn_commands: TurnCommands,
     turn_warnings: Vec<String>,
@@ -296,6 +297,7 @@ impl<'a> Run<'a> {
             notes: Vec::new(),
             owner_unread,
             unreadable: BTreeSet::new(),
+            unread_publications: BTreeSet::new(),
             discovery_warnings: Vec::new(),
             turn_commands,
             turn_warnings,
@@ -1207,9 +1209,14 @@ impl<'a> Run<'a> {
             }
             let tag = step.release_tag(&release);
             match self.tag_exists(&repo, &tag) {
-                None | Some(Ok(false)) => {}
+                None => {
+                    self.unread_publications.insert(target);
+                }
+                Some(Ok(false)) => {}
                 Some(Ok(true)) => match self.contains(&repo, &tag, &sha) {
-                    None => {}
+                    None => {
+                        self.unread_publications.insert(target);
+                    }
                     Some(Ok(true)) => {
                         let key = (
                             step.artifacts.iter().map(ToString::to_string).collect(),
@@ -1237,6 +1244,7 @@ impl<'a> Run<'a> {
                                 ))
                             },
                         ) else {
+                            self.unread_publications.insert(target);
                             continue;
                         };
                         let present = read.missing.is_empty() && read.unknown.is_empty();
@@ -1271,9 +1279,15 @@ impl<'a> Run<'a> {
                         "release-tag",
                         format!("{repo} tag {tag} does not contain the prep merge {sha}"),
                     )),
-                    Some(Err(error)) => self.unknown(&target, format!("{repo} {tag}: {error}")),
+                    Some(Err(error)) => {
+                        self.unknown(&target, format!("{repo} {tag}: {error}"));
+                        self.unread_publications.insert(target);
+                    }
                 },
-                Some(Err(error)) => self.unknown(&target, format!("{repo} {tag}: {error}")),
+                Some(Err(error)) => {
+                    self.unknown(&target, format!("{repo} {tag}: {error}"));
+                    self.unread_publications.insert(target);
+                }
             }
         }
     }
@@ -1762,8 +1776,19 @@ fn run_sync(
     if changed {
         store::write_json(&marker_path, &notified)?;
     }
-    if run.unreadable != published && (!run.unreadable.is_empty() || unreadable_path.exists()) {
-        store::write_json(&unreadable_path, &run.unreadable)?;
+    // A publication left unread by a failed tag read has not become readable: keep its notes.
+    let standing: BTreeSet<String> = published
+        .iter()
+        .filter(|note| {
+            run.unread_publications
+                .iter()
+                .any(|target| note.starts_with(&format!("- unknown {target}: ")))
+        })
+        .chain(&run.unreadable)
+        .cloned()
+        .collect();
+    if standing != published && (!standing.is_empty() || unreadable_path.exists()) {
+        store::write_json(&unreadable_path, &standing)?;
     }
     phases.enter("render");
     let next = plan::summary(root, &run.units);
