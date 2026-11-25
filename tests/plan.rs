@@ -498,7 +498,6 @@ fn card_rechecks_unmet_until_blocks_and_unblocks_satisfied_or_free_text_blocks()
             "campaign",
             &units,
             &plan::summary(&c.root, &units),
-            &[],
         );
         let blocked = card
             .split_once("## Blocked\n\n")
@@ -556,7 +555,6 @@ fn ready_owner_commands_finish_with_named_evidence() {
         "campaign",
         &units,
         &plan::summary(&c.root, &units),
-        &[],
     );
     assert!(
         card.contains(&format!("1. `01-a/u/owner` (owner) — `{command}`")),
@@ -640,7 +638,6 @@ fn ready_owner_rollouts_offer_launch_in_next_and_card() {
         "campaign",
         &units,
         &plan::summary(&c.root, &units),
-        &[],
     );
     assert!(
         card.contains(&format!("1. `{step}` (owner) — `{command}`")),
@@ -1289,17 +1286,15 @@ fn sync_moves_steps_from_github_state_and_renders_the_card() {
     assert_eq!(state(&c, "01-a/u/S1"), Phase::Merged);
     assert_eq!(state(&c, "01-a/u/S9"), Phase::PrOpen);
     let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
-    assert_eq!(card.lines().next(), Some("Last run: 2026-10-17T09:05Z"));
+    assert_eq!(card.lines().next(), Some("# campaign card"), "no run stamp");
     assert!(
         card.contains("1. `00-release/dekopon/0.49.0` (pi) — `cm launch 00-release/dekopon/0.49.0 --worktree '<worktree-path>'`"),
         "{card}"
     );
-    assert!(
-        card.contains("- `01-a/u/S1` pr-open → merged (sha aaa1)"),
-        "{card}"
-    );
+    assert!(!card.contains("Moved this run"), "{card}");
     let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
     assert!(journal.contains("## 2026-10-17T09:05Z — cm sync: 1 move(s) from GitHub\n"));
+    assert!(journal.contains("- 01-a/u/S1: pr-open → merged (sha aaa1)\n"));
 
     let next = plan::next(&c.root, None, None).unwrap();
     assert_eq!(
@@ -2111,7 +2106,7 @@ esac
         let launched = store::load_unit(&c.root.join("01-a/u")).unwrap();
         let claim = &launched.steps["S1"].attempt.as_ref().unwrap().claim;
         let end = cm(&["attempt", step, "--claim", claim, "end", "complete"]);
-        cm(&["sync"]);
+        let synced = cm(&["sync"]);
 
         let ended = store::load_unit(&c.root.join("01-a/u")).unwrap();
         let outcome = ended.steps["S1"]
@@ -2125,7 +2120,7 @@ esac
         assert_eq!(outcome, cm::state::AttemptOutcome::Complete);
 
         let expected = usize::from(mode == "valid");
-        for report in [&launch, &end] {
+        for report in [&launch, &end, &synced] {
             assert_eq!(
                 report.lines().filter(|line| *line == stamp).count(),
                 expected
@@ -2141,10 +2136,7 @@ esac
             2 * expected
         );
         let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
-        assert_eq!(
-            card.lines().nth(1),
-            Some(if mode == "valid" { stamp } else { "" })
-        );
+        assert!(!card.contains("GitHub REST core"), "{card}");
         assert_eq!(
             fs::read_to_string(&args_path).unwrap(),
             "api rate_limit\napi rate_limit\napi rate_limit\n"
@@ -2181,16 +2173,23 @@ echo '{"resources":{"core":{"used":17,"limit":5000,"reset":1792227600}}}'
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
-        fs::read_to_string(c.root.join("CARD.md")).unwrap()
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let sampled = |output: &str| {
+        output
+            .lines()
+            .filter(|line| line.starts_with("GitHub REST core: "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
     };
 
     // The same memory limit must still allow a normal sample.
     assert_eq!(
-        sync().lines().nth(1),
-        Some("GitHub REST core: 17/5000 used (reset 1792227600)")
+        sampled(&sync()),
+        ["GitHub REST core: 17/5000 used (reset 1792227600)"]
     );
     fs::write(gh.fixture().join("large"), "").unwrap();
-    assert_eq!(sync().lines().nth(1), Some(""));
+    assert!(sampled(&sync()).is_empty());
     assert_eq!(
         fs::read_to_string(gh.fixture().join("requests")).unwrap(),
         "api rate_limit\napi rate_limit\n"
@@ -4006,7 +4005,6 @@ fn card_watch_counts_and_rows_stay_bounded_and_prioritized() {
         "test",
         &units,
         &next,
-        &[],
     );
     let section = card
         .split_once("## Watches\n\n")
@@ -4077,7 +4075,6 @@ fn card_watch_withdrawals_are_visible_for_twenty_four_hours() {
         "test",
         &units,
         &next,
-        &[],
     );
     assert!(
         boundary
@@ -4097,7 +4094,6 @@ fn card_watch_withdrawals_are_visible_for_twenty_four_hours() {
         "test",
         &units,
         &next,
-        &[],
     );
     assert!(!card.contains("check#1"), "{card}");
     assert!(
@@ -4187,7 +4183,6 @@ fn card_watch_rows_are_short_and_only_show_relevant_live_watches() {
         "test",
         &units,
         &next,
-        &[],
     );
     assert!(!card.contains("live#1"), "{card}");
     assert!(!card.contains("finished#1"), "{card}");
@@ -4220,7 +4215,6 @@ fn card_watch_rows_are_short_and_only_show_relevant_live_watches() {
         "test",
         &units,
         &next,
-        &[],
     );
     assert!(
         reopened

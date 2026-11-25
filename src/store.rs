@@ -144,7 +144,27 @@ pub fn load_unit(dir: &Path) -> Result<UnitState> {
     Ok(state)
 }
 
+/// Replace `path` with `bytes` unless it is already a regular file holding exactly them, so an
+/// unchanged render leaves the file, its mtime and git untouched.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_changed(path, bytes).map(drop)
+}
+
+/// [`write_atomic`], reporting whether it wrote.
+pub fn write_changed(path: &Path, bytes: &[u8]) -> Result<bool> {
+    if unchanged(path, bytes) {
+        return Ok(false);
+    }
+    replace(path, bytes)?;
+    Ok(true)
+}
+
+fn unchanged(path: &Path, bytes: &[u8]) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() == bytes.len() as u64)
+        && fs::read(path).is_ok_and(|current| current == bytes)
+}
+
+fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
     let name = path
         .file_name()
         .context("a state path has a file name")?
@@ -212,6 +232,26 @@ pub fn lock(root: &Path) -> Result<Lock> {
     rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
         .context("locking .cm/lock")?;
     Ok(Lock { _file: file })
+}
+
+/// List `name` in `.cm/.gitignore`, which `lock` writes, so a runtime file cm keeps there stays
+/// out of git; a campaign whose ignore file predates it gains the line once.
+pub fn ignore(root: &Path, name: &str) -> Result<()> {
+    let path = root.join(CM_DIR).join(".gitignore");
+    let mut text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    if text.lines().any(|line| line.trim() == name) {
+        return Ok(());
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(name);
+    text.push('\n');
+    write_atomic(&path, text.as_bytes())
 }
 
 pub fn relative(root: &Path, path: &Path) -> String {
@@ -289,6 +329,34 @@ mod tests {
         assert!(!path.exists());
         assert!(create_new(&path, b"Complete kickoff.\n").unwrap());
         assert_eq!(fs::read(&path).unwrap(), b"Complete kickoff.\n");
+    }
+
+    #[test]
+    fn writing_the_same_bytes_leaves_the_file_alone() {
+        let (_temp, path) = fixture::destination();
+        assert!(write_changed(&path, b"Card.\n").unwrap());
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1 << 30);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(!write_changed(&path, b"Card.\n").unwrap());
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), old);
+        assert!(write_changed(&path, b"Card!\n").unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"Card!\n");
+
+        // A symlink is replaced by the file, as before, even when it reads the same.
+        #[cfg(unix)]
+        {
+            let target = path.with_file_name("target");
+            fs::write(&target, b"Card!\n").unwrap();
+            fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            assert!(write_changed(&path, b"Card!\n").unwrap());
+            assert!(fs::symlink_metadata(&path).unwrap().is_file());
+        }
     }
 
     #[test]

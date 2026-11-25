@@ -1,0 +1,661 @@
+//! A `cm sync` that finds no new fact writes nothing; one that finds a fact writes only the
+//! files that fact changes.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
+
+use cm::commands::{self, Declaration, Ships};
+use cm::forge::{CheckState, CommitSha, Forge, ForgeError, GithubRepo, Pull, PullState, TagName};
+use cm::host::Host;
+use cm::outcome::Outcome;
+use cm::state::{Evidence, Lane, Phase, Work};
+use cm::store::{self, parse_target};
+use cm::sync::{BUDGET, Reader, sync, sync_with};
+use jiff::Timestamp;
+
+mod support;
+
+#[path = "support/campaign.rs"]
+mod campaign_fixture;
+use campaign_fixture::{Campaign, campaign, git};
+
+struct Fake {
+    now: Timestamp,
+}
+
+impl Host for Fake {
+    fn now(&self) -> Timestamp {
+        self.now
+    }
+
+    fn free_bytes(&self, _: &Path) -> io::Result<u64> {
+        Ok(100 << 30)
+    }
+
+    fn heavy_builds(&self) -> io::Result<u32> {
+        Ok(0)
+    }
+}
+
+fn at(now: &str) -> Fake {
+    Fake {
+        now: now.parse().unwrap(),
+    }
+}
+
+const OPEN_PR: &str = "https://github.com/o/r/pull/1";
+const MERGED_PR: &str = "https://github.com/o/r/pull/2";
+
+/// GitHub as a forge that can be shared across threads: an unchanged pull answers its stored
+/// validator with a 304, as GitHub does, and every read is logged.
+#[derive(Default)]
+struct Github {
+    pulls: Mutex<BTreeMap<String, Pull>>,
+    tags: BTreeMap<(String, String), BTreeSet<String>>,
+    reads: Mutex<Vec<String>>,
+}
+
+impl Github {
+    fn log(&self, read: String) {
+        self.reads.lock().unwrap().push(read);
+    }
+
+    fn set(&self, url: &str, pull: Pull) {
+        self.pulls.lock().unwrap().insert(url.to_owned(), pull);
+    }
+
+    fn reads(&self) -> Vec<String> {
+        let mut reads = self.reads.lock().unwrap().clone();
+        reads.sort();
+        reads
+    }
+}
+
+impl Forge for Github {
+    fn pull(&self, url: &str) -> Result<Pull, ForgeError> {
+        self.log(format!("pull {url}"));
+        self.pulls
+            .lock()
+            .unwrap()
+            .get(url)
+            .cloned()
+            .ok_or(ForgeError::Json)
+    }
+
+    fn pull_conditional(
+        &self,
+        url: &str,
+        previous: &BTreeMap<String, String>,
+        etags: &mut BTreeMap<String, String>,
+    ) -> Result<Option<Pull>, ForgeError> {
+        let pull = self.pull(url)?;
+        let etag = format!("\"{pull:?}\"");
+        let unchanged = previous.get(url) == Some(&etag);
+        etags.insert(url.to_owned(), etag);
+        Ok((!unchanged).then_some(pull))
+    }
+
+    fn checks(&self, _: &GithubRepo, sha: &CommitSha) -> Result<Vec<CheckState>, ForgeError> {
+        self.log(format!("checks {sha}"));
+        Ok(vec![CheckState {
+            name: "ci".into(),
+            state: "success".to_owned().into(),
+        }])
+    }
+
+    fn rate_limit(&self) -> Option<String> {
+        Some("GitHub REST core: 1/5000 used (reset 1)".into())
+    }
+
+    fn tag_exists(&self, repo: &GithubRepo, tag: &TagName) -> Result<bool, ForgeError> {
+        self.log(format!("tag {repo} {tag}"));
+        Ok(self.tags.contains_key(&(repo.to_string(), tag.to_string())))
+    }
+
+    fn tag_contains(
+        &self,
+        repo: &GithubRepo,
+        tag: &TagName,
+        sha: &CommitSha,
+    ) -> Result<bool, ForgeError> {
+        self.log(format!("contains {repo} {tag} {sha}"));
+        Ok(self
+            .tags
+            .get(&(repo.to_string(), tag.to_string()))
+            .is_some_and(|shas| shas.contains(sha.as_str())))
+    }
+}
+
+fn open(head: &str) -> Pull {
+    Pull {
+        state: PullState::Open,
+        merge_commit: None,
+        merged_at: None,
+        head: Some(CommitSha::new(head)),
+        head_ref: None,
+        base: Some(CommitSha::new("b".repeat(40))),
+        mergeable_state: Some("clean".to_owned().into()),
+    }
+}
+
+fn merged(sha: &str) -> Pull {
+    Pull {
+        state: PullState::Merged,
+        merge_commit: Some(CommitSha::new(sha)),
+        merged_at: Some("2026-10-17T07:30:00Z".into()),
+        head: None,
+        head_ref: None,
+        base: None,
+        mergeable_state: None,
+    }
+}
+
+fn declare(host: &Fake, c: &Campaign, target: &str, after: &[&str], ships: Ships) {
+    let declaration = Declaration {
+        lane: Some(Lane::Pi),
+        after: after.iter().map(|text| (*text).to_owned()).collect(),
+        ships,
+        artifacts: Vec::new(),
+        parts: Vec::new(),
+        work: Work::Code,
+        kickoff: None,
+    };
+    let declared = commands::declare(host, &c.root.join(target), &declaration).unwrap();
+    assert!(declared.ok(), "{:?}", declared.violations);
+    fs::write(c.root.join(target).join("kickoff.md"), "Go.\n").unwrap();
+}
+
+fn advance(host: &Fake, c: &Campaign, target: &str, to: Phase, evidence: Evidence, repo: &Path) {
+    let moved = commands::advance(
+        host,
+        &c.root,
+        &parse_target(target, false).unwrap(),
+        &to,
+        &evidence,
+        None,
+        Some(repo),
+    )
+    .unwrap();
+    assert!(moved.ok(), "{:?}", moved.violations);
+}
+
+/// Opens a PR for `target` and returns its recorded head.
+fn open_pr(host: &Fake, c: &Campaign, worktree: &Path, target: &str, pr: &str) -> String {
+    let launched = commands::launch(
+        host,
+        &c.root,
+        &parse_target(target, true).unwrap(),
+        Some(worktree),
+    )
+    .unwrap();
+    assert!(launched.ok(), "{:?}", launched.violations);
+    git(worktree, &["commit", "-q", "--allow-empty", "-m", target]);
+    let head = git(worktree, &["rev-parse", "HEAD"]);
+    let evidence = Evidence {
+        pr: Some(pr.into()),
+        sha: Some(head.clone()),
+        ..Evidence::default()
+    };
+    advance(host, c, target, Phase::PrOpen, evidence, worktree);
+    head
+}
+
+fn state(c: &Campaign, target: &str) -> Phase {
+    let (unit, step) = target.rsplit_once('/').unwrap();
+    store::load_unit(&c.root.join(unit)).unwrap().steps[step]
+        .track
+        .state
+        .clone()
+}
+
+/// A small committed epoch shaped like a live one: a released tag, an open PR that waits on CI
+/// and review, a merged step its release does not contain, a step waiting on the open one, a
+/// blocked reviewer and RESUME.md's generated status, after one sync that moved the merged step.
+fn epoch() -> (Campaign, Github, String) {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let worktree = c.root.parent().unwrap().join("wt");
+    fs::create_dir_all(&worktree).unwrap();
+    git(&worktree, &["init", "-q"]);
+    git(
+        &worktree,
+        &["commit", "-q", "--allow-empty", "-m", "release"],
+    );
+    git(&worktree, &["tag", "v1.0.0"]);
+    let released = git(&worktree, &["rev-parse", "HEAD"]);
+    fs::write(
+        c.root.join("EPOCH.md"),
+        "---\nstatus: WORKING\nskill_revision: synthetic-skill\napproved_plan_revision: synthetic-plan\n---\n",
+    )
+    .unwrap();
+
+    declare(
+        &host,
+        &c,
+        "00-release/r/1.0.0",
+        &[],
+        Ships {
+            github: Some("o/r".parse().unwrap()),
+            tag: Some("v{version}".into()),
+        },
+    );
+    advance(
+        &host,
+        &c,
+        "00-release/r/1.0.0",
+        Phase::Released,
+        Evidence {
+            sha: Some(released.clone()),
+            tag: Some("v1.0.0".into()),
+            ..Evidence::default()
+        },
+        &worktree,
+    );
+    declare(&host, &c, "01-a/u/OPEN", &[], Ships::default());
+    declare(&host, &c, "01-a/u/MERGED", &[], Ships::default());
+    declare(
+        &host,
+        &c,
+        "02-b/w/LATER",
+        &["01-a/u/OPEN"],
+        Ships::default(),
+    );
+    declare(&host, &c, "02-b/x/REVIEW", &[], Ships::default());
+    let head = open_pr(&host, &c, &worktree, "01-a/u/OPEN", OPEN_PR);
+    open_pr(&host, &c, &worktree, "01-a/u/MERGED", MERGED_PR);
+    let dir = c.root.join("02-b/x");
+    let mut unit = store::load_unit(&dir).unwrap();
+    let review = unit.steps.get_mut("REVIEW").unwrap();
+    review.track.state = Phase::Blocked("REVIEW_BLOCKED".into());
+    review.track.blocked_from = Some(Phase::PrOpen);
+    review.track.since = "2026-10-17T07:00Z".into();
+    review.track.evidence.pr = Some("https://github.com/o/r/pull/3".into());
+    review.track.evidence.sha = Some("a".repeat(40));
+    commands::write_unit(&dir, &unit).unwrap();
+
+    let mut forge = Github::default();
+    forge
+        .tags
+        .insert(("o/r".into(), "v1.0.0".into()), [released].into());
+    forge.set(OPEN_PR, open(&head));
+    forge.set(MERGED_PR, merged(&"c".repeat(40)));
+    let moved = sync(&host, &forge, &c.root).unwrap();
+    assert!(moved.ok(), "{:?}", moved.violations);
+    assert_eq!(state(&c, "01-a/u/MERGED"), Phase::Merged);
+    commit(&c);
+    (c, forge, head)
+}
+
+fn commit(c: &Campaign) {
+    git(&c.root, &["add", "-A"]);
+    git(&c.root, &["commit", "-q", "-m", "sync"]);
+}
+
+/// The paths `git status` would show: changed, removed or new.
+fn status(c: &Campaign) -> Vec<String> {
+    let changed: BTreeSet<String> = git(
+        &c.root,
+        &[
+            "ls-files",
+            "--modified",
+            "--deleted",
+            "--others",
+            "--exclude-standard",
+        ],
+    )
+    .lines()
+    .map(str::to_owned)
+    .collect();
+    changed.into_iter().collect()
+}
+
+/// The untracked runtime files cm keeps under `.cm/`.
+const RUNTIME: [&str; 2] = [".cm/lock", ".cm/pulls-read.json"];
+
+/// Every file of the campaign but git's own and cm's untracked runtime files, with its bytes and
+/// mtime.
+fn files(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
+    fn visit(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, (Vec<u8>, SystemTime)>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.strip_prefix(root).unwrap().to_owned();
+            if name == Path::new(".git") || RUNTIME.iter().any(|runtime| name == Path::new(runtime))
+            {
+                continue;
+            }
+            if path.is_dir() {
+                visit(root, &path, out);
+            } else {
+                let modified = fs::metadata(&path).unwrap().modified().unwrap();
+                out.insert(name, (fs::read(&path).unwrap(), modified));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    visit(root, root, &mut out);
+    out
+}
+
+/// Backdate every file so that any rewrite, even of the same bytes, shows in its mtime.
+fn backdate(root: &Path) {
+    let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    for path in files(root).keys() {
+        fs::File::options()
+            .write(true)
+            .open(root.join(path))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+}
+
+fn quiet(outcome: &Outcome) {
+    assert!(outcome.ok(), "{:?}", outcome.violations);
+    assert_eq!(outcome.fields["moves"], serde_json::json!([]));
+    assert!(
+        outcome.fields.get("journal").is_none(),
+        "{:?}",
+        outcome.lines
+    );
+    assert_eq!(outcome.fields["card_written"], false);
+}
+
+#[test]
+fn a_second_sync_leaves_git_status_clean() {
+    let (c, forge, _) = epoch();
+    assert_eq!(status(&c), Vec::<String>::new());
+    // The time of each full PR read lives in an ignored file; the tracked observation does not
+    // change with it.
+    assert_eq!(
+        fs::read_to_string(c.root.join(".cm/.gitignore")).unwrap(),
+        "lock\nJOURNAL.md\npulls-read.json\n"
+    );
+    for runtime in RUNTIME {
+        git(&c.root, &["check-ignore", "-q", runtime]);
+    }
+    let memo = c.root.join(".cm/pulls-read.json");
+    let reads = |now: &str, reader| {
+        forge.reads.lock().unwrap().clear();
+        quiet(&sync_with(&at(now), reader, &c.root, BUDGET).unwrap());
+        assert_eq!(status(&c), Vec::<String>::new(), "after the sync at {now}");
+        forge.reads()
+    };
+    // Within 30 minutes of the full read at 08:00 the PR answers 304, which keeps that read's
+    // time; an hour later it is read in full.
+    let read_at = |memo: &Path| fs::read_to_string(memo).unwrap();
+    let before = read_at(&memo);
+    assert!(before.contains("\"at\": \"2026-10-17T08:00Z\""), "{before}");
+    for now in ["2026-10-17T08:10:00Z", "2026-10-17T08:20:00Z"] {
+        reads(now, Reader::Concurrent(&forge));
+        assert_eq!(read_at(&memo), before, "a 304 at {now} is not a full read");
+    }
+    assert_eq!(
+        reads("2026-10-17T09:00:00Z", Reader::Serial(&forge)),
+        [
+            format!("contains o/r v1.0.0 {}", "c".repeat(40)),
+            format!("pull {OPEN_PR}"),
+        ]
+    );
+    assert!(read_at(&memo).contains("\"at\": \"2026-10-17T09:00Z\""));
+    // A fresh clone has no read times: it reads every PR in full once.
+    fs::remove_file(&memo).unwrap();
+    reads("2026-10-17T09:01:00Z", Reader::Serial(&forge));
+    assert!(memo.exists());
+}
+
+#[test]
+fn render_on_change_writes_no_file_and_no_journal_entry() {
+    let (c, forge, _) = epoch();
+    backdate(&c.root);
+    let before = files(&c.root);
+    for now in ["2026-10-17T08:05:00Z", "2026-10-18T12:00:00Z"] {
+        quiet(&sync(&at(now), &forge, &c.root).unwrap());
+        let after = files(&c.root);
+        assert_eq!(
+            after.keys().collect::<Vec<_>>(),
+            before.keys().collect::<Vec<_>>(),
+            "a sync at {now} created or removed a file"
+        );
+        for (path, (bytes, modified)) in &before {
+            assert_eq!(&after[path].0, bytes, "{} changed at {now}", path.display());
+            assert_eq!(
+                &after[path].1,
+                modified,
+                "{} was rewritten at {now}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_real_change_writes_exactly_the_views_it_affects() {
+    let (c, forge, _) = epoch();
+    let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    forge.set(OPEN_PR, merged(&"d".repeat(40)));
+    let moved = sync(&at("2026-10-17T10:00:00Z"), &forge, &c.root).unwrap();
+    assert!(moved.ok(), "{:?}", moved.violations);
+    assert_eq!(state(&c, "01-a/u/OPEN"), Phase::Merged);
+    assert_eq!(moved.fields["card_written"], true);
+    assert_eq!(
+        status(&c),
+        [
+            ".cm/pulls.json",
+            "01-a/u/.cm/state.json",
+            "01-a/u/STATE.md",
+            "CARD.md",
+            "JOURNAL.md",
+            "RESUME.md",
+        ]
+    );
+    let added = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
+    let entries: Vec<_> = added
+        .strip_prefix(journal.as_str())
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with("## "))
+        .collect();
+    assert_eq!(
+        entries,
+        ["## 2026-10-17T10:00Z — cm sync: 1 move(s) from GitHub"]
+    );
+}
+
+#[test]
+fn every_view_renders_the_same_bytes_for_the_same_state() {
+    let (c, forge, _) = epoch();
+    let units = cm::plan::load_units(&c.root).unwrap();
+    let next = cm::plan::summary(&c.root, &units);
+    let card = |now: &str| cm::render::card(&c.root, at(now).now, "campaign", &units, &next);
+    let rendered = card("2026-10-17T08:00:00Z");
+    for now in [
+        "2026-10-17T08:00:00Z",
+        "2026-10-17T08:59:00Z",
+        "2026-10-17T11:30:00Z",
+    ] {
+        assert_eq!(card(now), rendered, "CARD.md rendered at {now}");
+    }
+    assert!(rendered.starts_with("# campaign card\n\n"), "{rendered}");
+    assert!(
+        rendered.contains(
+            "reviewer blocked 02-b/x/REVIEW: REVIEW_BLOCKED, since 2026-10-17T07:00Z (head "
+        ),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("waited"), "{rendered}");
+    assert!(!rendered.contains("Last run"), "{rendered}");
+    assert!(!rendered.contains("GitHub REST core"), "{rendered}");
+    assert!(!rendered.contains("Moved this run"), "{rendered}");
+    for (name, unit) in &units {
+        let state = cm::render::unit(unit);
+        assert_eq!(cm::render::unit(unit), state, "{name}/STATE.md");
+        assert_eq!(
+            fs::read_to_string(c.root.join(name).join(store::UNIT_STATE)).unwrap(),
+            state,
+            "{name}/STATE.md on disk"
+        );
+    }
+
+    // RESUME.md's status and the card a sync writes are the same at any later time.
+    let later = files(&c.root);
+    quiet(&sync(&at("2026-10-17T13:00:00Z"), &forge, &c.root).unwrap());
+    for name in ["CARD.md", "RESUME.md"] {
+        assert_eq!(
+            fs::read(c.root.join(name)).unwrap(),
+            later[Path::new(name)].0,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_concurrent_sync_makes_the_reads_and_writes_of_a_serial_one() {
+    let (c, forge, _) = epoch();
+    let copy = tempfile::tempdir().unwrap();
+    let twin = copy.path().join("campaign");
+    let copied = Command::new("cp")
+        .arg("-a")
+        .arg(&c.root)
+        .arg(&twin)
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    forge.set(OPEN_PR, merged(&"d".repeat(40)));
+    let host = at("2026-10-17T10:00:00Z");
+    forge.reads.lock().unwrap().clear();
+    let serial = sync(&host, &forge, &c.root).unwrap();
+    let serial_reads = forge.reads();
+    forge.reads.lock().unwrap().clear();
+    let concurrent = sync_with(&host, Reader::Concurrent(&forge), &twin, BUDGET).unwrap();
+    assert_eq!(forge.reads(), serial_reads);
+    assert_eq!(concurrent.violations, serial.violations);
+    assert_eq!(concurrent.fields["moves"], serial.fields["moves"]);
+    let strip = |files: BTreeMap<PathBuf, (Vec<u8>, SystemTime)>| {
+        files
+            .into_iter()
+            .map(|(path, (bytes, _))| (path, bytes))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(strip(files(&twin)), strip(files(&c.root)));
+}
+
+#[test]
+fn a_failing_sync_reports_each_phase_and_a_quiet_one_does_not() {
+    let (c, forge, _) = epoch();
+    let quietly = sync(&at("2026-10-17T08:05:00Z"), &forge, &c.root).unwrap();
+    quiet(&quietly);
+    assert!(quietly.fields.get("timing").is_none());
+    assert!(!quietly.lines.iter().any(|line| line.starts_with("phase ")));
+
+    forge.set(
+        OPEN_PR,
+        Pull {
+            state: PullState::Closed,
+            ..open(&"e".repeat(40))
+        },
+    );
+    let failed = sync(&at("2026-10-17T08:10:00Z"), &forge, &c.root).unwrap();
+    assert_eq!(
+        failed
+            .violations
+            .iter()
+            .map(|violation| violation.rule)
+            .collect::<Vec<_>>(),
+        ["pr-closed"]
+    );
+    let phases: Vec<_> = failed.fields["timing"]["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|phase| phase["phase"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        phases,
+        [
+            "guard", "load", "read", "lock", "apply", "write", "journal", "render", "report"
+        ]
+    );
+    assert!(
+        failed
+            .lines
+            .iter()
+            .any(|line| line.starts_with("phase read: ") && line.contains("1 pull")),
+        "{:?}",
+        failed.lines
+    );
+}
+
+#[test]
+fn gh_reads_run_at_once() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let worktree = c.root.parent().unwrap().join("wt");
+    fs::create_dir_all(&worktree).unwrap();
+    git(&worktree, &["init", "-q"]);
+    for number in 1..=4 {
+        let target = format!("01-a/u/S{number}");
+        declare(&host, &c, &target, &[], Ships::default());
+        open_pr(
+            &host,
+            &c,
+            &worktree,
+            &target,
+            &format!("https://github.com/o/r/pull/{number}"),
+        );
+    }
+    // Each PR read waits, up to five seconds, until another read is in flight beside it.
+    let gh = support::FakeGh::new(
+        r#"[ "$2" = rate_limit ] && exit 1
+touch "$FAKE_GH/in.$$"
+tries=100
+while :; do
+    seen=$(ls "$FAKE_GH" | grep -c '^in\.')
+    if [ "$seen" -ge 2 ] || [ "$tries" -eq 0 ]; then break; fi
+    tries=$((tries - 1))
+    sleep 0.05
+done
+echo "$seen" >>"$FAKE_GH/overlap"
+rm "$FAKE_GH/in.$$"
+echo '{"state":"open","merged":false,"head":{"sha":"0000000000000000000000000000000000000000"}}'
+"#,
+    );
+    let forge = cm::forge::Gh {
+        program: gh.program(),
+        timeout: Duration::from_secs(30),
+    };
+    let synced = sync_with(&host, Reader::Concurrent(&forge), &c.root, BUDGET).unwrap();
+    assert!(synced.ok(), "{:?}", synced.violations);
+    let overlap = fs::read_to_string(gh.fixture().join("overlap")).unwrap();
+    assert_eq!(overlap.lines().count(), 4, "{overlap}");
+    assert!(
+        overlap
+            .lines()
+            .all(|seen| seen.parse::<usize>().unwrap() >= 2),
+        "a read ran alone: {overlap}"
+    );
+}
+
+#[test]
+fn cm_sync_prints_phases_past_its_budget() {
+    let c = campaign(&at("2026-10-17T08:00:00Z"));
+    let gh = support::FakeGh::new("exit 1\n");
+    let run = |budget: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("-C")
+            .arg(&c.root)
+            .args(["--json", "sync", "--budget-secs", budget])
+            .env("PATH", gh.path())
+            .output()
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let over = run("0");
+    assert_eq!(over["timing"]["budget_seconds"], 0);
+    assert_eq!(over["timing"]["phases"].as_array().unwrap().len(), 9);
+    assert!(run("600").get("timing").is_none());
+}

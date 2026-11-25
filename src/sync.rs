@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::attempt::{recorded_id, remote_turn};
 use crate::commands::{check_release_pr, closed, is_pr_url, write_unit};
@@ -23,6 +26,15 @@ use crate::store::{self, lock, parse_target, write_atomic};
 
 pub const CARD: &str = "CARD.md";
 
+/// The default for `cm sync --budget-secs`: a sync slower than this prints its phase times.
+pub const BUDGET: Duration = Duration::from_secs(30);
+
+/// Forge reads in flight at once when the forge can be shared across threads.
+const READERS: usize = 8;
+
+/// Planning walks before the read walk makes what is still missing one read at a time.
+const PLAN_ROUNDS: usize = 5;
+
 pub struct Moved {
     pub target: String,
     pub from: Phase,
@@ -34,6 +46,18 @@ type Read<T> = Result<T, ForgeError>;
 type TurnQuery = (String, String, String, Vec<String>);
 
 const PULL_MAX_AGE: jiff::SignedDuration = jiff::SignedDuration::from_mins(30);
+
+/// `.cm/pulls-read.json`, kept out of git: when sync last read each open PR in full and the
+/// validators it holds, so a quiet sync's reads change no tracked file.
+pub const PULLS_READ: &str = "pulls-read.json";
+
+/// The last full read of an open PR and the ETags to send with the next.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct LastRead {
+    at: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    etags: BTreeMap<String, String>,
+}
 
 #[derive(Clone)]
 struct PullRead {
@@ -60,20 +84,106 @@ struct Reads {
     publications:
         BTreeMap<(Vec<String>, GithubRepo, TagName, Version), Read<crate::forge::Publication>>,
     completed_checks: BTreeMap<(GithubRepo, CommitSha, Vec<String>), Read<Vec<CheckState>>>,
+    /// The quota sample, when a concurrent sync took it beside its first reads.
+    rate_limit: Option<Option<String>>,
+    /// Reads made, by kind, for the phase report.
+    made: BTreeMap<&'static str, usize>,
 }
 
-fn cached<K: Ord, T: Clone>(
-    cache: &mut BTreeMap<K, T>,
-    key: K,
-    forge: Option<&dyn Forge>,
-    read: impl FnOnce(&dyn Forge) -> T,
-) -> Option<T> {
-    if let Some(hit) = cache.get(&key) {
-        return Some(hit.clone());
+impl Reads {
+    fn summary(&self) -> String {
+        if self.made.is_empty() {
+            return "no forge reads".to_owned();
+        }
+        let kinds: Vec<String> = self
+            .made
+            .iter()
+            .map(|(kind, count)| format!("{count} {kind}"))
+            .collect();
+        kinds.join(", ")
     }
-    let result = read(forge?);
-    cache.insert(key, result.clone());
-    Some(result)
+}
+
+/// Stores one finished read in the cache that wanted it.
+type Store = Box<dyn FnOnce(&mut Reads) + Send>;
+/// A read a planning walk missed, made later and possibly on another thread.
+type Job = Box<dyn FnOnce(&dyn Forge) -> Store + Send>;
+
+/// What a walk does on a cache miss.
+#[derive(Clone, Copy)]
+enum Access<'a> {
+    /// Read the forge now, one call at a time.
+    Read(&'a dyn Forge),
+    /// Record the read as a job and carry on as if it were unavailable.
+    Plan,
+    /// Nothing: the walk under the lock applies only what the reads saw.
+    Cached,
+}
+
+/// How `sync_with` reaches the forge.
+#[derive(Clone, Copy)]
+pub enum Reader<'a> {
+    /// Every read in walk order, one at a time.
+    Serial(&'a dyn Forge),
+    /// Up to eight independent reads at once before the walk, which then makes only what is left.
+    Concurrent(&'a (dyn Forge + Sync)),
+}
+
+/// Wall time per sync phase, printed when a sync fails or runs past its budget.
+struct Phases {
+    start: Instant,
+    last: Instant,
+    spent: Vec<(&'static str, Duration, String)>,
+}
+
+impl Phases {
+    fn new() -> Self {
+        let start = Instant::now();
+        Phases {
+            start,
+            last: start,
+            spent: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, phase: &'static str) {
+        self.note(phase, String::new());
+    }
+
+    fn note(&mut self, phase: &'static str, note: String) {
+        let now = Instant::now();
+        self.spent.push((phase, now - self.last, note));
+        self.last = now;
+    }
+
+    fn lines(&self, total: Duration, budget: Duration) -> Vec<String> {
+        let mut lines = vec![format!(
+            "sync took {:.2} s (budget {} s); phases:",
+            total.as_secs_f64(),
+            budget.as_secs()
+        )];
+        lines.extend(self.spent.iter().map(|(phase, spent, note)| {
+            let note = if note.is_empty() {
+                String::new()
+            } else {
+                format!(" ({note})")
+            };
+            format!("phase {phase}: {:.2} s{note}", spent.as_secs_f64())
+        }));
+        lines
+    }
+
+    fn json(&self, total: Duration, budget: Duration) -> Value {
+        json!({
+            "seconds": total.as_secs_f64(),
+            "budget_seconds": budget.as_secs(),
+            "phases": self.spent.iter().map(|(phase, spent, note)| json!({
+                "phase": phase,
+                "seconds": spent.as_secs_f64(),
+                "note": note,
+            })).collect::<Vec<_>>(),
+        })
+    }
 }
 
 struct Shipped {
@@ -85,8 +195,10 @@ struct Shipped {
 
 struct Run<'a> {
     root: &'a Path,
-    forge: Option<&'a dyn Forge>,
+    access: Access<'a>,
     reads: Reads,
+    wanted: Vec<Job>,
+    planned: BTreeSet<String>,
     at: String,
     units: Units,
     dirty: BTreeSet<String>,
@@ -94,6 +206,9 @@ struct Run<'a> {
     violations: Vec<Violation>,
     open: BTreeMap<String, plan::Observed>,
     seen: BTreeMap<String, plan::Observed>,
+    /// `.cm/pulls-read.json` as this walk found it, and as this walk leaves it.
+    last_read: BTreeMap<String, LastRead>,
+    read_now: BTreeMap<String, LastRead>,
     now: jiff::Timestamp,
     heads: BTreeMap<String, String>,
     notes: Vec<(String, String)>,
@@ -119,6 +234,17 @@ impl Tracked {
     }
 }
 
+/// Two observations of an open PR that differ at most in when and with which validators they
+/// were read.
+fn same_facts(a: &plan::Observed, b: &plan::Observed) -> bool {
+    a.target == b.target
+        && a.head == b.head
+        && a.base == b.base
+        && a.mergeable_state == b.mergeable_state
+        && a.ci_head == b.ci_head
+        && a.ci_base == b.ci_base
+}
+
 fn merge_of(evidence: &Evidence) -> Option<(GithubRepo, CommitSha)> {
     let repo = evidence.pr.as_deref().and_then(GithubRepo::of_pr)?;
     let sha = CommitSha::new(evidence.sha.clone()?);
@@ -128,7 +254,7 @@ fn merge_of(evidence: &Evidence) -> Option<(GithubRepo, CommitSha)> {
 impl<'a> Run<'a> {
     fn new(
         root: &'a Path,
-        forge: Option<&'a dyn Forge>,
+        access: Access<'a>,
         reads: Reads,
         now: jiff::Timestamp,
         units: Units,
@@ -138,8 +264,10 @@ impl<'a> Run<'a> {
         let turn_warnings = turn_commands.errors().cloned().collect();
         Run {
             root,
-            forge,
+            access,
             reads,
+            wanted: Vec::new(),
+            planned: BTreeSet::new(),
             at: stamp(now),
             units,
             dirty: BTreeSet::new(),
@@ -147,6 +275,9 @@ impl<'a> Run<'a> {
             violations: Vec::new(),
             open: BTreeMap::new(),
             seen: store::read_json(&plan::pulls_path(root)).unwrap_or_default(),
+            last_read: store::read_json(&root.join(store::CM_DIR).join(PULLS_READ))
+                .unwrap_or_default(),
+            read_now: BTreeMap::new(),
             now,
             heads: BTreeMap::new(),
             notes: Vec::new(),
@@ -154,6 +285,50 @@ impl<'a> Run<'a> {
             discovery_warnings: Vec::new(),
             turn_commands,
             turn_warnings,
+        }
+    }
+
+    fn planning(&self) -> bool {
+        matches!(self.access, Access::Plan)
+    }
+
+    /// A read through the cache. On a miss it reads now, records a job for later, or gives
+    /// nothing, by the walk's access.
+    fn read<K, T>(
+        &mut self,
+        kind: &'static str,
+        cache: fn(&mut Reads) -> &mut BTreeMap<K, T>,
+        key: K,
+        read: impl FnOnce(&dyn Forge) -> T + Send + 'static,
+    ) -> Option<T>
+    where
+        K: Ord + fmt::Debug + Send + 'static,
+        T: Clone + Send + 'static,
+    {
+        if let Some(hit) = cache(&mut self.reads).get(&key) {
+            return Some(hit.clone());
+        }
+        match self.access {
+            Access::Read(forge) => {
+                let value = read(forge);
+                *self.reads.made.entry(kind).or_default() += 1;
+                cache(&mut self.reads).insert(key, value.clone());
+                Some(value)
+            }
+            Access::Plan => {
+                if self.planned.insert(format!("{kind} {key:?}")) {
+                    self.wanted
+                        .push(Box::new(move |forge: &dyn Forge| -> Store {
+                            let value = read(forge);
+                            Box::new(move |reads: &mut Reads| {
+                                *reads.made.entry(kind).or_default() += 1;
+                                cache(reads).entry(key).or_insert(value);
+                            })
+                        }));
+                }
+                None
+            }
+            Access::Cached => None,
         }
     }
 
@@ -398,40 +573,53 @@ impl<'a> Run<'a> {
     }
 
     fn pull(&mut self, url: &str, target: Option<&str>) -> Option<Read<PullRead>> {
-        let previous = self.seen.get(url).filter(|seen| {
-            Some(seen.target.as_str()) == target
-                && seen.at.parse::<jiff::Timestamp>().is_ok_and(|at| {
-                    (jiff::SignedDuration::ZERO..PULL_MAX_AGE)
-                        .contains(&self.now.duration_since(at))
-                })
+        let fresh = self.last_read.get(url).filter(|read| {
+            read.at.parse::<jiff::Timestamp>().is_ok_and(|at| {
+                (jiff::SignedDuration::ZERO..PULL_MAX_AGE).contains(&self.now.duration_since(at))
+            })
         });
-        let empty = BTreeMap::new();
-        cached(&mut self.reads.pulls, url.to_owned(), self.forge, |forge| {
-            let mut etags = BTreeMap::new();
-            let validators = previous.map_or(&empty, |seen| &seen.etags);
-            if let Some(pull) = forge.pull_conditional(url, validators, &mut etags)? {
-                return Ok(PullRead {
+        let validators = fresh.map(|read| read.etags.clone()).unwrap_or_default();
+        let previous = self
+            .seen
+            .get(url)
+            .filter(|seen| fresh.is_some() && Some(seen.target.as_str()) == target)
+            .cloned();
+        let read = url.to_owned();
+        self.read(
+            "pull",
+            |reads| &mut reads.pulls,
+            url.to_owned(),
+            move |forge| {
+                let mut etags = BTreeMap::new();
+                let validators = if previous.is_some() {
+                    validators
+                } else {
+                    BTreeMap::new()
+                };
+                if let Some(pull) = forge.pull_conditional(&read, &validators, &mut etags)? {
+                    return Ok(PullRead {
+                        pull,
+                        etags,
+                        cached_at: None,
+                    });
+                }
+                let seen = previous.ok_or(ForgeError::Json)?;
+                let pull = Pull {
+                    state: PullState::Open,
+                    merge_commit: None,
+                    merged_at: None,
+                    head: seen.head.as_ref().map(CommitSha::new),
+                    head_ref: None,
+                    base: seen.base.as_ref().map(CommitSha::new),
+                    mergeable_state: seen.mergeable_state.clone(),
+                };
+                Ok(PullRead {
                     pull,
                     etags,
-                    cached_at: None,
-                });
-            }
-            let seen = previous.ok_or(ForgeError::Json)?;
-            let pull = Pull {
-                state: PullState::Open,
-                merge_commit: None,
-                merged_at: None,
-                head: seen.head.as_ref().map(CommitSha::new),
-                head_ref: None,
-                base: seen.base.as_ref().map(CommitSha::new),
-                mergeable_state: seen.mergeable_state.clone(),
-            };
-            Ok(PullRead {
-                pull,
-                etags,
-                cached_at: Some(seen.at.clone()),
-            })
-        })
+                    cached_at: Some(seen.at.clone()),
+                })
+            },
+        )
     }
 
     fn open_checks(
@@ -441,21 +629,31 @@ impl<'a> Run<'a> {
         previous: &BTreeMap<String, String>,
     ) -> Option<Read<OpenChecks>> {
         let key = (repo.clone(), head.clone());
-        cached(&mut self.reads.open_checks, key, self.forge, |forge| {
-            let mut etags = BTreeMap::new();
-            let checks = forge.checks_conditional(repo, head, previous, &mut etags)?;
-            let completed = checks.is_some_and(|checks| {
-                !checks.is_empty() && checks.iter().all(CheckState::completed)
-            });
-            Ok(OpenChecks { completed, etags })
-        })
+        let (repo, head, previous) = (repo.clone(), head.clone(), previous.clone());
+        self.read(
+            "pending-ci",
+            |reads| &mut reads.open_checks,
+            key,
+            move |forge| {
+                let mut etags = BTreeMap::new();
+                let checks = forge.checks_conditional(&repo, &head, &previous, &mut etags)?;
+                let completed = checks.is_some_and(|checks| {
+                    !checks.is_empty() && checks.iter().all(CheckState::completed)
+                });
+                Ok(OpenChecks { completed, etags })
+            },
+        )
     }
 
     fn tag_exists(&mut self, repo: &GithubRepo, tag: &TagName) -> Option<Read<bool>> {
         let key = (repo.clone(), tag.clone());
-        cached(&mut self.reads.tags, key, self.forge, |forge| {
-            forge.tag_exists(repo, tag)
-        })
+        let (repo, tag) = key.clone();
+        self.read(
+            "tag",
+            |reads| &mut reads.tags,
+            key,
+            move |forge| forge.tag_exists(&repo, &tag),
+        )
     }
 
     fn contains(
@@ -465,16 +663,24 @@ impl<'a> Run<'a> {
         sha: &CommitSha,
     ) -> Option<Read<bool>> {
         let key = (repo.clone(), tag.clone(), sha.clone());
-        cached(&mut self.reads.contains, key, self.forge, |forge| {
-            forge.tag_contains(repo, tag, sha)
-        })
+        let (repo, tag, sha) = key.clone();
+        self.read(
+            "compare",
+            |reads| &mut reads.contains,
+            key,
+            move |forge| forge.tag_contains(&repo, &tag, &sha),
+        )
     }
 
     fn checks(&mut self, repo: &GithubRepo, sha: &CommitSha) -> Option<Read<Vec<CheckState>>> {
         let key = (repo.clone(), sha.clone());
-        cached(&mut self.reads.checks, key, self.forge, |forge| {
-            forge.checks(repo, sha)
-        })
+        let (repo, sha) = key.clone();
+        self.read(
+            "ci",
+            |reads| &mut reads.checks,
+            key,
+            move |forge| forge.checks(&repo, &sha),
+        )
     }
 
     fn completed_checks(
@@ -491,9 +697,13 @@ impl<'a> Run<'a> {
             .map(|check| check.name.clone())
             .collect();
         let key = (repo.clone(), base.clone(), names.clone());
-        cached(&mut self.reads.completed_checks, key, self.forge, |forge| {
-            forge.latest_completed_checks(repo, base, &names)
-        })
+        let (repo, base) = (repo.clone(), base.clone());
+        self.read(
+            "completed-ci",
+            |reads| &mut reads.completed_checks,
+            key,
+            move |forge| forge.latest_completed_checks(&repo, &base, &names),
+        )
     }
 
     /// A codex step merged on GitHub moves to merged only when its merge gate holds at the PR
@@ -616,9 +826,13 @@ impl<'a> Run<'a> {
                 turn.turn.to_owned(),
                 argv.clone(),
             );
-            let observed = match cached(&mut self.reads.turns, key, self.forge, |_| {
-                read_remote_turn(&argv, turn.thread, turn.turn, TURN_READER_TIMEOUT)
-            }) {
+            let (thread, turn_id) = (key.1.clone(), key.2.clone());
+            let observed = match self.read(
+                "turn",
+                |reads| &mut reads.turns,
+                key,
+                move |_| read_remote_turn(&argv, &thread, &turn_id, TURN_READER_TIMEOUT),
+            ) {
                 Some(Ok(read)) if read.done => {
                     let completed_at = read
                         .completed_at
@@ -701,9 +915,13 @@ impl<'a> Run<'a> {
             if let Some(branch) = recorded_branch.filter(|branch| !branch.starts_with('-')) {
                 // Replay requires the same attempt and launch metadata that the read used.
                 let key = (attempt.id.clone(), repo.clone(), branch.to_owned());
-                match cached(&mut self.reads.branch_pulls, key, self.forge, |forge| {
-                    forge.open_pull_for_branch(&repo, branch)
-                }) {
+                let (lookup, wanted) = (repo.clone(), branch.to_owned());
+                match self.read(
+                    "branch",
+                    |reads| &mut reads.branch_pulls,
+                    key,
+                    move |forge| forge.open_pull_for_branch(&lookup, &wanted),
+                ) {
                     Some(Ok(Some(url))) if self.discover_pr(&target, &repo, &url, None) => continue,
                     Some(Err(error)) => self.discovery_warnings.push(format!(
                         "{target}: could not look up {repo} branch {branch}: {error}"
@@ -877,7 +1095,8 @@ impl<'a> Run<'a> {
                     {
                         let validators = previous
                             .filter(|seen| seen.head.as_deref() == Some(head.as_str()))
-                            .map(|seen| seen.etags.clone())
+                            .and_then(|_| self.last_read.get(&url))
+                            .map(|read| read.etags.clone())
                             .unwrap_or_default();
                         if let Some(Ok(checks)) = self.open_checks(&repo, head, &validators) {
                             etags.extend(checks.etags);
@@ -887,19 +1106,34 @@ impl<'a> Run<'a> {
                             }
                         }
                     }
-                    self.open.insert(
-                        url.clone(),
-                        plan::Observed {
-                            base: base.map(|base| base.to_string()),
-                            ci_head,
-                            ci_base,
-                            target: target.clone(),
-                            at: cached_at.unwrap_or_else(|| self.at.clone()),
-                            head: head.map(|head| head.to_string()),
-                            mergeable_state,
-                            etags,
-                        },
-                    );
+                    // A 304 keeps the time of the full read it validated.
+                    let read_at = match &cached_at {
+                        None => Some(self.at.clone()),
+                        Some(_) => self.last_read.get(&url).map(|read| read.at.clone()),
+                    };
+                    let observed = plan::Observed {
+                        base: base.map(|base| base.to_string()),
+                        ci_head,
+                        ci_base,
+                        target: target.clone(),
+                        at: cached_at.unwrap_or_else(|| self.at.clone()),
+                        head: head.map(|head| head.to_string()),
+                        mergeable_state,
+                        etags,
+                    };
+                    if let Some(at) = read_at {
+                        let etags = observed.etags.clone();
+                        self.read_now.insert(url.clone(), LastRead { at, etags });
+                    }
+                    // A read that saw no new fact keeps the stored observation, its stamp and
+                    // validators included, so `.cm/pulls.json` changes only with a fact.
+                    let observed = self
+                        .seen
+                        .get(&url)
+                        .filter(|seen| same_facts(seen, &observed))
+                        .cloned()
+                        .unwrap_or(observed);
+                    self.open.insert(url.clone(), observed);
                 }
             }
         }
@@ -942,17 +1176,26 @@ impl<'a> Run<'a> {
                             tag.clone(),
                             release.version,
                         );
-                        let Some(Ok(read)) =
-                            cached(&mut self.reads.publications, key, self.forge, |forge| {
+                        let (artifacts, shipped, tagged, version) = (
+                            step.artifacts.clone(),
+                            repo.clone(),
+                            tag.clone(),
+                            release.version,
+                        );
+                        let Some(Ok(read)) = self.read(
+                            "publication",
+                            |reads| &mut reads.publications,
+                            key,
+                            move |forge| {
                                 Ok(crate::forge::publication(
                                     Some(forge),
-                                    &step.artifacts,
-                                    Some(&repo),
-                                    &release.version,
-                                    &tag,
+                                    &artifacts,
+                                    Some(&shipped),
+                                    &version,
+                                    &tagged,
                                 ))
-                            })
-                        else {
+                            },
+                        ) else {
                             continue;
                         };
                         let present = read.missing.is_empty() && read.unknown.is_empty();
@@ -1044,6 +1287,8 @@ impl<'a> Run<'a> {
             };
             for shipped in releases.iter().filter(|shipped| shipped.repo == repo) {
                 match self.contains(&repo, &shipped.tag, &sha) {
+                    // A planning walk asks for every tag at once rather than one per round.
+                    None if self.planning() => {}
                     None => {
                         self.unknown(
                             &target,
@@ -1138,6 +1383,7 @@ impl<'a> Run<'a> {
                     continue;
                 }
                 match self.contains(&repo, &shipped.tag, &sha) {
+                    None if self.planning() => {}
                     None => break,
                     Some(Ok(true)) => {
                         found = Some(shipped);
@@ -1214,36 +1460,145 @@ pub(crate) fn render_resume(root: &Path, units: &Units, closed: bool) -> Result<
     Ok(())
 }
 
+/// Make every read a planning walk wants, `READERS` at a time, and walk again with the answers
+/// until a walk wants nothing new, so the read walk finds its reads cached. Planning walks change
+/// nothing on disk; a read they missed, the read walk makes itself.
+fn prefetch(
+    root: &Path,
+    forge: &(dyn Forge + Sync),
+    now: jiff::Timestamp,
+    units: &Units,
+    owner_unread: &[String],
+) -> Reads {
+    let mut reads = Reads::default();
+    let mut jobs: Vec<Job> = vec![Box::new(|forge: &dyn Forge| -> Store {
+        let sample = forge.rate_limit();
+        Box::new(move |reads: &mut Reads| reads.rate_limit = Some(sample))
+    })];
+    for _ in 0..PLAN_ROUNDS {
+        let mut plan = Run::new(
+            root,
+            Access::Plan,
+            reads,
+            now,
+            units.clone(),
+            owner_unread.to_vec(),
+        );
+        plan.walk();
+        reads = std::mem::take(&mut plan.reads);
+        jobs.append(&mut plan.wanted);
+        if jobs.is_empty() {
+            break;
+        }
+        for store in perform(std::mem::take(&mut jobs), forge) {
+            store(&mut reads);
+        }
+    }
+    reads
+}
+
+fn perform(jobs: Vec<Job>, forge: &(dyn Forge + Sync)) -> Vec<Store> {
+    let readers = READERS.min(jobs.len());
+    let queue = Mutex::new(jobs.into_iter());
+    let done = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..readers {
+            scope.spawn(|| {
+                loop {
+                    let Some(job) = queue.lock().expect("read queue").next() else {
+                        break;
+                    };
+                    let store = job(forge);
+                    done.lock().expect("read results").push(store);
+                }
+            });
+        }
+    });
+    done.into_inner().expect("read results")
+}
+
+/// `cm sync` with one read at a time and the default budget.
 pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> {
+    sync_with(host, Reader::Serial(forge), root, BUDGET)
+}
+
+/// `cm sync`. A sync that fails, or takes longer than `budget`, reports each phase's wall time:
+/// as output lines and the `timing` field, or on stderr when it stops with an error.
+pub fn sync_with(
+    host: &dyn Host,
+    reader: Reader<'_>,
+    root: &Path,
+    budget: Duration,
+) -> Result<Outcome> {
+    let mut phases = Phases::new();
+    let result = run_sync(host, reader, root, &mut phases);
+    let total = phases.start.elapsed();
+    match result {
+        Ok(mut outcome) => {
+            if !outcome.ok() || total > budget {
+                for line in phases.lines(total, budget) {
+                    outcome.line(line);
+                }
+                outcome.field("timing", phases.json(total, budget));
+            }
+            Ok(outcome)
+        }
+        Err(error) => {
+            for line in phases.lines(total, budget) {
+                eprintln!("{line}");
+            }
+            Err(error)
+        }
+    }
+}
+
+fn run_sync(
+    host: &dyn Host,
+    reader: Reader<'_>,
+    root: &Path,
+    phases: &mut Phases,
+) -> Result<Outcome> {
     let found = guard(root)?;
+    phases.mark("guard");
     if !found.is_empty() {
         return Ok(Outcome::refused(found));
     }
     let now = host.now();
-    let mut read = Run::new(
-        root,
-        Some(forge),
-        Reads::default(),
-        now,
-        plan::load_units(root)?,
-        crate::ledger::unread_owner_queue(root)?,
-    );
+    let units = plan::load_units(root)?;
+    let owner_unread = crate::ledger::unread_owner_queue(root)?;
+    phases.mark("load");
+    let (forge, reads, at_once): (&dyn Forge, _, _) = match reader {
+        Reader::Serial(forge) => (forge, Reads::default(), 1),
+        Reader::Concurrent(forge) => (
+            forge,
+            prefetch(root, forge, now, &units, &owner_unread),
+            READERS,
+        ),
+    };
+    let mut read = Run::new(root, Access::Read(forge), reads, now, units, owner_unread);
     read.walk();
-    let rate_limit = forge.rate_limit();
+    let rate_limit = match read.reads.rate_limit.take() {
+        Some(sample) => sample,
+        None => forge.rate_limit(),
+    };
+    let summary = read.reads.summary();
+    phases.note("read", format!("{summary}; up to {at_once} at once"));
     let _lock = lock(root)?;
+    phases.mark("lock");
     let found = guard(root)?;
     if !found.is_empty() {
         return Ok(Outcome::refused(found));
     }
     let mut run = Run::new(
         root,
-        None,
+        Access::Cached,
         read.reads,
         now,
         plan::load_units(root)?,
         crate::ledger::unread_owner_queue(root)?,
     );
     run.walk();
+    phases.mark("apply");
     for name in &run.dirty {
         write_unit(&root.join(name), &run.units[name])?;
     }
@@ -1258,10 +1613,27 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
             open.entry(url).or_insert(observed);
         }
     }
+    let mut last_read = std::mem::take(&mut run.read_now);
+    for url in open.keys() {
+        if let Some(kept) = run
+            .last_read
+            .get(url)
+            .filter(|_| !last_read.contains_key(url))
+        {
+            last_read.insert(url.clone(), kept.clone());
+        }
+    }
+    last_read.retain(|url, _| open.contains_key(url));
+    let last_read_path = root.join(store::CM_DIR).join(PULLS_READ);
+    if !last_read.is_empty() || last_read_path.exists() {
+        store::ignore(root, PULLS_READ)?;
+        store::write_json(&last_read_path, &last_read)?;
+    }
     let mut campaign = store::load_campaign(root)?;
     campaign.schema = crate::state::SCHEMA;
     store::write_json(&store::state_path(root), &campaign)?;
     store::write_json(&plan::pulls_path(root), &open)?;
+    phases.mark("write");
     let mut outcome = Outcome::refused(std::mem::take(&mut run.violations));
     crate::ledger::owner_queue_banner(root, &mut outcome)?;
     if !run.turn_warnings.is_empty() {
@@ -1327,22 +1699,16 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
     if changed {
         store::write_json(&marker_path, &notified)?;
     }
+    phases.mark("journal");
     let next = plan::summary(root, &run.units);
     let name = root
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let card = render::card_with_rate_limit(
-        root,
-        run.now,
-        &name,
-        &run.units,
-        &next,
-        &run.moves,
-        rate_limit.as_deref(),
-    );
-    write_atomic(&root.join(CARD), card.as_bytes())?;
+    let card = render::card(root, run.now, &name, &run.units, &next);
+    let wrote_card = store::write_changed(&root.join(CARD), card.as_bytes())?;
     render_resume(root, &run.units, false)?;
+    phases.mark("render");
     for moved in &run.moves {
         outcome.line(format!(
             "{}: {} → {} ({})",
@@ -1372,13 +1738,23 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
             .map(|(url, observed)| plan::dirty_json(url, observed))
             .collect::<Vec<_>>(),
     );
+    if let Some(sample) = rate_limit {
+        outcome.line(sample.clone());
+        outcome.field("rate_limit", sample);
+    }
     outcome.line(format!(
-        "synced at {}: {} move(s); wrote {CARD}",
+        "synced at {}: {} move(s); {}",
         run.at,
-        run.moves.len()
+        run.moves.len(),
+        if wrote_card {
+            format!("wrote {CARD}")
+        } else {
+            format!("{CARD} unchanged")
+        }
     ));
     outcome.field("at", run.at.clone());
     outcome.field("card", CARD);
+    outcome.field("card_written", wrote_card);
     let moves = run
         .moves
         .iter()
@@ -1392,5 +1768,6 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
         })
         .collect::<Result<Vec<_>, serde_json::Error>>()?;
     outcome.field("moves", moves);
+    phases.mark("report");
     Ok(outcome)
 }

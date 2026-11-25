@@ -965,7 +965,6 @@ fn a_pr_open_stale_pin_stays_visible_with_a_pending_fresh_review() {
         "campaign",
         &units,
         &plan::summary(&c.root, &units),
-        &[],
     );
     assert!(
         card.lines()
@@ -1924,14 +1923,15 @@ fn sync_holds_a_codex_merge_at_pr_open_until_its_gate_holds() {
             unit.history.last().unwrap().evidence.merged_at.as_deref(),
             merged_at
         );
-        let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
+        let journal = fs::read_to_string(c.root.join("JOURNAL.md")).unwrap();
         let suffix = merged_at
             .map(|at| format!("; merged_at {at}"))
             .unwrap_or_default();
         assert_eq!(
-            card.lines()
-                .find(|line| line.starts_with("- `01-a/u/S1` pr-open → merged ")),
-            Some(format!("- `{STEP}` pr-open → merged (sha {head}{suffix})").as_str()),
+            journal
+                .lines()
+                .find(|line| line.starts_with("- 01-a/u/S1: pr-open → merged ")),
+            Some(format!("- {STEP}: pr-open → merged (sha {head}{suffix})").as_str()),
         );
         assert!(sync(&later, &merged, &c.root).unwrap().ok());
         let card = fs::read_to_string(c.root.join("CARD.md")).unwrap();
