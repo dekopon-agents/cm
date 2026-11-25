@@ -4234,12 +4234,13 @@ fn merge_ready_reads_ci_on_every_sync_and_needs_a_clean_mergeable_head() {
     forge.checks = vec![("test", "success"), ("late", "success")];
     assert_eq!(synced(&forge), true);
     assert_eq!(merge_ready(&c, host.now()), std::slice::from_ref(&ready));
-    // Merging is not launching: neither a pause nor the Codex quota hold quiets it.
+    // A pause is the owner's stop and quiets it; the Codex quota hold holds dispatch only.
     let limits = c.root.join("LIMITS.toml");
     let text = fs::read_to_string(&limits).unwrap();
     fs::write(&limits, text.replace("paused = false", "paused = true")).unwrap();
-    assert_eq!(merge_ready(&c, host.now()), std::slice::from_ref(&ready));
+    assert!(merge_ready(&c, host.now()).is_empty());
     fs::write(&limits, &text).unwrap();
+    assert_eq!(merge_ready(&c, host.now()), std::slice::from_ref(&ready));
     let held = Command::new(env!("CARGO_BIN_EXE_cm"))
         .arg("-C")
         .arg(&c.root)

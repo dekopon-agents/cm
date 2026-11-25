@@ -1291,7 +1291,10 @@ fn actionable(
                 .chain([track.since.as_str()])
                 .max_by_key(|at| instant(at))
                 .unwrap_or_default();
-            if let Some(action) = merge_ready(root, &target, part, pr, observed, reviewed_since) {
+            // `paused = true` is the owner's stop, merges included; the Codex quota hold is not.
+            if !inputs.paused
+                && let Some(action) = merge_ready(root, &target, part, pr, observed, reviewed_since)
+            {
                 actions.push(action);
             }
             let detail = part.map_or_else(
