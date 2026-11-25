@@ -2714,17 +2714,17 @@ fn a_unit_from_a_newer_schema_is_refused() {
     let mut stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(stored["schema"], cm::state::SCHEMA);
-    stored["schema"] = (cm::state::SCHEMA + 1).into();
+    stored["schema"] = (cm::state::RESOLUTION_SCHEMA + 1).into();
     fs::write(&path, serde_json::to_string_pretty(&stored).unwrap()).unwrap();
     let error = store::load_unit(&c.root.join("01-a/u")).unwrap_err();
     let newer = error.downcast_ref::<store::NewerSchema>().unwrap();
-    assert_eq!(newer.found, cm::state::SCHEMA + 1);
+    assert_eq!(newer.found, cm::state::RESOLUTION_SCHEMA + 1);
     let linted = lint(&c.root).unwrap();
     assert_eq!(rules(&linted), vec!["state-parse"]);
     assert!(linted.violations[0].message.contains(&format!(
         "has schema {}, newer than the schema {}",
-        cm::state::SCHEMA + 1,
-        cm::state::SCHEMA
+        cm::state::RESOLUTION_SCHEMA + 1,
+        cm::state::RESOLUTION_SCHEMA
     )));
 }
 

@@ -1721,7 +1721,7 @@ fn run_sync(
     }
     last_read.retain(|url, _| open.contains_key(url));
     let mut campaign = store::load_campaign(root)?;
-    campaign.schema = crate::state::SCHEMA;
+    campaign.schema = campaign.schema.max(crate::state::SCHEMA);
     store::write_json(&store::state_path(root), &campaign)?;
     // The observations before the memo of their validators: a sync stopped between the two
     // leaves PR validators that no longer match, which `LastRead::validates` refuses.

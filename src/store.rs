@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::state::{CampaignState, Kind, SCHEMA, UnitState};
+use crate::state::{CampaignState, Kind, RESOLUTION_SCHEMA, UnitState};
 
 pub const CM_DIR: &str = ".cm";
 pub const STATE_FILE: &str = "state.json";
@@ -102,7 +102,7 @@ impl std::fmt::Display for NewerSchema {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} has schema {}, newer than the schema {SCHEMA} this cm {} reads; upgrade cm",
+            "{} has schema {}, newer than the schema {RESOLUTION_SCHEMA} this cm {} reads; upgrade cm",
             self.path.display(),
             self.found,
             env!("CARGO_PKG_VERSION")
@@ -118,7 +118,7 @@ fn read_state<T: DeserializeOwned>(path: &Path) -> Result<T> {
         schema: u32,
     }
     let probe: Probe = read_json(path)?;
-    if probe.schema > SCHEMA {
+    if probe.schema > RESOLUTION_SCHEMA {
         return Err(NewerSchema {
             path: path.to_path_buf(),
             found: probe.schema,
