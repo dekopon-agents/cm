@@ -439,7 +439,7 @@ empty.
 | Kind | Fires when | Command |
 |---|---|---|
 | `turn-ended` | a launched step's configured turn reader saw its turn complete with no PR | the lane's logs command |
-| `review-owed` | a `pr-open` head, the one sync last observed or else the recorded one, lacks a verdict from a review the merge gate needs (on a model lane, Astra's and a Claude reviewer's: see [Merge gate](#merge-gate)), or its verdict is FIX REQUIRED and no newer head has come. On a model lane both must be explicit ACCEPTs bound to that PR and part; a lane with no model author needs any one verdict. A `cm review wait` marker silences it; a review ledger row names no head and silences nothing | `cm brief <step>`, or `cm attention --pr …` for the fix |
+| `review-owed` | a `pr-open` head, the one sync last observed or else the recorded one, lacks a verdict from a review the merge gate needs (on a model lane, Astra's and a Claude reviewer's: see [Merge gate](#merge-gate)), or its verdict is FIX REQUIRED and no newer head has come. Only steps the merge gate holds owe reviews. On a model lane both must be explicit ACCEPTs, computed and stated, bound to that PR and part; a lane with no model author needs any one verdict. A `cm review wait` marker silences it; a review ledger row names no head and silences nothing | `cm brief <step>`, or `cm attention --pr …` for the fix |
 | `missing-kickoff` | a drafted step's gates are met and `kickoff.md` is missing | `cm amend <step> --kickoff-file …` |
 | `stalled-attempt` | a live attempt passed its lane's stall limit (see above) | `cm attempt <step>` |
 | `earlier-coordinator` | a live attempt is claimed by another coordinator | `cm attempt <step> claim --expect <generation>` |
@@ -449,7 +449,7 @@ empty.
 | `released-undeployed` | `deploy_after_hours` is set, the campaign is not paused, and a line's newest release is older than the dial while no deploy step gated on its `tag:` (or a later one of the line) has merged: a pin ends at its merge. A deploy step is a rollout, a step named `…/pin` or `…/deploy`, or a step whose PR is in a repository no release line ships (a homelab pin); a code PR in a released repository that waits on the tag consumes it and deploys nothing. Lines no deploy step names never fire; quiet while a covering deploy is launched or `pr-open`, or launchable. `waiting_count` is the line's releases since its last deploy | the drafted deploy step's `cm next`/`cm amend --kickoff-file`, or `tools/cloud-env/deploy.sh 00-release/<line>/<version>` |
 | `unblock-now` | each `unblock now` line `cm next` prints | its `cm unblock <step>` |
 | `expired-watch` | an unresolved watch is past its deadline | `cm watch <step> resolve <id> --evidence …` (or `withdraw <id> --reason …`) |
-| `merge-ready` | a `pr-open` PR whose observed head is the head CI completed green at (`ci_green` in `.cm/pulls.json`: sync re-reads finished CI in full with each full PR read, at least every 30 minutes, and clears the value on a read that finds checks still running or fails, and when the PR itself goes unread), whose `mergeable_state` is `clean`, and whose merge gate has no gaps there. A blocked step merges none of its parts. Each action carries its `part`. A red check leaves `mergeable_state` unstable or blocked, so a known-red merge never shows here; it stays with `cm advance … merged`. Quiet while `paused = true`, the owner's stop; the Codex quota hold, which holds dispatch only, does not quiet it | `cm advance <step> merged --pr <url> --sha '<merge-sha>'` after the merge |
+| `merge-ready` | a `pr-open` PR whose observed head is the head CI completed green at (`ci_green` in `.cm/pulls.json`: sync re-reads finished CI in full with each full PR read, at least every 30 minutes, and clears the value on a read that finds checks still running or fails, and when the PR itself goes unread), whose `mergeable_state` is `clean`, and whose merge gate has no gaps there (a step the gate exempts, a script pin or a lane no model writes in, needs no review). Before `cm next` lists it, a fresh read of GitHub must find the PR still open at that head, `mergeable_state` clean and CI green there; a failed read or no GitHub drops the line. A blocked step merges none of its parts. Each action carries its `part`. A red check leaves `mergeable_state` unstable or blocked, so a known-red merge never shows here; it stays with `cm advance … merged`. Quiet while `paused = true`, the owner's stop; the Codex quota hold, which holds dispatch only, does not quiet it | `cm advance <step> merged --pr <url> --sha '<merge-sha>'` after the merge |
 | `stale-block` | a free-text `blocked:` older than 24 h: lint's `block-stale`, without lint's journal-mention silencer. Reviewer waits (`EVIDENCE-BLOCKED`, `REVIEW_BLOCKED`) are `review_waits` timers, not owed blocks | `cm unblock <step> --evidence …` |
 
 `pr-open-unreviewed` is the old name of `review-owed`, which now also covers a new head after a
@@ -750,8 +750,10 @@ one `merge-gate` violation per gap, unless at the PR's head (GitHub's, via `gh a
   one part never clears another), and each one there is ACCEPT or has every blocking finding
   resolved (`cm review resolve`); and, on a model lane (`codex`, `claude-cloud`, `fable`,
   `coordinator`), Astra and a Claude reviewer (`claude`, `opus`, `fresh-opus`, `fable`, `sonnet`,
-  `haiku`) have each recorded an explicit ACCEPT there, whichever family wrote the change: a
-  FIX REQUIRED whose findings were resolved is no ACCEPT. `cm next --act`'s `merge-ready` uses
+  `haiku`) have each recorded an explicit ACCEPT there, whichever family wrote the change: the
+  computed verdict and the report's stated verdict line are both ACCEPT, and a FIX REQUIRED whose
+  findings were resolved is no ACCEPT. (a)'s receipt binds only an Astra review recorded for that
+  PR and part. `cm next --act`'s `merge-ready` uses
   the same gate;
 - (c) CI is green: GitHub reports at least one check run or commit status on the head and each is
   `success`, `neutral` or `skipped`. Every page of both lists is read; a page that cannot be read,

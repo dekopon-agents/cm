@@ -761,6 +761,7 @@ fn merge_ready(
     pr: &str,
     observed: Option<&Observed>,
     since: &str,
+    gated: bool,
 ) -> Option<Action> {
     let observed = observed?;
     let head = observed.head.as_deref()?;
@@ -769,10 +770,12 @@ fn merge_ready(
     if observed.ci_head.as_deref() != Some(head) || observed.ci_green != Some(true) || !clean {
         return None;
     }
-    let parsed = store::parse_target(target, true).ok()?;
-    let cleared = crate::verdict::merge_gaps(root, &parsed, part, Some(pr), head, None).ok()?;
-    if !cleared.gaps.is_empty() {
-        return None;
+    if gated {
+        let parsed = store::parse_target(target, true).ok()?;
+        let cleared = crate::verdict::merge_gaps(root, &parsed, part, Some(pr), head, None).ok()?;
+        if !cleared.gaps.is_empty() {
+            return None;
+        }
     }
     let part_flag = part
         .map(|part| format!(" --part {}", shell_word(part)))
@@ -1297,6 +1300,9 @@ fn actionable(
             if track.state != Phase::PrOpen {
                 return;
             }
+            // The merge gate's own exemption: a step it does not gate (a script's pin, a lane
+            // no model writes in) owes no review and merges on clean, green CI alone.
+            let gated = crate::commands::merge_gated(&target, step);
             let name = part.map_or_else(|| target.clone(), |part| format!("{target}#{part}"));
             let observed = seen.get(pr).filter(|observed| observed.target == name);
             let head = observed
@@ -1325,9 +1331,13 @@ fn actionable(
             // A blocked step merges none of its parts until it is unblocked.
             if !inputs.paused
                 && !matches!(step.track.state, Phase::Blocked(_))
-                && let Some(action) = merge_ready(root, &target, part, pr, observed, reviewed_since)
+                && let Some(action) =
+                    merge_ready(root, &target, part, pr, observed, reviewed_since, gated)
             {
                 actions.push(action);
+            }
+            if !gated {
+                return;
             }
             let detail = part.map_or_else(
                 || format!("PR {pr}"),
@@ -1573,6 +1583,7 @@ pub(crate) fn next_act(
     target: Option<&Target>,
     lane: Option<Lane>,
     now: Timestamp,
+    forge: Option<&dyn crate::forge::Forge>,
 ) -> Result<(Outcome, bool)> {
     let mut outcome = Outcome::default();
     let mut actions = if store::load_campaign(root)?.closed.is_some() {
@@ -1585,11 +1596,14 @@ pub(crate) fn next_act(
         };
         let stalled = stalls(&units, &inputs);
         let verdicts = crate::verdict::load(root)?;
-        action_scope(
-            actionable(root, &units, &inputs, &stalled, &verdicts),
-            &units,
-            target,
-            lane,
+        confirm_merge_ready(
+            action_scope(
+                actionable(root, &units, &inputs, &stalled, &verdicts),
+                &units,
+                target,
+                lane,
+            ),
+            forge,
         )
     };
     actions.sort_by_key(|action| action.kind.act_priority());
@@ -1842,11 +1856,54 @@ pub fn next(root: &Path, target: Option<&Target>, lane: Option<Lane>) -> Result<
     next_at(root, target, lane, Timestamp::now())
 }
 
+/// `cm next` without GitHub: every `merge-ready` fails closed, since none can be confirmed.
 pub fn next_at(
     root: &Path,
     target: Option<&Target>,
     lane: Option<Lane>,
     now: Timestamp,
+) -> Result<Outcome> {
+    next_with(root, target, lane, now, None)
+}
+
+/// A `merge-ready` action survives only a fresh read of its PR: still open at the head it was
+/// reviewed at, `mergeable_state` clean, and CI green there now. Sync's cached observation lets
+/// the line be found; this read is what lets an executor merge on it. A failed read, or no
+/// forge, drops the line.
+fn confirm_merge_ready(
+    actions: Vec<Action>,
+    forge: Option<&dyn crate::forge::Forge>,
+) -> Vec<Action> {
+    actions
+        .into_iter()
+        .filter(|action| {
+            if action.kind != ActionKind::MergeReady {
+                return true;
+            }
+            let (Some(forge), Some(pr), Some(head)) = (forge, &action.pr, &action.head) else {
+                return false;
+            };
+            let Ok(pull) = forge.pull(pr) else {
+                return false;
+            };
+            let open = pull.state == crate::forge::PullState::Open
+                && pull.head.as_ref().map(crate::forge::CommitSha::as_str) == Some(head.as_str())
+                && matches!(&pull.mergeable_state, Some(MergeableState::Other(state)) if state == "clean");
+            open && GithubRepo::of_pr(pr).is_some_and(|repo| {
+                forge
+                    .checks(&repo, &crate::forge::CommitSha::new(head.clone()))
+                    .is_ok_and(|checks| crate::forge::ci_green(&checks))
+            })
+        })
+        .collect()
+}
+
+pub fn next_with(
+    root: &Path,
+    target: Option<&Target>,
+    lane: Option<Lane>,
+    now: Timestamp,
+    forge: Option<&dyn crate::forge::Forge>,
 ) -> Result<Outcome> {
     let campaign = store::load_campaign(root)?;
     if let Some(at) = &campaign.closed {
@@ -1899,11 +1956,14 @@ pub fn next_at(
     outcome.field("review_waits", review_waits);
     let verdicts = crate::verdict::load(root)?;
     let stalled = stalls(&units, &inputs);
-    let actions = action_scope(
-        actionable(root, &units, &inputs, &stalled, &verdicts),
-        &units,
-        target,
-        lane,
+    let actions = confirm_merge_ready(
+        action_scope(
+            actionable(root, &units, &inputs, &stalled, &verdicts),
+            &units,
+            target,
+            lane,
+        ),
+        forge,
     );
     let driven = driver_held(&units, &inputs, target, lane);
     let quota = limits::codex_pause();

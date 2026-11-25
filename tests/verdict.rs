@@ -2200,13 +2200,15 @@ fn a_receipt_counts_only_for_a_review_that_happened_and_was_recorded() {
             };
         });
     }
+    // No receipt holds, and so no Astra ACCEPT is recorded either: both gaps are named.
     let refused = c.merge(&host, &gate);
     assert_eq!(
         rules(&refused),
-        vec!["merge-gate"],
+        vec!["merge-gate", "merge-gate"],
         "{:?}",
         refused.violations
     );
+    assert!(refused.violations[1].message.contains("no astra ACCEPT"));
     let message = &refused.violations[0].message;
     for why in [
         "turn not completed",
@@ -2227,7 +2229,8 @@ fn a_receipt_counts_only_for_a_review_that_happened_and_was_recorded() {
         receipt["verdict"] = "FIX REQUIRED".into();
     });
     let unrecorded = c.merge(&host, &gate);
-    assert_eq!(rules(&unrecorded), vec!["merge-gate"]);
+    // The receipt binds no recorded review, and so no Astra ACCEPT is recorded either.
+    assert_eq!(rules(&unrecorded), vec!["merge-gate", "merge-gate"]);
     assert!(
         unrecorded.violations[0].message.contains(
             "it is not recorded; `cm review record 01-a/u/S1 01-a/u/S1/evidence/astra-review-7/report.md --reviewer astra`"
@@ -4170,8 +4173,8 @@ fn review_wait_does_not_match_an_outer_round_through_a_malformed_inner_campaign(
 fn review_owed_and_merge_ready_follow_the_observed_head_and_its_verdicts() {
     let host = at("2026-10-25T00:00Z");
     let c = campaign(&host, true);
-    let owed = |c: &Campaign| -> Vec<(String, String)> {
-        plan::next_at(&c.root, None, None, host.now())
+    let owed = |c: &Campaign, forge: Option<&dyn Forge>| -> Vec<(String, String)> {
+        plan::next_with(&c.root, None, None, host.now(), forge)
             .unwrap()
             .fields["actionable"]
             .as_array()
@@ -4189,7 +4192,7 @@ fn review_owed_and_merge_ready_follow_the_observed_head_and_its_verdicts() {
             .collect()
     };
     let brief = ("review-owed".to_owned(), format!("cm brief {STEP}"));
-    assert_eq!(owed(&c), std::slice::from_ref(&brief));
+    assert_eq!(owed(&c, None), std::slice::from_ref(&brief));
     let fix = c.report(
         "r1",
         &c.head(),
@@ -4198,7 +4201,7 @@ fn review_owed_and_merge_ready_follow_the_observed_head_and_its_verdicts() {
     );
     assert!(record(&host, &c, &fix, "astra").ok());
     assert_eq!(
-        owed(&c),
+        owed(&c, None),
         [(
             "review-owed".to_owned(),
             format!(
@@ -4214,9 +4217,9 @@ fn review_owed_and_merge_ready_follow_the_observed_head_and_its_verdicts() {
     assert!(sync(&host, &forge, &c.root).unwrap().ok());
     let seen: serde_json::Value = store::read_json(&plan::pulls_path(&c.root)).unwrap();
     assert_eq!(seen[PR]["ci_green"], true);
-    assert_eq!(owed(&c), std::slice::from_ref(&brief));
+    assert_eq!(owed(&c, Some(&forge)), std::slice::from_ref(&brief));
     accepted(&host, &c);
-    let next = plan::next_at(&c.root, None, None, host.now()).unwrap();
+    let next = plan::next_with(&c.root, None, None, host.now(), Some(&forge)).unwrap();
     let ready = next.fields["actionable"]
         .as_array()
         .unwrap()
@@ -4230,7 +4233,7 @@ fn review_owed_and_merge_ready_follow_the_observed_head_and_its_verdicts() {
     assert_eq!(ready["base"], "b".repeat(40));
     assert_eq!(ready["ci_green"], true);
     assert_eq!(
-        owed(&c),
+        owed(&c, Some(&forge)),
         [(
             "merge-ready".to_owned(),
             format!("cm advance {STEP} merged --pr {PR} --sha '<merge-sha>'")
@@ -4243,11 +4246,14 @@ fn review_owed_and_merge_ready_follow_the_observed_head_and_its_verdicts() {
     sync(&host, &forge, &c.root).unwrap();
     let seen: serde_json::Value = store::read_json(&plan::pulls_path(&c.root)).unwrap();
     assert_eq!(seen[PR]["ci_green"], false);
-    assert_eq!(owed(&c), [brief]);
+    assert_eq!(owed(&c, Some(&forge)), [brief]);
 }
 
-fn merge_ready(c: &Campaign, now: Timestamp) -> Vec<String> {
-    plan::next_at(&c.root, None, None, now).unwrap().fields["actionable"]
+/// The `merge-ready` commands `cm next` gives with `forge` as GitHub for its fresh read.
+fn merge_ready(c: &Campaign, now: Timestamp, forge: &dyn Forge) -> Vec<String> {
+    plan::next_with(&c.root, None, None, now, Some(forge))
+        .unwrap()
+        .fields["actionable"]
         .as_array()
         .unwrap()
         .iter()
@@ -4272,42 +4278,87 @@ fn merge_ready_reads_ci_on_every_sync_and_needs_a_clean_mergeable_head() {
             .clone()
     };
     assert_eq!(synced(&forge), true);
-    assert_eq!(merge_ready(&c, host.now()), std::slice::from_ref(&ready));
+    assert_eq!(
+        merge_ready(&c, host.now(), &forge),
+        std::slice::from_ref(&ready)
+    );
     // A check registered later at the same head makes the green stale.
     forge.checks = vec![("test", "success"), ("late", "in_progress")];
     assert_eq!(synced(&forge), serde_json::Value::Null);
-    assert!(merge_ready(&c, host.now()).is_empty());
+    assert!(merge_ready(&c, host.now(), &forge).is_empty());
     // Its rerun finishing green at the same head is merge-ready again.
     forge.checks = vec![("test", "success"), ("late", "success")];
     assert_eq!(synced(&forge), true);
-    assert_eq!(merge_ready(&c, host.now()), std::slice::from_ref(&ready));
+    assert_eq!(
+        merge_ready(&c, host.now(), &forge),
+        std::slice::from_ref(&ready)
+    );
     // A pause is the owner's stop and quiets it; the Codex quota hold holds dispatch only.
     let limits = c.root.join("LIMITS.toml");
     let text = fs::read_to_string(&limits).unwrap();
     fs::write(&limits, text.replace("paused = false", "paused = true")).unwrap();
-    assert!(merge_ready(&c, host.now()).is_empty());
+    assert!(merge_ready(&c, host.now(), &forge).is_empty());
     fs::write(&limits, &text).unwrap();
-    assert_eq!(merge_ready(&c, host.now()), std::slice::from_ref(&ready));
-    let held = Command::new(env!("CARGO_BIN_EXE_cm"))
-        .arg("-C")
-        .arg(&c.root)
-        .args(["--json", "next", "--act"])
-        .env("CM_CODEX_WEEKLY_PCT", "90")
-        .output()
-        .unwrap();
-    let held: serde_json::Value = serde_json::from_slice(&held.stdout).unwrap();
-    assert!(
-        held["actionable"]
+    assert_eq!(
+        merge_ready(&c, host.now(), &forge),
+        std::slice::from_ref(&ready)
+    );
+    // The CLI confirms with a fresh read of GitHub, here a `gh` that answers for this PR.
+    let gh = support::FakeGh::new(&format!(
+        r#"case "$*" in
+    'api repos/o/r/pulls/7')
+        echo '{{"state":"open","merged":false,"merge_commit_sha":null,"mergeable_state":"clean","head":{{"sha":"{head}"}},"base":{{"sha":"{base}"}}}}' ;;
+    'api repos/o/r/commits/{head}/check-runs?per_page=100&page=1')
+        printf '{{"total_count":1,"check_runs":[{{"id":1,"name":"test","status":"completed","conclusion":"%s"}}]}}' "$(cat "$FAKE_GH/conclusion")" ;;
+    'api repos/o/r/commits/{head}/status?per_page=100&page=1')
+        echo '{{"total_count":0,"statuses":[]}}' ;;
+    *) echo "$*" >&2; exit 1 ;;
+esac"#,
+        base = "b".repeat(40),
+    ));
+    let act = |quota: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("-C")
+            .arg(&c.root)
+            .args(["--json", "next", "--act"])
+            .env("CM_CODEX_WEEKLY_PCT", quota)
+            .env("PATH", gh.path())
+            .output()
+            .unwrap();
+        let act: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        act["actionable"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|action| action["kind"] == "merge-ready"),
-        "{held}"
+            .any(|action| action["kind"] == "merge-ready")
+    };
+    fs::write(gh.fixture().join("conclusion"), "success").unwrap();
+    assert!(act("90"), "the Codex quota hold does not hold a merge");
+    // The cached observation is green, but the head is red now: the fresh read fails closed.
+    fs::write(gh.fixture().join("conclusion"), "failure").unwrap();
+    assert!(!act("0"));
+    let mut rerun = forge.clone();
+    rerun.checks = vec![("test", "in_progress")];
+    assert!(merge_ready(&c, host.now(), &rerun).is_empty());
+    let down = FakeForge {
+        down: true,
+        ..forge.clone()
+    };
+    assert!(merge_ready(&c, host.now(), &down).is_empty());
+    assert!(
+        plan::next_at(&c.root, None, None, host.now())
+            .unwrap()
+            .fields["actionable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["kind"] != "merge-ready"),
+        "no GitHub, no merge-ready"
     );
     // A conflicted PR is not merge-ready.
     forge.mergeable = "dirty";
     synced(&forge);
-    assert!(merge_ready(&c, host.now()).is_empty());
+    assert!(merge_ready(&c, host.now(), &forge).is_empty());
     // A red check is never merge-ready, even one a known-red exception covers: that merge
     // stays with `cm advance … merged`.
     let mut red = red_at_head(&head, "failure", "failure");
@@ -4315,17 +4366,16 @@ fn merge_ready_reads_ci_on_every_sync_and_needs_a_clean_mergeable_head() {
     let why = "red by design until build lands";
     assert!(known_red(&host, &c, &red, &head, why, "build").ok());
     assert_eq!(synced(&red), false);
-    assert!(merge_ready(&c, host.now()).is_empty());
+    assert!(merge_ready(&c, host.now(), &forge).is_empty());
     forge.mergeable = "clean";
     assert_eq!(synced(&forge), true);
-    assert_eq!(merge_ready(&c, host.now()), [ready]);
+    assert_eq!(merge_ready(&c, host.now(), &forge), [ready]);
 }
 
 #[test]
 fn each_part_of_a_multipart_step_is_merge_ready_on_its_own_pr() {
     let host = at("2026-10-26T08:00:00Z");
     let c = campaign(&host, true);
-    accepted(&host, &c);
     let amendment = commands::Amendment {
         parts: vec!["one".into(), "two".into()],
         ..Default::default()
@@ -4366,13 +4416,22 @@ fn each_part_of_a_multipart_step_is_merge_ready_on_its_own_pr() {
     forge.parts.insert(second_pr.into(), second);
     sync(&host, &forge, &c.root).unwrap();
     let one = format!("cm advance {STEP} merged --pr {PR} --sha '<merge-sha>' --part one");
-    // Reviews bind to their part: the step's reviews from before it had parts clear neither.
-    assert!(merge_ready(&c, host.now()).is_empty());
-    for (reviewer, name) in [("astra", "astra-one"), ("claude", "claude-one")] {
-        let report = c.write(
-            &format!("drafts/{name}.md"),
-            &format!("# {name}\n\nRead in full.\n\n```cm-review\nhead: {head}\n```\n\nACCEPT\n"),
-        );
+    assert!(merge_ready(&c, host.now(), &forge).is_empty());
+    // Part one's own reviews: Astra's receipted report and a Claude reviewer's, each recorded
+    // for that part. A review recorded for another part, or for none, would clear neither.
+    for (reviewer, name) in [("astra", "astra-review-7-one"), ("claude", "claude-one")] {
+        let report = if reviewer == "astra" {
+            let report = c.report(name, &head, &[], "ACCEPT");
+            c.receipt(name, &head, "gpt-6-astra", "xhigh");
+            report
+        } else {
+            c.write(
+                &format!("drafts/{name}.md"),
+                &format!(
+                    "# {name}\n\nRead in full.\n\n```cm-review\nhead: {head}\n```\n\nACCEPT\n"
+                ),
+            )
+        };
         let recorded = verdict::record(
             &host,
             &c.root,
@@ -4384,7 +4443,10 @@ fn each_part_of_a_multipart_step_is_merge_ready_on_its_own_pr() {
         .unwrap();
         assert!(recorded.ok(), "{:?}", recorded.violations);
     }
-    assert_eq!(merge_ready(&c, host.now()), std::slice::from_ref(&one));
+    assert_eq!(
+        merge_ready(&c, host.now(), &forge),
+        std::slice::from_ref(&one)
+    );
     let report = c.report("astra-review-8", &second_head, &[], "ACCEPT");
     c.receipt_with(
         "astra-review-8",
@@ -4422,14 +4484,14 @@ fn each_part_of_a_multipart_step_is_merge_ready_on_its_own_pr() {
     .unwrap();
     assert!(recorded.ok(), "{:?}", recorded.violations);
     assert_eq!(
-        merge_ready(&c, host.now()),
+        merge_ready(&c, host.now(), &forge),
         [
             one,
             format!("cm advance {STEP} merged --pr {second_pr} --sha '<merge-sha>' --part two")
         ]
     );
     // Each action carries its own part, so the JSON names that part's PR, head and CI.
-    let next = plan::next_at(&c.root, None, None, host.now()).unwrap();
+    let next = plan::next_with(&c.root, None, None, host.now(), Some(&forge)).unwrap();
     let two = next.fields["actionable"]
         .as_array()
         .unwrap()
@@ -4452,7 +4514,7 @@ fn each_part_of_a_multipart_step_is_merge_ready_on_its_own_pr() {
     )
     .unwrap();
     assert!(blocked.ok(), "{:?}", blocked.violations);
-    assert!(merge_ready(&c, host.now()).is_empty());
+    assert!(merge_ready(&c, host.now(), &forge).is_empty());
 }
 
 #[test]
@@ -4599,4 +4661,31 @@ fn a_known_red_note_is_journaled_only_with_the_merge_it_explains() {
     let added = after.strip_prefix(before.as_str()).unwrap();
     assert!(!added.contains("cm sync:"), "{added}");
     assert!(!added.contains("known-red"), "{added}");
+}
+
+#[test]
+fn an_explicit_accept_is_stated_as_well_as_computed() {
+    let host = at("2026-10-26T08:00:00Z");
+    let c = campaign(&host, true);
+    let head = c.head();
+    let accept = c.report("astra-review-7", &head, &[], "ACCEPT");
+    c.receipt("astra-review-7", &head, "gpt-6-astra", "xhigh");
+    assert!(record(&host, &c, &accept, "astra").ok());
+    let gaps = || {
+        verdict::merge_gaps(&c.root, &target(), None, Some(PR), &head, None)
+            .unwrap()
+            .gaps
+    };
+    // A Claude report with no findings and no verdict line computes ACCEPT but states none.
+    let unstated = c.write(
+        "drafts/claude-unstated.md",
+        &format!("# Claude review\n\nRead.\n\n```cm-review\nhead: {head}\n```\n"),
+    );
+    let recorded = record(&host, &c, &unstated, "claude");
+    assert!(recorded.ok(), "{:?}", recorded.violations);
+    let open = gaps();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert!(open[0].contains("no claude ACCEPT"), "{open:?}");
+    claude_accept(&host, &c, &head);
+    assert!(gaps().is_empty(), "{:?}", gaps());
 }

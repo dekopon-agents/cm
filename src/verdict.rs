@@ -1450,6 +1450,7 @@ fn astra_gap(
     head: &str,
     part: Option<&str>,
 ) -> Vec<String> {
+    let scope = part;
     let part = part
         .map(|part| format!(" --part={}", crate::commands::shell_word(part)))
         .unwrap_or_default();
@@ -1502,10 +1503,16 @@ fn astra_gap(
                     verdicts
                         .reviews
                         .iter()
+                        // Bound to this PR and part, as every review the gate reads.
                         .filter(|review| {
                             review.step == step
                                 && review.at_head(head)
                                 && review.reviewer.as_deref() == Some(ASTRA_REVIEWER)
+                                && review.part.as_deref() == scope
+                                && review
+                                    .pr
+                                    .as_deref()
+                                    .is_none_or(|recorded| pr.is_none_or(|pr| recorded == pr))
                         })
                         .map(|review| (review, report_sha256(root, review)))
                         .collect()
@@ -1620,9 +1627,11 @@ fn reviews_at<'a>(
 /// and one from a Claude reviewer. A FIX REQUIRED whose findings were resolved is no ACCEPT.
 fn missing_accepts(at_head: &[&Recorded]) -> Vec<&'static str> {
     let accepted = |family: &dyn Fn(&Recorded) -> bool| {
-        at_head
-            .iter()
-            .any(|review| review.verdict == Verdict::Accept && family(review))
+        at_head.iter().any(|review| {
+            review.verdict == Verdict::Accept
+                && review.stated == Some(Verdict::Accept)
+                && family(review)
+        })
     };
     let mut missing = Vec::new();
     if !accepted(&|review| review.reviewer.as_deref() == Some(ASTRA_REVIEWER)) {
@@ -1686,16 +1695,10 @@ fn review_gap(
             open.join(", ")
         ));
     }
-    // On a model lane both families accept the head explicitly: Astra and a Claude reviewer.
-    // A head with no Astra review at all is (a)'s gap already.
-    let astra_reviewed = at_head
-        .iter()
-        .any(|review| review.reviewer.as_deref() == Some(ASTRA_REVIEWER));
+    // On a model lane both families accept the head explicitly: Astra and a Claude reviewer,
+    // each with a computed and a stated ACCEPT.
     let missing: Vec<&str> = if model {
         missing_accepts(&at_head)
-            .into_iter()
-            .filter(|reviewer| *reviewer != ASTRA_REVIEWER || astra_reviewed)
-            .collect()
     } else {
         Vec::new()
     };

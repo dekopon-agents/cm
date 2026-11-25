@@ -5269,9 +5269,21 @@ fn next_act_orders_coordinator_actions_and_matches_the_card_until_they_clear() {
         now: host.now - jiff::SignedDuration::from_hours(3),
     };
     let c = campaign(&old);
-    assert!(declare(&host, &c, REVIEW, Lane::Pi, &[]).ok());
+    // A model lane: the merge gate, and so review-owed, holds its PR.
+    assert!(declare(&host, &c, REVIEW, Lane::Coordinator, &[]).ok());
     kickoff(&c, REVIEW);
     open_pr(&host, &c, REVIEW, PR);
+    // The in-process launch claimed it with no session label; this session holds it.
+    attempt_action(
+        &host,
+        &c,
+        REVIEW,
+        None,
+        Act::Claim {
+            coordinator: "session_current".into(),
+            expect: 1,
+        },
+    );
     assert!(declare(&host, &c, PACKET, Lane::Codex, &["pr-open:review"]).ok());
     assert!(declare(&old, &c, STALL, Lane::ClaudeCloud, &[]).ok());
     let stall_claim = launch_for(&old, &c, STALL, "session_current");
@@ -5799,7 +5811,7 @@ fn a_review_ledger_row_names_no_head_so_it_never_silences_review_owed() {
         (reviewed, pr),
         (other, "https://github.com/other/repo/pull/7"),
     ] {
-        assert!(declare(&host, &c, target, Lane::Pi, &[]).ok());
+        assert!(declare(&host, &c, target, Lane::Coordinator, &[]).ok());
         kickoff(&c, target);
         open_pr(&host, &c, target, url);
     }
@@ -7742,4 +7754,108 @@ fn a_registry_entry_written_as_cse_covers_its_session_claims_and_is_guarded_as_r
     );
     assert_eq!(code, Some(1), "{refused}");
     assert_eq!(refused["violations"][0]["rule"], "lane-driver-registrar");
+}
+
+/// GitHub as these open PRs, each clean and green at its head.
+struct GreenPulls(BTreeMap<String, String>);
+
+impl Forge for GreenPulls {
+    fn pull(&self, url: &str) -> Result<Pull, ForgeError> {
+        Ok(Pull {
+            state: PullState::Open,
+            merge_commit: None,
+            merged_at: None,
+            head: self.0.get(url).map(|head| CommitSha::new(head.clone())),
+            head_ref: None,
+            base: Some(CommitSha::new("b".repeat(40))),
+            mergeable_state: Some("clean".to_owned().into()),
+        })
+    }
+    fn checks(
+        &self,
+        _: &cm::forge::GithubRepo,
+        _: &CommitSha,
+    ) -> Result<Vec<cm::forge::CheckState>, ForgeError> {
+        Ok(vec![cm::forge::CheckState {
+            name: "test".into(),
+            state: "success".to_owned().into(),
+        }])
+    }
+    fn tag_exists(
+        &self,
+        _: &cm::forge::GithubRepo,
+        _: &cm::forge::TagName,
+    ) -> Result<bool, ForgeError> {
+        Ok(false)
+    }
+    fn tag_contains(
+        &self,
+        _: &cm::forge::GithubRepo,
+        _: &cm::forge::TagName,
+        _: &CommitSha,
+    ) -> Result<bool, ForgeError> {
+        Ok(false)
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_script_pin_is_merge_ready_on_clean_green_ci_and_owes_no_review() {
+    let host = at("2026-11-25T08:00:00Z");
+    let c = campaign(&host);
+    let mut heads = BTreeMap::new();
+    let mut seen = BTreeMap::new();
+    for (step, pr) in [
+        ("01-a/u/pin", "https://github.com/xrl/rpi-homelab/pull/1"),
+        (
+            "01-a/u/publish",
+            "https://github.com/xrl/rpi-homelab/pull/2",
+        ),
+    ] {
+        assert!(declare_work(&host, &c, step, Lane::Coordinator, &[], Work::Rollout).ok());
+        kickoff(&c, step);
+        open_pr(&host, &c, step, pr);
+        let head = plan::track(&plan::load_units(&c.root).unwrap(), step)
+            .unwrap()
+            .evidence
+            .sha
+            .clone()
+            .unwrap();
+        heads.insert(pr.to_owned(), head.clone());
+        seen.insert(
+            pr.to_owned(),
+            plan::Observed {
+                base: Some("b".repeat(40)),
+                ci_head: Some(head.clone()),
+                ci_base: Some("b".repeat(40)),
+                ci_green: Some(true),
+                target: step.to_owned(),
+                at: "2026-11-25T08:00Z".into(),
+                head: Some(head),
+                mergeable_state: Some("clean".to_owned().into()),
+            },
+        );
+    }
+    store::write_json(&plan::pulls_path(&c.root), &seen).unwrap();
+    let next = plan::next_with(&c.root, None, None, host.now, Some(&GreenPulls(heads))).unwrap();
+    let kinds: Vec<(String, String)> = next.fields["actionable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|action| ["merge-ready", "review-owed"].contains(&action["kind"].as_str().unwrap()))
+        .map(|action| {
+            (
+                action["kind"].as_str().unwrap().to_owned(),
+                action["target"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    // The pin merges on CI alone, as the gate exempts it; the config rollout is owed its reviews.
+    assert_eq!(
+        kinds,
+        [
+            ("merge-ready".to_owned(), "01-a/u/pin".to_owned()),
+            ("review-owed".to_owned(), "01-a/u/publish".to_owned()),
+        ]
+    );
 }

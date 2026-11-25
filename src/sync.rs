@@ -1141,9 +1141,12 @@ impl<'a> Run<'a> {
                     // page's ETag belongs to its own head's URL: a 304 says that page is
                     // unchanged whatever `.cm/pulls.json` holds.
                     // Finished CI at the same head is re-read with each full PR read (at least
-                    // every 30 minutes), so a quiet sync that GitHub answered 304 reads nothing.
+                    // every 30 minutes), so a quiet sync that GitHub answered 304 reads nothing;
+                    // CI not known green (pending, or a failed read) is read on every sync.
                     if let (Some(head), Some(base), Some(repo)) = (&head, &base, GithubRepo::of_pr(&url))
-                        && (ci_head.as_deref() != Some(head.as_str()) || cached_at.is_none())
+                        && (ci_head.as_deref() != Some(head.as_str())
+                            || cached_at.is_none()
+                            || ci_green.is_none())
                     {
                         let validators = previous
                             .filter(|seen| seen.head.as_deref() == Some(head.as_str()))

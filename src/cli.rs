@@ -893,11 +893,23 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
         }
         Commands::Next { target, lane, act } => {
             if *act {
-                let (outcome, actionable) =
-                    crate::plan::next_act(&root()?, target.as_ref(), *lane, host.now())?;
+                let forge = crate::forge::Gh::default();
+                let (outcome, actionable) = crate::plan::next_act(
+                    &root()?,
+                    target.as_ref(),
+                    *lane,
+                    host.now(),
+                    Some(&forge),
+                )?;
                 return Ok((outcome, ExitCode::from(u8::from(actionable))));
             }
-            crate::plan::next_at(&root()?, target.as_ref(), *lane, host.now())
+            crate::plan::next_with(
+                &root()?,
+                target.as_ref(),
+                *lane,
+                host.now(),
+                Some(&crate::forge::Gh::default()),
+            )
         }
         Commands::Sync { budget_secs } => crate::sync::sync_with(
             host,
