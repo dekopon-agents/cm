@@ -88,7 +88,8 @@ pub fn this_cm() -> OsString {
 
 // Children run in the checkout, so `--cm` is resolved where it was given: a path made absolute,
 // a bare name looked up on PATH as a shell would, an empty or relative entry taken from the
-// directory cm tick started in. A name PATH does not hold stays bare, to fail as one line.
+// directory cm tick started in. A name PATH does not hold from there stays bare, so the spawn
+// searches PATH again from the checkout, where an empty or relative entry can still find one.
 pub fn resolve(cm: &OsStr) -> OsString {
     let named = Path::new(cm);
     if cm.as_encoded_bytes().contains(&b'/') {
