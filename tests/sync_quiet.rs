@@ -728,6 +728,11 @@ fn cm_sync_prints_phases_past_its_budget() {
 #[test]
 fn the_card_does_not_depend_on_who_runs_sync_or_where() {
     let c = campaign(&at("2026-10-17T08:00:00Z"));
+    fs::write(
+        c.root.join("EPOCH.md"),
+        "---\nepoch: trail-slug\nstatus: WORKING\n---\n",
+    )
+    .unwrap();
     let kickoff = c.root.parent().unwrap().join("kickoff.md");
     fs::write(&kickoff, "Go.\n").unwrap();
     let gh = support::FakeGh::new("exit 1\n");
@@ -775,16 +780,22 @@ fn the_card_does_not_depend_on_who_runs_sync_or_where() {
     assert_eq!(card(&c.root, &[("CM_CODEX_WEEKLY_PCT", "87")]), held);
     assert_eq!(card(&c.root, &[]), alone);
 
-    // The same campaign checked out under another parent renders the same card.
+    assert!(alone.starts_with("# trail-slug card\n"), "{alone}");
+
+    // A checkout under another parent, or under another folder name, renders the same card.
     let elsewhere = tempfile::tempdir().unwrap();
-    let copy = elsewhere.path().join("clone").join("campaign");
-    fs::create_dir_all(copy.parent().unwrap()).unwrap();
-    let copied = Command::new("cp")
-        .arg("-a")
-        .arg(&c.root)
-        .arg(&copy)
-        .status()
-        .unwrap();
-    assert!(copied.success());
-    assert_eq!(card(&copy, &[]), alone);
+    for copy in [
+        elsewhere.path().join("clone").join("campaign"),
+        elsewhere.path().join("renamed"),
+    ] {
+        fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        let copied = Command::new("cp")
+            .arg("-a")
+            .arg(&c.root)
+            .arg(&copy)
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        assert_eq!(card(&copy, &[]), alone, "{}", copy.display());
+    }
 }

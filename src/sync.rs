@@ -1452,6 +1452,24 @@ impl<'a> Run<'a> {
     }
 }
 
+// EPOCH.md's `epoch` slug, so a checkout under another folder name renders the same card.
+fn card_name(root: &Path) -> String {
+    let declared = std::fs::read_to_string(root.join(crate::epoch::EPOCH))
+        .ok()
+        .and_then(|text| {
+            let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+            let front = crate::epoch::front(&lines)?;
+            crate::epoch::value(&lines, &front, "epoch")
+                .filter(|slug| !slug.is_empty())
+                .map(str::to_owned)
+        });
+    declared.unwrap_or_else(|| {
+        root.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    })
+}
+
 fn guard(root: &Path) -> Result<Vec<Violation>> {
     let campaign = store::load_campaign(root)?;
     let mut guard = journal::check(root, &campaign);
@@ -1741,11 +1759,7 @@ fn run_sync(
     }
     phases.mark("journal");
     let next = plan::summary(root, &run.units);
-    let name = root
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let card = render::card(root, run.now, &name, &run.units, &next);
+    let card = render::card(root, run.now, &card_name(root), &run.units, &next);
     let wrote_card = store::write_changed(&root.join(CARD), card.as_bytes())?;
     render_resume(root, &run.units, false)?;
     phases.mark("render");
