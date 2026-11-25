@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, Permissions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -63,10 +63,16 @@ fn boot_time(path: &Path) -> bool {
 // Renamed over from a staged file, so a failed write leaves the boot-time rules for the next
 // tick to replace. heartbeat.sh's `printf >` wrote in place, which kept the file's owner, group
 // and other links: a file whose owner or group is not this process's, one with another link, or
-// one beside which no staged file can be made is written in place, never cut short first.
+// one the staged write fails for (a full disk) is written in place, never cut short first.
 fn import(path: &Path) -> std::io::Result<()> {
+    import_by(path, staged)
+}
+
+fn import_by(
+    path: &Path,
+    stage: impl FnOnce(&Path, &str, Permissions) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let path = std::fs::canonicalize(path)?;
-    let dir = path.parent().ok_or(ErrorKind::InvalidInput)?;
     let text = format!("{IMPORT}\n");
     let meta = std::fs::metadata(&path)?;
     if meta.uid() != rustix::process::geteuid().as_raw()
@@ -75,16 +81,18 @@ fn import(path: &Path) -> std::io::Result<()> {
     {
         return in_place(&path, &text);
     }
-    let Ok(mut staged) = tempfile::Builder::new()
+    stage(&path, &text, meta.permissions()).or_else(|_| in_place(&path, &text))
+}
+
+fn staged(path: &Path, text: &str, mode: Permissions) -> std::io::Result<()> {
+    let dir = path.parent().ok_or(ErrorKind::InvalidInput)?;
+    let mut staged = tempfile::Builder::new()
         .prefix(".CLAUDE.md-")
-        .tempfile_in(dir)
-    else {
-        return in_place(&path, &text);
-    };
+        .tempfile_in(dir)?;
     within_size_limit(staged.as_file(), text.len())?;
     staged.write_all(text.as_bytes())?;
-    staged.as_file().set_permissions(meta.permissions())?;
-    staged.persist(&path).map_err(|error| error.error)?;
+    staged.as_file().set_permissions(mode)?;
+    staged.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -181,31 +189,52 @@ mod tests {
     }
 
     #[test]
-    fn a_file_another_user_owns_is_written_in_place_and_keeps_its_owner() {
+    fn a_file_another_user_or_group_owns_is_written_in_place_and_keeps_its_owner() {
+        let me = (
+            rustix::process::geteuid().as_raw(),
+            rustix::process::getegid().as_raw(),
+        );
+        let other = |id: u32| if id == 65534 { 65533 } else { 65534 };
+        for (uid, gid) in [
+            (Some(other(me.0)), None),
+            (None, Some(other(me.1))),
+            (Some(other(me.0)), Some(other(me.1))),
+        ] {
+            let home = own_dir();
+            let path = boot_time_file(home.path());
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+            // Only root can give a file away; any other user checks that its own file is renamed over.
+            let given = std::os::unix::fs::chown(&path, uid, gid).is_ok();
+            let before = fs::metadata(&path).unwrap();
+            assert_eq!(
+                tick(Some(home.path())).lines,
+                ["rules: now imported from tools/cloud-env/COORDINATOR.md; read it"]
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), format!("{IMPORT}\n"));
+            let after = fs::metadata(&path).unwrap();
+            assert_eq!(after.permissions().mode() & 0o777, 0o640);
+            if given {
+                assert_eq!(
+                    (after.ino(), after.uid(), after.gid()),
+                    (before.ino(), before.uid(), before.gid()),
+                    "{uid:?} {gid:?}"
+                );
+            } else {
+                assert_ne!(after.ino(), before.ino());
+                assert_eq!((after.uid(), after.gid()), me);
+            }
+        }
+    }
+
+    #[test]
+    fn a_staged_write_that_fails_as_on_a_full_disk_is_written_in_place() {
         let home = own_dir();
         let path = boot_time_file(home.path());
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
-        let me = rustix::process::geteuid().as_raw();
-        let other = if me == 65534 { 65533 } else { 65534 };
-        // Only root can give a file away; any other user checks that its own file is renamed over.
-        let given = std::os::unix::fs::chown(&path, Some(other), Some(other)).is_ok();
-        let before = fs::metadata(&path).unwrap();
-        assert_eq!(
-            tick(Some(home.path())).lines,
-            ["rules: now imported from tools/cloud-env/COORDINATOR.md; read it"]
-        );
+        let inode = fs::metadata(&path).unwrap().ino();
+        let full = |_: &Path, _: &str, _: Permissions| Err(ErrorKind::StorageFull.into());
+        import_by(&path, full).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), format!("{IMPORT}\n"));
-        let after = fs::metadata(&path).unwrap();
-        assert_eq!(after.permissions().mode() & 0o777, 0o640);
-        if given {
-            assert_eq!(
-                (after.ino(), after.uid(), after.gid()),
-                (before.ino(), other, other)
-            );
-        } else {
-            assert_ne!(after.ino(), before.ino());
-            assert_eq!(after.uid(), me);
-        }
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
     }
 
     #[test]

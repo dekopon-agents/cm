@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::Path;
@@ -143,8 +143,7 @@ fn stamp_fields(line: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 // A pickup anywhere in the journal counts, as heartbeat.sh's `grep -cF` over the whole file did.
-// A line holding pickups is kept once and the text after each is a slice of it: a directive can
-// only start that text when its stamp is the text's own leading stamp, so each is looked up once.
+// A line holding pickups is kept once, and the text after each is a slice of it.
 fn unpicked(journal: impl BufRead, stamp: &[u8]) -> std::io::Result<Option<Vec<String>>> {
     let heading = [b"## ", stamp, b" "].concat();
     let mut below = false;
@@ -163,24 +162,13 @@ fn unpicked(journal: impl BufRead, stamp: &[u8]) -> std::io::Result<Option<Vec<S
     if !below {
         return Ok(None);
     }
-    let mut by_stamp: HashMap<&[u8], Vec<&[u8]>> = HashMap::new();
-    for directive in &directives {
-        by_stamp
-            .entry(&directive[..stamp_len(directive)])
-            .or_default()
-            .push(directive);
-    }
+    let index = Prefixes::of(&directives);
     let mut picked: HashSet<&[u8]> = HashSet::new();
     for line in &pickups {
         for rest in after_each(line, PICKED_UP) {
-            if let Some(named) = by_stamp.get(&rest[..stamp_len(rest)]) {
-                picked.extend(
-                    named
-                        .iter()
-                        .copied()
-                        .filter(|directive| rest.starts_with(directive)),
-                );
-            }
+            index.starting(rest, |directive| {
+                picked.insert(directive);
+            });
         }
     }
     Ok(Some(
@@ -190,6 +178,45 @@ fn unpicked(journal: impl BufRead, stamp: &[u8]) -> std::io::Result<Option<Vec<S
             .map(|directive| format!("owner-directive: {}", String::from_utf8_lossy(directive)))
             .collect(),
     ))
+}
+
+// Sorted by bytes, the directives starting with some text are one run, and within it those whose
+// next byte is a given one are a run again: each byte of a pickup's text narrows the run by two
+// binary searches, and the walk ends at the first byte no directive has there.
+struct Prefixes<'a> {
+    sorted: Vec<&'a [u8]>,
+}
+
+impl<'a> Prefixes<'a> {
+    fn of(directives: &'a [Vec<u8>]) -> Self {
+        let mut sorted: Vec<&[u8]> = directives.iter().map(Vec::as_slice).collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        Prefixes { sorted }
+    }
+
+    fn starting(&self, text: &[u8], mut found: impl FnMut(&'a [u8])) -> usize {
+        let (mut from, mut to) = (0, self.sorted.len());
+        let mut looked = 0;
+        for (at, byte) in text.iter().enumerate() {
+            let run = &self.sorted[from..to];
+            let mut next = |directive: &&[u8]| {
+                looked += 1;
+                directive.get(at).copied()
+            };
+            let start = run.partition_point(|directive| next(directive) < Some(*byte));
+            let end =
+                start + run[start..].partition_point(|directive| next(directive) == Some(*byte));
+            (from, to) = (from + start, from + end);
+            if from == to {
+                break;
+            }
+            if self.sorted[from].len() == at + 1 {
+                found(self.sorted[from]);
+            }
+        }
+        looked
+    }
 }
 
 fn stamp_len(text: &[u8]) -> usize {
@@ -312,6 +339,45 @@ mod tests {
                 "owner-directive: 2026-11-25T04:05Z — Owner directive: other \u{fffd}".to_owned()
             ])
         );
+    }
+
+    #[test]
+    fn directives_sharing_one_stamp_are_found_by_bytes_walked_not_by_their_number() {
+        for count in [1_000, 2_000, 4_000] {
+            let heading = |n: usize| format!("2026-11-25T04:05Z — Owner directive: item {n}");
+            let mut text = format!("## {STAMP} — s\n");
+            for n in 0..count {
+                text.push_str(&format!("## {}\n", heading(n)));
+            }
+            for n in 1..count {
+                text.push_str(&format!("{MARKER}{}\n", heading(n)));
+            }
+            assert_eq!(
+                listed(&text, STAMP),
+                Some(vec![format!("owner-directive: {}", heading(0))]),
+                "{count}"
+            );
+            let directives: Vec<Vec<u8>> = (0..count).map(|n| heading(n).into_bytes()).collect();
+            let index = Prefixes::of(&directives);
+            let bits = (usize::BITS - count.leading_zeros()) as usize;
+            for n in 1..count {
+                let pickup = heading(n);
+                let mut found = Vec::new();
+                let looked = index.starting(pickup.as_bytes(), |directive| found.push(directive));
+                let mut starts: Vec<&[u8]> = directives
+                    .iter()
+                    .map(Vec::as_slice)
+                    .filter(|directive| pickup.as_bytes().starts_with(directive))
+                    .collect();
+                starts.sort_unstable();
+                found.sort_unstable();
+                assert_eq!(found, starts, "{count}: {pickup}");
+                assert!(
+                    looked <= 2 * pickup.len() * (bits + 1),
+                    "{count}: {pickup} looked at {looked} directives"
+                );
+            }
+        }
     }
 
     #[test]

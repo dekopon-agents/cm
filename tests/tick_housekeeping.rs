@@ -51,12 +51,12 @@ fn script(path: &Path, body: &str) {
 // A cm the pin phase staged in this process can still be open for writing in a sibling test's
 // fork that has not exec'd yet, so a run of it can meet ETXTBSY until that fork moves on.
 fn spawn(cmd: &Cmd) -> cm::tick::Result<Ran> {
-    for _ in 0..100 {
+    for _ in 0..1_000 {
         match SystemProc.run(cmd) {
             Err(TickError::Spawn { source, .. })
                 if source.kind() == std::io::ErrorKind::ExecutableFileBusy =>
             {
-                std::thread::sleep(Duration::from_millis(20));
+                std::thread::yield_now();
             }
             other => return other,
         }
@@ -729,6 +729,26 @@ fn unpicked_owner_directives_below_the_stamp_entry_are_listed_one_line_each() {
     );
     directives.append("\n## 2026-11-25T05:01Z — Directive picked up: 2026-11-25T05:00Z — Owner directive: second\n");
     assert_eq!(directives.run().lines, [LISTED]);
+}
+
+#[test]
+fn a_folder_or_fifo_named_like_a_handoff_is_skipped_as_grep_skipped_it() {
+    let directives = Directives::new();
+    directives.append(&format!("\n{OPEN}"));
+    let handoff = directives.epoch().join("handoff");
+    fs::create_dir(handoff.join("coordinator-folder.md")).unwrap();
+    let fifo = Command::new("mkfifo")
+        .arg(handoff.join("coordinator-fifo.md"))
+        .status()
+        .unwrap();
+    assert!(fifo.success());
+    assert_eq!(
+        directives.run(),
+        Report {
+            lines: vec![LISTED.to_owned()],
+            failed: false
+        }
+    );
 }
 
 #[test]

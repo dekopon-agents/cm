@@ -47,19 +47,16 @@ pub fn sync(ctx: &Ctx, mode: Mode) -> Report {
     } else if mode == Mode::IfDirty {
         return report;
     }
-    if let Err(tries) = pushed(ctx) {
-        report.lines.push(failed(tries));
-        report.failed = true;
-    }
+    push(ctx, &mut report);
     report
 }
 
-// The tries that ran: all three, as heartbeat.sh always made, unless the budget ended them first.
-fn pushed(ctx: &Ctx) -> Result<(), u32> {
+// heartbeat.sh's line, word for word, even when the budget ended the tries before the third.
+fn push(ctx: &Ctx, report: &mut Report) {
     for done in 1..=TRIES {
         if done > 1 {
             if ctx.remaining().is_zero() {
-                return Err(done - 1);
+                break;
             }
             ctx.pause(BETWEEN_TRIES);
         }
@@ -68,18 +65,14 @@ fn pushed(ctx: &Ctx) -> Result<(), u32> {
             &["pull", "-q", "--rebase", "--autostash", "origin", "main"],
         ) && git(ctx, &["push", "-q", "origin", "main"])
         {
-            return Ok(());
+            return;
         }
         abort(ctx);
     }
-    Err(TRIES)
-}
-
-fn failed(tries: u32) -> String {
-    let times = if tries == 1 { "time" } else { "times" };
-    format!(
-        "heartbeat: git pull --rebase and push to main failed {tries} {times}; main does not have this checkout's commits"
-    )
+    report.lines.push(format!(
+        "heartbeat: git pull --rebase and push to main failed {TRIES} times; main does not have this checkout's commits"
+    ));
+    report.failed = true;
 }
 
 fn slug_tail(slug: &str) -> &str {
@@ -298,28 +291,20 @@ mod tests {
             OsStr::new("cm"),
             Duration::ZERO,
         );
-        assert_eq!(pushed(&spent), Err(1));
+        let mut report = Report::default();
+        push(&spent, &mut report);
+        assert_eq!(
+            report.lines,
+            [
+                "heartbeat: git pull --rebase and push to main failed 3 times; main does not have this checkout's commits"
+            ]
+        );
+        assert!(report.failed);
         assert_eq!(proc.log(), [ABORT], "the spent budget runs no pull");
         let abort = proc.calls().pop().unwrap();
         assert_eq!(abort.cwd.as_deref(), Some(Path::new("/ct")));
         assert_eq!(abort.timeout, Duration::from_secs(30));
         assert!(proc.pauses().is_empty());
-    }
-
-    #[test]
-    fn the_failure_line_counts_the_tries_that_ran_and_three_is_heartbeat_sh_s() {
-        assert_eq!(
-            failed(3),
-            "heartbeat: git pull --rebase and push to main failed 3 times; main does not have this checkout's commits"
-        );
-        assert_eq!(
-            failed(1),
-            "heartbeat: git pull --rebase and push to main failed 1 time; main does not have this checkout's commits"
-        );
-        assert_eq!(
-            failed(2),
-            "heartbeat: git pull --rebase and push to main failed 2 times; main does not have this checkout's commits"
-        );
     }
 
     #[test]

@@ -118,7 +118,7 @@ Phases:
 | `collect.rs` | `run(&Ctx) -> Report` | review-latency U4 |
 | `claude_md.rs` | `run(&Ctx) -> Report` | step 6 |
 
-`Report { lines, failed }`: a phase that fails, or runs a whole second past its `BUDGET`, also gets a `tick: <phase> phase took …` line. The phase's `BUDGET` is also its children's deadline, except gitsync's `git rebase --abort`, which gets 30 s of its own after a failed try so a pull the budget cut mid-rebase is still aborted.
+`Report { lines, failed }`: a phase that fails, or runs a whole second past its `BUDGET`, also gets a `tick: <phase> phase took …` line. The phase's `BUDGET` is also its children's deadline, with two exceptions that get 30 s of their own whatever is left of the budget, so a phase can run up to 30 s (plus the 5 s grace) past it: gitsync's `git rebase --abort` after a failed try, so a pull the budget cut mid-rebase is still aborted, and pin's `--version` run of the staged cm, so a fetch that spent most of the budget is still checked before anything is installed.
 
 Executors:
 
