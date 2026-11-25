@@ -825,8 +825,11 @@ fn undeployed_releases(units: &Units) -> Vec<Undeployed<'_>> {
     // A deploy is a rollout, or a PR in a repository no release line ships (a homelab pin). A
     // code PR in a released repository that waits on a tag consumes the release; it deploys
     // nothing.
-    let deploys = |step: &Step| {
+    // A pin or deploy step deploys by its name, as a rollout does, even when declared as code.
+    let deploys = |target: &str, step: &Step| {
         step.work == Work::Rollout
+            || target.ends_with("/pin")
+            || target.ends_with("/deploy")
             || step
                 .track
                 .evidence
@@ -852,7 +855,7 @@ fn undeployed_releases(units: &Units) -> Vec<Undeployed<'_>> {
             }
             continue;
         }
-        if !deploys(step) {
+        if !deploys(&target, step) {
             continue;
         }
         for after in &step.after {
@@ -1328,7 +1331,7 @@ fn actionable(
                         verdicts,
                         &target,
                         head,
-                        crate::verdict::Family::author(step.lane),
+                        crate::verdict::model_lane(step.lane),
                     ),
                     None if verdict_prs.contains(pr) => Vec::new(),
                     None => vec!["any"],
@@ -1525,8 +1528,8 @@ pub struct Observed {
     pub ci_head: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_base: Option<String>,
-    /// Whether CI was green, or its red checks covered by known-red exceptions, when the last
-    /// read completed at `ci_head`; cleared by a later read that found checks still running.
+    /// Whether CI was green when the last read completed at `ci_head`; cleared by a later read
+    /// that found checks still running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_green: Option<bool>,
     pub target: String,

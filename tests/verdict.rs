@@ -726,7 +726,7 @@ fn merge_gate_needs_astra_a_cleared_review_and_green_ci_at_the_head() {
     assert!(
         c.merge(&host, &gate).violations[0]
             .message
-            .contains("no claude review")
+            .contains("no Claude review")
     );
     claude_accept(&host, &c, &head);
 
@@ -4261,17 +4261,16 @@ fn merge_ready_reads_ci_on_every_sync_and_needs_a_clean_mergeable_head() {
     forge.mergeable = "dirty";
     synced(&forge);
     assert!(merge_ready(&c, host.now()).is_empty());
-    // A red check a known-red exception covers at the head does not hold it.
+    // A red check is never merge-ready, even one a known-red exception covers: that merge
+    // stays with `cm advance … merged`.
     let mut red = red_at_head(&head, "failure", "failure");
     red.campaign = Some(c.root.clone());
     let why = "red by design until build lands";
     assert!(known_red(&host, &c, &red, &head, why, "build").ok());
-    let mut uncovered = red_at_head(&head, "failure", "failure");
-    uncovered.campaign = Some(c.root.clone());
-    uncovered.checks.push(("quality-2", "failure"));
-    assert_eq!(synced(&uncovered), false);
+    assert_eq!(synced(&red), false);
     assert!(merge_ready(&c, host.now()).is_empty());
-    assert_eq!(synced(&red), true);
+    forge.mergeable = "clean";
+    assert_eq!(synced(&forge), true);
     assert_eq!(merge_ready(&c, host.now()), [ready]);
 }
 
@@ -4364,4 +4363,49 @@ fn each_part_of_a_multipart_step_is_merge_ready_on_its_own_pr() {
             format!("cm advance {STEP} merged --pr {second_pr} --sha '<merge-sha>' --part two")
         ]
     );
+}
+
+#[test]
+fn every_model_lane_needs_astra_and_a_claude_verdict_at_the_head() {
+    for lane in [
+        Lane::Codex,
+        Lane::ClaudeCloud,
+        Lane::Fable,
+        Lane::Coordinator,
+    ] {
+        let host = at("2026-10-26T08:00:00Z");
+        let c = campaign(&host, true);
+        let head = c.head();
+        let dir = c.root.join(target().unit);
+        let mut unit = store::load_unit(&dir).unwrap();
+        unit.steps.get_mut("S1").unwrap().lane = Some(lane);
+        commands::write_unit(&dir, &unit).unwrap();
+        let gaps = || {
+            verdict::merge_gaps(&c.root, &target(), None, Some(PR), &head, None)
+                .unwrap()
+                .gaps
+        };
+        let missing = || {
+            verdict::missing_reviews(
+                &verdict::load(&c.root).unwrap(),
+                STEP,
+                &head,
+                verdict::model_lane(Some(lane)),
+            )
+        };
+        assert_eq!(missing(), ["astra", "claude"], "{lane:?}");
+        let accept = c.report("astra-review-7", &head, &[], "ACCEPT");
+        c.receipt("astra-review-7", &head, "gpt-6-astra", "xhigh");
+        assert!(record(&host, &c, &accept, "astra").ok());
+        assert_eq!(missing(), ["claude"], "{lane:?}");
+        let gaps_now = gaps();
+        assert_eq!(gaps_now.len(), 1, "{lane:?} {gaps_now:?}");
+        assert!(gaps_now[0].contains("no Claude review"), "{gaps_now:?}");
+        claude_accept(&host, &c, &head);
+        assert!(missing().is_empty(), "{lane:?}");
+        assert!(gaps().is_empty(), "{lane:?} {:?}", gaps());
+    }
+    // A lane no model builds in needs any one verdict.
+    assert!(!verdict::model_lane(Some(Lane::Owner)));
+    assert!(!verdict::model_lane(Some(Lane::Pi)));
 }

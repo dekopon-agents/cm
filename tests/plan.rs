@@ -6735,3 +6735,46 @@ fn the_deploy_executors_evidence_and_deployed_digest_clear_released_undeployed()
     assert_eq!(state(&c, RELEASE), Phase::Deployed);
     assert!(actions_of(&c, now.now, "released-undeployed").is_empty());
 }
+
+#[test]
+fn a_pin_declared_as_code_is_the_deploy_released_undeployed_names() {
+    let old = at("2026-11-22T08:00:00Z");
+    let now = at("2026-11-22T16:00:00Z").now;
+    let c = campaign(&old);
+    assert!(
+        declare_release(
+            &old,
+            &c,
+            "00-release/widget/1.0.0",
+            "o/widget",
+            "v{version}"
+        )
+        .ok()
+    );
+    set_track(
+        &old,
+        &c,
+        "00-release/widget/1.0.0",
+        Phase::Released,
+        Evidence::default(),
+    );
+    assert!(
+        declare(
+            &old,
+            &c,
+            "01-a/u/pin",
+            Lane::Coordinator,
+            &["tag:widget@1.0.0"]
+        )
+        .ok()
+    );
+    add_limit(&c, "deploy_after_hours = 4");
+    assert_eq!(
+        actions_of(&c, now, "released-undeployed"),
+        [(
+            "01-a/u/pin".to_owned(),
+            "2026-11-22T08:00Z".to_owned(),
+            "cm amend 01-a/u/pin --kickoff-file '<kickoff-file>'".to_owned()
+        )]
+    );
+}

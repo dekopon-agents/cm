@@ -48,7 +48,6 @@ struct OpenChecks {
     unchanged: bool,
     completed: bool,
     green: bool,
-    checks: Vec<CheckState>,
     etags: BTreeMap<String, String>,
 }
 
@@ -456,52 +455,9 @@ impl<'a> Run<'a> {
                 unchanged: checks.is_none(),
                 completed,
                 green,
-                checks: checks.unwrap_or_default(),
                 etags,
             })
         })
-    }
-
-    /// Whether known-red exceptions cover every red check at an open PR's head, as the merge gate
-    /// would take them.
-    fn red_covered(
-        &mut self,
-        target: &str,
-        repo: &GithubRepo,
-        head: &CommitSha,
-        base: &CommitSha,
-        checks: &[CheckState],
-    ) -> bool {
-        let name = target.split('#').next().unwrap_or(target);
-        let Some(step) = plan::step(&self.units, name).cloned() else {
-            return false;
-        };
-        let standing = self
-            .units
-            .values()
-            .flat_map(|unit| unit.steps.values())
-            .flat_map(|step| &step.known_red)
-            .any(|exception| exception.standing && exception.campaign);
-        if step.known_red.is_empty() && !standing {
-            return false;
-        }
-        let before = match self.checks(repo, base) {
-            Some(Ok(before)) => Some(before),
-            Some(Err(_)) | None => None,
-        };
-        let completed = self
-            .completed_checks(repo, base, checks, &step)
-            .and_then(Result::ok);
-        crate::commands::red_checks(
-            &step.known_red,
-            &self.units,
-            head.as_str(),
-            checks,
-            before.as_deref(),
-            completed.as_deref(),
-        )
-        .1
-        .is_empty()
     }
 
     fn tag_exists(&mut self, repo: &GithubRepo, tag: &TagName) -> Option<Read<bool>> {
@@ -947,10 +903,7 @@ impl<'a> Run<'a> {
                                         ci_head = Some(head.to_string());
                                         ci_base = Some(base.to_string());
                                     }
-                                    ci_green = Some(
-                                        checks.green
-                                            || self.red_covered(&target, &repo, head, base, &checks.checks),
-                                    );
+                                    ci_green = Some(checks.green);
                                 } else {
                                     ci_green = None;
                                 }
