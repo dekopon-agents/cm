@@ -14,7 +14,8 @@ use cm::tick::act::{ActLine, Ctx, Env, Executor, Outcome, Registry, Report};
 use cm::tick::beat::{self, Beat, Phases};
 use cm::tick::gitsync::Mode;
 use cm::tick::proc::{
-    Cmd, Exit, FakeProc, Keep, OUTPUT_CAP, Proc, Ran, Spilled, StdoutKeep, SystemProc, WHOLE_CAP,
+    Cmd, Exit, FakeProc, KILL_AFTER, Keep, OUTPUT_CAP, Proc, Ran, Spilled, StdoutKeep, SystemProc,
+    WHOLE_CAP,
 };
 use serde_json::{Value, json};
 
@@ -1495,7 +1496,6 @@ fn a_list_a_descendant_prints_after_the_leader_and_stderr_are_gone_is_read_whole
 fn a_spilling_capture_times_out_and_kills_a_descendant_that_outlives_the_leader() {
     for big in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("pid");
         let print = if big {
             let list = dir.path().join("big.json");
             write_big_list(&list);
@@ -1503,37 +1503,52 @@ fn a_spilling_capture_times_out_and_kills_a_descendant_that_outlives_the_leader(
         } else {
             "echo {}".to_owned()
         };
-        let leaves = script(
-            &dir.path().join("leaves"),
-            &format!(
-                "exec 2>&-\n( {print}; sleep 60 ) &\necho $! > '{}'\nexit 0\n",
-                pid_file.display()
-            ),
-        );
-        // Long enough for the big list to be printed and spilled before the timeout.
-        let timeout = Duration::from_millis(if big { 8000 } else { 200 });
+        let leaves = |name: &str, then: &str| {
+            let pid_file = dir.path().join(format!("{name}.pid"));
+            let leaves = script(
+                &dir.path().join(name),
+                &format!(
+                    "exec 2>&-\n( {print}{then} ) &\necho $! > '{}'\nexit 0\n",
+                    pid_file.display()
+                ),
+            );
+            (
+                Cmd::new(leaves).keep(StdoutKeep::Spill, Keep::Head),
+                pid_file,
+            )
+        };
+        // The capture sets the pace, not the producer, so the timeout is a multiple of how long
+        // the same capture takes here and now, whatever else the machine is running.
+        let (quick, _) = leaves("quick", "");
         let started = Instant::now();
-        let ran = spawn(
-            &Cmd::new(&leaves)
-                .keep(StdoutKeep::Spill, Keep::Head)
-                .timeout(timeout),
-        )
-        .unwrap();
-        assert_eq!(ran.exit, Exit::TimedOut, "big: {big}");
-        assert!(started.elapsed() >= timeout, "big: {big}");
-        assert!(
-            started.elapsed() < timeout + Duration::from_secs(8),
+        let ran = spawn(&quick.timeout(Duration::from_secs(3600))).unwrap();
+        let capture = started.elapsed();
+        assert_eq!(ran.exit, Exit::Code(0), "big: {big}");
+        assert_eq!(
+            matches!(ran.stdout_spill, Some(Spilled::Stored(_))),
+            big,
             "big: {big}"
+        );
+        let timeout = (capture * 5).max(Duration::from_millis(200));
+        let (slow, pid_file) = leaves("slow", "; sleep 3600");
+        let started = Instant::now();
+        let ran = spawn(&slow.timeout(timeout)).unwrap();
+        let took = started.elapsed();
+        assert_eq!(ran.exit, Exit::TimedOut, "big: {big}, capture {capture:?}");
+        assert!(took >= timeout, "big: {big}");
+        assert!(
+            took < timeout + KILL_AFTER + Duration::from_secs(30),
+            "big: {big}: {took:?} for a {timeout:?} timeout"
         );
         assert_eq!(
             matches!(ran.stdout_spill, Some(Spilled::Stored(_))),
             big,
-            "big: {big}: {:?}",
+            "big: {big}, capture {capture:?}: {:?}",
             ran.stdout_spill
         );
         let pid = read_pid(&pid_file);
         assert!(
-            gone_within(&pid, Duration::from_secs(2)),
+            gone_within(&pid, Duration::from_secs(10)),
             "big: {big}: descendant {pid} survived"
         );
     }

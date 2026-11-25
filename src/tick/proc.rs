@@ -23,6 +23,8 @@ pub const WHOLE_CAP: usize = 64 << 20;
 
 const GROUP_POLL: Duration = Duration::from_millis(50);
 
+const POLL_FIRST: Duration = Duration::from_millis(1);
+
 const POLL: Duration = Duration::from_millis(10);
 
 const PUMP_READS: usize = 64;
@@ -313,6 +315,7 @@ impl Proc for SystemProc {
         };
         let deadline = started.checked_add(cmd.timeout);
         let mut exited = false;
+        let mut idle = POLL_FIRST;
         let end = loop {
             let moved = feed.push() | out.pump() | err.pump();
             if out.overflowed || err.overflowed {
@@ -326,9 +329,14 @@ impl Proc for SystemProc {
             if deadline.is_some_and(|deadline| now >= deadline) {
                 break Some(Exit::TimedOut);
             }
-            if !moved {
-                let left = deadline.map_or(POLL, |deadline| deadline - now);
-                std::thread::sleep(left.min(POLL));
+            // A full pipe is drained within a millisecond, so on one CPU the capture is not held to
+            // a pipe's worth per POLL; an idle child backs off to POLL.
+            if moved {
+                idle = POLL_FIRST;
+            } else {
+                let left = deadline.map_or(idle, |deadline| deadline - now);
+                std::thread::sleep(left.min(idle));
+                idle = (idle * 2).min(POLL);
             }
         };
         drop(feed);
