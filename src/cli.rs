@@ -396,6 +396,12 @@ enum Commands {
         #[command(subcommand)]
         act: Option<FollowupAct>,
     },
+    /// The coordinator's routine moves once, as heartbeat.sh made them: choose the one PLANNING or WORKING epoch, then run each `cm --json next --act` line's executor in the bound coordinator, or print the line. Prints only lines left for the model; exits 0 whenever it ran.
+    Tick {
+        /// The campaign-trail checkout holding `store/epochs/`.
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        checkout: PathBuf,
+    },
     /// Report every violation in the campaign folder; exit 1 when there is any.
     Lint {
         /// A folder inside the campaign; defaults to --root or the current directory.
@@ -1314,6 +1320,21 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             act: Some(FollowupAct::Close { id, by }),
             ..
         } => crate::verdict::close_followup(host, &root()?, id, by),
+        Commands::Tick { checkout } => {
+            let mut lines = Vec::new();
+            crate::tick::beat::cli(checkout, &mut |line| {
+                if cli.json {
+                    lines.push(line);
+                } else {
+                    println!("{line}");
+                }
+            });
+            let mut outcome = Outcome::default();
+            if cli.json {
+                outcome.field("lines", lines);
+            }
+            return Ok((outcome, ExitCode::SUCCESS));
+        }
         Commands::Lint { dir } => {
             let start = match (dir, &cli.root) {
                 (Some(dir), _) => dir.clone(),
@@ -1358,6 +1379,7 @@ fn name(command: &Commands) -> &'static str {
         Commands::Ruling { .. } => "ruling",
         Commands::Brief { .. } => "brief",
         Commands::Followups { .. } => "followups",
+        Commands::Tick { .. } => "tick",
         Commands::Lint { .. } => "lint",
     }
 }
@@ -1372,6 +1394,14 @@ pub fn main() -> ExitCode {
             .error(
                 clap::error::ErrorKind::ArgumentConflict,
                 "--by applies only to superseded",
+            )
+            .exit();
+    }
+    if matches!(cli.command, Commands::Tick { .. }) && cli.root.is_some() {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "cm tick chooses its own epoch: name the checkout with --checkout, not -C",
             )
             .exit();
     }
