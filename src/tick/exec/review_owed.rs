@@ -1,0 +1,44 @@
+use crate::tick::act::{ActLine, Ctx, Executor, Outcome};
+
+pub const KEY: &str = "review-owed";
+
+pub struct ReviewOwed;
+
+impl Executor for ReviewOwed {
+    fn run(&self, line: &ActLine, _ctx: &Ctx) -> Outcome {
+        Outcome::Left(line.text())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::tick::act::Env;
+    use crate::tick::proc::{FakeProc, Ran};
+
+    #[test]
+    fn the_stub_leaves_its_line_for_the_model() {
+        let proc = FakeProc::new(|_| Ok(Ran::code(0, "")));
+        let env = Env::default();
+        let ctx = Ctx::new(
+            Path::new("."),
+            Path::new("store/epochs/e"),
+            &proc,
+            &env,
+            OsStr::new("cm"),
+            Duration::from_secs(1),
+        );
+        let line = ActLine {
+            json: json!({"kind": "review-owed", "target": "01-a/u/b", "command": "cm x 01-a/u/b"}),
+            lane: None,
+        };
+        assert_eq!(ReviewOwed.run(&line, &ctx), Outcome::Left(line.text()));
+        assert!(proc.calls().is_empty());
+    }
+}

@@ -24,4 +24,5 @@ pub mod state;
 pub mod store;
 pub mod sync;
 pub mod templates;
+pub mod tick;
 pub mod verdict;

@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -15,6 +15,7 @@ use crate::lint;
 use crate::outcome::{Outcome, Violation};
 use crate::state::{Evidence, LANES, Lane, Phase, Work};
 use crate::store::{self, Target, parse_target};
+use crate::tick::proc::FileSizeLimit;
 
 #[derive(Parser)]
 #[command(
@@ -406,6 +407,24 @@ enum Commands {
         epoch: bool,
         #[command(subcommand)]
         act: Option<FollowupAct>,
+    },
+    #[command(
+        about = "The coordinator's routine moves once, as heartbeat.sh made them: choose the one PLANNING or WORKING epoch, then run each `cm --json next --act` line's executor in the bound coordinator, or print the line. Prints only lines left for the model; exits 0 whenever it ran"
+    )]
+    Tick {
+        #[arg(
+            long,
+            value_name = "DIR",
+            default_value = ".",
+            help = "The campaign-trail checkout holding `store/epochs/`"
+        )]
+        checkout: PathBuf,
+        #[arg(
+            long,
+            value_name = "PROGRAM",
+            help = "The cm that `cm next --act` and the executors' cm calls run; defaults to this executable. A bare name is looked up on PATH"
+        )]
+        cm: Option<PathBuf>,
     },
     /// Report every violation in the campaign folder; exit 1 when there is any.
     Lint {
@@ -1349,6 +1368,34 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             act: Some(FollowupAct::Close { id, by }),
             ..
         } => crate::verdict::close_followup(host, &root()?, id, by),
+        Commands::Tick { checkout, cm } => {
+            let mut lines = Vec::new();
+            let mut stdout = std::io::stdout().lock();
+            let limit = FileSizeLimit::of(&stdout);
+            let mut full = false;
+            let used =
+                crate::tick::beat::cli(checkout, cm.as_deref().map(Path::as_os_str), &mut |line| {
+                    if cli.json {
+                        lines.push(line);
+                        return;
+                    }
+                    full = full
+                        || limit
+                            .as_ref()
+                            .is_some_and(|limit| !limit.fits(&stdout, line.len() + 1));
+                    if !full {
+                        // A closed stdout (`cm tick | true`) must not end the tick: its moves still run.
+                        let _ = writeln!(stdout, "{line}");
+                    }
+                });
+            drop(stdout);
+            let mut outcome = Outcome::default();
+            if cli.json {
+                outcome.field("cm", used.to_string_lossy());
+                outcome.field("lines", lines);
+            }
+            return Ok((outcome, ExitCode::SUCCESS));
+        }
         Commands::Lint { dir } => {
             let start = match (dir, &cli.root) {
                 (Some(dir), _) => dir.clone(),
@@ -1364,6 +1411,22 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
         ExitCode::from(1)
     };
     Ok((outcome, exit))
+}
+
+fn serialized_len(json: &serde_json::Value) -> usize {
+    struct Count(usize);
+    impl Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let _ = serde_json::to_writer(&mut count, json);
+    count.0
 }
 
 fn name(command: &Commands) -> &'static str {
@@ -1393,6 +1456,7 @@ fn name(command: &Commands) -> &'static str {
         Commands::Ruling { .. } => "ruling",
         Commands::Brief { .. } => "brief",
         Commands::Followups { .. } => "followups",
+        Commands::Tick { .. } => "tick",
         Commands::Lint { .. } => "lint",
     }
 }
@@ -1407,6 +1471,14 @@ pub fn main() -> ExitCode {
             .error(
                 clap::error::ErrorKind::ArgumentConflict,
                 "--by applies only to superseded",
+            )
+            .exit();
+    }
+    if matches!(cli.command, Commands::Tick { .. }) && cli.root.is_some() {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "cm tick chooses its own epoch: name the checkout with --checkout, not -C",
             )
             .exit();
     }
@@ -1426,7 +1498,17 @@ pub fn main() -> ExitCode {
     });
     match outcome {
         Ok((outcome, exit)) => {
-            if cli.json {
+            if cli.json && matches!(cli.command, Commands::Tick { .. }) {
+                // A closed stdout must not turn a tick whose moves ran into a panic. The object is
+                // streamed, never copied into one string: only its length is needed for a limit.
+                let json = outcome.to_json(command);
+                let mut stdout = std::io::stdout().lock();
+                if FileSizeLimit::of(&stdout)
+                    .is_none_or(|limit| limit.fits(&stdout, serialized_len(&json) + 1))
+                {
+                    let _ = writeln!(stdout, "{json}");
+                }
+            } else if cli.json {
                 println!("{}", outcome.to_json(command));
             } else {
                 for violation in &outcome.violations {
