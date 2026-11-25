@@ -372,10 +372,13 @@ pub(crate) struct ActionInputs {
 }
 
 impl ActionInputs {
-    // Sync does not refuse an unreadable registry, as it does not refuse an unreadable review
-    // ledger: it registers no driver, so every claim reads as it would without one.
+    // What any reader sees, for CARD.md and sync's stall lines: which session runs the sync is not
+    // a campaign fact, so neither its coordinator nor the lane-driver registry enters.
     pub(crate) fn read(root: &Path, now: Timestamp) -> Self {
-        Self::with_drivers(root, now, Drivers::read(root).unwrap_or_default())
+        Self {
+            coordinator: None,
+            ..Self::with_drivers(root, now, Drivers::default())
+        }
     }
 
     pub(crate) fn load(root: &Path, now: Timestamp) -> Result<Self, Violation> {
@@ -836,11 +839,7 @@ pub(crate) fn action_summary(
     units: &Units,
     now: Timestamp,
 ) -> (usize, Option<String>) {
-    // CARD.md counts what any reader sees: which session runs the sync is not a campaign fact.
-    let inputs = ActionInputs {
-        coordinator: None,
-        ..ActionInputs::read(root, now)
-    };
+    let inputs = ActionInputs::read(root, now);
     let stalled = stalls(units, &inputs);
     // Unlike next, sync has not historically refused an unreadable review ledger.
     let verdicts = crate::verdict::load(root).unwrap_or_default();

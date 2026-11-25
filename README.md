@@ -623,7 +623,7 @@ is refused the same way rather than dropped by the next `add`, since a newer cm 
 registry this one cannot apply: upgrade cm. This fails closed, so a later cm that adds a registry
 field must leave it out while unset until every session runs a cm that reads it. CARD.md's
 `Actionable` count lists no `earlier-coordinator` at all, registered driver or not, since which
-claims are earlier depends on the session asking; an unreadable registry cannot change it. cm
+claims are earlier depends on the session asking; `cm sync` does not read the registry. cm
 writes the registry whole, so two branches that each change it conflict when merged, like cm's other
 `.cm/*.json` state: keep one side, then run `cm lane driver list` and re-run `cm lane driver add`
 for the other side's driver.
