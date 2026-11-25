@@ -1,44 +1,31 @@
 use crate::tick::act::{ActLine, Ctx, Executor, Outcome};
+use crate::tick::exec::merge_ready::{command, shell_words, target};
 
 pub const KEY: &str = "unblock-now";
 
 pub struct UnblockNow;
 
 impl Executor for UnblockNow {
-    fn run(&self, line: &ActLine, _ctx: &Ctx) -> Outcome {
-        Outcome::Left(line.text())
+    fn run(&self, line: &ActLine, ctx: &Ctx) -> Outcome {
+        unblock(line, ctx).unwrap_or_else(Outcome::Failed)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::ffi::OsStr;
-    use std::path::Path;
-    use std::time::Duration;
-
-    use serde_json::json;
-
-    use super::*;
-    use crate::tick::act::Env;
-    use crate::tick::proc::{FakeProc, Ran};
-
-    #[test]
-    fn the_stub_leaves_its_line_for_the_model() {
-        let proc = FakeProc::new(|_| Ok(Ran::code(0, "")));
-        let env = Env::default();
-        let ctx = Ctx::new(
-            Path::new("."),
-            Path::new("store/epochs/e"),
-            &proc,
-            &env,
-            OsStr::new("cm"),
-            Duration::from_secs(1),
-        );
-        let line = ActLine {
-            json: json!({"kind": "unblock-now", "target": "01-a/u/b", "command": "cm x 01-a/u/b"}),
-            lane: None,
-        };
-        assert_eq!(UnblockNow.run(&line, &ctx), Outcome::Left(line.text()));
-        assert!(proc.calls().is_empty());
+fn unblock(line: &ActLine, ctx: &Ctx) -> Result<Outcome, String> {
+    if target(line)?.starts_with("04-owner/") {
+        return Ok(Outcome::Left(format!(
+            "{} [owner step: unblock it and file its OWNER-QUEUE item]",
+            line.text()
+        )));
     }
+    let command = command(line)?;
+    let words = shell_words(command)
+        .filter(|words| {
+            words.starts_with(&["cm".to_owned(), "unblock".to_owned()])
+                && !words.iter().any(|word| word.contains('<'))
+        })
+        .ok_or_else(|| format!("not a runnable cm unblock: {command}"))?;
+    let args: Vec<&str> = words[2..].iter().map(String::as_str).collect();
+    ctx.cm("unblock", &args)?;
+    Ok(Outcome::Done(Vec::new()))
 }
