@@ -248,13 +248,12 @@ impl Tracked {
     }
 }
 
+// Every field but the stamp is a fact, including any a later change adds.
 fn same_facts(a: &plan::Observed, b: &plan::Observed) -> bool {
-    a.target == b.target
-        && a.head == b.head
-        && a.base == b.base
-        && a.mergeable_state == b.mergeable_state
-        && a.ci_head == b.ci_head
-        && a.ci_base == b.ci_base
+    plan::Observed {
+        at: b.at.clone(),
+        ..a.clone()
+    } == *b
 }
 
 fn merge_of(evidence: &Evidence) -> Option<(GithubRepo, CommitSha)> {
