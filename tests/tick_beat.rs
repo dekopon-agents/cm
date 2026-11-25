@@ -755,6 +755,10 @@ fn what_an_executor_returns_is_printed_as_heartbeat_sh_printed_its_output() {
         ),
         (Outcome::Done(vec!["".into(), "".into()]), vec![]),
         (
+            Outcome::Done(vec!["a\n".into(), "b".into()]),
+            vec!["a".into(), "".into(), "b".into()],
+        ),
+        (
             Outcome::Done(vec!["two\nlines".into()]),
             vec!["two".into(), "lines".into()],
         ),
@@ -777,6 +781,14 @@ fn what_an_executor_returns_is_printed_as_heartbeat_sh_printed_its_output() {
                 &long[..300]
             )],
         ),
+        (
+            Outcome::Failed(format!("x{}", "é".repeat(200))),
+            vec![format!(
+                "{} [tick/launchable-not-launched failed: x{}]",
+                PRINTED[0],
+                "é".repeat(149)
+            )],
+        ),
     ] {
         let proc = Answers::new(1, act(vec![lines().remove(0)])).proc();
         let (executor, _) = Record::new(outcome.clone());
@@ -787,6 +799,28 @@ fn what_an_executor_returns_is_printed_as_heartbeat_sh_printed_its_output() {
             "{outcome:?}"
         );
     }
+}
+
+struct PanicsOnOneLine;
+
+impl Executor for PanicsOnOneLine {
+    fn run(&self, _: &ActLine, _: &Ctx) -> Outcome {
+        panic!("executor bug");
+    }
+}
+
+#[test]
+fn a_one_line_executor_panic_keeps_its_panicked_prefix() {
+    let ct = Ct::new();
+    let proc = Answers::new(1, act(vec![lines().remove(0)])).proc();
+    let registry = Registry::new().with("launchable-not-launched", PanicsOnOneLine);
+    assert_eq!(
+        tick(&ct, &proc, &bound_env(), &registry),
+        [format!(
+            "{} [tick/launchable-not-launched failed: panicked: executor bug]",
+            PRINTED[0]
+        )]
+    );
 }
 
 struct Panics;
