@@ -1,31 +1,3 @@
-//! `cm tick`'s frame: heartbeat.sh's order, with step 4, the act loop, in full.
-//!
-//! 1. Choose the one live epoch: `store/epochs/*/EPOCH.md` with a line starting
-//!    `status: PLANNING` or `status: WORKING`. Any other count prints heartbeat.sh's "not one"
-//!    line and stops before any child runs.
-//! 2. In heartbeat.sh's order: [`gitsync`] (always), [`pin`], [`directive`]; then the bound
-//!    check (the checkout on `main`, and handoff-pick.sh printing `ok` for this session's
-//!    lineage); then [`collect`], in the bound coordinator only, so a verdict it records is in
-//!    the act list read next; the act loop; [`gitsync`] again when an executor ran (only a dirty
-//!    tree); and [`claude_md`].
-//! 3. The act loop reads `cm --json next -C <epoch> --act` by argv. In the bound coordinator each
-//!    line goes to its executor, `<kind>.<lane>` then `<kind>`; elsewhere every line is printed.
-//!    While OWNER-QUEUE.md has unread items, `merge-ready` and `review-owed` lines are printed
-//!    instead. Each executor gets `min(120, deadline - elapsed)` seconds (deadline 230,
-//!    `HEARTBEAT_DEADLINE` overrides); once that is under 1 s the remaining lines are printed
-//!    unrun.
-//!
-//! When handoff-pick.sh refuses a malformed coordinator handoff, one line names it at the bound
-//! check, whether or not the act list is empty (see [`malformed`]'s documentation for how it
-//! relates to the `executors off` line).
-//!
-//! A phase's wall time is printed only when a housekeeping phase failed, or any phase ran a whole
-//! second past its budget: `tick: <phase> phase took <seconds> s (budget <budget> s)`. A failed
-//! `cm next` prints only its own line, as in heartbeat.sh. An executor or phase that
-//! panics fails with the panic's message instead of ending the tick. Every other line is
-//! heartbeat.sh's, byte for byte, except that an executor is named `tick/<key>` where
-//! heartbeat.sh named its `act.d/<file>`.
-
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -36,27 +8,18 @@ use crate::tick::act::{ActLine, Ctx, Env, Outcome, Registry, Report, clip};
 use crate::tick::proc::{Cmd, Exit, KILL_AFTER, Keep, Proc, SystemProc, WHOLE_CAP};
 use crate::tick::{claude_md, collect, directive, exec, gitsync, pin};
 
-/// Seconds after the tick began past which no executor starts; `HEARTBEAT_DEADLINE` overrides.
 pub const DEADLINE_SECS: i64 = 230;
 
-/// The most seconds one executor gets.
 pub const EXECUTOR_CAP_SECS: i64 = 120;
 
-/// The most each frame child gets: `cm --json next --act`, `git rev-parse` and handoff-pick.sh.
-/// They run even when the deadline is spent, as in heartbeat.sh.
 pub const FRAME_CAP: Duration = Duration::from_secs(30);
 
-/// The kinds whose executors wait while OWNER-QUEUE.md has unread items (execution.md: re-read
-/// the queue before every review dispatch and merge).
 pub const QUEUE_HELD: [&str; 2] = ["merge-ready", "review-owed"];
 
-/// handoff-pick.sh, relative to the checkout; run by argv, never ported.
 pub const HANDOFF_PICK: &str = "tools/cloud-env/handoff-pick.sh";
 
-/// A housekeeping phase.
 pub type Phase<'a> = &'a dyn Fn(&Ctx) -> Report;
 
-/// The housekeeping phases a tick runs around the act loop; [`Phases::REAL`] outside tests.
 pub struct Phases<'a> {
     pub gitsync: &'a dyn Fn(&Ctx, gitsync::Mode) -> Report,
     pub pin: Phase<'a>,
@@ -66,7 +29,6 @@ pub struct Phases<'a> {
 }
 
 impl Phases<'static> {
-    /// The phase modules' own functions.
     pub const REAL: Phases<'static> = Phases {
         gitsync: &gitsync::sync,
         pin: &pin::run,
@@ -76,17 +38,13 @@ impl Phases<'static> {
     };
 }
 
-/// Everything one tick reaches.
 pub struct Beat<'a> {
-    /// The campaign-trail checkout holding `store/epochs/`; every child runs here.
     pub checkout: &'a Path,
     pub proc: &'a dyn Proc,
     pub env: &'a Env,
     pub registry: &'a Registry,
     pub phases: &'a Phases<'a>,
-    /// The program `cm` calls go to.
     pub cm: &'a OsStr,
-    /// When the tick began; heartbeat.sh's `SECONDS` counts from here.
     pub started: Instant,
 }
 
@@ -95,15 +53,11 @@ impl Beat<'_> {
         Ctx::new(self.checkout, epoch, self.proc, self.env, self.cm, budget)
     }
 
-    /// Whole seconds since the tick began.
     fn elapsed_secs(&self) -> i64 {
         i64::try_from(self.started.elapsed().as_secs()).unwrap_or(i64::MAX)
     }
 }
 
-/// `cm tick`: one tick with the real children, environment and executors, each line handed to
-/// `out` as it is decided. `cm` is the program cm calls go to, by default this executable; the
-/// one used is returned.
 pub fn cli(checkout: &Path, cm: Option<&OsStr>, out: &mut dyn FnMut(String)) -> OsString {
     let started = Instant::now();
     let env = Env::system();
@@ -123,14 +77,10 @@ pub fn cli(checkout: &Path, cm: Option<&OsStr>, out: &mut dyn FnMut(String)) -> 
     cm
 }
 
-/// This executable's path, read once when the tick starts: once the pin phase installs the
-/// pinned cm at that path, the act lines come from the pinned cm, as in heartbeat.sh. `cm` on
-/// `PATH` when the path cannot be read.
 pub fn this_cm() -> OsString {
     std::env::current_exe().map_or_else(|_| "cm".into(), PathBuf::into_os_string)
 }
 
-/// One tick: every line for the model goes to `out`, in order.
 pub fn run(beat: &Beat, out: &mut dyn FnMut(String)) {
     let epochs = live_epochs(beat.checkout);
     let [epoch] = epochs.as_slice() else {
@@ -183,8 +133,6 @@ pub fn run(beat: &Beat, out: &mut dyn FnMut(String)) {
     );
 }
 
-/// heartbeat.sh's epoch choice: each `store/epochs/*/EPOCH.md` with a line starting
-/// `status: PLANNING` or `status: WORKING`, as `store/epochs/<slug>`, sorted.
 pub fn live_epochs(checkout: &Path) -> Vec<PathBuf> {
     let epochs = Path::new("store/epochs");
     let Ok(entries) = std::fs::read_dir(checkout.join(epochs)) else {
@@ -205,8 +153,6 @@ pub fn live_epochs(checkout: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// `HEARTBEAT_DEADLINE`, or 230 when it is unset or empty; a value that is not a whole number
-/// is the line saying so.
 fn deadline(env: &Env) -> Result<i64, String> {
     match env.non_empty("HEARTBEAT_DEADLINE") {
         None => Ok(DEADLINE_SECS),
@@ -244,7 +190,6 @@ fn phase(
     );
 }
 
-/// The phase's wall time, when it failed or ran a whole second past its budget.
 fn wall_time(
     out: &mut dyn FnMut(String),
     name: &str,
@@ -262,11 +207,9 @@ fn wall_time(
 }
 
 struct Act {
-    /// An executor ran, so its writes may need pushing.
     ran: bool,
 }
 
-/// heartbeat.sh step 4.
 fn act(
     beat: &Beat,
     epoch: &Path,
@@ -394,7 +337,6 @@ fn act(
     act
 }
 
-/// Whether this session is the bound coordinator; when not, why.
 fn bound(beat: &Beat, epoch: &Path, out: &mut dyn FnMut(String)) -> Result<(), String> {
     // Both answers are read from their first line, so each keeps its head.
     let frame = |cmd: Cmd| {
@@ -433,13 +375,6 @@ fn bound(beat: &Beat, epoch: &Path, out: &mut dyn FnMut(String)) -> Result<(), S
     Err(format!("handoff-pick.sh for {lineage}: {pick}"))
 }
 
-/// The line naming a coordinator handoff handoff-pick.sh refused as malformed (`refused
-/// malformed <path>…`, or `refused missing-fields=… bad-fields=… <path>`), or `None` for any
-/// other answer. heartbeat.sh printed nothing for it while the act list was empty, so the live
-/// coordinator fell silent (LANE-tooling.md §Order of work 1, amended); `cm tick` prints it once
-/// per tick at the bound check, whatever the list holds. With a non-empty list heartbeat.sh's
-/// `heartbeat: executors off (handoff-pick.sh for <lineage>: <answer>); …` line follows unchanged:
-/// this line says which file to fix, that one says the act lines are the model's.
 fn malformed(pick: &str) -> Option<String> {
     let mut words = pick.strip_prefix("refused ")?.split_whitespace().peekable();
     let mut fields = Vec::new();
@@ -468,8 +403,6 @@ fn malformed(pick: &str) -> Option<String> {
     ))
 }
 
-/// Runs one executor or phase so that its panic is a line, not the end of the tick; the panic
-/// hook still reports it on stderr.
 fn contained<T>(body: impl FnOnce() -> T) -> Result<T, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).map_err(|payload| {
         payload
@@ -480,7 +413,6 @@ fn contained<T>(body: impl FnOnce() -> T) -> Result<T, String> {
     })
 }
 
-/// The first line of the first `limit` bytes (heartbeat.sh's `head -c <limit> | head -1`).
 fn first_line(bytes: &[u8], limit: usize) -> String {
     let head = &bytes[..bytes.len().min(limit)];
     let line = head.split(|byte| *byte == b'\n').next().unwrap_or_default();

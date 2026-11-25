@@ -1,5 +1,3 @@
-//! The executors `cm tick` runs, one per heartbeat.sh `act.d/` script.
-
 pub mod codex_dispatch;
 pub mod merge_ready;
 pub mod released_undeployed;
@@ -8,7 +6,6 @@ pub mod unblock_now;
 
 use crate::tick::act::Registry;
 
-/// Every executor, under its `act.d/` name.
 pub fn registry() -> Registry {
     Registry::new()
         .with(codex_dispatch::KEY, codex_dispatch::CodexDispatch)
@@ -25,7 +22,6 @@ pub fn registry() -> Registry {
 mod tests {
     use super::*;
 
-    /// heartbeat.sh's five `act.d/` executors, each under its own name.
     #[test]
     fn the_registry_holds_the_five_act_d_executors() {
         assert_eq!(

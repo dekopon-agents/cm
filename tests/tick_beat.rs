@@ -1,6 +1,3 @@
-//! `cm tick`: test_heartbeat.py's act-loop, bound, budget, kill and epoch-choice cases, through
-//! the fake `Proc`, the real one, and the built binary with fake `cm` and `git` on `PATH`.
-
 use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::fs;
@@ -24,7 +21,6 @@ const PRINTED: [&str; 2] = [
     "launchable-not-launched 01-a/u/b: cm launch 01-a/u/b",
     "attempt-ended 01-a/u/c: cm attempt 01-a/u/c restart",
 ];
-/// The frame's own calls, as the fake scripts log them, in order.
 const FRAME: [&str; 3] = [
     "git rev-parse --abbrev-ref HEAD",
     "handoff-pick.sh store/epochs/eleemosynary-mnemosyne coordinator --lineage session_01abc --max-age-hours 24",
@@ -58,7 +54,6 @@ fn script(path: &Path, body: &str) -> PathBuf {
     path.to_owned()
 }
 
-/// A scratch campaign-trail checkout: the live epoch and a closed one.
 struct Ct(tempfile::TempDir);
 
 impl Ct {
@@ -80,7 +75,6 @@ impl Ct {
         write(&self.path().join(relative), text);
     }
 
-    /// Unit 01-a/u: step b in the codex lane, c in claude-cloud, d with none.
     fn state(&self) {
         self.write(
             &format!("{EPOCH}/01-a/u/.cm/state.json"),
@@ -90,7 +84,6 @@ impl Ct {
     }
 }
 
-/// What the fake children answer: `cm --json next`, `git rev-parse` and handoff-pick.sh.
 #[derive(Clone)]
 struct Answers {
     next: Ran,
@@ -140,7 +133,6 @@ fn quiet_gitsync(_: &Ctx, _: Mode) -> Report {
     Report::default()
 }
 
-/// Phases that do nothing: the loop's tests never depend on what the housekeeping cards fill in.
 const QUIET: Phases<'static> = Phases {
     gitsync: &quiet_gitsync,
     pin: &quiet,
@@ -153,8 +145,6 @@ fn tick(ct: &Ct, proc: &dyn Proc, env: &Env, registry: &Registry) -> Vec<String>
     tick_with(ct, proc, env, registry, &QUIET)
 }
 
-/// The entries of `log` that are one of `wanted`, in order is one of `wanted`, in order: the frame's own, whatever else the phases
-/// run.
 fn frame_calls<'a>(log: &'a [String], wanted: &[&str]) -> Vec<&'a str> {
     log.iter()
         .map(String::as_str)
@@ -183,7 +173,6 @@ fn tick_with(
     out
 }
 
-/// One executor call as the executor saw it.
 #[derive(Debug, Clone)]
 struct Call {
     json: Value,
@@ -202,7 +191,6 @@ impl Seen {
     }
 }
 
-/// An executor that records its call and returns a fixed outcome.
 struct Record {
     seen: Seen,
     outcome: Outcome,
@@ -238,7 +226,6 @@ fn done() -> Outcome {
     Outcome::Done(Vec::new())
 }
 
-/// `tick: <phase> phase took <s.s> s (budget <n> s)`.
 fn is_wall_line(line: &str, phase: &str) -> bool {
     let Some(rest) = line.strip_prefix(&format!("tick: {phase} phase took ")) else {
         return false;
@@ -831,7 +818,6 @@ fn a_panicking_executor_or_phase_fails_its_line_and_the_tick_goes_on() {
     assert_eq!(ended_seen.calls().len(), 1);
 }
 
-/// An executor that starts one child and returns `Done`, however the child ended.
 struct Spawns(Cmd);
 
 impl Executor for Spawns {
@@ -1006,10 +992,6 @@ fn the_live_epoch_is_one_with_a_line_starting_status_planning_or_working() {
     assert!(beat::live_epochs(empty.path()).is_empty());
 }
 
-// ---- the real `Proc` ----
-
-/// The real runner, with bare program names found in `bin` first (fake `git` on a private
-/// `PATH`, without changing this process's).
 struct Bin(PathBuf);
 
 impl Proc for Bin {
@@ -1023,8 +1005,6 @@ impl Proc for Bin {
     }
 }
 
-/// The real runner, retrying a script that another test thread's fork still holds open for
-/// writing (ETXTBSY), a race of parallel tests that write executables.
 fn spawn(cmd: &Cmd) -> cm::tick::Result<Ran> {
     for _ in 0..100 {
         match SystemProc.run(cmd) {
@@ -1039,7 +1019,6 @@ fn spawn(cmd: &Cmd) -> cm::tick::Result<Ran> {
     SystemProc.run(cmd)
 }
 
-/// Whether the process is gone: no such pid, or only a zombie left for init to reap.
 fn gone(pid: &str) -> bool {
     match fs::read_to_string(format!("/proc/{pid}/stat")) {
         Err(_) => true,
@@ -1319,8 +1298,6 @@ fn a_descendant_holding_stdout_open_runs_until_the_timeout_then_goes_with_the_gr
         "child {pid} survived"
     );
 }
-
-// ---- the built binary, with fake `cm` and `git` on PATH as test_heartbeat.py has them ----
 
 struct Harness {
     ct: Ct,
@@ -1652,9 +1629,6 @@ fn the_ctx_helpers_are_act_libs() {
     assert_eq!(proc.calls().len(), 3, "a spent budget starts nothing");
 }
 
-// ---- fix round 1 (Astra r1 at 8f291da9): regression tests ----
-
-/// F1: `cm next --act`'s JSON is kept whole, past the 4 MiB a diagnostic keeps.
 #[test]
 fn a_valid_act_list_above_4_mib_prints_every_line() {
     let ct = Ct::new();
@@ -1706,7 +1680,6 @@ fn a_valid_act_list_above_4_mib_prints_every_line() {
     }
 }
 
-/// F1, swept: handoff-pick.sh's answer is its first line, kept from the head of its stdout.
 #[test]
 fn a_first_line_answer_is_read_from_its_head_whatever_follows() {
     let ct = Ct::new();
@@ -1741,7 +1714,6 @@ fn a_first_line_answer_is_read_from_its_head_whatever_follows() {
     assert_eq!(seen.calls().len(), 1, "bound: `ok` was the first line");
 }
 
-/// F2: a malformed coordinator handoff is named once per tick, act list empty or not.
 #[test]
 fn a_malformed_coordinator_handoff_is_named_once_whatever_the_act_list_holds() {
     let ct = Ct::new();
@@ -1785,7 +1757,6 @@ fn a_malformed_coordinator_handoff_is_named_once_whatever_the_act_list_holds() {
     );
 }
 
-/// F3: after TERM the group gets its whole grace even once the leader has exited.
 #[test]
 fn a_descendant_cleaning_up_on_term_gets_the_whole_grace() {
     let dir = tempfile::tempdir().unwrap();
@@ -1814,7 +1785,6 @@ fn a_descendant_cleaning_up_on_term_gets_the_whole_grace() {
     );
 }
 
-/// F3: a descendant that ignores TERM is KILLed when the grace ends, though the leader exited.
 #[test]
 fn a_descendant_ignoring_term_is_killed_when_the_grace_ends_though_the_leader_exited() {
     let dir = tempfile::tempdir().unwrap();
@@ -1842,10 +1812,6 @@ fn a_descendant_ignoring_term_is_killed_when_the_grace_ends_though_the_leader_ex
     );
 }
 
-// ---- fix round 1 (Fable r1 at 8f291da9): regression tests ----
-
-/// Fable F3: only a child the budget cut short spends it; one past its own shorter timeout is
-/// the executor's to handle.
 #[test]
 fn a_child_past_its_own_shorter_timeout_does_not_spend_the_budget() {
     let ct = Ct::new();
@@ -1874,8 +1840,6 @@ fn a_child_past_its_own_shorter_timeout_does_not_spend_the_budget() {
     );
 }
 
-/// Fable F2 (= Astra F3), the reviewer's repro: the leader waits on a worker that cleans up for
-/// a second on TERM and then writes a marker, as under `timeout --kill-after=5 1`.
 #[test]
 fn a_worker_cleaning_up_under_a_waiting_leader_writes_its_marker() {
     let dir = tempfile::tempdir().unwrap();
@@ -1903,8 +1867,6 @@ fn a_worker_cleaning_up_under_a_waiting_leader_writes_its_marker() {
     );
 }
 
-/// Fable F5: `cm tick` run through a symlinked `cm` reads its act list from the resolved
-/// binary, which is where the pin phase installs (`ctx.cm`).
 #[test]
 fn the_built_cm_tick_run_through_a_symlink_reads_from_the_resolved_binary() {
     let harness = Harness::new(0, &act(Vec::new()), PICK_OK);
@@ -1943,7 +1905,6 @@ fn the_built_cm_tick_run_through_a_symlink_reads_from_the_resolved_binary() {
     assert_eq!(json["lines"], json!([]));
 }
 
-/// Fable F7: a head or tail that dropped bytes says so; a whole stream does not cut silently.
 #[test]
 fn ran_says_when_a_stream_was_truncated() {
     let dir = tempfile::tempdir().unwrap();
@@ -1964,7 +1925,6 @@ fn ran_says_when_a_stream_was_truncated() {
     assert!(!ran.stdout_truncated && !ran.stderr_truncated);
 }
 
-/// Fable F9: a closed stdout (`cm tick | true`) does not end the tick with a panic.
 #[test]
 fn the_built_cm_tick_exits_0_when_its_stdout_is_closed() {
     let harness = Harness::new(0, &act(lines()), PICK_OK);
@@ -1986,8 +1946,6 @@ fn the_built_cm_tick_exits_0_when_its_stdout_is_closed() {
     );
 }
 
-/// The siblings' gaps: a variable removed from a child's environment, a pause that a fake does
-/// not wait, and a cm command built with stdin and `--json`.
 #[test]
 fn ctx_removes_variables_pauses_through_the_runner_and_builds_cm_commands() {
     let dir = tempfile::tempdir().unwrap();
@@ -2056,8 +2014,6 @@ fn ctx_removes_variables_pauses_through_the_runner_and_builds_cm_commands() {
     assert_eq!(ran.stdout_text(), "body\n");
 }
 
-/// Fable F8: a line without a target prints it empty, as heartbeat.sh's
-/// `.target + (if .part then "#" + .part else "" end)` did.
 #[test]
 fn a_line_without_a_target_prints_it_empty_as_jq_did() {
     let ct = Ct::new();

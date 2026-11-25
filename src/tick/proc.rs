@@ -1,27 +1,3 @@
-//! Child processes for the tick: always an argv, never a shell string.
-//!
-//! Every child runs in a process group of its own. At its timeout the whole group gets TERM. The
-//! group then has [`KILL_AFTER`] to finish (GNU `timeout --kill-after=5`, which heartbeat.sh
-//! used), whether or not the leader has already exited, before the whole group gets KILL, so a
-//! child's own children go with it and a descendant that cleans up on TERM gets the full grace.
-//! The group leader is not reaped until the KILL has been sent, so its id cannot be reused by an
-//! unrelated group in between. A child that exits but leaves a descendant holding its stdout or
-//! stderr open counts as running until the timeout.
-//!
-//! Each output stream is kept by its [`Keep`]: whole (a producer's JSON; past [`WHOLE_CAP`] the
-//! child is killed and exits [`Exit::TooLarge`], never cut silently), its head (a first line) or
-//! its tail (a last line); [`Ran`] says when a head or tail dropped bytes.
-//!
-//! Limit: the tick forwards no signal, so a kill of `cm tick` itself (the Stop hook's timeout
-//! signalling the hook's own process group) does not reach a running child's group, which then
-//! runs on, bounded only by its own behaviour. Under heartbeat.sh the frame children died with
-//! the hook's group. The hook must therefore bound `cm tick` by session, not only by signalling
-//! its group. `PR_SET_PDEATHSIG` is not used: it needs an `unsafe` `pre_exec` and would reach only
-//! the direct child, not the rest of its group.
-//!
-//! [`SystemProc`] is the real runner; [`FakeProc`] answers from a closure and records every
-//! call, for tests.
-
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Read, Write};
@@ -35,62 +11,39 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
 use crate::tick::{Result, TickError};
 
-/// How long a timed-out child's process group has between TERM and KILL.
 pub const KILL_AFTER: Duration = Duration::from_secs(5);
 
-/// Bytes a [`Keep::Head`] or [`Keep::Tail`] stream keeps.
 pub const OUTPUT_CAP: usize = 4 << 20;
 
-/// The most bytes a [`Keep::Whole`] stream holds; one byte more kills the child with its process
-/// group, and it exits [`Exit::TooLarge`].
 pub const WHOLE_CAP: usize = 64 << 20;
 
-/// How often the runner looks for live members of a TERMed group during its grace.
 const GROUP_POLL: Duration = Duration::from_millis(50);
 
-/// How long the runner sleeps when a child has neither exited nor written.
 const POLL: Duration = Duration::from_millis(10);
 
-/// The most buffers one pump of a pipe reads before the runner checks the clock again.
 const PUMP_READS: usize = 64;
 
-/// One child to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cmd {
-    /// `argv[0]` is the program, looked up on `PATH` when it has no `/`.
     pub argv: Vec<OsString>,
-    /// The working directory; `None` keeps the tick's own.
     pub cwd: Option<PathBuf>,
-    /// Variables added to the inherited environment.
     pub env: Vec<(OsString, OsString)>,
-    /// Variables removed from the inherited environment (before `env` adds).
     pub env_remove: Vec<OsString>,
-    /// Written to the child's stdin, which is then closed; `None` gives it `/dev/null`.
     pub stdin: Option<Vec<u8>>,
-    /// After this the whole process group gets TERM, then KILL [`KILL_AFTER`] later.
     pub timeout: Duration,
-    /// stderr shares stdout's pipe, interleaved as written (`2>&1`); [`Ran::stderr`] stays empty.
     pub merge_stderr: bool,
-    /// What is kept of stdout (with `merge_stderr`, of both); [`Keep::Whole`] by default.
     pub keep_stdout: Keep,
-    /// What is kept of stderr; [`Keep::Tail`] by default.
     pub keep_stderr: Keep,
 }
 
-/// What a runner keeps of one output stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keep {
-    /// Every byte, for output that is parsed, up to [`WHOLE_CAP`]; past it the child is killed
-    /// with its process group and exits [`Exit::TooLarge`].
     Whole,
-    /// The first [`OUTPUT_CAP`] bytes, for a first line.
     Head,
-    /// The last [`OUTPUT_CAP`] bytes, for a last line.
     Tail,
 }
 
 impl Cmd {
-    /// The timeout a new `Cmd` has; a [`Ctx`](crate::tick::act::Ctx) lowers it to its budget.
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
     pub fn new(program: impl AsRef<OsStr>) -> Self {
@@ -155,7 +108,6 @@ impl Cmd {
         self
     }
 
-    /// The program's file name: `/usr/bin/git` is `git`.
     pub fn program_name(&self) -> String {
         self.argv.first().map_or_else(String::new, |program| {
             Path::new(program)
@@ -166,7 +118,6 @@ impl Cmd {
         })
     }
 
-    /// The call as a fake script logs it: the program's file name, then its arguments, spaced.
     pub fn line(&self) -> String {
         std::iter::once(self.program_name())
             .chain(
@@ -180,15 +131,11 @@ impl Cmd {
     }
 }
 
-/// How a child ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
     Code(i32),
     Signal(i32),
-    /// It ran past its timeout and was killed with its process group.
     TimedOut,
-    /// It printed more than [`WHOLE_CAP`] to a stream kept whole and was killed with its process
-    /// group; that stream holds only its first [`WHOLE_CAP`] bytes.
     TooLarge,
 }
 
@@ -197,8 +144,6 @@ impl Exit {
         self == Exit::Code(0)
     }
 
-    /// The status a shell reports: the code, 128 plus the signal, GNU timeout's 124, or 137 (a
-    /// kill) for [`Exit::TooLarge`].
     pub fn shell_status(self) -> i32 {
         match self {
             Exit::Code(code) => code,
@@ -209,23 +154,17 @@ impl Exit {
     }
 }
 
-/// What a child left.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ran {
     pub exit: Exit,
     pub stdout: Vec<u8>,
-    /// Empty when the command merged it into stdout.
     pub stderr: Vec<u8>,
-    /// stdout dropped bytes: a [`Keep::Head`] or [`Keep::Tail`] past [`OUTPUT_CAP`], or a
-    /// [`Keep::Whole`] past [`WHOLE_CAP`] (which also exits [`Exit::TooLarge`]).
     pub stdout_truncated: bool,
-    /// stderr dropped bytes, likewise.
     pub stderr_truncated: bool,
     pub wall: Duration,
 }
 
 impl Ran {
-    /// A child that exited with `code` after printing `stdout`; for fakes.
     pub fn code(code: i32, stdout: impl Into<Vec<u8>>) -> Self {
         Ran {
             exit: Exit::Code(code),
@@ -237,7 +176,6 @@ impl Ran {
         }
     }
 
-    /// A child killed at its timeout before printing anything.
     pub fn timed_out() -> Self {
         Ran {
             exit: Exit::TimedOut,
@@ -259,19 +197,14 @@ impl Ran {
     }
 }
 
-/// Runs children. The tick reaches every program through this, so tests can fake them all.
 pub trait Proc {
-    /// Runs `cmd` until it exits, or until its timeout and the kill of its process group.
-    /// `Err` only when it could not be started or waited for; an exit status is data.
     fn run(&self, cmd: &Cmd) -> Result<Ran>;
 
-    /// Waits, as between retries; a fake records it and returns at once.
     fn pause(&self, pause: Duration) {
         std::thread::sleep(pause);
     }
 }
 
-/// The real runner.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemProc;
 
@@ -394,16 +327,11 @@ impl Proc for SystemProc {
     }
 }
 
-/// Signals the child's process group, and the child itself in case it left the group. The
-/// child is not reaped yet, so neither id can belong to anyone else.
 fn kill(pid: Pid, signal: Signal) {
     let _ = rustix::process::kill_process_group(pid, signal);
     let _ = rustix::process::kill_process(pid, signal);
 }
 
-/// Whether any member of the process group `pgid` is still running; a zombie is not. Linux reads
-/// `/proc`; elsewhere a group cannot be told apart from its unreaped leader, so it reads as
-/// running and the whole grace is waited.
 fn group_running(pgid: Pid) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -436,7 +364,6 @@ fn group_running(pgid: Pid) -> bool {
     }
 }
 
-/// Whether the group leader has exited, leaving it unreaped so its pid stays reserved.
 fn leader_exited(pid: Pid) -> bool {
     let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
     match rustix::process::waitid(WaitId::Pid(pid), options) {
@@ -456,14 +383,11 @@ fn nonblocking(fd: impl AsFd) -> std::io::Result<()> {
     Ok(())
 }
 
-/// One output pipe, read without blocking, kept by its [`Keep`].
 struct Drain {
     reader: Option<Box<dyn Stream>>,
     keep: Keep,
     bytes: Vec<u8>,
-    /// A [`Keep::Whole`] stream passed [`WHOLE_CAP`].
     overflowed: bool,
-    /// Bytes were dropped.
     truncated: bool,
 }
 
@@ -485,8 +409,6 @@ impl Drain {
         self.reader.is_none()
     }
 
-    /// Reads what is there, at most [`PUMP_READS`] buffers so a flood cannot hold off the
-    /// deadline; true when it read anything or reached the end.
     fn pump(&mut self) -> bool {
         let mut buffer = [0; 8192];
         let mut moved = false;
@@ -536,7 +458,6 @@ impl Drain {
         }
     }
 
-    /// The bytes kept, and whether any were dropped.
     fn finish(mut self) -> (Vec<u8>, bool) {
         if self.keep == Keep::Tail && self.bytes.len() > OUTPUT_CAP {
             self.bytes.drain(..self.bytes.len() - OUTPUT_CAP);
@@ -546,7 +467,6 @@ impl Drain {
     }
 }
 
-/// The child's stdin, written without blocking, then closed.
 struct Feed<'a> {
     writer: Option<std::process::ChildStdin>,
     rest: &'a [u8],
@@ -566,7 +486,6 @@ impl<'a> Feed<'a> {
         })
     }
 
-    /// Writes what the pipe takes; true when it wrote anything or closed the pipe.
     fn push(&mut self) -> bool {
         let Some(writer) = &mut self.writer else {
             return false;
@@ -591,8 +510,6 @@ impl<'a> Feed<'a> {
 
 type Answer = dyn Fn(&Cmd) -> Result<Ran>;
 
-/// A runner for tests: answers every call from a closure and records it, and records pauses
-/// without waiting.
 pub struct FakeProc {
     calls: RefCell<Vec<Cmd>>,
     pauses: RefCell<Vec<Duration>>,
@@ -608,17 +525,14 @@ impl FakeProc {
         }
     }
 
-    /// Every call so far, in order.
     pub fn calls(&self) -> Vec<Cmd> {
         self.calls.borrow().clone()
     }
 
-    /// Every pause so far, in order.
     pub fn pauses(&self) -> Vec<Duration> {
         self.pauses.borrow().clone()
     }
 
-    /// Every call so far as [`Cmd::line`] prints it.
     pub fn log(&self) -> Vec<String> {
         self.calls.borrow().iter().map(Cmd::line).collect()
     }

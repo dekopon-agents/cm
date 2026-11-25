@@ -1,40 +1,3 @@
-//! The act loop's contract: what an executor and a housekeeping phase see and return.
-//!
-//! An executor replaces one heartbeat.sh `act.d/` script. Where the script got the act line's
-//! JSON on stdin and the epoch directory as `$1`, an [`Executor`] gets the [`ActLine`] and a
-//! [`Ctx`]; where it exited 0 printing what is left for the model, or 1 printing why, it returns
-//! an [`Outcome`]. It starts every child through [`Ctx::run`] (or [`Ctx::cm`]), which gives the
-//! child what remains of the executor's budget; a child killed at that budget makes the loop
-//! print heartbeat.sh's timeout line, whatever the executor returns. Executor code itself must
-//! not block: only children are bounded.
-//!
-//! # Frozen signatures
-//!
-//! The sibling cards fill these files and nothing else, against these signatures:
-//!
-//! - `07-tick/mvp/housekeeping`, each phase in heartbeat.sh's order, each with its own
-//!   `pub const BUDGET: Duration` (the context's deadline, and the line past which `beat` prints
-//!   the phase's wall time):
-//!   - [`gitsync::sync`](crate::tick::gitsync::sync)`(ctx: &Ctx, mode: gitsync::Mode) -> Report`
-//!     (heartbeat.sh step 1 with `Mode::Always`, step 5 with `Mode::IfDirty`);
-//!   - [`pin::run`](crate::tick::pin::run)`(ctx: &Ctx) -> Report` (step 2; it installs the
-//!     pinned cm at `ctx.cm`, the program the act list is read from, so the act lines that
-//!     follow come from the pinned cm whether `cm` on `PATH` is a file or a symlink);
-//!   - [`directive::run`](crate::tick::directive::run)`(ctx: &Ctx) -> Report` (step 3);
-//!   - [`claude_md::run`](crate::tick::claude_md::run)`(ctx: &Ctx) -> Report` (step 6).
-//! - `07-tick/mvp/exec-codex` also fills
-//!   [`collect::run`](crate::tick::collect::run)`(ctx: &Ctx) -> Report` (review-latency U4,
-//!   run in the bound coordinator only, before `cm --json next --act` is read).
-//! - `07-tick/mvp/exec-merge` and `07-tick/mvp/exec-codex`: in each `exec/<name>.rs`, keep
-//!   `pub const KEY: &str` (the `act.d/` name, `<kind>` or `<kind>.<lane>`) and the unit struct
-//!   with `impl Executor`, whose
-//!   [`run`](Executor::run)`(&self, line: &ActLine, ctx: &Ctx) -> Outcome` is the body to fill.
-//!   [`exec::registry`](crate::tick::exec::registry) registers them.
-//!
-//! The helpers here are act_lib.py's, for executors: [`ActLine::text`], [`Ctx::step_state`],
-//! [`Ctx::pull`], [`Ctx::cm`] and [`last_line`]; [`Ctx::cm_cmd`] and [`Ctx::cm_run`] build and run
-//! a cm command with stdin or `--json`, and [`Ctx::pause`] waits between retries.
-
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -46,19 +9,13 @@ use serde_json::{Map, Value};
 use crate::tick::Result;
 use crate::tick::proc::{Cmd, Exit, Proc, Ran};
 
-/// One object of `cm --json next --act`'s `actionable` list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActLine {
-    /// The object as cm printed it. cm's JSON carries `kind`, `target`, `part`, `since` and
-    /// `command`, and may carry `lane`, `pr`, `head`, `base`, `ci_green` and `weight`.
     pub json: Value,
-    /// `.lane`, else the step's lane in its unit's `.cm/state.json`: heartbeat.sh's lookup.
     pub lane: Option<String>,
 }
 
 impl ActLine {
-    /// Reads the lane as heartbeat.sh did: the line's own non-empty `lane`, else
-    /// `.steps[<step>].lane` in `<epoch_dir>/<NN-area>/<unit>/.cm/state.json`.
     pub fn read(json: Value, epoch_dir: &Path) -> Self {
         let own = json
             .get("lane")
@@ -80,13 +37,10 @@ impl ActLine {
         ActLine { json, lane }
     }
 
-    /// `.kind` as `jq -r` prints it.
     pub fn kind(&self) -> String {
         jq_raw(self.json.get("kind"))
     }
 
-    /// `.target`, plus `#<part>` when the line names a part: heartbeat.sh's
-    /// `.target + (if .part then "#" + .part else "" end)`, where a missing target adds as empty.
     pub fn target(&self) -> String {
         let target = self
             .json
@@ -103,19 +57,14 @@ impl ActLine {
         jq_raw(self.json.get("command"))
     }
 
-    /// `<kind> <target>[#<part>]: <command>`, the line the model sees when nothing ran, as
-    /// heartbeat.sh's `jq` built it (act_lib.py's `text` differs only for an empty `part`, which
-    /// it drops, and a missing `command`, which it prints empty; cm emits neither).
     pub fn text(&self) -> String {
         format!("{} {}: {}", self.kind(), self.target(), self.command())
     }
 
-    /// A string field of the line, when present.
     pub fn field(&self, name: &str) -> Option<&str> {
         self.json.get(name).and_then(Value::as_str)
     }
 
-    /// The line as heartbeat.sh fed an executor's stdin: compact JSON and a newline.
     pub fn stdin(&self) -> Vec<u8> {
         let mut bytes = self.json.to_string().into_bytes();
         bytes.push(b'\n');
@@ -123,7 +72,6 @@ impl ActLine {
     }
 }
 
-/// How `jq -r` prints a value: a string bare, a missing value as `null`, anything else as JSON.
 fn jq_raw(value: Option<&Value>) -> String {
     match value {
         Some(Value::String(text)) => text.clone(),
@@ -132,8 +80,6 @@ fn jq_raw(value: Option<&Value>) -> String {
     }
 }
 
-/// heartbeat.sh's `cut -d/ -f1-2` and `cut -d/ -f3` of the target without its part: a target
-/// with no `/` is both.
 fn unit_and_step(target: &str) -> (&str, &str) {
     let target = target.split('#').next().unwrap_or_default();
     if !target.contains('/') {
@@ -150,12 +96,10 @@ fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
-/// The environment variables the tick reads, captured once so tests can set them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Env(BTreeMap<String, String>);
 
 impl Env {
-    /// The process's variables whose names and values are UTF-8.
     pub fn system() -> Self {
         Env(std::env::vars_os()
             .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
@@ -166,7 +110,6 @@ impl Env {
         self.0.get(name).map(String::as_str)
     }
 
-    /// A variable's value when it is set and not empty (the shell's `${NAME:+…}`).
     pub fn non_empty(&self, name: &str) -> Option<&str> {
         self.get(name).filter(|value| !value.is_empty())
     }
@@ -181,26 +124,19 @@ impl<K: Into<String>, V: Into<String>> FromIterator<(K, V)> for Env {
     }
 }
 
-/// The longest budget a [`Ctx`] keeps; a longer one is cut to this.
 pub const MAX_BUDGET: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// What an executor or phase can reach, and the budget its children share.
 pub struct Ctx<'a> {
-    /// The campaign-trail checkout; every child starts here unless its command says otherwise.
     pub checkout: &'a Path,
-    /// The live epoch's folder relative to the checkout, `store/epochs/<slug>`: heartbeat.sh's
-    /// `$1` for an executor and `cm -C`'s argument.
     pub epoch: &'a Path,
     pub proc: &'a dyn Proc,
     pub env: &'a Env,
-    /// The program `cm` calls go to.
     pub cm: &'a OsStr,
     deadline: Instant,
     timed_out: Cell<bool>,
 }
 
 impl<'a> Ctx<'a> {
-    /// A context whose children share `budget` from now.
     pub fn new(
         checkout: &'a Path,
         epoch: &'a Path,
@@ -220,12 +156,10 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// The epoch folder on disk.
     pub fn epoch_dir(&self) -> PathBuf {
         self.checkout.join(self.epoch)
     }
 
-    /// The live epoch's slug: `eleemosynary-mnemosyne`.
     pub fn slug(&self) -> String {
         self.epoch
             .file_name()
@@ -233,20 +167,14 @@ impl<'a> Ctx<'a> {
             .unwrap_or_default()
     }
 
-    /// What is left of the budget.
     pub fn remaining(&self) -> Duration {
         self.deadline.saturating_duration_since(Instant::now())
     }
 
-    /// Whether a child was killed at the budget.
     pub fn timed_out(&self) -> bool {
         self.timed_out.get()
     }
 
-    /// Runs `cmd` in the checkout (unless it names a directory) with at most what remains of
-    /// the budget. A spent budget starts nothing and reads as a timeout. Only a child the
-    /// budget cut short spends the budget ([`Ctx::timed_out`]); one that ran past its own
-    /// shorter timeout is the caller's to handle.
     pub fn run(&self, mut cmd: Cmd) -> Result<Ran> {
         let remaining = self.remaining();
         if remaining.is_zero() {
@@ -265,14 +193,10 @@ impl<'a> Ctx<'a> {
         Ok(ran)
     }
 
-    /// Waits `pause`, at most what remains of the budget, through the runner (a fake does not
-    /// wait): gitsync's pause between retries.
     pub fn pause(&self, pause: Duration) {
         self.proc.pause(pause.min(self.remaining()));
     }
 
-    /// The command [`Ctx::cm`] runs, `cm <sub> -C <epoch> <args>`, to give stdin, a shorter
-    /// timeout or `--json` (a global flag cm also takes after the verb) before [`Ctx::cm_run`].
     pub fn cm_cmd(&self, sub: &str, args: &[&str]) -> Cmd {
         Cmd::new(self.cm)
             .arg(sub)
@@ -281,14 +205,10 @@ impl<'a> Ctx<'a> {
             .args(args)
     }
 
-    /// act_lib.py's `cm`: runs `cm <sub> -C <epoch> <args>`; a non-zero exit is
-    /// `cm <sub> failed: <last line>`.
     pub fn cm(&self, sub: &str, args: &[&str]) -> std::result::Result<Ran, String> {
         self.cm_run(sub, self.cm_cmd(sub, args))
     }
 
-    /// Runs a cm command, normally from [`Ctx::cm_cmd`]; a non-zero exit is
-    /// `cm <sub> failed: <last line>`.
     pub fn cm_run(&self, sub: &str, cmd: Cmd) -> std::result::Result<Ran, String> {
         match self.run(cmd) {
             Ok(ran) if ran.exit.success() => Ok(ran),
@@ -297,9 +217,6 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// act_lib.py's `step_state`: `.steps[<step>]` of
-    /// `<epoch>/<NN-name>/<unit>/.cm/state.json` for a target (its `#<part>` ignored); fails
-    /// `<target> is not <NN-name>/<unit>/<step>` or `no cm state for <target>`.
     pub fn step_state(&self, target: &str) -> std::result::Result<Value, String> {
         let parts: Vec<&str> = target
             .split('#')
@@ -320,9 +237,6 @@ impl<'a> Ctx<'a> {
             .ok_or_else(|| format!("no cm state for {target}"))
     }
 
-    /// act_lib.py's `pull`: the step's pull request, from the line's `pr`, else the step's
-    /// `evidence.pr`, else its `pr` (each only when not empty); fails `<target> records no PR
-    /// URL`. `observed` is what `cm sync` last saw of it in `<epoch>/.cm/pulls.json`, or `{}`.
     pub fn pull(&self, line: &ActLine, step: &Value) -> std::result::Result<Pull, String> {
         fn given(value: &Value) -> Option<&str> {
             value.as_str().filter(|url| !url.is_empty())
@@ -346,7 +260,6 @@ impl<'a> Ctx<'a> {
     }
 }
 
-/// Python's truth: `null`, `false`, `0`, `""`, `[]` and `{}` are false.
 fn truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
@@ -358,18 +271,14 @@ fn truthy(value: &Value) -> bool {
     }
 }
 
-/// A step's pull request, as [`Ctx::pull`] finds it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pull {
-    /// `<owner>/<repo>`.
     pub repo: String,
     pub number: u64,
     pub url: String,
-    /// `.cm/pulls.json[url]`, or `{}`.
     pub observed: Value,
 }
 
-/// `https://github.com/<owner>/<repo>/pull/<N>` as (`<owner>/<repo>`, N).
 fn pull_url(url: &str) -> Option<(String, u64)> {
     let rest = url.strip_prefix("https://github.com/")?;
     let mut parts = rest.split('/');
@@ -389,8 +298,6 @@ fn pull_url(url: &str) -> Option<(String, u64)> {
         .then(|| (format!("{owner}/{repo}"), number))
 }
 
-/// act_lib.py's `last_line`: the last line of stdout, a newline and stderr that is not blank,
-/// cut to 300 characters; `exit <status>` when there is none.
 pub fn last_line(ran: &Ran) -> String {
     let text = format!(
         "{}\n{}",
@@ -407,30 +314,21 @@ pub fn last_line(ran: &Ran) -> String {
     }
 }
 
-/// At most 300 bytes, cut at a character boundary (heartbeat.sh's `head -c 300`).
 pub(crate) fn clip(text: &str) -> &str {
     &text[..text.floor_char_boundary(300)]
 }
 
-/// What an executor did with its act line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// The move is done; these lines are left for the model (none: nothing is left).
     Done(Vec<String>),
-    /// The executor did not make the move; this line goes to the model as it is, normally
-    /// [`ActLine::text`].
     Left(String),
-    /// The move failed: the act line is printed once with this reason, cut to its last
-    /// non-empty line.
     Failed(String),
 }
 
-/// One `act.d/` script's replacement.
 pub trait Executor {
     fn run(&self, line: &ActLine, ctx: &Ctx) -> Outcome;
 }
 
-/// The executors, keyed `<kind>.<lane>` or `<kind>` as heartbeat.sh named `act.d/` files.
 #[derive(Default)]
 pub struct Registry {
     executors: BTreeMap<String, Box<dyn Executor>>,
@@ -441,14 +339,11 @@ impl Registry {
         Registry::default()
     }
 
-    /// Adds an executor under `key`; a later one replaces an earlier one.
     pub fn with(mut self, key: &str, executor: impl Executor + 'static) -> Self {
         self.executors.insert(key.to_owned(), Box::new(executor));
         self
     }
 
-    /// heartbeat.sh's lookup: `<kind>.<lane>` when the line has a lane, then `<kind>`. Returns
-    /// the matched key, the executor's name in the loop's lines (`tick/<key>`).
     pub fn lookup(&self, kind: &str, lane: Option<&str>) -> Option<(&str, &dyn Executor)> {
         let laned = lane.map(|lane| format!("{kind}.{lane}"));
         laned
@@ -464,12 +359,9 @@ impl Registry {
     }
 }
 
-/// What a housekeeping phase leaves.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
-    /// Lines for the model, printed in order.
     pub lines: Vec<String>,
-    /// The phase itself failed (not one item of it); `beat` then prints its wall time.
     pub failed: bool,
 }
 

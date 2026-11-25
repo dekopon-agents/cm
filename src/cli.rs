@@ -396,13 +396,22 @@ enum Commands {
         #[command(subcommand)]
         act: Option<FollowupAct>,
     },
-    /// The coordinator's routine moves once, as heartbeat.sh made them: choose the one PLANNING or WORKING epoch, then run each `cm --json next --act` line's executor in the bound coordinator, or print the line. Prints only lines left for the model; exits 0 whenever it ran.
+    #[command(
+        about = "The coordinator's routine moves once, as heartbeat.sh made them: choose the one PLANNING or WORKING epoch, then run each `cm --json next --act` line's executor in the bound coordinator, or print the line. Prints only lines left for the model; exits 0 whenever it ran"
+    )]
     Tick {
-        /// The campaign-trail checkout holding `store/epochs/`.
-        #[arg(long, value_name = "DIR", default_value = ".")]
+        #[arg(
+            long,
+            value_name = "DIR",
+            default_value = ".",
+            help = "The campaign-trail checkout holding `store/epochs/`"
+        )]
         checkout: PathBuf,
-        /// The cm that `cm next --act` and the executors' cm calls run; defaults to this executable. A bare name is looked up on PATH.
-        #[arg(long, value_name = "PROGRAM")]
+        #[arg(
+            long,
+            value_name = "PROGRAM",
+            help = "The cm that `cm next --act` and the executors' cm calls run; defaults to this executable. A bare name is looked up on PATH"
+        )]
         cm: Option<PathBuf>,
     },
     /// Report every violation in the campaign folder; exit 1 when there is any.
