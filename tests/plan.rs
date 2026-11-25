@@ -8375,3 +8375,45 @@ fn an_owner_queue_number_past_u32_is_refused_by_the_one_item_parser() {
     );
     assert!(plan::next_at(&c.root, None, None, host.now).is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn one_parts_merge_is_not_its_steps_deploy() {
+    let host = at("2026-11-22T16:00:00Z");
+    let c = campaign(&host);
+    assert!(
+        declare_work(
+            &host,
+            &c,
+            "01-a/u/pin",
+            Lane::Coordinator,
+            &[],
+            Work::Rollout
+        )
+        .ok()
+    );
+    let moved = |target: &str| {
+        let dir = c.root.join("01-a/u");
+        let mut unit = store::load_unit(&dir).unwrap();
+        unit.history.push(cm::state::Move {
+            at: "2026-11-22T15:00Z".into(),
+            target: target.to_owned(),
+            from: Phase::PrOpen,
+            to: Phase::Merged,
+            evidence: Evidence::default(),
+        });
+        commands::write_unit(&dir, &unit).unwrap();
+        sync(&host, &FakeForge::default(), &c.root).unwrap();
+        fs::read_to_string(c.root.join("CARD.md"))
+            .unwrap()
+            .lines()
+            .find(|line| line.starts_with("Deployed in 24 h: "))
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(moved("01-a/u/pin#a"), "Deployed in 24 h: 0 (last: —)");
+    assert_eq!(
+        moved("01-a/u/pin"),
+        "Deployed in 24 h: 1 (last: 2026-11-22T15:00Z)"
+    );
+}

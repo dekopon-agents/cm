@@ -1750,7 +1750,8 @@ pub(crate) fn card_lines(
         .map_or("—", |(_, since)| since.as_str());
     let day_ago = now - jiff::SignedDuration::from_hours(24);
     // A deploy is a deploy step (a rollout, a pin, or a tag-gated PR in a repository no release
-    // line ships) reaching merged: the pin ends at its merge. Parts count once, as their step.
+    // line ships) reaching merged: the pin ends at its merge. A multipart step counts when the step
+    // itself moves, never on one part's move.
     let deploys_step = deploy_predicate(units);
     let deploy_steps: BTreeSet<String> = steps(units)
         .filter(|(target, step)| {
@@ -1768,7 +1769,8 @@ pub(crate) fn card_lines(
         .flat_map(|unit| &unit.history)
         .filter(|moved| matches!(moved.to, Phase::Merged | Phase::Deployed))
         .filter_map(|moved| {
-            let target = moved.target.split('#').next().unwrap_or(&moved.target);
+            // Only the step's own move counts: one part merging is not the step's deploy.
+            let target = moved.target.as_str();
             deploy_steps.contains(target).then_some((
                 target,
                 instant(&moved.at)?,

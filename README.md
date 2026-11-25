@@ -491,7 +491,7 @@ Launchable at sync: <count> (oldest: <stamp>)
 ```
 
 `Actionable` counts every `--act` kind. `Deployed in 24 h` counts the deploy steps that reached
-`merged` or `deployed` in the last 24 hours, a multipart step once: a rollout, or a `tag:`-gated
+`merged` or `deployed` in the last 24 hours by the step's own move (a part's move is not the step's deploy): a rollout, or a `tag:`-gated
 pin (`…/pin`, `…/deploy`) or step whose PR is in a repository no release line ships, the set
 `released-undeployed` reads. Its
 `last` is the newest such move ever, inside the window or not. `Launchable at sync`'s
