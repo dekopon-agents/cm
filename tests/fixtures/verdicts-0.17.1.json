@@ -1,0 +1,78 @@
+{
+  "reviews": [
+    {
+      "number": 1,
+      "at": "2026-11-25T17:20Z",
+      "step": "01-a/u/S1",
+      "reviewer": "astra",
+      "head": "e43938088df8248338df6ef022dbc7c5760f9deb",
+      "verdict": "accept",
+      "stated": "accept",
+      "report": "01-a/u/S1/evidence/reviews/R1-astra.md",
+      "findings": []
+    },
+    {
+      "number": 2,
+      "at": "2026-11-25T17:20Z",
+      "step": "01-a/u/S1",
+      "reviewer": "claude",
+      "pr": "https://github.com/o/r/pull/7",
+      "head": "e43938088df8248338df6ef022dbc7c5760f9deb",
+      "verdict": "fix-required",
+      "stated": "fix-required",
+      "report": "01-a/u/S1/evidence/reviews/R2-claude.md",
+      "findings": [
+        {
+          "id": "F1",
+          "type": "contract",
+          "origin": "introduced",
+          "at": "src/lib.rs:1",
+          "summary": "broken",
+          "blocking": true,
+          "resolution": {
+            "at": "2026-11-25T17:20Z",
+            "by": {
+              "commit": "54601f80c460eff9b0771ffa91287e9bd9ce593d"
+            }
+          }
+        },
+        {
+          "id": "F2",
+          "type": "contract",
+          "origin": "exposed",
+          "at": "src/lib.rs:2-4",
+          "summary": "main exposed it",
+          "blocking": true,
+          "resolution": {
+            "at": "2026-11-25T17:20Z",
+            "by": {
+              "ruling": "ruling.md"
+            }
+          }
+        },
+        {
+          "id": "F3",
+          "type": "guideline",
+          "origin": "introduced",
+          "at": "-",
+          "summary": "name it better",
+          "blocking": false,
+          "closed": {
+            "at": "2026-11-25T17:20Z",
+            "by": "kept as is"
+          }
+        }
+      ]
+    },
+    {
+      "number": 3,
+      "at": "2026-11-25T17:20Z",
+      "step": "01-a/u/S1",
+      "pr": "https://github.com/o/r/pull/7",
+      "head": "54601f80c460eff9b0771ffa91287e9bd9ce593d",
+      "verdict": "accept",
+      "report": "01-a/u/S1/evidence/reviews/R3.md",
+      "findings": []
+    }
+  ]
+}
