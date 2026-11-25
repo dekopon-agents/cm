@@ -1,14 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::attempt::{recorded_id, remote_turn};
 use crate::commands::{check_release_pr, closed, is_pr_url, write_unit};
 use crate::forge::{
-    CheckState, CommitSha, Forge, ForgeError, GithubRepo, Pull, PullState, TURN_READER_TIMEOUT,
-    TagName, TurnRead, ci_green, read_remote_turn,
+    CheckState, CommitSha, Forge, ForgeError, GithubRepo, MergeableState, Pull, PullState,
+    TURN_READER_TIMEOUT, TagName, TurnRead, ci_green, read_remote_turn,
 };
 use crate::host::{Host, stamp};
 use crate::journal;
@@ -23,6 +26,12 @@ use crate::store::{self, lock, parse_target, write_atomic};
 
 pub const CARD: &str = "CARD.md";
 
+pub const BUDGET: Duration = Duration::from_secs(30);
+
+const READERS: usize = 8;
+
+const PLAN_ROUNDS: usize = 5;
+
 pub struct Moved {
     pub target: String,
     pub from: Phase,
@@ -34,6 +43,34 @@ type Read<T> = Result<T, ForgeError>;
 type TurnQuery = (String, String, String, Vec<String>);
 
 const PULL_MAX_AGE: jiff::SignedDuration = jiff::SignedDuration::from_mins(30);
+
+// Ignored by git, so a quiet sync's reads change no tracked file.
+pub const PULLS_READ: &str = "pulls-read.json";
+
+const UNREADABLE_NOTIFIED: &str = "unreadable-notified.json";
+
+// A PR's 304 restores the stored observation, so its ETag goes out only while `.cm/pulls.json`
+// holds the one it validated; a check page's ETag is keyed by its own head's URL.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct LastRead {
+    at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mergeable_state: Option<MergeableState>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    etags: BTreeMap<String, String>,
+}
+
+impl LastRead {
+    fn validates(&self, seen: &plan::Observed) -> bool {
+        self.head == seen.head
+            && self.base == seen.base
+            && self.mergeable_state == seen.mergeable_state
+    }
+}
 
 #[derive(Clone)]
 struct PullRead {
@@ -60,20 +97,109 @@ struct Reads {
     publications:
         BTreeMap<(Vec<String>, GithubRepo, TagName, Version), Read<crate::forge::Publication>>,
     completed_checks: BTreeMap<(GithubRepo, CommitSha, Vec<String>), Read<Vec<CheckState>>>,
+    made: BTreeMap<&'static str, usize>,
 }
 
-fn cached<K: Ord, T: Clone>(
-    cache: &mut BTreeMap<K, T>,
-    key: K,
-    forge: Option<&dyn Forge>,
-    read: impl FnOnce(&dyn Forge) -> T,
-) -> Option<T> {
-    if let Some(hit) = cache.get(&key) {
-        return Some(hit.clone());
+impl Reads {
+    fn summary(&self) -> String {
+        if self.made.is_empty() {
+            return "no forge reads".to_owned();
+        }
+        let kinds: Vec<String> = self
+            .made
+            .iter()
+            .map(|(kind, count)| format!("{count} {kind}"))
+            .collect();
+        kinds.join(", ")
     }
-    let result = read(forge?);
-    cache.insert(key, result.clone());
-    Some(result)
+}
+
+type Store = Box<dyn FnOnce(&mut Reads) + Send>;
+type Job = Box<dyn FnOnce(&dyn Forge) -> Store + Send>;
+
+#[derive(Clone, Copy)]
+enum Access<'a> {
+    Read(&'a dyn Forge),
+    Plan,
+    Cached,
+}
+
+#[derive(Clone, Copy)]
+pub enum Reader<'a> {
+    Serial(&'a dyn Forge),
+    Concurrent(&'a (dyn Forge + Sync)),
+}
+
+struct Phases {
+    start: Instant,
+    current: Option<(&'static str, Instant, String)>,
+    spent: Vec<(&'static str, Duration, String)>,
+}
+
+impl Phases {
+    fn new() -> Self {
+        Phases {
+            start: Instant::now(),
+            current: None,
+            spent: Vec::new(),
+        }
+    }
+
+    fn enter(&mut self, phase: &'static str) {
+        self.close();
+        self.current = Some((phase, Instant::now(), String::new()));
+    }
+
+    fn note(&mut self, note: String) {
+        if let Some((_, _, current)) = &mut self.current {
+            *current = note;
+        }
+    }
+
+    fn fail(&mut self) {
+        if let Some((_, _, note)) = &mut self.current {
+            if !note.is_empty() {
+                note.push_str("; ");
+            }
+            note.push_str("failed");
+        }
+        self.close();
+    }
+
+    fn close(&mut self) {
+        if let Some((phase, began, note)) = self.current.take() {
+            self.spent.push((phase, began.elapsed(), note));
+        }
+    }
+
+    fn lines(&self, total: Duration, budget: Duration) -> Vec<String> {
+        let mut lines = vec![format!(
+            "sync took {:.2} s (budget {} s); phases:",
+            total.as_secs_f64(),
+            budget.as_secs()
+        )];
+        lines.extend(self.spent.iter().map(|(phase, spent, note)| {
+            let note = if note.is_empty() {
+                String::new()
+            } else {
+                format!(" ({note})")
+            };
+            format!("phase {phase}: {:.2} s{note}", spent.as_secs_f64())
+        }));
+        lines
+    }
+
+    fn json(&self, total: Duration, budget: Duration) -> Value {
+        json!({
+            "seconds": total.as_secs_f64(),
+            "budget_seconds": budget.as_secs(),
+            "phases": self.spent.iter().map(|(phase, spent, note)| json!({
+                "phase": phase,
+                "seconds": spent.as_secs_f64(),
+                "note": note,
+            })).collect::<Vec<_>>(),
+        })
+    }
 }
 
 struct Shipped {
@@ -85,8 +211,10 @@ struct Shipped {
 
 struct Run<'a> {
     root: &'a Path,
-    forge: Option<&'a dyn Forge>,
+    access: Access<'a>,
     reads: Reads,
+    wanted: Vec<Job>,
+    planned: BTreeSet<String>,
     at: String,
     units: Units,
     dirty: BTreeSet<String>,
@@ -94,10 +222,14 @@ struct Run<'a> {
     violations: Vec<Violation>,
     open: BTreeMap<String, plan::Observed>,
     seen: BTreeMap<String, plan::Observed>,
+    last_read: BTreeMap<String, LastRead>,
+    read_now: BTreeMap<String, LastRead>,
     now: jiff::Timestamp,
     heads: BTreeMap<String, String>,
     notes: Vec<(String, String)>,
     owner_unread: Vec<String>,
+    unreadable: BTreeSet<String>,
+    unread_publications: BTreeSet<String>,
     discovery_warnings: Vec<String>,
     turn_commands: TurnCommands,
     turn_warnings: Vec<String>,
@@ -119,6 +251,14 @@ impl Tracked {
     }
 }
 
+// Every field but the stamp is a fact, including any a later change adds.
+fn same_facts(a: &plan::Observed, b: &plan::Observed) -> bool {
+    plan::Observed {
+        at: b.at.clone(),
+        ..a.clone()
+    } == *b
+}
+
 fn merge_of(evidence: &Evidence) -> Option<(GithubRepo, CommitSha)> {
     let repo = evidence.pr.as_deref().and_then(GithubRepo::of_pr)?;
     let sha = CommitSha::new(evidence.sha.clone()?);
@@ -128,7 +268,7 @@ fn merge_of(evidence: &Evidence) -> Option<(GithubRepo, CommitSha)> {
 impl<'a> Run<'a> {
     fn new(
         root: &'a Path,
-        forge: Option<&'a dyn Forge>,
+        access: Access<'a>,
         reads: Reads,
         now: jiff::Timestamp,
         units: Units,
@@ -138,8 +278,10 @@ impl<'a> Run<'a> {
         let turn_warnings = turn_commands.errors().cloned().collect();
         Run {
             root,
-            forge,
+            access,
             reads,
+            wanted: Vec::new(),
+            planned: BTreeSet::new(),
             at: stamp(now),
             units,
             dirty: BTreeSet::new(),
@@ -147,13 +289,60 @@ impl<'a> Run<'a> {
             violations: Vec::new(),
             open: BTreeMap::new(),
             seen: store::read_json(&plan::pulls_path(root)).unwrap_or_default(),
+            last_read: store::read_json(&root.join(store::CM_DIR).join(PULLS_READ))
+                .unwrap_or_default(),
+            read_now: BTreeMap::new(),
             now,
             heads: BTreeMap::new(),
             notes: Vec::new(),
             owner_unread,
+            unreadable: BTreeSet::new(),
+            unread_publications: BTreeSet::new(),
             discovery_warnings: Vec::new(),
             turn_commands,
             turn_warnings,
+        }
+    }
+
+    fn planning(&self) -> bool {
+        matches!(self.access, Access::Plan)
+    }
+
+    fn read<K, T>(
+        &mut self,
+        kind: &'static str,
+        cache: fn(&mut Reads) -> &mut BTreeMap<K, T>,
+        key: K,
+        read: impl FnOnce(&dyn Forge) -> T + Send + 'static,
+    ) -> Option<T>
+    where
+        K: Ord + fmt::Debug + Send + 'static,
+        T: Clone + Send + 'static,
+    {
+        if let Some(hit) = cache(&mut self.reads).get(&key) {
+            return Some(hit.clone());
+        }
+        match self.access {
+            Access::Read(forge) => {
+                let value = read(forge);
+                *self.reads.made.entry(kind).or_default() += 1;
+                cache(&mut self.reads).insert(key, value.clone());
+                Some(value)
+            }
+            Access::Plan => {
+                if self.planned.insert(format!("{kind} {key:?}")) {
+                    self.wanted
+                        .push(Box::new(move |forge: &dyn Forge| -> Store {
+                            let value = read(forge);
+                            Box::new(move |reads: &mut Reads| {
+                                *reads.made.entry(kind).or_default() += 1;
+                                cache(reads).entry(key).or_insert(value);
+                            })
+                        }));
+                }
+                None
+            }
+            Access::Cached => None,
         }
     }
 
@@ -398,40 +587,54 @@ impl<'a> Run<'a> {
     }
 
     fn pull(&mut self, url: &str, target: Option<&str>) -> Option<Read<PullRead>> {
-        let previous = self.seen.get(url).filter(|seen| {
-            Some(seen.target.as_str()) == target
-                && seen.at.parse::<jiff::Timestamp>().is_ok_and(|at| {
-                    (jiff::SignedDuration::ZERO..PULL_MAX_AGE)
-                        .contains(&self.now.duration_since(at))
-                })
+        let fresh = self.last_read.get(url).filter(|read| {
+            read.at.parse::<jiff::Timestamp>().is_ok_and(|at| {
+                (jiff::SignedDuration::ZERO..PULL_MAX_AGE).contains(&self.now.duration_since(at))
+            })
         });
-        let empty = BTreeMap::new();
-        cached(&mut self.reads.pulls, url.to_owned(), self.forge, |forge| {
-            let mut etags = BTreeMap::new();
-            let validators = previous.map_or(&empty, |seen| &seen.etags);
-            if let Some(pull) = forge.pull_conditional(url, validators, &mut etags)? {
-                return Ok(PullRead {
+        let previous = self
+            .seen
+            .get(url)
+            .filter(|seen| {
+                Some(seen.target.as_str()) == target
+                    && fresh.is_some_and(|read| read.validates(seen))
+            })
+            .cloned();
+        let validators = fresh
+            .filter(|_| previous.is_some())
+            .map(|read| read.etags.clone())
+            .unwrap_or_default();
+        let read = url.to_owned();
+        self.read(
+            "pull",
+            |reads| &mut reads.pulls,
+            url.to_owned(),
+            move |forge| {
+                let mut etags = BTreeMap::new();
+                if let Some(pull) = forge.pull_conditional(&read, &validators, &mut etags)? {
+                    return Ok(PullRead {
+                        pull,
+                        etags,
+                        cached_at: None,
+                    });
+                }
+                let seen = previous.ok_or(ForgeError::Json)?;
+                let pull = Pull {
+                    state: PullState::Open,
+                    merge_commit: None,
+                    merged_at: None,
+                    head: seen.head.as_ref().map(CommitSha::new),
+                    head_ref: None,
+                    base: seen.base.as_ref().map(CommitSha::new),
+                    mergeable_state: seen.mergeable_state.clone(),
+                };
+                Ok(PullRead {
                     pull,
                     etags,
-                    cached_at: None,
-                });
-            }
-            let seen = previous.ok_or(ForgeError::Json)?;
-            let pull = Pull {
-                state: PullState::Open,
-                merge_commit: None,
-                merged_at: None,
-                head: seen.head.as_ref().map(CommitSha::new),
-                head_ref: None,
-                base: seen.base.as_ref().map(CommitSha::new),
-                mergeable_state: seen.mergeable_state.clone(),
-            };
-            Ok(PullRead {
-                pull,
-                etags,
-                cached_at: Some(seen.at.clone()),
-            })
-        })
+                    cached_at: Some(seen.at.clone()),
+                })
+            },
+        )
     }
 
     fn open_checks(
@@ -441,21 +644,31 @@ impl<'a> Run<'a> {
         previous: &BTreeMap<String, String>,
     ) -> Option<Read<OpenChecks>> {
         let key = (repo.clone(), head.clone());
-        cached(&mut self.reads.open_checks, key, self.forge, |forge| {
-            let mut etags = BTreeMap::new();
-            let checks = forge.checks_conditional(repo, head, previous, &mut etags)?;
-            let completed = checks.is_some_and(|checks| {
-                !checks.is_empty() && checks.iter().all(CheckState::completed)
-            });
-            Ok(OpenChecks { completed, etags })
-        })
+        let (repo, head, previous) = (repo.clone(), head.clone(), previous.clone());
+        self.read(
+            "pending-ci",
+            |reads| &mut reads.open_checks,
+            key,
+            move |forge| {
+                let mut etags = BTreeMap::new();
+                let checks = forge.checks_conditional(&repo, &head, &previous, &mut etags)?;
+                let completed = checks.is_some_and(|checks| {
+                    !checks.is_empty() && checks.iter().all(CheckState::completed)
+                });
+                Ok(OpenChecks { completed, etags })
+            },
+        )
     }
 
     fn tag_exists(&mut self, repo: &GithubRepo, tag: &TagName) -> Option<Read<bool>> {
         let key = (repo.clone(), tag.clone());
-        cached(&mut self.reads.tags, key, self.forge, |forge| {
-            forge.tag_exists(repo, tag)
-        })
+        let (repo, tag) = key.clone();
+        self.read(
+            "tag",
+            |reads| &mut reads.tags,
+            key,
+            move |forge| forge.tag_exists(&repo, &tag),
+        )
     }
 
     fn contains(
@@ -465,16 +678,24 @@ impl<'a> Run<'a> {
         sha: &CommitSha,
     ) -> Option<Read<bool>> {
         let key = (repo.clone(), tag.clone(), sha.clone());
-        cached(&mut self.reads.contains, key, self.forge, |forge| {
-            forge.tag_contains(repo, tag, sha)
-        })
+        let (repo, tag, sha) = key.clone();
+        self.read(
+            "compare",
+            |reads| &mut reads.contains,
+            key,
+            move |forge| forge.tag_contains(&repo, &tag, &sha),
+        )
     }
 
     fn checks(&mut self, repo: &GithubRepo, sha: &CommitSha) -> Option<Read<Vec<CheckState>>> {
         let key = (repo.clone(), sha.clone());
-        cached(&mut self.reads.checks, key, self.forge, |forge| {
-            forge.checks(repo, sha)
-        })
+        let (repo, sha) = key.clone();
+        self.read(
+            "ci",
+            |reads| &mut reads.checks,
+            key,
+            move |forge| forge.checks(&repo, &sha),
+        )
     }
 
     fn completed_checks(
@@ -491,9 +712,13 @@ impl<'a> Run<'a> {
             .map(|check| check.name.clone())
             .collect();
         let key = (repo.clone(), base.clone(), names.clone());
-        cached(&mut self.reads.completed_checks, key, self.forge, |forge| {
-            forge.latest_completed_checks(repo, base, &names)
-        })
+        let (repo, base) = (repo.clone(), base.clone());
+        self.read(
+            "completed-ci",
+            |reads| &mut reads.completed_checks,
+            key,
+            move |forge| forge.latest_completed_checks(&repo, &base, &names),
+        )
     }
 
     /// A codex step merged on GitHub moves to merged only when its merge gate holds at the PR
@@ -589,6 +814,11 @@ impl<'a> Run<'a> {
     }
 
     fn observe_turns(&mut self) {
+        // A turn reader is an operator's command cm cannot vouch for as read-only: it runs in
+        // the read walk, one at a time, never beside other reads.
+        if self.planning() {
+            return;
+        }
         for (target, step) in self.steps_at(&Phase::Launched) {
             let Some(attempt) = step
                 .attempt
@@ -616,9 +846,13 @@ impl<'a> Run<'a> {
                 turn.turn.to_owned(),
                 argv.clone(),
             );
-            let observed = match cached(&mut self.reads.turns, key, self.forge, |_| {
-                read_remote_turn(&argv, turn.thread, turn.turn, TURN_READER_TIMEOUT)
-            }) {
+            let (thread, turn_id) = (key.1.clone(), key.2.clone());
+            let observed = match self.read(
+                "turn",
+                |reads| &mut reads.turns,
+                key,
+                move |_| read_remote_turn(&argv, &thread, &turn_id, TURN_READER_TIMEOUT),
+            ) {
                 Some(Ok(read)) if read.done => {
                     let completed_at = read
                         .completed_at
@@ -701,9 +935,13 @@ impl<'a> Run<'a> {
             if let Some(branch) = recorded_branch.filter(|branch| !branch.starts_with('-')) {
                 // Replay requires the same attempt and launch metadata that the read used.
                 let key = (attempt.id.clone(), repo.clone(), branch.to_owned());
-                match cached(&mut self.reads.branch_pulls, key, self.forge, |forge| {
-                    forge.open_pull_for_branch(&repo, branch)
-                }) {
+                let (lookup, wanted) = (repo.clone(), branch.to_owned());
+                match self.read(
+                    "branch",
+                    |reads| &mut reads.branch_pulls,
+                    key,
+                    move |forge| forge.open_pull_for_branch(&lookup, &wanted),
+                ) {
                     Some(Ok(Some(url))) if self.discover_pr(&target, &repo, &url, None) => continue,
                     Some(Err(error)) => self.discovery_warnings.push(format!(
                         "{target}: could not look up {repo} branch {branch}: {error}"
@@ -831,10 +1069,7 @@ impl<'a> Run<'a> {
                         head.as_ref(),
                         base.as_ref(),
                     ) {
-                        self.notes.extend(
-                            used.into_iter()
-                                .map(|line| (String::new(), format!("{line} ({target})"))),
-                        );
+                        let moves = self.moves.len();
                         self.advance(
                             &tracked.target,
                             tracked.part.as_deref(),
@@ -845,6 +1080,13 @@ impl<'a> Run<'a> {
                                 ..Evidence::default()
                             },
                         );
+                        // An exception explains a merge; a refused advance has none to explain.
+                        if self.moves.len() > moves {
+                            self.notes.extend(
+                                used.into_iter()
+                                    .map(|line| (String::new(), format!("{line} ({target})"))),
+                            );
+                        }
                     }
                 }
                 Pull {
@@ -872,12 +1114,27 @@ impl<'a> Run<'a> {
                     let previous = self.seen.get(&url).filter(|seen| seen.target == target);
                     let mut ci_head = previous.and_then(|seen| seen.ci_head.clone());
                     let mut ci_base = previous.and_then(|seen| seen.ci_base.clone());
+                    // GitHub answers `unknown` while it computes mergeability: keep what was
+                    // stored for the same head and base rather than write it twice.
+                    let mergeable_state = match (&mergeable_state, previous) {
+                        (Some(MergeableState::Other(state)), Some(seen))
+                            if state == "unknown"
+                                && seen.head.as_deref() == head.as_ref().map(CommitSha::as_str)
+                                && seen.base.as_deref() == base.as_ref().map(CommitSha::as_str) =>
+                        {
+                            seen.mergeable_state.clone()
+                        }
+                        _ => mergeable_state,
+                    };
                     if let (Some(head), Some(base), Some(repo)) = (&head, &base, GithubRepo::of_pr(&url))
                         && ci_head.as_deref() != Some(head.as_str())
                     {
+                        // A check page's ETag belongs to its own head's URL: a 304 says that
+                        // page is unchanged whatever `.cm/pulls.json` holds.
                         let validators = previous
                             .filter(|seen| seen.head.as_deref() == Some(head.as_str()))
-                            .map(|seen| seen.etags.clone())
+                            .and_then(|_| self.last_read.get(&url))
+                            .map(|read| read.etags.clone())
                             .unwrap_or_default();
                         if let Some(Ok(checks)) = self.open_checks(&repo, head, &validators) {
                             etags.extend(checks.etags);
@@ -887,19 +1144,39 @@ impl<'a> Run<'a> {
                             }
                         }
                     }
-                    self.open.insert(
-                        url.clone(),
-                        plan::Observed {
-                            base: base.map(|base| base.to_string()),
-                            ci_head,
-                            ci_base,
-                            target: target.clone(),
-                            at: cached_at.unwrap_or_else(|| self.at.clone()),
-                            head: head.map(|head| head.to_string()),
-                            mergeable_state,
+                    // A 304 keeps the time of the full read it validated.
+                    let read_at = match &cached_at {
+                        None => Some(self.at.clone()),
+                        Some(_) => self.last_read.get(&url).map(|read| read.at.clone()),
+                    };
+                    let observed = plan::Observed {
+                        base: base.map(|base| base.to_string()),
+                        ci_head,
+                        ci_base,
+                        target: target.clone(),
+                        at: cached_at.unwrap_or_else(|| self.at.clone()),
+                        head: head.map(|head| head.to_string()),
+                        mergeable_state,
+                    };
+                    // A read that saw no new fact keeps the stored observation and its stamp, so
+                    // `.cm/pulls.json` changes only with a fact.
+                    let observed = self
+                        .seen
+                        .get(&url)
+                        .filter(|seen| same_facts(seen, &observed))
+                        .cloned()
+                        .unwrap_or(observed);
+                    if let Some(at) = read_at {
+                        let read = LastRead {
+                            at,
+                            head: observed.head.clone(),
+                            base: observed.base.clone(),
+                            mergeable_state: observed.mergeable_state.clone(),
                             etags,
-                        },
-                    );
+                        };
+                        self.read_now.insert(url.clone(), read);
+                    }
+                    self.open.insert(url.clone(), observed);
                 }
             }
         }
@@ -910,6 +1187,7 @@ impl<'a> Run<'a> {
             let Some(release) = Release::of_target(&target) else {
                 continue;
             };
+            self.unread_publications.insert(target.clone());
             let Some((repo, sha)) = merge_of(&step.track.evidence) else {
                 self.unknown(
                     &target,
@@ -942,19 +1220,29 @@ impl<'a> Run<'a> {
                             tag.clone(),
                             release.version,
                         );
-                        let Some(Ok(read)) =
-                            cached(&mut self.reads.publications, key, self.forge, |forge| {
+                        let (artifacts, shipped, tagged, version) = (
+                            step.artifacts.clone(),
+                            repo.clone(),
+                            tag.clone(),
+                            release.version,
+                        );
+                        let Some(Ok(read)) = self.read(
+                            "publication",
+                            |reads| &mut reads.publications,
+                            key,
+                            move |forge| {
                                 Ok(crate::forge::publication(
                                     Some(forge),
-                                    &step.artifacts,
-                                    Some(&repo),
-                                    &release.version,
-                                    &tag,
+                                    &artifacts,
+                                    Some(&shipped),
+                                    &version,
+                                    &tagged,
                                 ))
-                            })
-                        else {
+                            },
+                        ) else {
                             continue;
                         };
+                        self.unread_publications.remove(&target);
                         let present = read.missing.is_empty() && read.unknown.is_empty();
                         for message in read.missing {
                             self.violations.push(Violation::new(
@@ -964,8 +1252,9 @@ impl<'a> Run<'a> {
                             ));
                         }
                         for message in read.unknown {
-                            self.notes
-                                .push((String::new(), format!("- unknown {target}: {message}")));
+                            let note = format!("- unknown {target}: {message}");
+                            self.unreadable.insert(note.clone());
+                            self.notes.push((String::new(), note));
                             self.unknown(&target, message);
                         }
                         if present {
@@ -1044,6 +1333,8 @@ impl<'a> Run<'a> {
             };
             for shipped in releases.iter().filter(|shipped| shipped.repo == repo) {
                 match self.contains(&repo, &shipped.tag, &sha) {
+                    // A planning walk asks for every tag at once rather than one per round.
+                    None if self.planning() => {}
                     None => {
                         self.unknown(
                             &target,
@@ -1138,6 +1429,7 @@ impl<'a> Run<'a> {
                     continue;
                 }
                 match self.contains(&repo, &shipped.tag, &sha) {
+                    None if self.planning() => {}
                     None => break,
                     Some(Ok(true)) => {
                         found = Some(shipped);
@@ -1166,6 +1458,21 @@ impl<'a> Run<'a> {
             }
         }
     }
+}
+
+// EPOCH.md's `epoch` slug, else a fixed name: a checkout under another folder name renders the
+// same card.
+fn card_name(root: &Path) -> String {
+    let declared = std::fs::read_to_string(root.join(crate::epoch::EPOCH))
+        .ok()
+        .and_then(|text| {
+            let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+            let front = crate::epoch::front(&lines)?;
+            crate::epoch::value(&lines, &front, "epoch")
+                .filter(|slug| !slug.is_empty())
+                .map(str::to_owned)
+        });
+    declared.unwrap_or_else(|| "campaign".to_owned())
 }
 
 fn guard(root: &Path) -> Result<Vec<Violation>> {
@@ -1214,36 +1521,140 @@ pub(crate) fn render_resume(root: &Path, units: &Units, closed: bool) -> Result<
     Ok(())
 }
 
+// Planning walks change nothing on disk; a read they miss, the read walk makes itself.
+fn prefetch(
+    root: &Path,
+    forge: &(dyn Forge + Sync),
+    now: jiff::Timestamp,
+    units: &Units,
+    owner_unread: &[String],
+) -> Reads {
+    let mut reads = Reads::default();
+    for _ in 0..PLAN_ROUNDS {
+        let mut plan = Run::new(
+            root,
+            Access::Plan,
+            reads,
+            now,
+            units.clone(),
+            owner_unread.to_vec(),
+        );
+        plan.walk();
+        reads = std::mem::take(&mut plan.reads);
+        let jobs = std::mem::take(&mut plan.wanted);
+        if jobs.is_empty() {
+            break;
+        }
+        for store in perform(jobs, forge) {
+            store(&mut reads);
+        }
+    }
+    reads
+}
+
+fn perform(jobs: Vec<Job>, forge: &(dyn Forge + Sync)) -> Vec<Store> {
+    let readers = READERS.min(jobs.len());
+    let queue = Mutex::new(jobs.into_iter());
+    let done = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..readers {
+            scope.spawn(|| {
+                loop {
+                    let Some(job) = queue.lock().expect("read queue").next() else {
+                        break;
+                    };
+                    let store = job(forge);
+                    done.lock().expect("read results").push(store);
+                }
+            });
+        }
+    });
+    done.into_inner().expect("read results")
+}
+
 pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> {
+    sync_with(host, Reader::Serial(forge), root, BUDGET)
+}
+
+pub fn sync_with(
+    host: &dyn Host,
+    reader: Reader<'_>,
+    root: &Path,
+    budget: Duration,
+) -> Result<Outcome> {
+    let mut phases = Phases::new();
+    let result = run_sync(host, reader, root, &mut phases);
+    if result.is_err() {
+        phases.fail();
+    }
+    phases.close();
+    let total = phases.start.elapsed();
+    match result {
+        Ok(mut outcome) => {
+            if !outcome.ok() || total > budget {
+                for line in phases.lines(total, budget) {
+                    outcome.line(line);
+                }
+                outcome.field("timing", phases.json(total, budget));
+            }
+            Ok(outcome)
+        }
+        Err(error) => {
+            for line in phases.lines(total, budget) {
+                eprintln!("{line}");
+            }
+            Err(error)
+        }
+    }
+}
+
+fn run_sync(
+    host: &dyn Host,
+    reader: Reader<'_>,
+    root: &Path,
+    phases: &mut Phases,
+) -> Result<Outcome> {
+    phases.enter("guard");
     let found = guard(root)?;
     if !found.is_empty() {
         return Ok(Outcome::refused(found));
     }
+    phases.enter("load");
     let now = host.now();
-    let mut read = Run::new(
-        root,
-        Some(forge),
-        Reads::default(),
-        now,
-        plan::load_units(root)?,
-        crate::ledger::unread_owner_queue(root)?,
-    );
+    let units = plan::load_units(root)?;
+    let owner_unread = crate::ledger::unread_owner_queue(root)?;
+    phases.enter("read");
+    let (forge, reads, at_once): (&dyn Forge, _, _) = match reader {
+        Reader::Serial(forge) => (forge, Reads::default(), 1),
+        Reader::Concurrent(forge) => (
+            forge,
+            prefetch(root, forge, now, &units, &owner_unread),
+            READERS,
+        ),
+    };
+    let mut read = Run::new(root, Access::Read(forge), reads, now, units, owner_unread);
     read.walk();
+    // Sampled after the reads, so `used` counts this sync's own.
     let rate_limit = forge.rate_limit();
+    let summary = read.reads.summary();
+    phases.note(format!("{summary}; up to {at_once} at once"));
+    phases.enter("lock");
     let _lock = lock(root)?;
+    phases.enter("apply");
     let found = guard(root)?;
     if !found.is_empty() {
         return Ok(Outcome::refused(found));
     }
     let mut run = Run::new(
         root,
-        None,
+        Access::Cached,
         read.reads,
         now,
         plan::load_units(root)?,
         crate::ledger::unread_owner_queue(root)?,
     );
     run.walk();
+    phases.enter("write");
     for name in &run.dirty {
         write_unit(&root.join(name), &run.units[name])?;
     }
@@ -1258,10 +1669,29 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
             open.entry(url).or_insert(observed);
         }
     }
+    let mut last_read = std::mem::take(&mut run.read_now);
+    for url in open.keys() {
+        if let Some(kept) = run
+            .last_read
+            .get(url)
+            .filter(|_| !last_read.contains_key(url))
+        {
+            last_read.insert(url.clone(), kept.clone());
+        }
+    }
+    last_read.retain(|url, _| open.contains_key(url));
     let mut campaign = store::load_campaign(root)?;
     campaign.schema = crate::state::SCHEMA;
     store::write_json(&store::state_path(root), &campaign)?;
+    // The observations before the memo of their validators: a sync stopped between the two
+    // leaves PR validators that no longer match, which `LastRead::validates` refuses.
     store::write_json(&plan::pulls_path(root), &open)?;
+    let last_read_path = root.join(store::CM_DIR).join(PULLS_READ);
+    if !last_read.is_empty() || last_read_path.exists() {
+        store::ignore(root, PULLS_READ)?;
+        store::write_json(&last_read_path, &last_read)?;
+    }
+    phases.enter("journal");
     let mut outcome = Outcome::refused(std::mem::take(&mut run.violations));
     crate::ledger::owner_queue_banner(root, &mut outcome)?;
     if !run.turn_warnings.is_empty() {
@@ -1301,7 +1731,17 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
             ));
         }
     }
-    if !run.moves.is_empty() || !run.notes.is_empty() {
+    // A publication already journaled as unreadable, and unreadable since, is not news.
+    let unreadable_path = root.join(store::CM_DIR).join(UNREADABLE_NOTIFIED);
+    let published: BTreeSet<String> = store::read_json(&unreadable_path).unwrap_or_default();
+    let news = run
+        .notes
+        .iter()
+        .any(|(_, note)| !run.unreadable.contains(note) || !published.contains(note));
+    for (_, note) in &run.notes {
+        outcome.line(note.trim_start_matches("- ").to_owned());
+    }
+    if !run.moves.is_empty() || news {
         let mut body: String = run
             .moves
             .iter()
@@ -1318,7 +1758,6 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
         for (_, note) in &run.notes {
             body.push_str(note);
             body.push('\n');
-            outcome.line(note.trim_start_matches("- ").to_owned());
         }
         let title = format!("cm sync: {} move(s) from GitHub", run.moves.len());
         journal::append(root, &journal::entry(&run.at, &title, Some(&body)))?;
@@ -1327,22 +1766,27 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
     if changed {
         store::write_json(&marker_path, &notified)?;
     }
+    // A merged release whose publication went unread this sync, whatever stopped the read, keeps
+    // the notes last published for it; one no longer merged keeps none.
+    let standing: BTreeSet<String> = published
+        .iter()
+        .filter(|note| {
+            run.unread_publications
+                .iter()
+                .any(|target| note.starts_with(&format!("- unknown {target}: ")))
+        })
+        .chain(&run.unreadable)
+        .cloned()
+        .collect();
+    if standing != published && (!standing.is_empty() || unreadable_path.exists()) {
+        store::write_json(&unreadable_path, &standing)?;
+    }
+    phases.enter("render");
     let next = plan::summary(root, &run.units);
-    let name = root
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let card = render::card_with_rate_limit(
-        root,
-        run.now,
-        &name,
-        &run.units,
-        &next,
-        &run.moves,
-        rate_limit.as_deref(),
-    );
-    write_atomic(&root.join(CARD), card.as_bytes())?;
+    let card = render::card(root, run.now, &card_name(root), &run.units, &next);
+    let wrote_card = store::write_changed(&root.join(CARD), card.as_bytes())?;
     render_resume(root, &run.units, false)?;
+    phases.enter("report");
     for moved in &run.moves {
         outcome.line(format!(
             "{}: {} → {} ({})",
@@ -1372,13 +1816,23 @@ pub fn sync(host: &dyn Host, forge: &dyn Forge, root: &Path) -> Result<Outcome> 
             .map(|(url, observed)| plan::dirty_json(url, observed))
             .collect::<Vec<_>>(),
     );
+    if let Some(sample) = rate_limit {
+        outcome.line(sample.clone());
+        outcome.field("rate_limit", sample);
+    }
     outcome.line(format!(
-        "synced at {}: {} move(s); wrote {CARD}",
+        "synced at {}: {} move(s); {}",
         run.at,
-        run.moves.len()
+        run.moves.len(),
+        if wrote_card {
+            format!("wrote {CARD}")
+        } else {
+            format!("{CARD} unchanged")
+        }
     ));
     outcome.field("at", run.at.clone());
     outcome.field("card", CARD);
+    outcome.field("card_written", wrote_card);
     let moves = run
         .moves
         .iter()
