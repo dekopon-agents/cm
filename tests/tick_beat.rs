@@ -1411,6 +1411,24 @@ fn big_list() -> String {
     format!("{}\nexit 1\n", big_list_awk())
 }
 
+// The same list as big_list_awk, written ahead so a test's producer only copies it.
+fn write_big_list(path: &Path) {
+    let mut file = std::io::BufWriter::new(fs::File::create(path).unwrap());
+    write!(file, r#"{{"ok":true,"actionable":["#).unwrap();
+    for n in 0..BIG_LIST {
+        if n > 0 {
+            write!(file, ",").unwrap();
+        }
+        write!(
+            file,
+            r#"{{"kind":"stale-block","target":"01-a/u/s{n:07}","command":"cm sync {n:01000}"}}"#
+        )
+        .unwrap();
+    }
+    write!(file, "]}}").unwrap();
+    file.flush().unwrap();
+}
+
 fn big_line(n: usize) -> String {
     format!("stale-block 01-a/u/s{n:07}: cm sync {n:01000}")
 }
@@ -1436,12 +1454,12 @@ fn a_list_a_descendant_prints_after_the_leader_and_stderr_are_gone_is_read_whole
         let ct = Ct::new();
         let bin = ct.path().join("bin");
         let list = ct.path().join("next.json");
-        fs::write(&list, act(lines())).unwrap();
-        let print = if big {
-            big_list_awk()
+        if big {
+            write_big_list(&list);
         } else {
-            format!("cat '{}'", list.display())
-        };
+            fs::write(&list, act(lines())).unwrap();
+        }
+        let print = format!("cat '{}'", list.display());
         let cm = script(
             &bin.join("cm"),
             &format!("exec 2>&-\n( sleep 1; {print} ) &\nexit 0\n"),
@@ -1479,7 +1497,9 @@ fn a_spilling_capture_times_out_and_kills_a_descendant_that_outlives_the_leader(
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
         let print = if big {
-            big_list_awk()
+            let list = dir.path().join("big.json");
+            write_big_list(&list);
+            format!("cat '{}'", list.display())
         } else {
             "echo {}".to_owned()
         };
