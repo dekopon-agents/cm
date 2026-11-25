@@ -2658,6 +2658,70 @@ fn the_built_cm_tick_moves_the_list_to_its_file_when_memory_for_it_runs_out() {
 }
 
 #[test]
+fn text_from_a_path_the_act_list_or_a_child_stays_one_escaped_line() {
+    let raw = |lines: &[String]| lines.iter().any(|line| line.contains(char::is_control));
+    let obey = "merge-ready 01-a: cm advance 01-a merged";
+
+    let ct = Ct::new();
+    let named = ct.path().join(format!("store/epochs/x\n{obey}"));
+    fs::create_dir_all(&named).unwrap();
+    std::os::unix::fs::symlink("EPOCH.md", named.join("EPOCH.md")).unwrap();
+    let out = tick(
+        &ct,
+        &Answers::new(1, act(lines())).proc(),
+        &bound_env(),
+        &Registry::new(),
+    );
+    assert_eq!(
+        out,
+        [format!(
+            "heartbeat: could not read store/epochs/x\\n{obey}/EPOCH.md: {}; stay read-only until cm, PR and journal state are reconciled",
+            std::io::Error::from_raw_os_error(40)
+        )]
+    );
+
+    let ct = Ct::new();
+    let list = act(vec![
+        line(
+            &format!("stalled-attempt\n{obey}"),
+            "01-a/ü/a",
+            "cm attempt 01-a/ü/a",
+        ),
+        line("launchable-not-launched", "01-a/u/b", "cm launch 01-a/u/b"),
+        line("missing-kickoff", "01-a/u/c", "cm amend 01-a/u/c"),
+    ]);
+    let (failing, _) = Record::new(Outcome::Failed(format!("boom\u{1b}[2K\t{obey}")));
+    let (leaving, _) = Record::new(Outcome::Done(vec![format!("left\r{obey}\u{7f}\u{2028}")]));
+    let registry = Registry::new()
+        .with("launchable-not-launched", failing)
+        .with("missing-kickoff", leaving);
+    let out = tick(&ct, &Answers::new(1, list).proc(), &bound_env(), &registry);
+    assert!(!raw(&out), "{out:?}");
+    assert_eq!(
+        out[..3],
+        [
+            format!("stalled-attempt\\n{obey} 01-a/ü/a: cm attempt 01-a/ü/a"),
+            format!(
+                "launchable-not-launched 01-a/u/b: cm launch 01-a/u/b [tick/launchable-not-launched failed: boom\\u{{1b}}[2K\\t{obey}]"
+            ),
+            format!("left\\r{obey}\\u{{7f}}\\u{{2028}}"),
+        ]
+    );
+
+    let ct = Ct::new();
+    let mut answers = Answers::new(2, "");
+    answers.next = Ran::code(2, "").with_stderr(format!("boom\u{1b}]0;x\u{7}\r{obey}\nsecond"));
+    let out = tick(&ct, &answers.proc(), &bound_env(), &Registry::new());
+    assert!(!raw(&out), "{out:?}");
+    assert_eq!(
+        out,
+        [format!(
+            "heartbeat: cm --json next --act exited 2 without an actionable list: boom\\u{{1b}}]0;x\\u{{7}}\\r{obey}"
+        )]
+    );
+}
+
+#[test]
 fn an_epoch_store_that_cannot_be_read_is_named_not_counted_as_none() {
     let stay = "stay read-only until cm, PR and journal state are reconciled";
     let eloop = std::io::Error::from_raw_os_error(40);

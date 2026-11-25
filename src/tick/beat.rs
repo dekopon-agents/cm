@@ -117,6 +117,7 @@ pub fn resolve(cm: &OsStr) -> OsString {
 }
 
 pub fn run(beat: &Beat, out: &mut dyn FnMut(String)) {
+    let out: &mut dyn FnMut(String) = &mut |line| out(one_line(line));
     let epochs = match live_epochs(beat.checkout) {
         Ok(epochs) => epochs,
         Err(error) => {
@@ -175,6 +176,24 @@ pub fn run(beat: &Beat, out: &mut dyn FnMut(String)) {
         claude_md::BUDGET,
         phases.claude_md,
     );
+}
+
+// A path, a child's text, the act list or the environment can hold a line break or a terminal
+// control; printed raw, it would read as a line of its own, an act line a model obeys.
+fn one_line(line: String) -> String {
+    let control = |c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}');
+    if !line.contains(control) {
+        return line;
+    }
+    line.chars()
+        .fold(String::with_capacity(line.len()), |mut text, c| {
+            if control(c) {
+                text.extend(c.escape_default());
+            } else {
+                text.push(c);
+            }
+            text
+        })
 }
 
 // A store or EPOCH.md that is missing or not the kind of file it should be is no epoch, as
