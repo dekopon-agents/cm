@@ -1,10 +1,12 @@
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
@@ -34,12 +36,12 @@ pub struct Cmd {
     pub merge_stderr: bool,
     pub keep_stdout: Keep,
     pub keep_stderr: Keep,
-    pub stdout_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keep {
     Whole,
+    Spill,
     Head,
     Tail,
 }
@@ -58,7 +60,6 @@ impl Cmd {
             merge_stderr: false,
             keep_stdout: Keep::Whole,
             keep_stderr: Keep::Tail,
-            stdout_file: None,
         }
     }
 
@@ -101,11 +102,6 @@ impl Cmd {
 
     pub fn merge_stderr(mut self) -> Self {
         self.merge_stderr = true;
-        self
-    }
-
-    pub fn stdout_file(mut self, path: impl Into<PathBuf>) -> Self {
-        self.stdout_file = Some(path.into());
         self
     }
 
@@ -161,6 +157,24 @@ impl Exit {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum Spilled {
+    Stored(Arc<File>),
+    Failed(Arc<std::io::Error>),
+}
+
+impl PartialEq for Spilled {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Spilled::Stored(one), Spilled::Stored(other)) => Arc::ptr_eq(one, other),
+            (Spilled::Failed(one), Spilled::Failed(other)) => Arc::ptr_eq(one, other),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Spilled {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ran {
     pub exit: Exit,
@@ -168,6 +182,7 @@ pub struct Ran {
     pub stderr: Vec<u8>,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    pub stdout_spill: Option<Spilled>,
     pub wall: Duration,
 }
 
@@ -179,6 +194,7 @@ impl Ran {
             stderr: Vec::new(),
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_spill: None,
             wall: Duration::ZERO,
         }
     }
@@ -242,17 +258,7 @@ impl Proc for SystemProc {
         if let Some(dir) = &cmd.cwd {
             command.current_dir(dir);
         }
-        let merged = if let Some(path) = &cmd.stdout_file {
-            // Straight to disk: output of any size, never held in memory.
-            let file = std::fs::File::create(path).map_err(fail)?;
-            if cmd.merge_stderr {
-                command.stderr(file.try_clone().map_err(fail)?);
-            } else {
-                command.stderr(Stdio::piped());
-            }
-            command.stdout(file);
-            None
-        } else if cmd.merge_stderr {
+        let merged = if cmd.merge_stderr {
             let (reader, writer) = std::io::pipe().map_err(fail)?;
             command
                 .stdout(writer.try_clone().map_err(fail)?)
@@ -331,14 +337,15 @@ impl Proc for SystemProc {
         } else {
             Exit::Signal(status.signal().unwrap_or(0))
         };
-        let (stdout, stdout_truncated) = out.finish();
-        let (stderr, stderr_truncated) = err.finish();
+        let (stdout, stdout_truncated, stdout_spill) = out.finish();
+        let (stderr, stderr_truncated, _) = err.finish();
         Ok(Ran {
             exit,
             stdout,
             stderr,
             stdout_truncated,
             stderr_truncated,
+            stdout_spill,
             wall: started.elapsed(),
         })
     }
@@ -406,6 +413,8 @@ struct Drain {
     bytes: Vec<u8>,
     overflowed: bool,
     truncated: bool,
+    spill: Option<std::io::Result<File>>,
+    open_spill: fn() -> std::io::Result<File>,
 }
 
 impl Drain {
@@ -419,6 +428,9 @@ impl Drain {
             bytes: Vec::new(),
             overflowed: false,
             truncated: false,
+            spill: None,
+            // Unlinked from the start, so a killed tick leaves nothing behind.
+            open_spill: tempfile::tempfile,
         })
     }
 
@@ -455,6 +467,7 @@ impl Drain {
 
     fn take(&mut self, chunk: &[u8]) {
         let cap = match self.keep {
+            Keep::Spill => return self.spill(chunk),
             Keep::Whole => WHOLE_CAP,
             Keep::Head => OUTPUT_CAP,
             Keep::Tail => {
@@ -475,12 +488,46 @@ impl Drain {
         }
     }
 
-    fn finish(mut self) -> (Vec<u8>, bool) {
+    fn spill(&mut self, chunk: &[u8]) {
+        let written = match &mut self.spill {
+            Some(Err(_)) => return,
+            Some(Ok(file)) => file.write_all(chunk),
+            None if self.bytes.len() + chunk.len() <= WHOLE_CAP => {
+                self.bytes.extend_from_slice(chunk);
+                return;
+            }
+            None => {
+                let held = std::mem::take(&mut self.bytes);
+                let stored = (self.open_spill)().and_then(|mut file| {
+                    file.write_all(&held)?;
+                    file.write_all(chunk)?;
+                    Ok(file)
+                });
+                match stored {
+                    Ok(file) => {
+                        self.spill = Some(Ok(file));
+                        return;
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        if let Err(error) = written {
+            self.spill = Some(Err(error));
+            self.overflowed = true;
+        }
+    }
+
+    fn finish(mut self) -> (Vec<u8>, bool, Option<Spilled>) {
         if self.keep == Keep::Tail && self.bytes.len() > OUTPUT_CAP {
             self.bytes.drain(..self.bytes.len() - OUTPUT_CAP);
             self.truncated = true;
         }
-        (self.bytes, self.truncated)
+        let spill = self.spill.map(|spill| match spill {
+            Ok(file) => Spilled::Stored(Arc::new(file)),
+            Err(error) => Spilled::Failed(Arc::new(error)),
+        });
+        (self.bytes, self.truncated, spill)
     }
 }
 
@@ -558,19 +605,87 @@ impl FakeProc {
 impl Proc for FakeProc {
     fn run(&self, cmd: &Cmd) -> Result<Ran> {
         self.calls.borrow_mut().push(cmd.clone());
-        let mut ran = (self.answer)(cmd)?;
-        if let Some(path) = &cmd.stdout_file {
-            std::fs::write(path, std::mem::take(&mut ran.stdout)).map_err(|source| {
-                TickError::Io {
-                    path: path.clone(),
-                    source,
-                }
-            })?;
-        }
-        Ok(ran)
+        (self.answer)(cmd)
     }
 
     fn pause(&self, pause: Duration) {
         self.pauses.borrow_mut().push(pause);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Seek, SeekFrom};
+
+    use super::*;
+
+    fn spilling(open_spill: fn() -> std::io::Result<File>) -> Drain {
+        Drain {
+            open_spill,
+            ..Drain::new(None, Keep::Spill).unwrap()
+        }
+    }
+
+    fn unreachable_store() -> std::io::Result<File> {
+        panic!("nothing up to the cap is stored")
+    }
+
+    #[test]
+    fn a_spill_keeps_64_mib_in_memory_and_moves_the_rest_to_an_unlinked_file() {
+        let chunk = vec![b'x'; 1 << 20];
+        let mut kept = spilling(unreachable_store);
+        for _ in 0..WHOLE_CAP >> 20 {
+            kept.take(&chunk);
+        }
+        let (bytes, truncated, spill) = kept.finish();
+        assert_eq!((bytes.len(), truncated, spill), (WHOLE_CAP, false, None));
+
+        let mut spilled = spilling(tempfile::tempfile);
+        for _ in 0..WHOLE_CAP >> 20 {
+            spilled.take(&chunk);
+        }
+        spilled.take(b"yz");
+        assert!(!spilled.overflowed);
+        let (bytes, truncated, spill) = spilled.finish();
+        assert_eq!((bytes.len(), truncated), (0, false));
+        let Some(Spilled::Stored(file)) = spill else {
+            panic!("{spill:?}");
+        };
+        let mut file = &*file;
+        assert_eq!(file.seek(SeekFrom::End(0)).unwrap(), WHOLE_CAP as u64 + 2);
+        file.seek(SeekFrom::End(-3)).unwrap();
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail).unwrap();
+        assert_eq!(tail, b"xyz");
+    }
+
+    #[test]
+    fn a_spill_that_cannot_be_stored_stops_the_child_and_keeps_the_error() {
+        fn full() -> std::io::Result<File> {
+            File::options().write(true).open("/dev/full")
+        }
+        fn missing() -> std::io::Result<File> {
+            Err(ErrorKind::NotFound.into())
+        }
+        for (store, kind) in [
+            (
+                full as fn() -> std::io::Result<File>,
+                ErrorKind::StorageFull,
+            ),
+            (missing, ErrorKind::NotFound),
+        ] {
+            let mut drain = spilling(store);
+            drain.take(&vec![b'x'; WHOLE_CAP]);
+            assert!(!drain.overflowed);
+            drain.take(b"y");
+            assert!(drain.overflowed, "the run loop kills the child on this");
+            drain.take(b"discarded");
+            let (bytes, _, spill) = drain.finish();
+            assert!(bytes.is_empty());
+            let Some(Spilled::Failed(error)) = spill else {
+                panic!("{spill:?}");
+            };
+            assert_eq!(error.kind(), kind);
+        }
     }
 }

@@ -1,17 +1,21 @@
 use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cm::tick::TickError;
 use cm::tick::act::{ActLine, Ctx, Env, Executor, Outcome, Registry, Report};
 use cm::tick::beat::{self, Beat, Phases};
 use cm::tick::gitsync::Mode;
-use cm::tick::proc::{Cmd, Exit, FakeProc, Keep, OUTPUT_CAP, Proc, Ran, SystemProc, WHOLE_CAP};
+use cm::tick::proc::{
+    Cmd, Exit, FakeProc, Keep, OUTPUT_CAP, Proc, Ran, Spilled, SystemProc, WHOLE_CAP,
+};
 use serde_json::{Value, json};
 
 const EPOCH: &str = "store/epochs/eleemosynary-mnemosyne";
@@ -1260,7 +1264,7 @@ fn head_keeps_the_first_bytes_and_tail_the_last() {
 }
 
 #[test]
-fn the_act_list_is_read_from_a_file_and_the_frame_children_keep_their_heads() {
+fn the_act_list_spills_past_64_mib_and_the_frame_children_keep_their_heads() {
     let ct = Ct::new();
     let proc = Answers::new(1, act(lines())).proc();
     assert_eq!(tick(&ct, &proc, &bound_env(), &Registry::new()), PRINTED);
@@ -1269,14 +1273,77 @@ fn the_act_list_is_read_from_a_file_and_the_frame_children_keep_their_heads() {
         .into_iter()
         .find(|cmd| cmd.program_name() == "cm")
         .unwrap();
-    assert!(next.stdout_file.is_some(), "{next:?}");
-    assert_eq!(next.keep_stderr, Keep::Head);
-    assert!(
-        !next.stdout_file.unwrap().exists(),
-        "the list's file is gone once the tick is done"
+    assert_eq!(
+        (next.keep_stdout, next.keep_stderr),
+        (Keep::Spill, Keep::Head)
     );
     for frame in proc.calls().iter().filter(|cmd| cmd.program_name() != "cm") {
         assert_eq!(frame.keep_stdout, Keep::Head, "{}", frame.line());
+    }
+}
+
+#[test]
+fn a_spilled_act_list_is_read_from_its_file() {
+    let ct = Ct::new();
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(act(lines()).as_bytes()).unwrap();
+    let mut answers = Answers::new(1, "");
+    answers.next.stdout_spill = Some(Spilled::Stored(Arc::new(file)));
+    assert_eq!(
+        tick(&ct, &answers.proc(), &bound_env(), &Registry::new()),
+        PRINTED
+    );
+}
+
+#[test]
+fn a_list_that_could_not_be_spilled_is_one_line_naming_the_store() {
+    let ct = Ct::new();
+    let error = std::io::Error::from(std::io::ErrorKind::StorageFull);
+    let named = format!(
+        "heartbeat: cm --json next --act printed more than 64 MiB, which could not be stored in {}: {error}; no act line was read",
+        std::env::temp_dir().display()
+    );
+    let mut answers = Answers::new(1, "");
+    answers.next.exit = Exit::TooLarge;
+    answers.next.stdout_spill = Some(Spilled::Failed(Arc::new(error)));
+    let (executor, seen) = Record::new(done());
+    let registry = Registry::new().with("launchable-not-launched", executor);
+    assert_eq!(tick(&ct, &answers.proc(), &bound_env(), &registry), [named]);
+    assert!(seen.calls().is_empty());
+}
+
+#[test]
+fn a_list_the_acting_pass_could_not_read_is_never_acted_on() {
+    let merge = line("merge-ready", "01-a/u/b", "cm merge 01-a/u/b");
+    let review = line("review-owed", "01-a/u/c", "cm brief 01-a/u/c");
+    let deep = format!("{}{}", "[".repeat(130), "]".repeat(130));
+    let unreadable: [(&str, Vec<u8>); 4] = [
+        ("a number out of range", br#"{"n": 1e999}"#.to_vec()),
+        ("nesting past 128", deep.into_bytes()),
+        ("invalid UTF-8", b"{\"n\": \"\xff\"}".to_vec()),
+        ("a lone surrogate", br#"{"n": "\ud800"}"#.to_vec()),
+    ];
+    for (what, middle) in unreadable {
+        let mut list = format!(r#"{{"ok": true, "actionable": [{merge}, "#).into_bytes();
+        list.extend_from_slice(&middle);
+        list.extend_from_slice(format!(", {review}]}}").as_bytes());
+        let ct = Ct::new();
+        let (merging, merged) = Record::new(done());
+        let (reviewing, reviewed) = Record::new(done());
+        let registry = Registry::new()
+            .with("merge-ready", merging)
+            .with("review-owed", reviewing);
+        assert_eq!(
+            tick(&ct, &Answers::new(0, list).proc(), &bound_env(), &registry),
+            ["heartbeat: cm --json next --act exited 0 without an actionable list: "],
+            "{what}"
+        );
+        assert!(merged.calls().is_empty(), "{what}: {:?}", merged.calls());
+        assert!(
+            reviewed.calls().is_empty(),
+            "{what}: {:?}",
+            reviewed.calls()
+        );
     }
 }
 
@@ -1301,13 +1368,8 @@ fn a_list_cut_short_prints_no_act_line() {
 fn a_valid_act_list_above_64_mib_prints_every_line() {
     let ct = Ct::new();
     let bin = ct.path().join("bin");
-    let count = 70_000;
-    let cm = script(
-        &bin.join("cm"),
-        &format!(
-            "awk 'BEGIN {{ printf \"{{\\\"ok\\\":true,\\\"actionable\\\":[\"; for (i = 0; i < {count}; i++) {{ if (i) printf \",\"; printf \"{{\\\"kind\\\":\\\"stale-block\\\",\\\"target\\\":\\\"01-a/u/s%07d\\\",\\\"command\\\":\\\"cm sync %01000d\\\"}}\", i, i }} printf \"]}}\" }}'\nexit 1\n"
-        ),
-    );
+    let count = BIG_LIST;
+    let cm = script(&bin.join("cm"), &big_list());
     script(&bin.join("git"), "echo main\n");
     let probe = Command::new(&cm).output().unwrap();
     assert!(probe.stdout.len() > 64 << 20, "{}", probe.stdout.len());
@@ -1331,11 +1393,21 @@ fn a_valid_act_list_above_64_mib_prints_every_line() {
         "heartbeat: executors off (no CLAUDE_CODE_REMOTE_SESSION_ID, so no lineage); every act line below is yours"
     );
     for (n, line) in out[1..].iter().enumerate() {
-        assert_eq!(
-            *line,
-            format!("stale-block 01-a/u/s{n:07}: cm sync {n:01000}")
-        );
+        assert_eq!(*line, big_line(n));
     }
+}
+
+const BIG_LIST: usize = 70_000;
+
+// A `cm` printing a valid list of BIG_LIST lines, more than 64 MiB, generated as it is printed.
+fn big_list() -> String {
+    format!(
+        "awk 'BEGIN {{ printf \"{{\\\"ok\\\":true,\\\"actionable\\\":[\"; for (i = 0; i < {BIG_LIST}; i++) {{ if (i) printf \",\"; printf \"{{\\\"kind\\\":\\\"stale-block\\\",\\\"target\\\":\\\"01-a/u/s%07d\\\",\\\"command\\\":\\\"cm sync %01000d\\\"}}\", i, i }} printf \"]}}\" }}'\nexit 1\n"
+    )
+}
+
+fn big_line(n: usize) -> String {
+    format!("stale-block 01-a/u/s{n:07}: cm sync {n:01000}")
 }
 
 #[test]
@@ -2173,20 +2245,126 @@ fn a_list_read_past_the_act_budget_still_prints_the_wall_time() {
 }
 
 #[test]
-fn the_built_cm_tick_without_a_place_for_the_list_is_one_line() {
+fn the_built_cm_tick_prints_a_list_under_64_mib_without_a_usable_tmpdir() {
     let harness = Harness::new(1, &act(lines()), PICK_OK);
+    let not_a_dir = harness.ct.path().join("a-file");
+    fs::write(&not_a_dir, "").unwrap();
+    for tmpdir in [harness.ct.path().join("no-such-dir"), not_a_dir] {
+        let output = harness
+            .command("cse_01abc")
+            .env("TMPDIR", &tmpdir)
+            .args(["tick", "--cm", "cm"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{tmpdir:?}: {output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}\n", PRINTED.join("\n")),
+            "{tmpdir:?}"
+        );
+    }
+}
+
+impl Harness {
+    fn big(&self) {
+        script(&self.bin.join("cm"), &big_list());
+    }
+}
+
+fn peak_kib(pid: u32) -> Option<u64> {
+    fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))?
+        .trim()
+        .strip_suffix(" kB")?
+        .parse()
+        .ok()
+}
+
+#[test]
+fn the_built_cm_tick_spills_a_list_above_64_mib_and_prints_every_line_in_bounded_memory() {
+    let harness = Harness::new(1, "", PICK_OK);
+    harness.big();
+    let tmpdir = harness.ct.path().join("tmp");
+    fs::create_dir(&tmpdir).unwrap();
+    let mut child = harness
+        .command("cse_01abc")
+        .env("TMPDIR", &tmpdir)
+        .args(["tick", "--cm", "cm"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let mut peak = 0;
+    let mut count = 0;
+    for line in BufReader::new(child.stdout.take().unwrap()).lines() {
+        assert_eq!(line.unwrap(), big_line(count));
+        count += 1;
+        if count % 1000 == 0 {
+            peak = peak.max(peak_kib(pid).unwrap_or(0));
+        }
+    }
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    assert_eq!(count, BIG_LIST);
+    assert!(peak > 0, "no VmHWM read for {pid}");
+    // 64 MiB held before the spill, then one line at a time; reading the list whole into a
+    // `Value` peaked past 400 MiB.
+    assert!(peak < 160 << 10, "peak RSS {peak} KiB");
+    assert_eq!(fs::read_dir(&tmpdir).unwrap().count(), 0);
+}
+
+#[test]
+fn the_built_cm_tick_names_a_spill_that_could_not_be_stored() {
+    let harness = Harness::new(1, "", PICK_OK);
+    harness.big();
+    let tmpdir = harness.ct.path().join("no-such-dir");
     let output = harness
         .command("cse_01abc")
-        .env("TMPDIR", harness.ct.path().join("no-such-dir"))
+        .env("TMPDIR", &tmpdir)
         .args(["tick", "--cm", "cm"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert_eq!(stdout.lines().count(), 1, "{stdout}");
-    assert!(
-        stdout.starts_with("heartbeat: cm --json next --act could not run: "),
-        "{stdout}"
+    let prefix = format!(
+        "heartbeat: cm --json next --act printed more than 64 MiB, which could not be stored in {}: ",
+        tmpdir.display()
+    );
+    assert!(stdout.starts_with(&prefix), "{stdout}");
+    assert!(stdout.ends_with("; no act line was read\n"), "{stdout}");
+}
+
+#[test]
+fn a_killed_cm_tick_leaves_no_spilled_list_behind() {
+    let harness = Harness::new(1, "", PICK_OK);
+    harness.big();
+    let tmpdir = harness.ct.path().join("tmp");
+    fs::create_dir(&tmpdir).unwrap();
+    let mut child = harness
+        .command("cse_01abc")
+        .env("TMPDIR", &tmpdir)
+        .args(["tick", "--cm", "cm"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    stdout.read_line(&mut first).unwrap();
+    assert_eq!(first.trim_end(), big_line(0), "the act loop is running");
+    let status = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    child.wait().unwrap();
+    assert_eq!(
+        fs::read_dir(&tmpdir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        Vec::<std::ffi::OsString>::new()
     );
 }
 

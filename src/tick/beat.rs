@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::Deserializer as _;
-use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 use crate::tick::act::{ActLine, Ctx, Env, Outcome, Registry, Report, clip};
-use crate::tick::proc::{Cmd, Exit, KILL_AFTER, Keep, Proc, SystemProc};
+use crate::tick::proc::{Cmd, Exit, KILL_AFTER, Keep, Proc, Ran, Spilled, SystemProc, WHOLE_CAP};
 use crate::tick::{claude_md, collect, directive, exec, gitsync, pin};
 
 pub const DEADLINE_SECS: i64 = 230;
@@ -229,30 +229,31 @@ fn act(
     deadline: i64,
     out: &mut dyn FnMut(String),
 ) -> Act {
-    // The list goes to a file and is read from it twice, whole and then line by line, so a list
-    // of any size prints every line in bounded memory.
-    let stdout = match tempfile::NamedTempFile::new() {
-        Ok(file) => file,
-        Err(error) => {
-            out(format!(
-                "heartbeat: cm --json next --act could not run: {error}"
-            ));
-            return READ_FAILED;
-        }
-    };
+    // Up to 64 MiB the list stays in memory, as heartbeat.sh held it, so it needs no disk;
+    // past that it spills to a file. Either way it is read twice, whole and then line by line.
     let next = Cmd::new(beat.cm)
         .args(["--json", "next", "-C"])
         .arg(epoch)
         .arg("--act")
         .cwd(beat.checkout)
         .timeout(FRAME_CAP)
-        .keep(Keep::Whole, Keep::Head)
-        .stdout_file(stdout.path());
+        .keep(Keep::Spill, Keep::Head);
     let next = match beat.proc.run(&next) {
         Ok(ran) if ran.exit == Exit::TimedOut => {
             out(format!(
                 "heartbeat: cm --json next --act ran past {} s and was killed",
                 FRAME_CAP.as_secs()
+            ));
+            return READ_FAILED;
+        }
+        Ok(Ran {
+            stdout_spill: Some(Spilled::Failed(error)),
+            ..
+        }) => {
+            out(format!(
+                "heartbeat: cm --json next --act printed more than {} MiB, which could not be stored in {}: {error}; no act line was read",
+                WHOLE_CAP >> 20,
+                std::env::temp_dir().display()
             ));
             return READ_FAILED;
         }
@@ -265,12 +266,10 @@ fn act(
         }
     };
     let status = next.exit.shell_status();
-    let list = stdout.as_file();
-    let shape = (status <= 1)
-        .then(|| read_list(BufReader::new(list), None).ok())
-        .flatten();
+    let list = List::of(&next);
+    let shape = (status <= 1).then(|| list.read(None).ok()).flatten();
     let Some(shape) = shape else {
-        if status == 0 && only_newlines(list) {
+        if status == 0 && list.only_newlines() {
             return Act {
                 ran: false,
                 failed: false,
@@ -308,12 +307,7 @@ fn act(
         deadline,
     };
     let mut ran = false;
-    let read = rewind(list).and_then(|()| {
-        read_list(
-            BufReader::new(list),
-            Some(&mut |json| ran |= lines.act(json, out)),
-        )
-    });
+    let read = list.read(Some(&mut |json| ran |= lines.act(json, out)));
     if let Err(error) = read {
         out(format!(
             "heartbeat: cm --json next --act's list could not be read again: {error}"
@@ -323,18 +317,45 @@ fn act(
     Act { ran, failed: false }
 }
 
-fn rewind(mut file: &File) -> serde_json::Result<()> {
-    file.seek(SeekFrom::Start(0))
-        .map(drop)
-        .map_err(serde_json::Error::io)
+enum List<'a> {
+    Kept(&'a [u8]),
+    Spilled(&'a File),
 }
 
-// heartbeat.sh's `[ -z "$act" ]`: nothing but newlines.
-fn only_newlines(file: &File) -> bool {
-    rewind(file).is_ok()
-        && BufReader::new(file)
-            .bytes()
-            .all(|byte| matches!(byte, Ok(b'\n')))
+impl<'a> List<'a> {
+    fn of(ran: &'a Ran) -> Self {
+        match &ran.stdout_spill {
+            Some(Spilled::Stored(file)) => List::Spilled(file),
+            _ => List::Kept(&ran.stdout),
+        }
+    }
+
+    fn read(&self, each: Option<&mut dyn FnMut(Value)>) -> serde_json::Result<Shape> {
+        match self {
+            List::Kept(bytes) => read_list(*bytes, each),
+            List::Spilled(file) => {
+                rewind(file).map_err(serde_json::Error::io)?;
+                read_list(BufReader::new(*file), each)
+            }
+        }
+    }
+
+    // heartbeat.sh's `[ -z "$act" ]`: nothing but newlines.
+    fn only_newlines(&self) -> bool {
+        match self {
+            List::Kept(bytes) => bytes.iter().all(|byte| *byte == b'\n'),
+            List::Spilled(file) => {
+                rewind(file).is_ok()
+                    && BufReader::new(*file)
+                        .bytes()
+                        .all(|byte| matches!(byte, Ok(b'\n')))
+            }
+        }
+    }
+}
+
+fn rewind(mut file: &File) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(0)).map(drop)
 }
 
 struct Shape {
@@ -342,7 +363,8 @@ struct Shape {
     unread: usize,
 }
 
-// Without `each` this only checks the whole document, keeping none of its lines.
+// Without `each` this only checks the whole document, keeping none of its lines. Both passes
+// parse every value alike, so a document the check accepts is one the acting pass reads.
 fn read_list(source: impl Read, each: Option<&mut dyn FnMut(Value)>) -> serde_json::Result<Shape> {
     let mut parser = serde_json::Deserializer::from_reader(source);
     let shape = parser.deserialize_map(Document { each })?;
@@ -378,7 +400,7 @@ impl<'de> Visitor<'de> for Document<'_> {
                     unread = map.next_value::<Value>()?.as_array().map_or(0, Vec::len);
                 }
                 _ => {
-                    map.next_value::<IgnoredAny>()?;
+                    map.next_value::<Value>()?;
                 }
             }
         }
@@ -406,20 +428,13 @@ impl<'de> Visitor<'de> for Elements<'_> {
         f.write_str("an array of act lines")
     }
 
-    fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<usize, S::Error> {
+    fn visit_seq<S: SeqAccess<'de>>(mut self, mut seq: S) -> Result<usize, S::Error> {
         let mut count = 0;
-        match self.each {
-            Some(each) => {
-                while let Some(line) = seq.next_element::<Value>()? {
-                    each(line);
-                    count += 1;
-                }
+        while let Some(line) = seq.next_element::<Value>()? {
+            if let Some(each) = &mut self.each {
+                each(line);
             }
-            None => {
-                while seq.next_element::<IgnoredAny>()?.is_some() {
-                    count += 1;
-                }
-            }
+            count += 1;
         }
         Ok(count)
     }
@@ -693,6 +708,26 @@ mod tests {
         ] {
             assert_eq!(shape(bad), None, "{bad}");
         }
+        let deep = format!("{}{}", "[".repeat(130), "]".repeat(130));
+        for middle in [
+            br#"1e999"#.to_vec(),
+            deep.into_bytes(),
+            b"\"\xff\"".to_vec(),
+            br#""\ud800""#.to_vec(),
+        ] {
+            for at in [r#"{"actionable": [1, "#, r#"{"actionable": [], "other": ["#] {
+                let mut text = at.as_bytes().to_vec();
+                text.extend_from_slice(&middle);
+                text.extend_from_slice(b"]}");
+                let mut seen = 0;
+                assert!(
+                    read_list(&text[..], None).is_err(),
+                    "{}",
+                    String::from_utf8_lossy(&text)
+                );
+                assert!(read_list(&text[..], Some(&mut |_| seen += 1)).is_err());
+            }
+        }
         let mut seen = Vec::new();
         let shape = read_list(
             r#"{"actionable": [{"k": 1}, {"k": 2}], "ok": true}"#.as_bytes(),
@@ -707,11 +742,13 @@ mod tests {
     }
 
     #[test]
-    fn only_newlines_is_an_empty_capture() {
+    fn only_newlines_is_an_empty_capture_kept_or_spilled() {
         let check = |bytes: &[u8]| {
             let file = tempfile::tempfile().unwrap();
             std::io::Write::write_all(&mut &file, bytes).unwrap();
-            only_newlines(&file)
+            let kept = List::Kept(bytes).only_newlines();
+            assert_eq!(List::Spilled(&file).only_newlines(), kept);
+            kept
         };
         assert!(check(b""));
         assert!(check(b"\n\n"));
