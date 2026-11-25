@@ -49,7 +49,6 @@ pub(crate) fn coordinator_label(given: &Option<String>) -> Option<String> {
     })
 }
 
-/// A remote session id as cm records it: a leading `cse_` becomes `session_`.
 fn session_label(value: &str) -> String {
     match value.strip_prefix("cse_") {
         Some(id) => format!("session_{id}"),
@@ -505,12 +504,8 @@ pub fn attempt(
 
 pub const LANE_DRIVERS: &str = "lane-drivers.json";
 
-/// The sessions the coordinator registered as lane drivers, by lane name, in
-/// `.cm/lane-drivers.json`. A live attempt a registered driver claimed, on a step under one of its
-/// units, is the driver's own, not an earlier coordinator's. cm trusts the labels it is given: the
-/// journal names who registered whom.
-/// Fields cm does not know are refused, not dropped: a newer cm may have written a registry whose
-/// meaning this one cannot apply, and the next `add` would otherwise rewrite it without them.
+// Unknown fields are refused, not dropped on the next write: a newer cm may have written a
+// registry this one cannot apply.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Drivers {
@@ -521,11 +516,8 @@ pub struct Drivers {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Driver {
-    /// The driver's session label, as its claims record it.
     pub session: String,
-    /// `<NN-name>[/<unit>[/<step>]]` prefixes, sorted: the steps under them are the driver's.
     pub units: Vec<String>,
-    /// When the driver was registered, and the label of the session that registered it.
     pub at: String,
     pub by: String,
 }
@@ -534,7 +526,6 @@ fn drivers_path(root: &Path) -> PathBuf {
     root.join(CM_DIR).join(LANE_DRIVERS)
 }
 
-/// A unit prefix covers the steps under it, whole path segments at a time.
 pub fn covers(prefix: &str, target: &str) -> bool {
     target
         .strip_prefix(prefix)
@@ -542,8 +533,6 @@ pub fn covers(prefix: &str, target: &str) -> bool {
 }
 
 impl Drivers {
-    /// No file registers no driver; a file cm cannot read or parse is `lane-drivers-unreadable`,
-    /// which names how to restore it.
     pub fn read(root: &Path) -> std::result::Result<Self, Violation> {
         let path = drivers_path(root);
         if !path.exists() {
@@ -561,10 +550,8 @@ impl Drivers {
         })
     }
 
-    /// The lane whose registered driver is `session` with a unit covering `target`. A claim label
-    /// recorded as `cse_<id>` (an explicit `--coordinator` is stored as given) is the registered
-    /// `session_<id>`.
     pub fn driving(&self, session: &str, target: &str) -> Option<&str> {
+        // An explicit `--coordinator` is stored as given, so a claim may carry the `cse_` form.
         let session = session_label(session);
         self.drivers
             .iter()
@@ -616,9 +603,7 @@ fn check_registrar(by: &str, out: &mut Vec<Violation>) {
     }
 }
 
-/// Journal a registry change, then write the registry: no registry write goes unjournaled. Each
-/// failure is a refusal naming the re-run. A failed journal append changes nothing; a failed write
-/// after it leaves the registry as it was, with a journal entry the re-run repeats.
+// Journal first, so no registry write goes unjournaled.
 fn journal_then_write(
     root: &Path,
     at: &str,
@@ -655,8 +640,6 @@ fn units_line(units: &[String]) -> String {
     units.join(", ")
 }
 
-/// `cm lane driver add`: register `session` as the driver of `lane` for the steps under `units`,
-/// replacing the lane's earlier driver.
 pub fn driver_add(
     host: &dyn Host,
     root: &Path,
@@ -813,8 +796,6 @@ pub fn driver_add(
     Ok(outcome)
 }
 
-/// `cm lane driver remove`: drop `lane`'s driver, whose claims read as an earlier coordinator's
-/// again.
 pub fn driver_remove(host: &dyn Host, root: &Path, lane: &str, by: &str) -> Result<Outcome> {
     let path = registry_path();
     let by = session_label(by);
@@ -885,7 +866,6 @@ pub fn driver_remove(host: &dyn Host, root: &Path, lane: &str, by: &str) -> Resu
     Ok(outcome)
 }
 
-/// `cm lane driver list`: the registered drivers, by lane name.
 pub fn driver_list(root: &Path) -> Result<Outcome> {
     let drivers = match Drivers::read(root) {
         Ok(drivers) => drivers,

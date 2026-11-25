@@ -6085,7 +6085,6 @@ echo '{"done":true,"successful":true,"turn_status":"completed"}'
 
 const DRIVEN: &str = "07-t/mvp/driven";
 
-/// `cm --json <args>` as the current session, `session_current`: its exit code and JSON.
 fn current_json(c: &Campaign, args: &[&str]) -> (Option<i32>, serde_json::Value) {
     let output = coordinator_cm(c, &[&["--json"], args].concat())
         .output()
@@ -6095,7 +6094,6 @@ fn current_json(c: &Campaign, args: &[&str]) -> (Option<i32>, serde_json::Value)
     (output.status.code(), json)
 }
 
-/// The `earlier-coordinator` targets `cm next --act` lists for the current session, with its exit.
 fn earlier_coordinators(c: &Campaign) -> (Option<i32>, Vec<String>) {
     let (code, act) = current_json(c, &["next", "--act"]);
     let targets = act["actionable"]
@@ -6173,8 +6171,6 @@ fn a_registered_drivers_claim_under_its_units_is_live_while_unregistered_and_out
         "only the driver's claim under 07-t/mvp is live"
     );
 
-    // A driver registered for a whole subcampaign covers every unit under it, and the current
-    // session's own claim never reads as an earlier coordinator's.
     let (code, replaced) = current_json(
         &c,
         &[
@@ -6193,7 +6189,6 @@ fn a_registered_drivers_claim_under_its_units_is_live_while_unregistered_and_out
     assert_eq!(code, Some(1));
     assert_eq!(after, [STRANGER]);
 
-    // CARD's Actionable count follows the same rule as `--act`.
     let card = {
         let synced = coordinator_cm(&c, &["sync"])
             .env("PATH", support::FakeGh::new("exit 1").path())
@@ -6353,8 +6348,6 @@ fn registering_listing_and_removing_a_lane_driver_journal_who_registered_whom_an
             "lane-driver-unchanged",
             "already has driver `session_driver`",
         ),
-        // An explicit `--coordinator` names the same session whether given as `cse_` or
-        // `session_`.
         (
             &[
                 "self",
@@ -6395,8 +6388,6 @@ fn registering_listing_and_removing_a_lane_driver_journal_who_registered_whom_an
         assert_eq!(journal(&c), text, "{args:?}");
     }
 
-    // A remote session id as the runtime reports it (`cse_…`) is recorded as its claims are,
-    // and a unit with nothing declared under it yet is registered with a warning line.
     let replaced = coordinator_cm(
         &c,
         &[
@@ -6450,7 +6441,6 @@ fn registering_listing_and_removing_a_lane_driver_journal_who_registered_whom_an
     );
     assert_eq!(journal(&c), text);
 
-    // Without a session to default to, the registrar is a required flag, as for `attempt claim`.
     let usage = Command::new(env!("CARGO_BIN_EXE_cm"))
         .arg("-C")
         .arg(&c.root)
@@ -6538,12 +6528,10 @@ fn next_notes_a_driver_held_claim_without_a_command_and_removing_the_driver_flag
         1,
         "the note is one unnumbered line: {text}"
     );
-    // The note follows the scope of `cm next`: a named step or a lane.
     let (_, named) = current_json(&c, &["next", DRIVEN]);
     assert_eq!(named["driver_held"][0]["target"], DRIVEN, "{named}");
     let (_, other_lane) = current_json(&c, &["next", "--lane", "codex"]);
     assert!(other_lane.get("driver_held").is_none(), "{other_lane}");
-    // The driver's own session sees its claim as its own: no note, no act line.
     let own = coordinator_cm(&c, &["--json", "next"])
         .env("CLAUDE_CODE_REMOTE_SESSION_ID", "session_driver")
         .output()
@@ -6572,7 +6560,6 @@ fn an_unreadable_lane_driver_registry_is_refused_with_the_command_that_restores_
     launch_for(&host, &c, DRIVEN, "session_driver");
     let registry = c.root.join(".cm/lane-drivers.json");
     let before = journal(&c);
-    // A merge conflict, and fields this cm does not know, which it refuses rather than drop.
     for (contents, says) in [
         (
             "<<<<<<< ours\n",
@@ -6635,8 +6622,7 @@ fn a_registry_change_whose_journal_entry_fails_leaves_the_registry_as_it_was_and
     let c = campaign(&host);
     assert!(declare(&host, &c, DRIVEN, Lane::ClaudeCloud, &[]).ok());
     launch_for(&host, &c, DRIVEN, "session_driver");
-    // The same obstruction the owner-queue read test uses: the journal's atomic write cannot
-    // create its temporary file, so the append fails after every check has passed.
+    // A directory where the journal's atomic write puts its temporary file fails the append.
     let obstruction = c.root.join(".JOURNAL.md.cm-tmp");
     let attempt = |args: &[&str], title: &str| {
         let before = (registry(&c), journal(&c));
@@ -6666,7 +6652,6 @@ fn a_registry_change_whose_journal_entry_fails_leaves_the_registry_as_it_was_and
         assert!(journal(&c).contains(retried["journal"].as_str().unwrap()));
     };
 
-    // A new driver: no registry is written, so the claim still reads as an earlier coordinator's.
     let add = [
         "lane",
         "driver",
@@ -6686,7 +6671,6 @@ fn a_registry_change_whose_journal_entry_fails_leaves_the_registry_as_it_was_and
     attempt(&add, " — lane driver add tooling: session_driver");
     assert_eq!(earlier_coordinators(&c), (Some(0), Vec::new()));
 
-    // A replacement and a removal leave the registered driver in place until they are journaled.
     attempt(
         &[
             "lane",
@@ -6719,7 +6703,7 @@ fn a_registry_write_that_fails_after_its_journal_entry_is_refused_with_the_regis
     let c = campaign(&host);
     assert!(declare(&host, &c, DRIVEN, Lane::ClaudeCloud, &[]).ok());
     launch_for(&host, &c, DRIVEN, "session_driver");
-    // The registry's atomic write cannot create its temporary file once the journal holds the entry.
+    // A directory where the registry's atomic write puts its temporary file fails the write.
     let obstruction = c.root.join(".cm/.lane-drivers.json.cm-tmp");
     let attempt = |args: &[&str], title: &str| {
         let registered = registry(&c);
@@ -6759,7 +6743,6 @@ fn a_registry_write_that_fails_after_its_journal_entry_is_refused_with_the_regis
     ];
     fs::create_dir(&obstruction).unwrap();
     assert_eq!(current_json(&c, &add).0, Some(1));
-    // Journaled but not registered: the claim still reads as an earlier coordinator's.
     assert_eq!(earlier_coordinators(&c), (Some(1), vec![DRIVEN.to_owned()]));
     fs::remove_dir(&obstruction).unwrap();
     assert_eq!(current_json(&c, &add).0, Some(0));
@@ -6784,4 +6767,85 @@ fn a_registry_write_that_fails_after_its_journal_entry_is_refused_with_the_regis
     );
     let (_, listed) = current_json(&c, &["lane", "driver", "list"]);
     assert_eq!(listed["drivers"], serde_json::json!([]));
+}
+
+#[test]
+#[cfg(unix)]
+fn a_driver_registered_as_cse_covers_its_explicit_cse_claim_and_its_env_derived_session_claim() {
+    let host = Fake {
+        now: Timestamp::now(),
+    };
+    let c = campaign(&host);
+    assert!(declare(&host, &c, DRIVEN, Lane::ClaudeCloud, &[]).ok());
+    launch_for(&host, &c, DRIVEN, "session_earlier");
+    let claim = |expect: &str, explicit: bool| {
+        let mut command = coordinator_cm(&c, &["attempt", DRIVEN, "claim", "--expect", expect]);
+        if explicit {
+            command.args(["--coordinator", "cse_A"]);
+        } else {
+            command.env("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_A");
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let unit = store::load_unit(&c.root.join("07-t/mvp")).unwrap();
+        let attempt = unit.steps["driven"].attempt.clone().unwrap();
+        (attempt.coordinator, attempt.generation)
+    };
+    let held = |c: &Campaign| {
+        let act = coordinator_cm(c, &["next", "--act"]).output().unwrap();
+        assert_eq!(act.status.code(), Some(0), "{act:?}");
+        assert!(act.stdout.is_empty(), "{act:?}");
+        let (code, regular) = current_json(c, &["next"]);
+        assert_eq!(code, Some(0), "{regular}");
+        regular["driver_held"][0].clone()
+    };
+
+    assert_eq!(claim("1", true), ("cse_A".to_owned(), 2));
+    let (code, act) = current_json(&c, &["next", "--act"]);
+    assert_eq!(code, Some(1));
+    assert_eq!(
+        act["actionable"][0]["command"],
+        format!("cm attempt {DRIVEN} claim --expect 2")
+    );
+
+    let (code, added) = current_json(
+        &c,
+        &[
+            "lane",
+            "driver",
+            "add",
+            "tooling",
+            "--session",
+            "cse_A",
+            "--unit",
+            "07-t/mvp",
+        ],
+    );
+    assert_eq!(code, Some(0), "{added}");
+    assert_eq!(added["driver"]["session"], "session_A");
+    let listing = coordinator_cm(&c, &["lane", "driver", "list"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(listing.stdout).unwrap(),
+        format!(
+            "tooling: session_A for 07-t/mvp (registered {} by session_current)\n",
+            added["driver"]["at"].as_str().unwrap()
+        )
+    );
+
+    let note = held(&c);
+    assert_eq!(note["driver"], "cse_A");
+    assert_eq!(note["generation"], 2);
+    assert!(
+        note["note"].as_str().unwrap().starts_with(&format!(
+            "note: {DRIVEN} is held by cse_A, driver of lane tooling (generation 2, claimed "
+        )),
+        "{note}"
+    );
+
+    assert_eq!(claim("2", false), ("session_A".to_owned(), 3));
+    let note = held(&c);
+    assert_eq!(note["driver"], "session_A");
+    assert_eq!(note["generation"], 3);
 }

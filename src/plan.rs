@@ -372,14 +372,12 @@ pub(crate) struct ActionInputs {
 }
 
 impl ActionInputs {
-    /// Sync's reading: like an unreadable review ledger, an unreadable lane-driver registry is not
-    /// refused there; it registers no driver, so every claim reads as it would without one.
+    // Sync does not refuse an unreadable registry, as it does not refuse an unreadable review
+    // ledger: it registers no driver, so every claim reads as it would without one.
     pub(crate) fn read(root: &Path, now: Timestamp) -> Self {
         Self::with_drivers(root, now, Drivers::read(root).unwrap_or_default())
     }
 
-    /// `cm next`'s reading, which refuses an unreadable lane-driver registry with the violation
-    /// that names how to restore it.
     pub(crate) fn load(root: &Path, now: Timestamp) -> Result<Self, Violation> {
         Ok(Self::with_drivers(root, now, Drivers::read(root)?))
     }
@@ -785,8 +783,6 @@ fn append_actions(outcome: &mut Outcome, number: &mut usize, actions: &[Action])
     outcome.field("actionable", json!(actions));
 }
 
-/// The live attempts a registered lane driver holds on steps under its units, other than the
-/// session running cm: each is an unnumbered note in `cm next`, never an act line.
 fn driver_held(
     units: &Units,
     inputs: &ActionInputs,
@@ -823,7 +819,7 @@ fn driver_held(
         .collect()
 }
 
-/// Absent while no driver holds a step, so `cm next` reads as it did before drivers existed.
+// Absent while empty, so `cm next` output is unchanged where no driver holds a step.
 fn append_held(outcome: &mut Outcome, held: &[Value]) {
     for item in held {
         outcome.line(item["note"].as_str().unwrap_or_default());
