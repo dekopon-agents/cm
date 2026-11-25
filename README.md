@@ -403,7 +403,8 @@ blocks offer `cm unblock`.
 When `CM_CODEX_WEEKLY_PCT` contains a valid percentage at or above 85, `cm next`
 lists ready Codex steps as waiting and shows the reason. Named `cm next <step>` and
 `cm launch <step>` refuse the held dispatch with exit 1 and `codex-paused`. The
-hold appears in regular `cm next` and CARD dispatch guidance.
+hold appears in regular `cm next` and CARD dispatch guidance; CARD shows it without the usage
+percent, which changes with every sample.
 
 ### Remote turns
 
@@ -428,7 +429,9 @@ LIMITS.toml, invalid command pairs, and reader failures in `turn_reader_warnings
 behind them. An ended turn without a PR shows its configured logs command in place of the age
 stall while the attempt is active. Codex launches with an ended attempt retain the informational
 stall report. JSON carries `kind`, `since`, and `command` in the `actionable` list. Exit 1 means
-actions remain. Exit 0 means the list is empty.
+actions remain. Exit 0 means the list is empty. CARD.md's `Actionable:` count is the same list as
+a reader with no coordinator session sees it: without the `earlier-coordinator` items that depend
+on which session asks.
 
 ### Finishing
 

@@ -185,14 +185,23 @@ impl TurnCommands {
     }
 }
 
-pub(crate) fn codex_pause() -> Option<String> {
+fn codex_weekly_held() -> Option<f64> {
     let used = std::env::var("CM_CODEX_WEEKLY_PCT")
         .ok()?
         .parse::<f64>()
         .ok()?;
-    (85.0..=100.0)
-        .contains(&used)
-        .then(|| format!("Codex dispatch held: weekly usage {used}% reached the 85% pause"))
+    (85.0..=100.0).contains(&used).then_some(used)
+}
+
+pub(crate) fn codex_pause() -> Option<String> {
+    codex_weekly_held()
+        .map(|used| format!("Codex dispatch held: weekly usage {used}% reached the 85% pause"))
+}
+
+/// The hold as CARD.md shows it: without the usage percent, which moves with every sample.
+pub(crate) fn codex_pause_held() -> Option<String> {
+    codex_weekly_held()
+        .map(|_| "Codex dispatch held: weekly usage reached the 85% pause".to_owned())
 }
 
 pub(crate) fn codex_pause_violation(target: &str, reason: &str) -> Violation {

@@ -772,7 +772,11 @@ pub(crate) fn action_summary(
     units: &Units,
     now: Timestamp,
 ) -> (usize, Option<String>) {
-    let inputs = ActionInputs::read(root, now);
+    // CARD.md counts what any reader sees: which session runs the sync is not a campaign fact.
+    let inputs = ActionInputs {
+        coordinator: None,
+        ..ActionInputs::read(root, now)
+    };
     let stalled = stalls(units, &inputs);
     // Unlike next, sync has not historically refused an unreadable review ledger.
     let verdicts = crate::verdict::load(root).unwrap_or_default();
@@ -1020,9 +1024,10 @@ pub(crate) fn unblock_command(target: &str, condition_met: bool) -> String {
     }
 }
 
+/// What CARD.md lists as next and waiting.
 pub fn summary(root: &Path, units: &Units) -> Next {
     let paused = paused(root).unwrap_or(true);
-    let quota = limits::codex_pause();
+    let quota = limits::codex_pause_held();
     let mut ready = Vec::new();
     let mut waiting = Vec::new();
     for candidate in candidates(root, units) {

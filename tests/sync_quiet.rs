@@ -724,3 +724,67 @@ fn cm_sync_prints_phases_past_its_budget() {
     assert_eq!(over["timing"]["phases"].as_array().unwrap().len(), 9);
     assert!(run("600").get("timing").is_none());
 }
+
+#[test]
+fn the_card_does_not_depend_on_who_runs_sync_or_where() {
+    let c = campaign(&at("2026-10-17T08:00:00Z"));
+    let kickoff = c.root.parent().unwrap().join("kickoff.md");
+    fs::write(&kickoff, "Go.\n").unwrap();
+    let gh = support::FakeGh::new("exit 1\n");
+    let cm = |root: &Path, args: &[&str], env: &[(&str, &str)]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cm"));
+        command
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("PATH", gh.path())
+            .env_remove("CLAUDE_CODE_REMOTE_SESSION_ID")
+            .env_remove("CM_CODEX_WEEKLY_PCT")
+            .envs(env.iter().copied());
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{args:?} {env:?}: {output:?}");
+    };
+    let kickoff = kickoff.to_str().unwrap();
+    for (target, lane) in [("01-a/u/CLOUD", "claude-cloud"), ("01-a/u/CODEX", "codex")] {
+        cm(
+            &c.root,
+            &["init", target, "--lane", lane, "--kickoff-file", kickoff],
+            &[],
+        );
+    }
+    cm(
+        &c.root,
+        &["launch", "01-a/u/CLOUD", "--coordinator", "session_one"],
+        &[],
+    );
+    let card = |root: &Path, env: &[(&str, &str)]| {
+        cm(root, &["sync"], env);
+        fs::read_to_string(root.join("CARD.md")).unwrap()
+    };
+    let alone = card(&c.root, &[]);
+    // Another session's claim is an action for that session's `cm next`, not a card fact.
+    assert_eq!(
+        card(&c.root, &[("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_other")]),
+        alone
+    );
+    let held = card(&c.root, &[("CM_CODEX_WEEKLY_PCT", "86")]);
+    assert!(
+        held.contains("Codex dispatch held: weekly usage reached the 85% pause"),
+        "{held}"
+    );
+    assert_eq!(card(&c.root, &[("CM_CODEX_WEEKLY_PCT", "87")]), held);
+    assert_eq!(card(&c.root, &[]), alone);
+
+    // The same campaign checked out under another parent renders the same card.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let copy = elsewhere.path().join("clone").join("campaign");
+    fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    let copied = Command::new("cp")
+        .arg("-a")
+        .arg(&c.root)
+        .arg(&copy)
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    assert_eq!(card(&copy, &[]), alone);
+}

@@ -5297,12 +5297,17 @@ esac"#
         fs::read_to_string(c.root.join("CARD.md")).unwrap()
     };
     let card = sync_card();
+    // The card counts what any reader sees: another session's claim is this session's action.
+    let shared = actions
+        .iter()
+        .filter(|action| action["kind"] != "earlier-coordinator")
+        .count();
+    assert_eq!(shared, lines.lines().count() - 1);
     assert_eq!(
         card.lines().find(|line| line.starts_with("Actionable: ")),
         Some(
             format!(
-                "Actionable: {} (oldest: {})",
-                lines.lines().count(),
+                "Actionable: {shared} (oldest: {})",
                 cm::host::stamp(old.now)
             )
             .as_str()
