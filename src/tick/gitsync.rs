@@ -1,8 +1,15 @@
 use std::time::Duration;
 
 use crate::tick::act::{Ctx, Report};
+use crate::tick::proc::{Cmd, Keep, Ran};
 
 pub const BUDGET: Duration = Duration::from_secs(60);
+
+pub const TRIES: u32 = 3;
+
+pub const BETWEEN_TRIES: Duration = Duration::from_secs(2);
+
+pub const ABORT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -11,34 +18,599 @@ pub enum Mode {
 }
 
 pub fn sync(ctx: &Ctx, mode: Mode) -> Report {
-    let _ = (ctx, mode);
-    Report::default()
+    let mut report = Report::default();
+    let branch = output(ctx, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let branch = branch.trim_end_matches('\n');
+    if branch != "main" {
+        let branch = if branch.is_empty() {
+            "no branch"
+        } else {
+            branch
+        };
+        report.lines.push(format!(
+            "heartbeat: the checkout is on {branch}, not main; nothing committed, pulled or pushed"
+        ));
+        return report;
+    }
+    if !output(ctx, &["status", "--porcelain"])
+        .trim_end_matches('\n')
+        .is_empty()
+    {
+        let message = format!("chore({}): heartbeat sync", slug_tail(&ctx.slug()));
+        if !(git(ctx, &["add", "-A"]) && git(ctx, &["commit", "-qm", &message])) {
+            report.lines.push(
+                "heartbeat: git commit of the tree's changes failed; commit them by hand"
+                    .to_owned(),
+            );
+            report.failed = true;
+        }
+    } else if mode == Mode::IfDirty {
+        return report;
+    }
+    push(ctx, &mut report);
+    report
+}
+
+// heartbeat.sh's line, word for word, even when the budget ended the tries before the third.
+fn push(ctx: &Ctx, report: &mut Report) {
+    for done in 1..=TRIES {
+        if done > 1 {
+            if ctx.remaining().is_zero() {
+                break;
+            }
+            ctx.pause(BETWEEN_TRIES);
+        }
+        if git(
+            ctx,
+            &["pull", "-q", "--rebase", "--autostash", "origin", "main"],
+        ) {
+            // A successor's handoff that arrived with this pull retires this session: heartbeat.sh
+            // pushed nothing and said nothing.
+            if !ctx.still_bound() {
+                return;
+            }
+            if git(ctx, &["push", "-q", "origin", "main"]) {
+                return;
+            }
+        }
+        abort(ctx, report);
+    }
+    report.lines.push(format!(
+        "heartbeat: git pull --rebase and push to main failed {TRIES} times; main does not have this checkout's commits"
+    ));
+    report.failed = true;
+}
+
+fn slug_tail(slug: &str) -> &str {
+    slug.rsplit('-').next().unwrap_or(slug)
+}
+
+fn command(args: &[&str]) -> Cmd {
+    Cmd::new("git").args(args).keep(Keep::Head, Keep::Tail)
+}
+
+pub const QUIT: &str = "heartbeat: git rebase --abort could not end the rebase a pull left; git rebase --quit did, and the tree's autostashed changes, if any, are in git stash list";
+
+// A pull the budget cut can stop mid-rebase, with the tree's change in the autostash, so the
+// abort gets its own timeout rather than what is left of the spent budget. Cut before the rebase
+// wrote its state, the pull leaves a folder holding only the autostash, which the abort cannot
+// read and every later pull refuses: `--quit`, in the rest of the abort's time, removes it and
+// stores the autostash. A rebase moves HEAD off main only once its state is written, so the quit
+// runs only while HEAD is still on main: after the move, a quit would leave a stopped rebase's
+// HEAD detached on origin's commit and its conflicts in the tree, which the next try's or tick's
+// abort ends instead.
+fn abort(ctx: &Ctx, report: &mut Report) {
+    let started = ctx.now();
+    if past_budget(ctx, &["rebase", "--abort"], ABORT_TIMEOUT).is_some() {
+        return;
+    }
+    let left = || ABORT_TIMEOUT.saturating_sub(ctx.now().saturating_duration_since(started));
+    let on_main = past_budget(ctx, &["rev-parse", "--abbrev-ref", "HEAD"], left())
+        .is_some_and(|ran| ran.stdout_text().trim_end_matches('\n') == "main");
+    if on_main && past_budget(ctx, &["rebase", "--quit"], left()).is_some() {
+        if !report.lines.iter().any(|line| line == QUIT) {
+            report.lines.push(QUIT.to_owned());
+        }
+        report.failed = true;
+    }
+}
+
+fn past_budget(ctx: &Ctx, args: &[&str], timeout: Duration) -> Option<Ran> {
+    if timeout.is_zero() {
+        return None;
+    }
+    ctx.proc
+        .run(&command(args).cwd(ctx.checkout).timeout(timeout))
+        .ok()
+        .filter(|ran| ran.exit.success())
+}
+
+fn git(ctx: &Ctx, args: &[&str]) -> bool {
+    ctx.run(command(args)).is_ok_and(|ran| ran.exit.success())
+}
+
+fn output(ctx: &Ctx, args: &[&str]) -> String {
+    ctx.run(command(args))
+        .map(|ran| ran.stdout_text())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::ffi::OsStr;
     use std::path::Path;
-    use std::time::Duration;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::tick::act::Env;
-    use crate::tick::proc::{FakeProc, Ran};
+    use crate::tick::act::{Env, Ticking};
+    use crate::tick::beat::FRAME_CAP;
+    use crate::tick::proc::{FakeProc, KILL_AFTER, Ran};
 
-    #[test]
-    fn the_stub_prints_nothing_and_runs_nothing() {
-        let proc = FakeProc::new(|_| Ok(Ran::code(0, "")));
-        let env = Env::default();
+    const PULL: &str = "git pull -q --rebase --autostash origin main";
+    const PUSH: &str = "git push -q origin main";
+    const ABORT: &str = "git rebase --abort";
+    const ON_MAIN: &str = "git rev-parse --abbrev-ref HEAD";
+    const QUIT_CALL: &str = "git rebase --quit";
+    const FAILED: &str = "heartbeat: git pull --rebase and push to main failed 3 times; main does not have this checkout's commits";
+
+    const BOUND: &str = "still_bound";
+
+    struct Git {
+        branch: &'static str,
+        branch_after_an_abort: &'static str,
+        status: &'static str,
+        failing: &'static [&'static str],
+        pick: &'static str,
+    }
+
+    impl Git {
+        fn proc(self) -> FakeProc {
+            let aborted = Cell::new(false);
+            FakeProc::new(move |cmd| {
+                let line = cmd.line();
+                aborted.set(aborted.get() || line == ABORT);
+                Ok(if self.failing.iter().any(|call| line.starts_with(call)) {
+                    Ran::code(1, "")
+                } else if line == ON_MAIN && aborted.get() {
+                    Ran::code(0, self.branch_after_an_abort)
+                } else if line == ON_MAIN {
+                    Ran::code(0, self.branch)
+                } else if line == "git status --porcelain" {
+                    Ran::code(0, self.status)
+                } else if line.contains("handoff-pick.sh") {
+                    Ran::code(0, self.pick)
+                } else {
+                    Ran::code(0, "")
+                })
+            })
+        }
+    }
+
+    const CLEAN: Git = Git {
+        branch: "main\n",
+        branch_after_an_abort: "main\n",
+        status: "",
+        failing: &[],
+        pick: "ok store/epochs/eleemosynary-mnemosyne/handoff/coordinator-1.md\n",
+    };
+
+    fn checked(proc: &FakeProc) -> Vec<String> {
+        let mut log = Vec::new();
+        for call in proc.log() {
+            if call.contains("handoff-pick.sh") {
+                log.pop();
+                log.push(BOUND.to_owned());
+            } else if !(call.starts_with("git fetch ") || call.starts_with("git diff ")) {
+                log.push(call);
+            }
+        }
+        log
+    }
+
+    fn session() -> Env {
+        [("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_1")]
+            .into_iter()
+            .collect()
+    }
+
+    fn synced(proc: &FakeProc, mode: Mode) -> Report {
+        let env = session();
         let ctx = Ctx::new(
             Path::new("."),
-            Path::new("store/epochs/e"),
+            Path::new("store/epochs/eleemosynary-mnemosyne"),
+            proc,
+            &env,
+            OsStr::new("cm"),
+            BUDGET,
+        );
+        sync(&ctx, mode)
+    }
+
+    #[test]
+    fn a_dirty_tree_is_committed_under_the_slug_tail_then_pulled_and_pushed() {
+        let proc = Git {
+            status: " M CARD.md\n",
+            ..CLEAN
+        }
+        .proc();
+        assert_eq!(synced(&proc, Mode::Always), Report::default());
+        assert_eq!(
+            checked(&proc),
+            [
+                "git rev-parse --abbrev-ref HEAD",
+                "git status --porcelain",
+                "git add -A",
+                "git commit -qm chore(mnemosyne): heartbeat sync",
+                PULL,
+                BOUND,
+                PUSH,
+            ]
+        );
+        assert!(proc.pauses().is_empty());
+    }
+
+    #[test]
+    fn a_clean_tree_is_still_pulled_and_pushed_but_not_after_executors() {
+        let proc = CLEAN.proc();
+        assert_eq!(synced(&proc, Mode::Always), Report::default());
+        assert_eq!(
+            checked(&proc),
+            [
+                "git rev-parse --abbrev-ref HEAD",
+                "git status --porcelain",
+                PULL,
+                BOUND,
+                PUSH
+            ]
+        );
+        let proc = CLEAN.proc();
+        assert_eq!(synced(&proc, Mode::IfDirty), Report::default());
+        assert_eq!(
+            proc.log(),
+            ["git rev-parse --abbrev-ref HEAD", "git status --porcelain"]
+        );
+        let proc = Git {
+            status: "?? new\n",
+            ..CLEAN
+        }
+        .proc();
+        assert_eq!(synced(&proc, Mode::IfDirty), Report::default());
+        assert_eq!(proc.log().last().map(String::as_str), Some(PUSH));
+    }
+
+    #[test]
+    fn off_main_nothing_is_committed_pulled_or_pushed() {
+        for (branch, named) in [("tick-mvp/x\n", "tick-mvp/x"), ("", "no branch")] {
+            let proc = Git {
+                branch,
+                status: " M x\n",
+                ..CLEAN
+            }
+            .proc();
+            assert_eq!(
+                synced(&proc, Mode::Always).lines,
+                [format!(
+                    "heartbeat: the checkout is on {named}, not main; nothing committed, pulled or pushed"
+                )]
+            );
+            assert_eq!(proc.log(), ["git rev-parse --abbrev-ref HEAD"]);
+        }
+    }
+
+    #[test]
+    fn a_failed_commit_is_one_line_and_the_pull_and_push_still_run() {
+        for failing in [&["git add"][..], &["git commit"][..]] {
+            let proc = Git {
+                status: " M x\n",
+                failing,
+                ..CLEAN
+            }
+            .proc();
+            let report = synced(&proc, Mode::Always);
+            assert_eq!(
+                report.lines,
+                ["heartbeat: git commit of the tree's changes failed; commit them by hand"]
+            );
+            assert!(report.failed);
+            assert_eq!(proc.log().last().map(String::as_str), Some(PUSH));
+            assert_eq!(
+                proc.log().iter().any(|call| call.starts_with("git commit")),
+                failing == ["git commit"],
+                "a failed add runs no commit"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pull_or_push_that_keeps_failing_is_tried_three_times_two_seconds_apart() {
+        for failing in [&[PULL][..], &[PUSH][..]] {
+            let proc = Git { failing, ..CLEAN }.proc();
+            let report = synced(&proc, Mode::Always);
+            assert_eq!(
+                report.lines,
+                [
+                    "heartbeat: git pull --rebase and push to main failed 3 times; main does not have this checkout's commits"
+                ]
+            );
+            assert!(report.failed);
+            let tries: Vec<String> = checked(&proc).into_iter().skip(2).collect();
+            let one: &[&str] = if failing == [PULL] {
+                &[PULL, ABORT]
+            } else {
+                &[PULL, BOUND, PUSH, ABORT]
+            };
+            assert_eq!(tries, one.repeat(3));
+            assert_eq!(proc.pauses(), [Duration::from_secs(2); 2]);
+        }
+    }
+
+    #[test]
+    fn once_the_budget_is_spent_the_abort_still_runs_and_no_try_follows() {
+        let proc = Git {
+            failing: &[PULL],
+            ..CLEAN
+        }
+        .proc();
+        let env = Env::default();
+        let spent = Ctx::new(
+            Path::new("/ct"),
+            Path::new("store/epochs/eleemosynary-mnemosyne"),
             &proc,
             &env,
             OsStr::new("cm"),
-            Duration::from_secs(1),
+            Duration::ZERO,
         );
-        assert_eq!(sync(&ctx, Mode::Always), Report::default());
-        assert_eq!(sync(&ctx, Mode::IfDirty), Report::default());
-        assert!(proc.calls().is_empty());
+        let mut report = Report::default();
+        push(&spent, &mut report);
+        assert_eq!(
+            report.lines,
+            [
+                "heartbeat: git pull --rebase and push to main failed 3 times; main does not have this checkout's commits"
+            ]
+        );
+        assert!(report.failed);
+        assert_eq!(proc.log(), [ABORT], "the spent budget runs no pull");
+        let abort = proc.calls().pop().unwrap();
+        assert_eq!(abort.cwd.as_deref(), Some(Path::new("/ct")));
+        assert_eq!(abort.timeout, Duration::from_secs(30));
+        assert!(proc.pauses().is_empty());
+    }
+
+    #[test]
+    fn an_abort_that_fails_with_head_still_on_main_is_followed_by_a_quit_in_the_rest_of_its_time() {
+        for (failing, said) in [
+            (&[PULL, ABORT][..], &[QUIT, FAILED][..]),
+            (&[PULL, ABORT, QUIT_CALL][..], &[FAILED][..]),
+        ] {
+            let proc = Git { failing, ..CLEAN }.proc();
+            let report = synced(&proc, Mode::Always);
+            assert_eq!(report.lines, said);
+            assert!(report.failed);
+            let tries: Vec<String> = checked(&proc).into_iter().skip(2).collect();
+            assert_eq!(tries, [PULL, ABORT, ON_MAIN, QUIT_CALL].repeat(3));
+            let calls = proc.calls();
+            for call in &calls[calls.len() - 2..] {
+                assert_eq!(call.cwd.as_deref(), Some(Path::new(".")));
+                assert!(call.timeout > Duration::ZERO && call.timeout <= ABORT_TIMEOUT);
+            }
+        }
+    }
+
+    #[test]
+    fn an_abort_that_fails_once_the_rebase_moved_head_off_main_is_never_followed_by_a_quit() {
+        for branch_after_an_abort in ["HEAD\n", ""] {
+            let proc = Git {
+                failing: &[PULL, ABORT],
+                branch_after_an_abort,
+                ..CLEAN
+            }
+            .proc();
+            let report = synced(&proc, Mode::Always);
+            assert_eq!(report.lines, [FAILED], "{branch_after_an_abort:?}");
+            assert!(report.failed);
+            let tries: Vec<String> = checked(&proc).into_iter().skip(2).collect();
+            assert_eq!(tries, [PULL, ABORT, ON_MAIN].repeat(3));
+        }
+    }
+
+    #[test]
+    fn a_quit_fails_the_sync_though_a_later_try_pushes() {
+        let pulls = Cell::new(0);
+        let proc = FakeProc::new(move |cmd| {
+            let line = cmd.line();
+            Ok(if line == ON_MAIN {
+                Ran::code(0, "main\n")
+            } else if line == PULL {
+                pulls.set(pulls.get() + 1);
+                Ran::code(if pulls.get() < 2 { 1 } else { 0 }, "")
+            } else if line == ABORT {
+                Ran::code(1, "")
+            } else if line.contains("handoff-pick.sh") {
+                Ran::code(0, CLEAN.pick)
+            } else {
+                Ran::code(0, "")
+            })
+        });
+        assert_eq!(
+            synced(&proc, Mode::Always),
+            Report {
+                lines: vec![QUIT.to_owned()],
+                failed: true
+            }
+        );
+        assert_eq!(
+            checked(&proc).into_iter().skip(2).collect::<Vec<_>>(),
+            [PULL, ABORT, ON_MAIN, QUIT_CALL, PULL, BOUND, PUSH]
+        );
+    }
+
+    #[test]
+    fn gitsync_ends_at_most_40_s_past_its_budget() {
+        let near = ABORT_TIMEOUT - Duration::from_millis(1);
+        let half = ABORT_TIMEOUT / 2;
+        for (abort, check_hangs, quits) in [
+            (Some(near), false, true),
+            (Some(half), true, false),
+            (None, false, false),
+        ] {
+            let clock = Rc::new(Cell::new(Instant::now()));
+            let aborted = Cell::new(false);
+            let proc = FakeProc::new({
+                let clock = clock.clone();
+                move |cmd| {
+                    let hang = || {
+                        clock.set(clock.get() + cmd.timeout + KILL_AFTER);
+                        Ok(Ran::timed_out())
+                    };
+                    match cmd.line().as_str() {
+                        ON_MAIN if check_hangs && aborted.get() => hang(),
+                        ON_MAIN => Ok(Ran::code(0, "main\n")),
+                        PULL | QUIT_CALL => hang(),
+                        ABORT => {
+                            aborted.set(true);
+                            match abort {
+                                Some(took) => {
+                                    clock.set(clock.get() + took);
+                                    Ok(Ran::code(1, ""))
+                                }
+                                None => hang(),
+                            }
+                        }
+                        _ => Ok(Ran::code(0, "")),
+                    }
+                }
+            });
+            let (env, ticking) = (session(), Ticking(clock.clone()));
+            let ctx = Ctx::new(
+                Path::new("."),
+                Path::new("store/epochs/eleemosynary-mnemosyne"),
+                &proc,
+                &env,
+                OsStr::new("cm"),
+                Duration::ZERO,
+            )
+            .clocked(&ticking, BUDGET);
+            let start = clock.get();
+            let report = sync(&ctx, Mode::Always);
+            assert_eq!(report.lines, [FAILED]);
+            assert_eq!(proc.log().contains(&QUIT_CALL.to_owned()), quits);
+            assert_eq!(
+                proc.log().iter().filter(|call| *call == ON_MAIN).count(),
+                if abort.is_some() { 2 } else { 1 }
+            );
+            assert_eq!(clock.get() - start, BUDGET + Duration::from_secs(40));
+        }
+    }
+
+    #[test]
+    fn gitsync_ends_at_most_40_s_past_its_budget_and_the_time_of_its_three_checks() {
+        let clock = Rc::new(Cell::new(Instant::now()));
+        let (pulls, checks) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let proc = FakeProc::new({
+            let (clock, pulls, checks) = (clock.clone(), pulls.clone(), checks.clone());
+            move |cmd| {
+                let line = cmd.line();
+                let last = pulls.get() == TRIES;
+                let hang = |ran: Ran| {
+                    clock.set(clock.get() + cmd.timeout + KILL_AFTER);
+                    Ok(ran)
+                };
+                if line == "git rev-parse --abbrev-ref HEAD" {
+                    Ok(Ran::code(0, "main\n"))
+                } else if line.contains("handoff-pick.sh") {
+                    Ok(Ran::code(0, CLEAN.pick))
+                } else if line.starts_with("git fetch ") {
+                    checks.set(checks.get() + 1);
+                    hang(Ran::timed_out())
+                } else if line == PULL {
+                    pulls.set(pulls.get() + 1);
+                    if pulls.get() == TRIES {
+                        clock.set(clock.get() + cmd.timeout - Duration::from_millis(1));
+                    }
+                    Ok(Ran::code(0, ""))
+                } else if line == PUSH && !last {
+                    Ok(Ran::code(1, ""))
+                } else if line == PUSH || (line == ABORT && last) {
+                    hang(Ran::timed_out())
+                } else {
+                    Ok(Ran::code(0, ""))
+                }
+            }
+        });
+        let (env, ticking) = (session(), Ticking(clock.clone()));
+        let ctx = Ctx::new(
+            Path::new("."),
+            Path::new("store/epochs/eleemosynary-mnemosyne"),
+            &proc,
+            &env,
+            OsStr::new("cm"),
+            Duration::ZERO,
+        )
+        .clocked(&ticking, BUDGET);
+        let start = clock.get();
+        assert!(sync(&ctx, Mode::Always).failed);
+        let check = FRAME_CAP + KILL_AFTER;
+        assert_eq!(checks.get(), TRIES);
+        assert_eq!(ctx.checking(), check * TRIES);
+        assert_eq!(
+            clock.get() - start,
+            BUDGET + Duration::from_secs(40) + check * TRIES
+        );
+    }
+
+    #[test]
+    fn a_try_that_pushes_ends_the_retries() {
+        let pulls = std::cell::Cell::new(0);
+        let proc = FakeProc::new(move |cmd| {
+            let line = cmd.line();
+            Ok(if line == "git rev-parse --abbrev-ref HEAD" {
+                Ran::code(0, "main\n")
+            } else if line == PULL {
+                pulls.set(pulls.get() + 1);
+                Ran::code(if pulls.get() < 2 { 1 } else { 0 }, "")
+            } else if line.contains("handoff-pick.sh") {
+                Ran::code(0, CLEAN.pick)
+            } else {
+                Ran::code(0, "")
+            })
+        });
+        assert_eq!(synced(&proc, Mode::Always), Report::default());
+        assert_eq!(
+            checked(&proc).into_iter().skip(2).collect::<Vec<_>>(),
+            [PULL, ABORT, PULL, BOUND, PUSH]
+        );
+        assert_eq!(proc.pauses(), [Duration::from_secs(2)]);
+    }
+
+    #[test]
+    fn a_pull_that_retires_the_session_pushes_nothing_and_says_nothing() {
+        for pick in [
+            "",
+            "missing other-lineage store/epochs/e/handoff/coordinator-2.md\n",
+        ] {
+            let proc = Git {
+                status: " M x\n",
+                pick,
+                ..CLEAN
+            }
+            .proc();
+            assert_eq!(synced(&proc, Mode::Always), Report::default());
+            assert_eq!(checked(&proc).last().map(String::as_str), Some(BOUND));
+            assert_eq!(
+                checked(&proc).iter().filter(|call| *call == PULL).count(),
+                1
+            );
+            assert!(proc.pauses().is_empty());
+        }
+    }
+
+    #[test]
+    fn the_slug_tail_is_what_follows_its_last_hyphen() {
+        assert_eq!(slug_tail("eleemosynary-mnemosyne"), "mnemosyne");
+        assert_eq!(slug_tail("a-b-c"), "c");
+        assert_eq!(slug_tail("solo"), "solo");
+        assert_eq!(slug_tail("trailing-"), "");
     }
 }
