@@ -8372,6 +8372,7 @@ enum Refused {
     // Each name git moved an entry aside to, `{first}` or `{main}` standing for the side's commit.
     Keeps(&'static [&'static str]),
     History,
+    Shape(&'static str),
 }
 
 impl Refused {
@@ -8397,6 +8398,7 @@ impl Refused {
                     .join("; "),
             ],
             Refused::History => vec![SUBMODULE_HISTORY.to_owned()],
+            Refused::Shape(shape) => vec![format!("{shape}, a conflict shape cm does not read")],
         }
     }
 }
@@ -8523,7 +8525,7 @@ fn a_merge_stands_on_resolution_reviews_where_it_differs_from_gits_own_merge_onl
             sub_ours,
             sub_dir,
             &|s, _| unlink(s, "sub"),
-            None,
+            Some(Shape("its parents put a submodule at \"sub\" against a directory")),
         ),
         (
             "submodule against a directory, keep the submodule",
@@ -8534,7 +8536,7 @@ fn a_merge_stands_on_resolution_reviews_where_it_differs_from_gits_own_merge_onl
                 s.git(&["update-index", "--force-remove", "sub/inner.txt"]);
                 gitlink(s, "sub", SUB_B);
             },
-            None,
+            Some(Shape("its parents put a submodule at \"sub\" against a directory")),
         ),
         (
             "submodule against a directory, keep both where git moved it",
@@ -8545,7 +8547,7 @@ fn a_merge_stands_on_resolution_reviews_where_it_differs_from_gits_own_merge_onl
                 unlink(s, "sub");
                 gitlink(s, &made_up("sub", h2), SUB_B);
             },
-            Some(Keeps(&["sub~{first}"])),
+            Some(Shape("its parents put a submodule at \"sub\" against a directory")),
         ),
         (
             "submodule against a directory, keep both as the checkout names it",
@@ -8556,7 +8558,7 @@ fn a_merge_stands_on_resolution_reviews_where_it_differs_from_gits_own_merge_onl
                 unlink(s, "sub");
                 gitlink(s, "sub~HEAD", SUB_B);
             },
-            Some(Beyond(&["sub~HEAD"])),
+            Some(Shape("its parents put a submodule at \"sub\" against a directory")),
         ),
         (
             "a submodule main deleted, deleted",
@@ -8588,7 +8590,7 @@ fn a_merge_stands_on_resolution_reviews_where_it_differs_from_gits_own_merge_onl
             sub_file,
             sub_theirs,
             &|s, h2| put(s, "100644", &blob(s, h2, "sub"), "sub"),
-            None,
+            Some(Shape("its parents put a file and a submodule at \"sub\"")),
         ),
         (
             "a submodule against a file, keep the submodule",
@@ -8596,7 +8598,7 @@ fn a_merge_stands_on_resolution_reviews_where_it_differs_from_gits_own_merge_onl
             sub_file,
             sub_theirs,
             &|s, _| gitlink(s, "sub", SUB_C),
-            None,
+            Some(Shape("its parents put a file and a submodule at \"sub\"")),
         ),
         (
             "a submodule both parents set to the same commit, with a conflict elsewhere",
@@ -8694,7 +8696,7 @@ fn a_merge_stands_on_resolution_reviews_where_it_differs_from_gits_own_merge_onl
                 s.git(&["update-index", "--force-remove", "x/inner.txt"]);
                 put(s, "120000", &blob(s, h2, "x"), "x");
             },
-            None,
+            Some(Shape("its parents put a symlink at \"x\" against a directory")),
         ),
         (
             "a file main adds to a directory the first parent renamed, kept where git moved it",
@@ -8879,7 +8881,7 @@ fn a_merge_stands_on_resolution_reviews_where_it_differs_from_gits_own_merge_onl
                 unlink(s, "l");
                 put(s, "100644", &blob(s, h2, "l"), "l");
             },
-            None,
+            Some(Shape("its parents put a file and a symlink at \"l\"")),
         ),
         (
             "a file against a symlink, keep the symlink",
@@ -8891,7 +8893,7 @@ fn a_merge_stands_on_resolution_reviews_where_it_differs_from_gits_own_merge_onl
                 unlink(s, "l");
                 put(s, "120000", &blob(s, &main, "l"), "l");
             },
-            None,
+            Some(Shape("its parents put a file and a symlink at \"l\"")),
         ),
         (
             "a file against a symlink, keep both where git moved the file",
@@ -8904,7 +8906,7 @@ fn a_merge_stands_on_resolution_reviews_where_it_differs_from_gits_own_merge_onl
                 put(s, "120000", &blob(s, &main, "l"), "l");
                 put(s, "100644", &blob(s, h2, "l"), &made_up("l", h2));
             },
-            Some(Keeps(&["l~{first}"])),
+            Some(Shape("its parents put a file and a symlink at \"l\"")),
         ),
         (
             "a symlink against a submodule, neither kept",
@@ -8912,7 +8914,7 @@ fn a_merge_stands_on_resolution_reviews_where_it_differs_from_gits_own_merge_onl
             l_theirs,
             sub_l,
             &|_, _| {},
-            None,
+            Some(Shape("its parents put a symlink and a submodule at \"l\"")),
         ),
         (
             "a symlink against a submodule, keep the symlink",
@@ -8920,7 +8922,7 @@ fn a_merge_stands_on_resolution_reviews_where_it_differs_from_gits_own_merge_onl
             l_theirs,
             sub_l,
             &|s, h2| put(s, "120000", &blob(s, h2, "l"), "l"),
-            Some(Beyond(&["l"])),
+            Some(Shape("its parents put a symlink and a submodule at \"l\"")),
         ),
         (
             "a symlink against a submodule, keep both where git moved them",
@@ -8932,7 +8934,7 @@ fn a_merge_stands_on_resolution_reviews_where_it_differs_from_gits_own_merge_onl
                 put(s, "120000", &blob(s, h2, "l"), &made_up("l", h2));
                 gitlink(s, &made_up("l", &main), SUB_C);
             },
-            Some(Keeps(&["l~{first}", "l~{main}"])),
+            Some(Shape("its parents put a symlink and a submodule at \"l\"")),
         ),
         (
             "a content conflict resolved at its path",
@@ -9079,9 +9081,6 @@ fn shallow_clone(s: &Scratch, name: &str, feature_depth: &str, main_depth: &str)
     clone
 }
 
-// Main's first change merged and reviewed, then a second merged; the clone holds both merges,
-// their parents and the first merge base, and lists h1 and main's first commit, whose parent it
-// lacks.
 fn shallow_history(host: &Fake, second: Option<&str>) -> (Scratch, String, PathBuf) {
     let s = Scratch::new(host);
     s.on_main("m.txt", "one\n");
@@ -9128,11 +9127,28 @@ fn a_shallow_checkout_is_read_in_the_scratch_repository_within_its_boundary() {
     assert!(waived.status.success(), "{waived:?}");
 
     let (s, merge, shallow) = shallow_history(&host, Some("feature and main\n"));
+    let above = shallow_base(&merge, &s.h1);
+    let recorded = record_env(&s, None, &[], shallow.as_os_str(), "claude", &merge);
+    assert_eq!(recorded.status.code(), Some(1), "{recorded:?}");
+    assert!(
+        String::from_utf8_lossy(&recorded.stdout).contains(&above),
+        "{recorded:?}"
+    );
+    hand_written_resolutions(&s, &merge);
+    let walked = offline_merge(&s, &merge, &shallow);
+    assert_eq!(walked.status.code(), Some(1), "{walked:?}");
+    assert!(
+        String::from_utf8_lossy(&walked.stdout).contains(&above),
+        "{walked:?}"
+    );
+
+    let (s, merge, _) = shallow_history(&host, Some("feature and main\n"));
+    let deeper = shallow_clone(&s, "deeper", "4", "2");
     for reviewer in ["claude", "astra"] {
-        let recorded = record_env(&s, None, &[], shallow.as_os_str(), reviewer, &merge);
+        let recorded = record_env(&s, None, &[], deeper.as_os_str(), reviewer, &merge);
         assert!(recorded.status.success(), "{reviewer}: {recorded:?}");
     }
-    let merged = offline_merge(&s, &merge, &shallow);
+    let merged = offline_merge(&s, &merge, &deeper);
     assert!(merged.status.success(), "{merged:?}");
 
     let (s, clean, shallow) = shallow_history(&host, None);
@@ -9202,15 +9218,23 @@ fn the_scratch_repository_stops_at_a_shallow_entry_with_a_missing_parent_and_rea
     assert!(waived.status.success(), "{waived:?}");
 }
 
+fn shallow_base(merge: &str, shallow: &str) -> String {
+    format!(
+        "{}'s parents reach the checkout's shallow boundary at {} above their merge base",
+        &merge[..12],
+        &shallow[..12]
+    )
+}
+
 fn no_merge_base(merge: &str) -> String {
     format!(
-        "{}'s parents have no merge base in the history the checkout holds, so it is neither a clean update nor a conflict resolution",
+        "{}'s parents have no merge base in the history the checkout holds, so it is no conflict resolution a resolution review can cover",
         &merge[..12]
     )
 }
 
 #[test]
-fn a_merge_whose_parents_have_no_merge_base_in_the_scratch_repository_is_no_clean_update_and_no_resolution()
+fn a_merge_whose_parents_have_no_merge_base_in_the_scratch_repository_is_waived_when_clean_and_no_resolution()
  {
     let host = at("2026-11-25T06:00:00Z");
     let refused = |out: &std::process::Output, merge: &str| {
@@ -9233,7 +9257,8 @@ fn a_merge_whose_parents_have_no_merge_base_in_the_scratch_repository_is_no_clea
         shown.status.success() && shown.stdout.is_empty(),
         "{shown:?}"
     );
-    refused(&offline_merge(&s, &clean, &cut), &clean);
+    let waived = offline_merge(&s, &clean, &cut);
+    assert!(waived.status.success(), "{waived:?}");
 
     let s = Scratch::new(&host);
     s.on_main("shared.txt", "main\n");
@@ -9247,10 +9272,6 @@ fn a_merge_whose_parents_have_no_merge_base_in_the_scratch_repository_is_no_clea
     refused(&offline_merge(&s, &merge, &cut), &merge);
 }
 
-// Main changes x.txt and changes it back, then merges a side branch from before the change. The
-// feature branch, reviewed at its merge of the change, merges main again keeping the change,
-// reverting main's revert. A shallow entry at main's revert, whose parent the checkout holds,
-// leaves the side branch's start, from before the change, as the merge base there.
 fn reverting_merge(host: &Fake, conflicted: bool) -> (Scratch, String) {
     let s = Scratch::new(host);
     s.on_main("x.txt", "before\n");
@@ -9614,13 +9635,11 @@ fn each_step_of_the_scratch_repository_fails_its_parent_or_names_the_scratch_rep
         let waived = offline_merge_env(&s, None, &env, &clean, s.c.repo.as_os_str());
         match fault {
             TempIsAFile | TempInit | TempAlternates | MergeTree | TreeDiff | QuietTreeDiff
-            | WarnedWaiverRead | Boundary => {
+            | WarnedWaiverRead | Boundary | Bases | SilentBases => {
                 assert!(waived.status.success(), "{fault:?}: {waived:?}");
             }
             UnreadTree | OddTreeDiff | TrailingRecord | UnknownRecord => unreachable!(),
             EveryInit => refused_with(&waived, std::slice::from_ref(&no_scratch)),
-            Bases => refused_with(&waived, &in_scratch("merge-base", &clean)),
-            SilentBases => refused_with(&waived, &moved(silent(&clean))),
             WaiverRead => refused_with(&waived, &in_scratch("show", &clean)),
             QuietWaiverRead => {
                 let mut says = in_scratch("show", &clean);
@@ -9942,10 +9961,14 @@ fn the_scratch_repository_and_its_files_are_private_and_gone_whatever_the_umask(
             }
             let [umasks, modes, alternates] =
                 logs.map(|log| fs::read_to_string(log).unwrap_or_default());
-            // Every history reads its merge base there after the init.
-            for (log, want) in [(&umasks, "0077"), (&modes, "700"), (&alternates, "600")] {
+            let read_there = history != "unreviewed resolution";
+            for (log, want, made) in [
+                (&umasks, "0077", true),
+                (&modes, "700", true),
+                (&alternates, "600", read_there),
+            ] {
                 assert!(
-                    !log.is_empty() && log.lines().all(|line| line == want),
+                    log.is_empty() != made && log.lines().all(|line| line == want),
                     "{umask} {history}: {want} in {log}"
                 );
             }

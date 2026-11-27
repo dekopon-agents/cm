@@ -832,6 +832,7 @@ fn resolution_parent(
             short(&merge)
         ));
     }
+    resolvable(&isolated, &merge, &merged).map_err(|why| why.to_string())?;
     if let Some(gap) =
         beyond_resolution(&isolated, &merge, &merged).map_err(|why| why.to_string())?
     {
@@ -2149,6 +2150,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
 // caller's, decides them.
 struct Isolated {
     dir: PathBuf,
+    boundary: Vec<String>,
 }
 
 impl Isolated {
@@ -2207,17 +2209,19 @@ impl Isolated {
                     .collect::<Option<Vec<&str>>>()
             })
             .ok_or_else(unreadable)?;
-        let isolated = Isolated::under(scratch_parents(), &Borrowed { objects, format })?;
-        isolated
-            .bound(&entries)
-            .map_err(|why| isolated.failed(commit, why))?;
-        Ok(isolated)
+        Isolated::under(
+            scratch_parents(),
+            &Borrowed { objects, format },
+            &entries,
+            commit,
+        )
     }
 
     // A listed commit with a parent missing from the objects is where git can read no further.
     // Past one whose parents are all there, forged or left by a later fetch, the scratch repository
-    // reads on, so that no entry hides a merge base the objects hold.
-    fn bound(&self, entries: &[&str]) -> Result<(), String> {
+    // reads on. A boundary that stays can still cut one parent's only path to a merge base the
+    // objects hold, which `resolvable` refuses.
+    fn boundary(&self, entries: &[&str]) -> Result<Vec<String>, String> {
         let listed = self.commits(&["--parents"], entries)?;
         let parents: BTreeSet<&str> = listed
             .iter()
@@ -2226,19 +2230,15 @@ impl Isolated {
         let parents: Vec<&str> = parents.into_iter().collect();
         let present = self.commits(&[], &parents)?;
         let present: BTreeSet<&str> = present.iter().map(String::as_str).collect();
-        let mut boundary = String::new();
-        for commit in &listed {
-            let mut ids = commit.split(' ');
-            let id = ids.next().unwrap_or_default();
-            if ids.any(|parent| !present.contains(parent)) {
-                boundary.push_str(id);
-                boundary.push('\n');
-            }
-        }
-        if boundary.is_empty() {
-            return Ok(());
-        }
-        write_private(&self.dir.join("shallow"), boundary.as_bytes())
+        Ok(listed
+            .iter()
+            .filter_map(|commit| {
+                let mut ids = commit.split(' ');
+                let id = ids.next()?;
+                ids.any(|parent| !present.contains(parent))
+                    .then(|| id.to_owned())
+            })
+            .collect())
     }
 
     fn commits(&self, flags: &[&str], names: &[&str]) -> Result<Vec<String>, String> {
@@ -2254,13 +2254,38 @@ impl Isolated {
         Ok(listed.lines().map(str::to_owned).collect())
     }
 
-    fn under(parents: Vec<PathBuf>, borrowed: &Borrowed) -> Result<Isolated, CleanUpdateError> {
+    fn under(
+        parents: Vec<PathBuf>,
+        borrowed: &Borrowed,
+        entries: &[&str],
+        commit: &str,
+    ) -> Result<Isolated, CleanUpdateError> {
         let mut tried = Vec::new();
+        let mut boundary: Option<Vec<String>> = None;
         for parent in parents {
-            match Isolated::made_in(&parent, borrowed) {
-                Ok(isolated) => return Ok(isolated),
-                Err(why) => tried.push((parent, why)),
+            let mut isolated = match Isolated::made_in(&parent, borrowed) {
+                Ok(isolated) => isolated,
+                Err(why) => {
+                    tried.push((parent, why));
+                    continue;
+                }
+            };
+            let listed = match &boundary {
+                Some(listed) => listed.clone(),
+                None => isolated
+                    .boundary(entries)
+                    .map_err(|why| isolated.failed(commit, why))?,
+            };
+            if !listed.is_empty() {
+                let shallow: String = listed.iter().map(|id| format!("{id}\n")).collect();
+                if let Err(why) = write_private(&isolated.dir.join("shallow"), shallow.as_bytes()) {
+                    tried.push((parent, why));
+                    boundary = Some(listed);
+                    continue;
+                }
             }
+            isolated.boundary = listed;
+            return Ok(isolated);
         }
         Err(CleanUpdateError::NoScratch { tried })
     }
@@ -2269,6 +2294,7 @@ impl Isolated {
     fn made_in(parent: &Path, borrowed: &Borrowed) -> Result<Isolated, String> {
         let isolated = Isolated {
             dir: scratch_dir_under(parent).map_err(|error| error.to_string())?,
+            boundary: Vec::new(),
         };
         isolated.bytes(&[
             "init",
@@ -2464,6 +2490,10 @@ pub enum CleanUpdateError {
     NoMergeBase {
         commit: String,
     },
+    ShallowBase {
+        commit: String,
+        shallow: String,
+    },
     /// The walk passed this many clean updates without reaching a reviewed commit.
     TooLong {
         limit: usize,
@@ -2518,8 +2548,14 @@ impl fmt::Display for CleanUpdateError {
             ),
             CleanUpdateError::NoMergeBase { commit } => write!(
                 f,
-                "{}'s parents have no merge base in the history the checkout holds, so it is neither a clean update nor a conflict resolution; it needs its own review, or a checkout deep enough to hold their merge base",
+                "{}'s parents have no merge base in the history the checkout holds, so it is no conflict resolution a resolution review can cover; it needs its own review, or a checkout deep enough to hold their merge base",
                 short(commit)
+            ),
+            CleanUpdateError::ShallowBase { commit, shallow } => write!(
+                f,
+                "{}'s parents reach the checkout's shallow boundary at {} above their merge base, so a nearer merge base may lie past it and git's merge of them cannot be read; it needs its own review, or a checkout that holds their history back to their merge base",
+                short(commit),
+                short(shallow)
             ),
             CleanUpdateError::TooLong { limit } => write!(f, "more than {limit} updates"),
             CleanUpdateError::BaseContainsHead { head, base } => write!(
@@ -2597,20 +2633,6 @@ fn merge_from_base(
             base: shown(base).to_owned(),
         });
     }
-    // Without a merge base git merges the parents as if from an empty tree, so neither remerge diff
-    // says what either side changed.
-    let bases = isolated
-        .output(&["merge-base", "--all", first, second])
-        .map_err(|why| isolated.failed(commit, why))?;
-    match bases.status.code() {
-        Some(0) => {}
-        Some(1) if bases.stdout.is_empty() => {
-            return Err(CleanUpdateError::NoMergeBase {
-                commit: commit.to_owned(),
-            });
-        }
-        _ => return Err(isolated.failed(commit, failure(&bases))),
-    }
     let empty = |reader| remerge_diff(reader, commit).map(|diff| diff.trim_ascii().is_empty());
     // Empty in the checkout, as the waiver always asked, and where no local merge setting reaches.
     let clean = empty(Reader::Checkout(repo))? && empty(Reader::Isolated(isolated))?;
@@ -2619,6 +2641,49 @@ fn merge_from_base(
         second: second.to_owned(),
         clean,
     })
+}
+
+// Git's merge of the parents is what a resolution is read against. Without a merge base git
+// merges them as if from an empty tree; with a shallow boundary above the merge bases it found, a
+// nearer one may lie past the boundary on a parent's only path to it. Either way git's merge does
+// not say what the resolution resolved.
+fn resolvable(isolated: &Isolated, commit: &str, merge: &Merge) -> Result<(), CleanUpdateError> {
+    let failed = |why| isolated.failed(commit, why);
+    let bases = isolated
+        .output(&["merge-base", "--all", &merge.first, &merge.second])
+        .map_err(failed)?;
+    match bases.status.code() {
+        Some(0) => {}
+        Some(1) if bases.stdout.is_empty() => {
+            return Err(CleanUpdateError::NoMergeBase {
+                commit: commit.to_owned(),
+            });
+        }
+        _ => return Err(failed(failure(&bases))),
+    }
+    if isolated.boundary.is_empty() {
+        return Ok(());
+    }
+    let bases = String::from_utf8(bases.stdout)
+        .map_err(|_| failed("git merge-base listed a commit cm cannot read".to_owned()))?;
+    let mut args = vec![
+        "rev-list",
+        merge.first.as_str(),
+        merge.second.as_str(),
+        "--not",
+    ];
+    args.extend(bases.lines());
+    args.push("--");
+    let above = String::from_utf8(isolated.bytes(&args).map_err(failed)?)
+        .map_err(|_| failed("git rev-list listed a commit cm cannot read".to_owned()))?;
+    let boundary: BTreeSet<&str> = isolated.boundary.iter().map(String::as_str).collect();
+    match above.lines().find(|listed| boundary.contains(listed)) {
+        Some(shallow) => Err(CleanUpdateError::ShallowBase {
+            commit: commit.to_owned(),
+            shallow: shallow.to_owned(),
+        }),
+        None => Ok(()),
+    }
 }
 
 // The waiver's account of a merge, with each flag that would let configuration or attributes leave
@@ -2695,6 +2760,7 @@ fn nul_paths(listed: &[u8]) -> Vec<&[u8]> {
 }
 
 const GITLINK: &[u8] = b"160000";
+const SYMLINK: &[u8] = b"120000";
 
 // The mode and object merge-tree lists for one conflicted path at each stage: the merge base, the
 // first parent, the second parent; none where that side has no such path.
@@ -2775,6 +2841,7 @@ struct Bounds<'a, K> {
 enum Unbounded<'a> {
     Unreadable,
     Unknown(&'a [u8]),
+    Unsupported(String),
 }
 
 // git names an entry it moves aside `<path>~<the side's name>`, with a suffix when that is taken.
@@ -2784,15 +2851,25 @@ fn moved_aside(made_up: &[u8], from: &[u8]) -> bool {
         .is_some_and(|rest| rest.first() == Some(&b'~'))
 }
 
+fn entry_kind(mode: &[u8]) -> &'static str {
+    match mode {
+        GITLINK => "a submodule",
+        SYMLINK => "a symlink",
+        _ => "a file",
+    }
+}
+
 // The record types of git 2.43 to 2.56. A file/directory record names the made-up path first, a
-// distinct-types one the original path first; the original path of a distinct-types conflict is
-// conflicted only while git leaves one entry at it.
+// distinct-types one the original path first. A file/directory record bounds a path only where
+// git left a stage entry at the made-up one; one whose entry is a symlink or submodule, and every
+// distinct-types conflict, which always involves one, is a shape cm does not read.
 fn bounds<'a, K: Ord + From<&'a [u8]>>(
     listing: Listing<'a, K>,
 ) -> Result<Bounds<'a, K>, Unbounded<'a>> {
     let records = listing.records.ok_or(Unbounded::Unreadable)?;
+    let conflicts = listing.conflicts;
     let mut bounds = Bounds {
-        paths: listing.conflicts.into_keys().collect(),
+        paths: BTreeSet::new(),
         displaced: BTreeSet::new(),
         made_up: Vec::new(),
     };
@@ -2804,13 +2881,31 @@ fn bounds<'a, K: Ord + From<&'a [u8]>>(
                 | b"CONFLICT (binary)"
                 | b"CONFLICT (modify/delete)"
                 | b"CONFLICT (rename/delete)"
-                | b"CONFLICT (rename/rename)",
+                | b"CONFLICT (rename/rename)"
+                | b"CONFLICT (rename involved in collision)"
+                | b"CONFLICT (file in way of directory rename)"
+                | b"CONFLICT(directory rename collision)"
+                | b"CONFLICT(directory rename unclear split)",
                 _,
             ) => {}
             (b"CONFLICT (directory rename suggested)", named) => {
                 bounds.paths.extend(named.iter().map(|path| K::from(*path)));
             }
             (b"CONFLICT (file/directory)", [made_up, from]) if moved_aside(made_up, from) => {
+                let Some(stages) = conflicts.get(&K::from(*made_up)) else {
+                    continue;
+                };
+                if let Some((mode, _)) = stages[1..]
+                    .iter()
+                    .flatten()
+                    .find(|(mode, _)| *mode == GITLINK || *mode == SYMLINK)
+                {
+                    return Err(Unbounded::Unsupported(format!(
+                        "its parents put {} at {} against a directory",
+                        entry_kind(mode),
+                        quoted_paths([from])
+                    )));
+                }
                 bounds.paths.insert(K::from(*from));
                 bounds.displaced.insert(K::from(*from));
                 bounds.made_up.push((*made_up, *from));
@@ -2818,9 +2913,23 @@ fn bounds<'a, K: Ord + From<&'a [u8]>>(
             (b"CONFLICT (distinct modes)", [from, made_up @ ..])
                 if !made_up.is_empty() && made_up.iter().all(|path| moved_aside(path, from)) =>
             {
-                bounds
-                    .made_up
-                    .extend(made_up.iter().map(|made_up| (*made_up, *from)));
+                let side = |stage: usize| {
+                    paths.iter().find_map(|path| {
+                        conflicts
+                            .get(&K::from(*path))
+                            .and_then(|stages| stages[stage])
+                    })
+                };
+                let entries = match (side(1), side(2)) {
+                    (Some((first, _)), Some((second, _))) => {
+                        format!("{} and {}", entry_kind(first), entry_kind(second))
+                    }
+                    _ => "entries of different types".to_owned(),
+                };
+                return Err(Unbounded::Unsupported(format!(
+                    "its parents put {entries} at {}",
+                    quoted_paths([from])
+                )));
             }
             (b"CONFLICT (file/directory)" | b"CONFLICT (distinct modes)", _) => {
                 return Err(Unbounded::Unreadable);
@@ -2828,6 +2937,7 @@ fn bounds<'a, K: Ord + From<&'a [u8]>>(
             (kind, _) => return Err(Unbounded::Unknown(kind)),
         }
     }
+    bounds.paths.extend(conflicts.into_keys());
     Ok(bounds)
 }
 
@@ -2924,6 +3034,9 @@ fn beyond_resolution(
                 "git's merge of its parents reports a message of a type cm does not read, {}",
                 quoted_paths([kind])
             )));
+        }
+        Err(Unbounded::Unsupported(shape)) => {
+            return Ok(Some(format!("{shape}, a conflict shape cm does not read")));
         }
     };
     let listed = isolated
@@ -3131,7 +3244,9 @@ fn gate(
             match merge_from_base(repo, &isolated, &at, base) {
                 Ok(merge) if merge.clean => at = merge.first,
                 Ok(merge) if resolution_at(&at) => {
-                    let open = match beyond_resolution(&isolated, &at, &merge) {
+                    let read = resolvable(&isolated, &at, &merge)
+                        .and_then(|()| beyond_resolution(&isolated, &at, &merge));
+                    let open = match read {
                         Err(reason) => {
                             why = reason;
                             break;
@@ -3228,6 +3343,8 @@ mod tests {
         let isolated = Isolated::under(
             vec![missing.clone(), parent.path().to_path_buf()],
             &borrowed,
+            &[],
+            SHA,
         )
         .unwrap();
         assert!(
@@ -3239,9 +3356,14 @@ mod tests {
             fs::metadata(&isolated.dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
-        let refused = Isolated::under(vec![missing.clone(), missing.join("deeper")], &borrowed)
-            .err()
-            .unwrap();
+        let refused = Isolated::under(
+            vec![missing.clone(), missing.join("deeper")],
+            &borrowed,
+            &[],
+            SHA,
+        )
+        .err()
+        .unwrap();
         assert_eq!(
             refused.to_string(),
             format!(
@@ -3680,8 +3802,12 @@ mod tests {
 
     #[test]
     fn only_a_moved_aside_name_that_extends_its_own_path_is_read_as_made_up() {
-        let bounded = |paths: &[&str], kind: &str| {
-            let mut listed = format!("{SHA}\0\0{}\0", paths.len());
+        let bounded = |staged: &[(&str, u8, &str)], paths: &[&str], kind: &str| {
+            let mut listed = format!("{SHA}\0");
+            for (mode, stage, path) in staged {
+                listed.push_str(&format!("{mode} {SHA} {stage}\t{path}\0"));
+            }
+            listed.push_str(&format!("\0{}\0", paths.len()));
             for path in paths {
                 listed.push_str(&format!("{path}\0"));
             }
@@ -3705,18 +3831,36 @@ mod tests {
                 )),
                 Err(Unbounded::Unreadable) => Err("unreadable".to_owned()),
                 Err(Unbounded::Unknown(kind)) => Err(String::from_utf8_lossy(kind).into_owned()),
+                Err(Unbounded::Unsupported(shape)) => Err(shape),
             }
         };
         let moved = format!("x~{SHA}");
         let file_directory = "CONFLICT (file/directory)";
         assert_eq!(
-            bounded(&[&moved, "x"], file_directory),
-            Ok((vec![format!("{moved} from x")], 1, 1))
+            bounded(&[("100644", 2, &moved)], &[&moved, "x"], file_directory),
+            Ok((vec![format!("{moved} from x")], 2, 1))
+        );
+        let suffixed = format!("x~{SHA}_1");
+        assert_eq!(
+            bounded(
+                &[("100644", 3, &suffixed)],
+                &[&suffixed, "x"],
+                file_directory
+            ),
+            Ok((vec![format!("{suffixed} from x")], 2, 1))
         );
         assert_eq!(
-            bounded(&[&format!("x~{SHA}_1"), "x"], file_directory),
-            Ok((vec![format!("x~{SHA}_1 from x")], 1, 1))
+            bounded(&[], &[&moved, "x"], file_directory),
+            Ok((Vec::new(), 0, 0))
         );
+        for (mode, kind) in [("120000", "a symlink"), ("160000", "a submodule")] {
+            assert_eq!(
+                bounded(&[(mode, 2, &moved)], &[&moved, "x"], file_directory),
+                Err(format!(
+                    "its parents put {kind} at \"x\" against a directory"
+                ))
+            );
+        }
         for unread in [
             vec!["x", moved.as_str()],
             vec![moved.as_str()],
@@ -3725,39 +3869,61 @@ mod tests {
             vec!["x-moved", "x"],
         ] {
             assert_eq!(
-                bounded(&unread, file_directory),
+                bounded(&[("100644", 2, &moved)], &unread, file_directory),
                 Err("unreadable".to_owned()),
                 "{unread:?}"
             );
         }
         let distinct = "CONFLICT (distinct modes)";
+        let ours = format!("l~{SHA}");
         let other = format!("l~{}", "1".repeat(40));
         assert_eq!(
-            bounded(&["l", &format!("l~{SHA}"), &other], distinct),
-            Ok((
-                vec![format!("l~{SHA} from l"), format!("{other} from l")],
-                0,
-                0
-            ))
+            bounded(
+                &[("120000", 2, &ours), ("160000", 3, &other)],
+                &["l", &ours, &other],
+                distinct
+            ),
+            Err("its parents put a symlink and a submodule at \"l\"".to_owned())
+        );
+        assert_eq!(
+            bounded(
+                &[("100644", 2, &ours), ("120000", 3, "l")],
+                &["l", &ours],
+                distinct
+            ),
+            Err("its parents put a file and a symlink at \"l\"".to_owned())
         );
         for unread in [vec![other.as_str(), "l"], vec!["l"], vec!["l", "m~1"]] {
             assert_eq!(
-                bounded(&unread, distinct),
+                bounded(&[], &unread, distinct),
                 Err("unreadable".to_owned()),
                 "{unread:?}"
             );
         }
         assert_eq!(
             bounded(
+                &[],
                 &["e/new.txt", "d/new.txt"],
                 "CONFLICT (directory rename suggested)"
             ),
             Ok((Vec::new(), 2, 0))
         );
-        assert_eq!(bounded(&["x"], "Auto-merging"), Ok((Vec::new(), 0, 0)));
+        for kind in [
+            "Auto-merging",
+            "CONFLICT (rename involved in collision)",
+            "CONFLICT (file in way of directory rename)",
+            "CONFLICT(directory rename collision)",
+            "CONFLICT(directory rename unclear split)",
+        ] {
+            assert_eq!(
+                bounded(&[("100644", 2, "y")], &["x"], kind),
+                Ok((Vec::new(), 1, 0)),
+                "{kind}"
+            );
+        }
         assert_eq!(
-            bounded(&["x"], "CONFLICT (rename involved in collision)"),
-            Err("CONFLICT (rename involved in collision)".to_owned())
+            bounded(&[], &["x"], "Path updated due to directory rename"),
+            Err("Path updated due to directory rename".to_owned())
         );
     }
 }
