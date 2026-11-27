@@ -10,7 +10,7 @@ use crate::commands::{closed, write_unit};
 use crate::evidence::CampaignFile;
 use crate::host::{Host, stamp};
 use crate::journal;
-use crate::outcome::{Next, Outcome, Violation};
+use crate::outcome::{self, Next, Outcome, Violation};
 use crate::state::{Attempt, AttemptOutcome, Ended, External, Lane, ObservedTurn};
 use crate::store::{self, CM_DIR, Target, is_name, is_subcampaign_name, lock};
 
@@ -337,20 +337,22 @@ pub fn attempt(
         }
         Act::Record { kind, id } => {
             match pending {
-                None => violations.push(Violation::refuse(
-                    &full,
-                    "attempt-record",
-                    format!("no {kind} has begun without an id; its begin comes first"),
-                    Next::run(vec![
-                        "cm".into(),
-                        "attempt".into(),
-                        (&full).into(),
-                        "begin".into(),
-                        kind.into(),
-                        "--claim".into(),
-                        (&attempt.claim).into(),
-                    ]),
-                )),
+                None => {
+                    let mut begin = vec!["attempt".into(), (&full).into(), "begin".into()];
+                    if kind.starts_with('-') {
+                        begin.extend(outcome::option("--claim", &attempt.claim));
+                        begin.extend(outcome::last(kind));
+                    } else {
+                        begin.push(kind.into());
+                        begin.extend(outcome::option("--claim", &attempt.claim));
+                    }
+                    violations.push(Violation::refuse(
+                        &full,
+                        "attempt-record",
+                        format!("no {kind} has begun without an id; its begin comes first"),
+                        Next::run(outcome::cm(host.prefix(), begin)),
+                    ))
+                }
                 Some(action) if action.kind != *kind => violations.push(Violation::refuse(
                     &full,
                     "attempt-record",
@@ -358,7 +360,10 @@ pub fn attempt(
                         "{} began at {} and has no id yet, so no {kind} can be recorded",
                         action.kind, action.began
                     ),
-                    Next::run(vec!["cm".into(), "attempt".into(), (&full).into()]),
+                    Next::run(outcome::cm(
+                        host.prefix(),
+                        ["attempt".into(), (&full).into()],
+                    )),
                 )),
                 Some(_) => {}
             }

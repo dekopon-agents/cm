@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 use std::process::Command;
@@ -12,24 +13,55 @@ pub trait Host {
     fn github_rate_limit(&self) -> Option<String> {
         None
     }
-    // The invocation as `cm …`, without `--json`, for a refusal that re-issues it.
-    fn argv(&self) -> Vec<String> {
-        Vec::new()
+    // The invocation as `cm …`, without `--json`, for a refusal that re-issues it; None when it
+    // is not UTF-8.
+    fn argv(&self) -> Option<Vec<String>> {
+        None
+    }
+    // What every printed move starts with: `cm`, or `cm -C <root>` when a campaign was selected.
+    fn prefix(&self) -> Vec<String> {
+        vec!["cm".to_owned()]
     }
 }
 
 pub struct System;
 
 pub struct Invoked {
-    pub argv: Vec<String>,
+    pub argv: Option<Vec<String>>,
+    pub prefix: Vec<String>,
 }
 
 impl Invoked {
-    pub fn record(args: impl IntoIterator<Item = String>) -> Self {
-        let argv = std::iter::once("cm".to_owned())
-            .chain(args.into_iter().skip(1).filter(|arg| arg != "--json"))
-            .collect();
-        Invoked { argv }
+    // Drops `--json` only where it is an option: not after `--`, nor as the value of -C/--root.
+    pub fn record(args: impl IntoIterator<Item: Into<OsString>>) -> Self {
+        let mut argv = Some(vec!["cm".to_owned()]);
+        let (mut ended, mut value) = (false, false);
+        for arg in args.into_iter().skip(1).map(Into::into) {
+            let option = !ended && !value;
+            value = option && (arg == "-C" || arg == "--root");
+            if option && arg == "--json" {
+                continue;
+            }
+            ended |= option && arg == "--";
+            argv = argv.and_then(|mut argv| {
+                argv.push(arg.into_string().ok()?);
+                Some(argv)
+            });
+        }
+        Invoked {
+            argv,
+            prefix: vec!["cm".to_owned()],
+        }
+    }
+
+    pub fn in_campaign(mut self, root: &Path) -> Self {
+        let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+        self.prefix = vec![
+            "cm".to_owned(),
+            "-C".to_owned(),
+            root.to_string_lossy().into_owned(),
+        ];
+        self
     }
 }
 
@@ -50,8 +82,12 @@ impl Host for Invoked {
         System.github_rate_limit()
     }
 
-    fn argv(&self) -> Vec<String> {
+    fn argv(&self) -> Option<Vec<String>> {
         self.argv.clone()
+    }
+
+    fn prefix(&self) -> Vec<String> {
+        self.prefix.clone()
     }
 }
 

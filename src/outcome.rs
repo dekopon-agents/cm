@@ -17,12 +17,16 @@ pub struct Violation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Next {
     Run(Vec<Move>),
-    // `recorded` is boxed to keep `Violation` small enough for the `Result<_, Violation>` returns.
-    Missing {
-        what: String,
-        recorded: Option<Box<str>>,
-    },
+    // Boxed to keep `Violation` small enough for the `Result<_, Violation>` returns.
+    Missing(Box<Missing>),
     Settled(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Missing {
+    pub what: String,
+    pub recorded: Option<String>,
+    pub campaign: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +160,29 @@ impl Arg {
     }
 }
 
+// The invocation prefix (`cm`, or `cm -C <root>`) followed by the rest of a move.
+pub fn cm(prefix: Vec<String>, rest: impl IntoIterator<Item = Arg>) -> Vec<Arg> {
+    prefix.into_iter().map(Arg::Lit).chain(rest).collect()
+}
+
+// A value the parser would read as an option is attached to its flag.
+pub fn option(flag: &str, value: &str) -> Vec<Arg> {
+    if value.starts_with('-') {
+        vec![format!("{flag}={value}").into()]
+    } else {
+        vec![flag.into(), value.into()]
+    }
+}
+
+// The last positional of a move; one the parser would read as an option goes after `--`.
+pub fn last(value: &str) -> Vec<Arg> {
+    if value.starts_with('-') {
+        vec!["--".into(), value.into()]
+    } else {
+        vec![value.into()]
+    }
+}
+
 impl Move {
     pub fn new(argv: Vec<Arg>) -> Self {
         let next = Move { when: None, argv };
@@ -169,16 +196,21 @@ impl Move {
 
     pub fn set(mut self, flag: &str, input: Input) -> Self {
         let inline = format!("{flag}=");
-        let at = self.argv.iter().position(|arg| match arg {
+        let end = self
+            .argv
+            .iter()
+            .position(|arg| matches!(arg, Arg::Lit(text) if text == "--"))
+            .unwrap_or(self.argv.len());
+        let at = self.argv[..end].iter().position(|arg| match arg {
             Arg::Lit(text) => text == flag || text.starts_with(&inline),
             Arg::Input(_) => false,
         });
         match at {
             Some(at) if matches!(&self.argv[at], Arg::Lit(text) if text == flag) => {
-                if at + 1 < self.argv.len() {
+                if at + 1 < end {
                     self.argv[at + 1] = Arg::Input(input);
                 } else {
-                    self.argv.push(Arg::Input(input));
+                    self.argv.insert(at + 1, Arg::Input(input));
                 }
             }
             Some(at) => {
@@ -186,8 +218,8 @@ impl Move {
                 self.argv.insert(at + 1, Arg::Input(input));
             }
             None => {
-                self.argv.push(Arg::Lit(flag.to_owned()));
-                self.argv.push(Arg::Input(input));
+                self.argv.insert(end, Arg::Input(input));
+                self.argv.insert(end, Arg::Lit(flag.to_owned()));
             }
         }
         self.check();
@@ -267,10 +299,11 @@ impl Next {
     }
 
     pub fn missing(what: impl Into<String>) -> Self {
-        Next::Missing {
+        Next::Missing(Box::new(Missing {
             what: what.into(),
             recorded: None,
-        }
+            campaign: vec!["cm".to_owned()],
+        }))
     }
 
     pub fn settled(why: impl Into<String>) -> Self {
@@ -278,9 +311,8 @@ impl Next {
     }
 }
 
-fn feedback_recipe(what: &str) -> Vec<String> {
-    [
-        "cm",
+fn feedback_recipe(campaign: &[String], what: &str) -> Vec<String> {
+    let rest = [
         "feedback",
         &format!("missing command: {what}"),
         "--urgency",
@@ -288,8 +320,8 @@ fn feedback_recipe(what: &str) -> Vec<String> {
         "--body-file",
         &Input::BodyFile.placeholder(),
     ]
-    .map(str::to_owned)
-    .to_vec()
+    .map(str::to_owned);
+    campaign.iter().cloned().chain(rest).collect()
 }
 
 impl Violation {
@@ -331,10 +363,9 @@ impl Violation {
         }
     }
 
-    fn adopt(&self, feedback: &str) -> Vec<String> {
-        ["cm", "adopt", &self.place(), "--feedback", feedback]
-            .map(str::to_owned)
-            .to_vec()
+    fn adopt(&self, campaign: &[String], feedback: &str) -> Vec<String> {
+        let rest = ["adopt", &self.place(), "--feedback", feedback].map(str::to_owned);
+        campaign.iter().cloned().chain(rest).collect()
     }
 
     pub fn next_json(&self) -> Vec<Value> {
@@ -351,10 +382,18 @@ impl Violation {
                     })
                 })
                 .collect(),
-            Next::Missing { what, recorded } => {
+            Next::Missing(missing) => {
+                let Missing {
+                    what,
+                    recorded,
+                    campaign,
+                } = &**missing;
                 let (argv, inputs) = match recorded {
-                    Some(id) => (self.adopt(id), vec![]),
-                    None => (feedback_recipe(what), vec![Input::BodyFile.name()]),
+                    Some(id) => (self.adopt(campaign, id), vec![]),
+                    None => (
+                        feedback_recipe(campaign, what),
+                        vec![Input::BodyFile.name()],
+                    ),
                 };
                 vec![json!({
                     "kind": "missing-command",
@@ -396,23 +435,27 @@ impl std::fmt::Display for Violation {
                     }
                 }
             }
-            Next::Missing {
-                what,
-                recorded: Some(id),
-            } => write!(
-                f,
-                "\n  missing-command: {what} (recorded as {id})\n  next: make the change by hand, then: {}",
-                command(&self.adopt(id))
-            )?,
-            Next::Missing {
-                what,
-                recorded: None,
-            } => write!(
-                f,
-                "\n  missing-command: {what} (not yet recorded)\n  next: {}\n  then: make the change by hand, then: {}",
-                command(&feedback_recipe(what)),
-                command(&self.adopt("<feedback-id>"))
-            )?,
+            Next::Missing(missing) => match &**missing {
+                Missing {
+                    what,
+                    recorded: Some(id),
+                    campaign,
+                } => write!(
+                    f,
+                    "\n  missing-command: {what} (recorded as {id})\n  next: make the change by hand, then: {}",
+                    command(&self.adopt(campaign, id))
+                )?,
+                Missing {
+                    what,
+                    recorded: None,
+                    campaign,
+                } => write!(
+                    f,
+                    "\n  missing-command: {what} (not yet recorded)\n  next: {}\n  then: make the change by hand, then: {}",
+                    command(&feedback_recipe(campaign, what)),
+                    command(&self.adopt(campaign, "<feedback-id>"))
+                )?,
+            },
             Next::Settled(why) => write!(f, "\n  next: nothing; {why}")?,
         }
         Ok(())
@@ -447,11 +490,17 @@ impl Outcome {
     }
 
     pub fn resolve_missing(&mut self, root: &Path) {
+        self.resolve_missing_in(root, &["cm".to_owned()]);
+    }
+
+    // `campaign` is the prefix the feedback and adopt moves start with.
+    pub fn resolve_missing_in(&mut self, root: &Path, campaign: &[String]) {
         for violation in &mut self.violations {
-            if let Next::Missing { what, recorded } = &mut violation.next
-                && recorded.is_none()
-            {
-                *recorded = crate::ledger::missing_command_entry(root, what).map(Into::into);
+            if let Next::Missing(missing) = &mut violation.next {
+                missing.campaign = campaign.to_vec();
+                if missing.recorded.is_none() {
+                    missing.recorded = crate::ledger::missing_command_entry(root, &missing.what);
+                }
             }
         }
     }

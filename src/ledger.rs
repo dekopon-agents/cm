@@ -121,10 +121,14 @@ pub(crate) fn missing_command_entry(root: &Path, what: &str) -> Option<String> {
         .into_iter()
         .filter(|heading| heading.level == 3)
         .find_map(|heading| {
-            let mut words = heading.text.split_whitespace();
-            let id = words.next().filter(|word| feedback_id(word).is_some())?;
-            let title = heading.text.rsplit(" · ").next()?.trim();
-            (words.next() != Some("follow-up") && title == wanted).then(|| id.to_owned())
+            let [id, _urgency, title] = heading
+                .text
+                .splitn(3, " · ")
+                .collect::<Vec<_>>()
+                .try_into()
+                .ok()?;
+            let id = id.trim();
+            (feedback_id(id).is_some() && title.trim() == wanted).then(|| id.to_owned())
         })
 }
 

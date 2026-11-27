@@ -276,9 +276,16 @@ fn again_reissues_the_recorded_invocation_without_json_and_with_one_input_correc
     ]));
     assert_eq!(
         host.argv(),
-        words(&["cm", "advance", "01-a/u/s", "done", "--evidence", "gone.md"])
+        Some(words(&[
+            "cm",
+            "advance",
+            "01-a/u/s",
+            "done",
+            "--evidence",
+            "gone.md"
+        ]))
     );
-    let fixed = Move::again(host.argv()).set("--evidence", Input::EvidenceFile);
+    let fixed = Move::again(host.argv().unwrap()).set("--evidence", Input::EvidenceFile);
     assert_eq!(
         fixed.command(),
         "cm advance 01-a/u/s done --evidence '<evidence-file>'"
@@ -530,4 +537,284 @@ fn packet_kickoff_names_the_amend_of_the_real_step_and_the_attempt_record_its_be
     assert_eq!(next[0]["inputs"], json!([]));
     let began = c.cm(&["attempt", "01-a/u/run", "begin", "turn", "--claim", &claim]);
     assert!(began.status.success(), "{began:?}");
+}
+
+#[test]
+fn owner_queue_not_open_on_a_unit_adds_without_block_and_blocks_the_unit() {
+    let c = Scratch::new(&[("01-a/u/park", "codex")]);
+    let refused = c.refused(&["--json", "advance", "01-a/u", "blocked:until:owner-queue:7"]);
+    let next = rule_next(&refused, "owner-queue-not-open");
+    let add = &argvs(&next)[0];
+    assert!(
+        !add.as_array().unwrap().contains(&json!("--block")),
+        "{add}"
+    );
+    let added = c.cm(&[
+        "owner-queue",
+        "add",
+        "Chart termination",
+        "--context",
+        "c",
+        "--question",
+        "q?",
+        "--recommendation",
+        "r",
+    ]);
+    assert!(added.status.success(), "{added:?}");
+    let refused = c.refused(&["--json", "advance", "01-a/u", "blocked:until:owner-queue:7"]);
+    let next = rule_next(&refused, "owner-queue-not-open");
+    assert_eq!(
+        argvs(&next)[1],
+        json!(["cm", "advance", "01-a/u", "blocked:until:owner-queue:1"])
+    );
+    let blocked = c.cm(&["advance", "01-a/u", "blocked:until:owner-queue:1"]);
+    assert!(blocked.status.success(), "{blocked:?}");
+}
+
+#[test]
+fn owner_queue_not_open_on_a_part_blocks_the_whole_step() {
+    let c = Scratch::new(&[]);
+    let declared = c.cm(&["init", "01-a/u/s", "--lane", "codex", "--part", "p"]);
+    assert!(declared.status.success(), "{declared:?}");
+    let added = c.cm(&[
+        "owner-queue",
+        "add",
+        "Chart termination",
+        "--context",
+        "c",
+        "--question",
+        "q?",
+        "--recommendation",
+        "r",
+    ]);
+    assert!(added.status.success(), "{added:?}");
+    let refused = c.refused(&[
+        "--json",
+        "advance",
+        "01-a/u/s",
+        "blocked:until:owner-queue:9",
+        "--part",
+        "p",
+    ]);
+    let next = rule_next(&refused, "owner-queue-not-open");
+    assert_eq!(
+        argvs(&next)[1],
+        json!(["cm", "advance", "01-a/u/s", "blocked:until:owner-queue:1"])
+    );
+    let blocked = c.cm(&["advance", "01-a/u/s", "blocked:until:owner-queue:1"]);
+    assert!(blocked.status.success(), "{blocked:?}");
+}
+
+#[test]
+fn a_move_printed_for_a_selected_campaign_replays_in_that_campaign() {
+    let a = Scratch::new(&[("01-a/u/run", "claude-cloud")]);
+    let b = Scratch::new(&[("01-a/u/run", "claude-cloud")]);
+    let b_root = b.root.to_str().unwrap();
+    let refused = a.refused(&[
+        "-C",
+        b_root,
+        "--json",
+        "launch",
+        "01-a/u/run",
+        "--coordinator",
+        "session_x",
+    ]);
+    let next = rule_next(&refused, "packet-kickoff");
+    let root = std::path::absolute(&b.root).unwrap();
+    assert_eq!(
+        argvs(&next),
+        [json!([
+            "cm",
+            "-C",
+            root.to_str().unwrap(),
+            "amend",
+            "01-a/u/run",
+            "--kickoff-file",
+            "<kickoff-file>"
+        ])]
+    );
+    let kickoff = a.root.join("../kickoff.md");
+    fs::write(&kickoff, "Do it.\n").unwrap();
+    let words: Vec<String> = argvs(&next)[0]
+        .as_array()
+        .unwrap()
+        .iter()
+        .skip(1)
+        .map(|word| match word.as_str().unwrap() {
+            "<kickoff-file>" => kickoff.to_str().unwrap().to_owned(),
+            word => word.to_owned(),
+        })
+        .collect();
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let amended = a.cm(&words);
+    assert!(amended.status.success(), "{amended:?}");
+    let launched = b.cm(&["launch", "01-a/u/run", "--coordinator", "session_x"]);
+    assert!(launched.status.success(), "{launched:?}");
+    let still = a.refused(&[
+        "--json",
+        "launch",
+        "01-a/u/run",
+        "--coordinator",
+        "session_x",
+    ]);
+    rule_next(&still, "packet-kickoff");
+}
+
+#[test]
+fn a_selected_campaign_prefixes_the_feedback_and_adopt_moves() {
+    let dir = tempfile::tempdir().unwrap();
+    let campaign = words(&["cm", "-C", "/c"]);
+    let mut outcome = Outcome::refused(vec![renumber()]);
+    outcome.resolve_missing_in(dir.path(), &campaign);
+    assert_eq!(
+        next(&outcome.violations[0])[0]["argv"],
+        json!([
+            "cm",
+            "-C",
+            "/c",
+            "feedback",
+            "missing command: renumber MAC-LANE.md",
+            "--urgency",
+            "queued",
+            "--body-file",
+            "<body-file>"
+        ])
+    );
+    assert!(
+        outcome.violations[0]
+            .to_string()
+            .contains("then: cm -C /c adopt MAC-LANE.md:41")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_argument_records_no_argv_and_does_not_panic() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let odd = OsString::from_vec(b"camp\xffaign".to_vec());
+    let host = Invoked::record([OsString::from("cm"), OsString::from("init"), odd.clone()]);
+    assert_eq!(host.argv(), None);
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .current_dir(dir.path())
+        .arg("--json")
+        .arg("init")
+        .arg(&odd)
+        .output()
+        .unwrap();
+    assert_ne!(output.status.code(), Some(101), "{output:?}");
+}
+
+#[test]
+fn a_leading_dash_kind_is_begun_after_the_end_of_options() {
+    let c = Scratch::new(&[("01-a/u/run", "claude-cloud")]);
+    fs::write(c.root.join("../kickoff.md"), "Do it.\n").unwrap();
+    let kickoff = c.root.join("../kickoff.md");
+    assert!(
+        c.cm(&[
+            "amend",
+            "01-a/u/run",
+            "--kickoff-file",
+            kickoff.to_str().unwrap()
+        ])
+        .status
+        .success()
+    );
+    assert!(
+        c.cm(&["launch", "01-a/u/run", "--coordinator", "session_x"])
+            .status
+            .success()
+    );
+    let shown: Value =
+        serde_json::from_slice(&c.cm(&["--json", "attempt", "01-a/u/run"]).stdout).unwrap();
+    let claim = shown["claim"].as_str().unwrap().to_owned();
+    let refused = c.refused(&[
+        "--json",
+        "attempt",
+        "01-a/u/run",
+        "--claim",
+        &claim,
+        "record",
+        "--",
+        "-turn",
+        "t-2",
+    ]);
+    let next = rule_next(&refused, "attempt-record");
+    assert_eq!(
+        argvs(&next),
+        [json!([
+            "cm",
+            "attempt",
+            "01-a/u/run",
+            "begin",
+            "--claim",
+            claim,
+            "--",
+            "-turn"
+        ])]
+    );
+    let began = c.cm(&[
+        "attempt",
+        "01-a/u/run",
+        "begin",
+        "--claim",
+        &claim,
+        "--",
+        "-turn",
+    ]);
+    assert!(began.status.success(), "{began:?}");
+    assert_eq!(
+        cm::outcome::option("--claim", "-c"),
+        [cm::outcome::Arg::Lit("--claim=-c".into())]
+    );
+}
+
+#[test]
+fn replay_keeps_positional_data_after_the_end_of_options() {
+    let host = Invoked::record(words(&["cm", "--json", "journal", "--", "--json"]));
+    assert_eq!(host.argv(), Some(words(&["cm", "journal", "--", "--json"])));
+    let rooted = Invoked::record(words(&["cm", "-C", "--json", "status"]));
+    assert_eq!(
+        rooted.argv(),
+        Some(words(&["cm", "-C", "--json", "status"]))
+    );
+    let moved = Move::again(words(&["cm", "advance", "--", "01-a/u/run", "done"]))
+        .set("--evidence", Input::EvidenceFile);
+    assert_eq!(
+        moved.command(),
+        "cm advance --evidence '<evidence-file>' -- 01-a/u/run done"
+    );
+    let dashed = Move::again(words(&["cm", "journal", "--", "--evidence"]))
+        .set("--body-file", Input::BodyFile);
+    assert_eq!(
+        dashed.command(),
+        "cm journal --body-file '<body-file>' -- --evidence"
+    );
+}
+
+#[test]
+fn a_missing_command_title_holding_the_ledger_delimiter_is_found_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("FEEDBACK.md"),
+        "# Feedback\n\n### FB-e-001 · queued · missing command: rename A · B\n\nBody.\n",
+    )
+    .unwrap();
+    let mut outcome = Outcome::refused(vec![Violation::refuse(
+        "x.md",
+        "x-rule",
+        "cause",
+        Next::missing("rename A · B"),
+    )]);
+    outcome.resolve_missing(dir.path());
+    assert_eq!(next(&outcome.violations[0])[0]["recorded"], "FB-e-001");
+    let mut other = Outcome::refused(vec![Violation::refuse(
+        "x.md",
+        "x-rule",
+        "cause",
+        Next::missing("B"),
+    )]);
+    other.resolve_missing(dir.path());
+    assert_eq!(next(&other.violations[0])[0]["recorded"], Value::Null);
 }

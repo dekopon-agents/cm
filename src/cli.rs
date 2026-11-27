@@ -1521,7 +1521,12 @@ pub fn main() -> ExitCode {
         };
     }
     let command = name(&cli.command);
-    let host = Invoked::record(std::env::args());
+    let mut host = Invoked::record(std::env::args_os());
+    if cli.root.is_some()
+        && let Ok(root) = store::root_or_cwd(cli.root.as_deref())
+    {
+        host = host.in_campaign(&root);
+    }
     let outcome = run(&cli, &host).or_else(|error| {
         if let Some(large) = error.downcast_ref::<InputTooLarge>() {
             return Ok((
@@ -1538,7 +1543,7 @@ pub fn main() -> ExitCode {
     match outcome {
         Ok((mut outcome, exit)) => {
             if let Ok(root) = store::root_or_cwd(cli.root.as_deref()) {
-                outcome.resolve_missing(&root);
+                outcome.resolve_missing_in(&root, &host.prefix());
             }
             if cli.json && matches!(cli.command, Commands::Tick { .. }) {
                 // A closed stdout must not turn a tick whose moves ran into a panic. The object is
