@@ -887,15 +887,19 @@ submodule to two different commits, even when one is the other's ancestor, reads
 there and needs its own review. Of the commits the checkout's `shallow` file lists, it stops only
 at those with a parent missing from the checkout's objects, where git could read no further; past
 any other, whose parents are all there (forged, or left listed by a later, deeper fetch), it reads
-on, so no entry can hide a merge base the checkout's objects hold. A merge whose parents have no
-merge base there (`git merge-base --all` finds none), because it lies past the boundary or the two
-histories are unrelated, is no clean update and no conflict resolution: the waiver, `cm review
-record --kind resolution` and the walk refuse it, naming the merge. A shallow file the gate cannot
+on. A merge whose parents have no merge base there (`git merge-base --all` finds none), because it
+lies past the boundary or the two histories are unrelated, is still a clean update when both
+remerge diffs are empty, but no conflict resolution: `cm review record --kind resolution` and the
+walk refuse it, naming the merge. Nor is a merge whose parents reach a boundary entry that stays
+above the merge bases git found, since a nearer merge base may lie past it (a shallow clone of
+the feature branch three commits deep and of the base branch two deep, or one that cuts a
+criss-cross merge): both refuse it, naming the merge and the entry, and ask for its own review or
+a checkout that holds the history back to the merge base. A shallow file the gate cannot
 read, or with a line that is not a full object id, stops the gate as unreadable, though git reads
 a shallow file it cannot read as no boundary, and a line that starts with an object id as that id.
 It is made, mode 0700 and its files 0600 whatever the umask, under TMPDIR, taken as
 absolute (an empty TMPDIR names none), else under `/tmp`: a directory where it, its `git init` or
-its alternates file cannot be made is passed over, and with neither the gate refuses, naming both
+its alternates file or its copy of the shallow boundary cannot be made is passed over, and with neither the gate refuses, naming both
 and why, and asks for a writable TMPDIR. Every git command in it runs under umask 077 whatever the
 caller's, so nothing git makes there, a remerge diff's temporary object directory included, takes
 the caller's umask. Once it is made, git failing in it, or printing a line that begins `error:` or
@@ -952,24 +956,27 @@ compared with that tree path by path, with renames not folded. So git's default 
 commits decides all three, and no merge attribute, driver or `merge.*` setting, committed or
 local, does: a `-merge` or `binary` attribute makes no file conflicted, and a merge whose parents
 merge there without a conflict, or that differs from git's merge at any path its conflicts do not
-allow, does not pass this way. The merge may differ at a conflicted path. Where git suggests
+allow, does not pass this way. The merge may differ at a conflicted path. Symlinks and
+submodules git moves aside are not read: a merge whose parents put a symlink or a submodule
+against a directory, or entries of two different types (a file, a symlink, a submodule) at one
+path, is refused whatever it keeps, naming the path and the two kinds, as a conflict shape cm does
+not read, and needs its own review. Where git suggests
 moving a file one parent put in a directory the other parent renamed
 (`CONFLICT (file location)`), it lists the file's path in the renamed directory as conflicted,
 and the merge may keep the file there or put it back at the path its parent gave it. Where git
-moves a file, symlink or submodule aside, for a directory (`CONFLICT (file/directory)`) or for an
-entry of another type (`CONFLICT (distinct types)`), the record names the path it made up for
-the entry, `<path>~` and the commit of the parent it came from, and that path must not remain: a
-merge that keeps both entries, under that name or a new one, does not pass. Against a directory
-the merge may keep the directory, or put the entry back at its own path and delete the
-directory's files; no other change beneath that path passes. Against an entry of another type
-the path itself is conflicted only while git leaves one of the two entries there: for a symlink
-against a submodule git moves both aside, so no merge that keeps either passes. Git's other
-records, `Auto-merging` and content, binary, modify/delete, rename/delete and rename/rename
-conflicts, allow nothing more, and a record of any other type, such as a directory rename git
-could not apply, stops the merge passing this way. Nor does a merge whose parents set a
-submodule to two different commits: without the submodule's objects their merge cannot be read.
-Any other conflict on a submodule, one parent deleting it or putting a file or directory in its
-place, is read like a file's. A resolution review is never an ACCEPT of the head, and its receipt never meets (a) at
+moves a file aside for a directory (`CONFLICT (file/directory)`), the record names the path it
+made up for the file, `<path>~` and the commit of the parent it came from, and that path must not
+remain: a merge that keeps both entries, under that name or a new one, does not pass. The merge
+may keep the directory, or put the file back at its own path and delete the directory's files;
+no other change beneath that path passes. A file/directory record whose made-up path holds no
+conflicted entry, as when a parent renames the file it names while the other parent puts a
+directory in its place, allows nothing. Git's other records, `Auto-merging` and content, binary,
+modify/delete, rename/delete and rename/rename conflicts, a rename involved in a collision, a
+file in the way of a directory rename, a directory rename collision and a directory rename git
+could not split, allow nothing more than the paths git lists as conflicted, and a record of any
+other type stops the merge passing this way. Nor does a merge whose parents set a submodule to
+two different commits: without the submodule's objects their merge cannot be read. A submodule
+one parent deletes is read like a file. A resolution review is never an ACCEPT of the head, and its receipt never meets (a) at
 the head: without a checkout, (a) and (b) must hold at the merge itself, and a review of the head
 recorded at the merge governs it. Any commit after the merge needs its own review, and so does
 the merge once it is amended. The journal entry of the `merged` move names each merge the walk
