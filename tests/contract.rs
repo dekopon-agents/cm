@@ -665,7 +665,7 @@ fn a_selected_campaign_prefixes_the_feedback_and_adopt_moves() {
     let dir = tempfile::tempdir().unwrap();
     let campaign = words(&["cm", "-C", "/c"]);
     let mut outcome = Outcome::refused(vec![renumber()]);
-    outcome.resolve_missing_in(dir.path(), &campaign);
+    outcome.resolve_missing_in(dir.path(), Some(&campaign));
     assert_eq!(
         next(&outcome.violations[0])[0]["argv"],
         json!([
@@ -879,4 +879,66 @@ fn a_fenced_or_claimless_record_is_not_handed_the_live_claim() {
                 .contains(&format!("begin turn --claim {claim}"))
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_campaign_path_prints_no_move_rather_than_a_substituted_one() {
+    use std::os::unix::ffi::OsStrExt;
+    let temp = tempfile::tempdir().unwrap();
+    let odd = temp
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"camp\xffaign"));
+    let lossy = temp.path().join("camp\u{fffd}aign");
+    for dir in [&odd, &lossy] {
+        fs::create_dir(dir).unwrap();
+        git(dir, &["init", "-q", "."]);
+        let run = |args: &[&str]| {
+            Command::new(env!("CARGO_BIN_EXE_cm"))
+                .current_dir(dir)
+                .args(args)
+                .env_remove("CLAUDE_CODE_REMOTE_SESSION_ID")
+                .output()
+                .unwrap()
+        };
+        assert!(run(&["init", "."]).status.success());
+        assert!(
+            run(&["init", "01-a/u/run", "--lane", "claude-cloud"])
+                .status
+                .success()
+        );
+    }
+    let host = Invoked::record(words(&["cm", "status"])).in_campaign(&odd);
+    assert_eq!(host.prefix(), None);
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .current_dir(temp.path())
+        .arg("-C")
+        .arg(&odd)
+        .args([
+            "--json",
+            "launch",
+            "01-a/u/run",
+            "--coordinator",
+            "session_x",
+        ])
+        .env_remove("CLAUDE_CODE_REMOTE_SESSION_ID")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let refused: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let violation = refused["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|violation| violation["rule"] == "packet-kickoff")
+        .unwrap();
+    assert_eq!(violation["next"], json!([]));
+    assert!(
+        violation["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("no next move is printed: the campaign path is not UTF-8"),
+        "{violation}"
+    );
+    assert!(!refused.to_string().contains('\u{fffd}'), "{refused}");
 }

@@ -160,7 +160,6 @@ impl Arg {
     }
 }
 
-// The invocation prefix (`cm`, or `cm -C <root>`) followed by the rest of a move.
 pub fn cm(prefix: Vec<String>, rest: impl IntoIterator<Item = Arg>) -> Vec<Arg> {
     prefix.into_iter().map(Arg::Lit).chain(rest).collect()
 }
@@ -311,6 +310,8 @@ impl Next {
     }
 }
 
+const UNPRINTABLE: &str = "; no next move is printed: the campaign path is not UTF-8";
+
 fn feedback_recipe(campaign: &[String], what: &str) -> Vec<String> {
     let rest = [
         "feedback",
@@ -333,6 +334,24 @@ impl Violation {
             rule,
             message: message.into(),
             next: Next::Run(Vec::new()),
+        }
+    }
+
+    // `None` when no move can name the selected campaign: the refusal then says so and prints
+    // none, rather than a command that would act on another path.
+    pub fn refuse_printed(
+        path: impl Into<String>,
+        rule: &'static str,
+        cause: impl Into<String>,
+        next: Option<Next>,
+    ) -> Self {
+        match next {
+            Some(next) => Violation::refuse(path, rule, cause, next),
+            None => {
+                let mut cause = cause.into();
+                cause.push_str(UNPRINTABLE);
+                Violation::refuse(path, rule, cause, Next::Run(Vec::new()))
+            }
         }
     }
 
@@ -490,13 +509,17 @@ impl Outcome {
     }
 
     pub fn resolve_missing(&mut self, root: &Path) {
-        self.resolve_missing_in(root, &["cm".to_owned()]);
+        self.resolve_missing_in(root, Some(&["cm".to_owned()]));
     }
 
-    // `campaign` is the prefix the feedback and adopt moves start with.
-    pub fn resolve_missing_in(&mut self, root: &Path, campaign: &[String]) {
+    pub fn resolve_missing_in(&mut self, root: &Path, campaign: Option<&[String]>) {
         for violation in &mut self.violations {
             if let Next::Missing(missing) = &mut violation.next {
+                let Some(campaign) = campaign else {
+                    violation.message.push_str(UNPRINTABLE);
+                    violation.next = Next::Run(Vec::new());
+                    continue;
+                };
                 missing.campaign = campaign.to_vec();
                 if missing.recorded.is_none() {
                     missing.recorded = crate::ledger::missing_command_entry(root, &missing.what);

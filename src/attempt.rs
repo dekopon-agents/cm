@@ -394,14 +394,13 @@ pub fn attempt(
         Act::Record { kind, id } => {
             match pending {
                 None if claim != Some(attempt.claim.as_str()) => {
-                    violations.push(Violation::refuse(
+                    violations.push(Violation::refuse_printed(
                         &full,
                         "attempt-record",
                         format!("no {kind} has begun without an id; its begin comes first"),
-                        Next::run(outcome::cm(
-                            host.prefix(),
-                            ["attempt".into(), (&full).into()],
-                        )),
+                        host.prefix().map(|prefix| {
+                            Next::run(outcome::cm(prefix, ["attempt".into(), (&full).into()]))
+                        }),
                     ))
                 }
                 None => {
@@ -413,24 +412,24 @@ pub fn attempt(
                         begin.push(kind.into());
                         begin.extend(outcome::option("--claim", &attempt.claim));
                     }
-                    violations.push(Violation::refuse(
+                    violations.push(Violation::refuse_printed(
                         &full,
                         "attempt-record",
                         format!("no {kind} has begun without an id; its begin comes first"),
-                        Next::run(outcome::cm(host.prefix(), begin)),
+                        host.prefix()
+                            .map(|prefix| Next::run(outcome::cm(prefix, begin))),
                     ))
                 }
-                Some(action) if action.kind != *kind => violations.push(Violation::refuse(
+                Some(action) if action.kind != *kind => violations.push(Violation::refuse_printed(
                     &full,
                     "attempt-record",
                     format!(
                         "{} began at {} and has no id yet, so no {kind} can be recorded",
                         action.kind, action.began
                     ),
-                    Next::run(outcome::cm(
-                        host.prefix(),
-                        ["attempt".into(), (&full).into()],
-                    )),
+                    host.prefix().map(|prefix| {
+                        Next::run(outcome::cm(prefix, ["attempt".into(), (&full).into()]))
+                    }),
                 )),
                 Some(_) => {}
             }

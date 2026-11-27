@@ -1491,7 +1491,7 @@ pub fn parses(argv: &[String]) -> bool {
 // FEEDBACK.md id that records them.
 pub fn resolved(root: Option<&Path>, host: &dyn Host, mut outcome: Outcome) -> Outcome {
     if let Ok(root) = store::root_or_cwd(root) {
-        outcome.resolve_missing_in(&root, &host.prefix());
+        outcome.resolve_missing_in(&root, host.prefix().as_deref());
     }
     outcome
 }

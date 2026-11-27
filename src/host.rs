@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use jiff::Timestamp;
@@ -18,9 +18,10 @@ pub trait Host {
     fn argv(&self) -> Option<Vec<String>> {
         None
     }
-    // What every printed move starts with: `cm`, or `cm -C <root>` when a campaign was selected.
-    fn prefix(&self) -> Vec<String> {
-        vec!["cm".to_owned()]
+    // What every printed move starts with: `cm`, or `cm -C <root>` when a campaign was selected;
+    // None when that root is not UTF-8, since no printed word can name it.
+    fn prefix(&self) -> Option<Vec<String>> {
+        Some(vec!["cm".to_owned()])
     }
 }
 
@@ -28,7 +29,7 @@ pub struct System;
 
 pub struct Invoked {
     pub argv: Option<Vec<String>>,
-    pub prefix: Vec<String>,
+    pub root: Option<PathBuf>,
 }
 
 impl Invoked {
@@ -48,19 +49,11 @@ impl Invoked {
                 Some(argv)
             });
         }
-        Invoked {
-            argv,
-            prefix: vec!["cm".to_owned()],
-        }
+        Invoked { argv, root: None }
     }
 
     pub fn in_campaign(mut self, root: &Path) -> Self {
-        let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
-        self.prefix = vec![
-            "cm".to_owned(),
-            "-C".to_owned(),
-            root.to_string_lossy().into_owned(),
-        ];
+        self.root = Some(std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()));
         self
     }
 }
@@ -86,8 +79,15 @@ impl Host for Invoked {
         self.argv.clone()
     }
 
-    fn prefix(&self) -> Vec<String> {
-        self.prefix.clone()
+    fn prefix(&self) -> Option<Vec<String>> {
+        match &self.root {
+            None => Some(vec!["cm".to_owned()]),
+            Some(root) => Some(vec![
+                "cm".to_owned(),
+                "-C".to_owned(),
+                root.to_str()?.to_owned(),
+            ]),
+        }
     }
 }
 

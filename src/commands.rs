@@ -825,19 +825,21 @@ pub fn journal(host: &dyn Host, root: &Path, title: &str, body: Option<&str>) ->
 }
 
 pub(crate) fn packet_kickoff(host: &dyn Host, step_dir: &str, step: &str) -> Violation {
-    Violation::refuse(
+    Violation::refuse_printed(
         step_dir,
         "packet-kickoff",
         "the step folder has no kickoff.md",
-        Next::run(outcome::cm(
-            host.prefix(),
-            [
-                "amend".into(),
-                step.into(),
-                "--kickoff-file".into(),
-                Input::KickoffFile.into(),
-            ],
-        )),
+        host.prefix().map(|prefix| {
+            Next::run(outcome::cm(
+                prefix,
+                [
+                    "amend".into(),
+                    step.into(),
+                    "--kickoff-file".into(),
+                    Input::KickoffFile.into(),
+                ],
+            ))
+        }),
     )
 }
 
@@ -867,47 +869,53 @@ fn owner_queue_not_open(
     if target.step.is_some() {
         add.extend(["--block".into(), step.as_str().into()]);
     }
-    let add = outcome::Move::new(outcome::cm(host.prefix(), add));
     let open = crate::ledger::open_titles(root);
     let full = match part {
         Some(part) => format!("{step}#{part}"),
         None => step.clone(),
     };
+    let prefix = host.prefix();
+    let add = prefix
+        .clone()
+        .map(|prefix| outcome::Move::new(outcome::cm(prefix, add)));
     if open.is_empty() {
-        return Violation::refuse(
+        return Violation::refuse_printed(
             full,
             "owner-queue-not-open",
             format!("OWNER-QUEUE.md has no open item {number}, and no item is open"),
-            add.into(),
+            add.map(Into::into),
         );
     }
     let listed: Vec<String> = open
         .iter()
         .map(|(open, title)| format!("{open}. {title}"))
         .collect();
-    let mut moves = vec![("to file a new question for the owner".to_owned(), add)];
-    for (open, title) in &open {
-        let argv = outcome::cm(
-            host.prefix(),
-            [
-                "advance".into(),
-                step.as_str().into(),
-                format!("blocked:until:owner-queue:{open}").into(),
-            ],
-        );
-        moves.push((
-            format!("when the step waits on item {open}, `{title}`"),
-            outcome::Move::new(argv),
-        ));
-    }
-    Violation::refuse(
+    let next = prefix.zip(add).map(|(prefix, add)| {
+        let mut moves = vec![("to file a new question for the owner".to_owned(), add)];
+        for (open, title) in &open {
+            let argv = outcome::cm(
+                prefix.clone(),
+                [
+                    "advance".into(),
+                    step.as_str().into(),
+                    format!("blocked:until:owner-queue:{open}").into(),
+                ],
+            );
+            moves.push((
+                format!("when the step waits on item {open}, `{title}`"),
+                outcome::Move::new(argv),
+            ));
+        }
+        Next::either(moves)
+    });
+    Violation::refuse_printed(
         full,
         "owner-queue-not-open",
         format!(
             "OWNER-QUEUE.md has no open item {number}; the open items are {}",
             listed.join("; ")
         ),
-        Next::either(moves),
+        next,
     )
 }
 
