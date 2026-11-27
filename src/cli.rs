@@ -1487,6 +1487,15 @@ pub fn parses(argv: &[String]) -> bool {
     Cli::try_parse_from(argv).is_ok()
 }
 
+// Every outcome cm prints passes here: missing-command moves gain the campaign prefix and the
+// FEEDBACK.md id that records them.
+pub fn resolved(root: Option<&Path>, host: &dyn Host, mut outcome: Outcome) -> Outcome {
+    if let Ok(root) = store::root_or_cwd(root) {
+        outcome.resolve_missing_in(&root, &host.prefix());
+    }
+    outcome
+}
+
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Commands::Advance { state, by, .. } = &cli.command
@@ -1541,10 +1550,8 @@ pub fn main() -> ExitCode {
         Err(error)
     });
     match outcome {
-        Ok((mut outcome, exit)) => {
-            if let Ok(root) = store::root_or_cwd(cli.root.as_deref()) {
-                outcome.resolve_missing_in(&root, &host.prefix());
-            }
+        Ok((outcome, exit)) => {
+            let outcome = resolved(cli.root.as_deref(), &host, outcome);
             if cli.json && matches!(cli.command, Commands::Tick { .. }) {
                 // A closed stdout must not turn a tick whose moves ran into a panic. The object is
                 // streamed, never copied into one string: only its length is needed for a limit.

@@ -337,6 +337,17 @@ pub fn attempt(
         }
         Act::Record { kind, id } => {
             match pending {
+                None if claim != Some(attempt.claim.as_str()) => {
+                    violations.push(Violation::refuse(
+                        &full,
+                        "attempt-record",
+                        format!("no {kind} has begun without an id; its begin comes first"),
+                        Next::run(outcome::cm(
+                            host.prefix(),
+                            ["attempt".into(), (&full).into()],
+                        )),
+                    ))
+                }
                 None => {
                     let mut begin = vec!["attempt".into(), (&full).into(), "begin".into()];
                     if kind.starts_with('-') {

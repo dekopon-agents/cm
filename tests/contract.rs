@@ -818,3 +818,65 @@ fn a_missing_command_title_holding_the_ledger_delimiter_is_found_whole() {
     other.resolve_missing(dir.path());
     assert_eq!(next(&other.violations[0])[0]["recorded"], Value::Null);
 }
+
+#[test]
+fn the_printed_outcome_resolves_missing_commands_against_the_selected_campaign() {
+    let c = Scratch::new(&[]);
+    fs::write(
+        c.root.join("FEEDBACK.md"),
+        "# Feedback\n\n### FB-e-021 · queued · missing command: renumber MAC-LANE.md\n\nBody.\n",
+    )
+    .unwrap();
+    let host = Invoked::record(words(&["cm", "status"])).in_campaign(&c.root);
+    let outcome = cm::cli::resolved(Some(&c.root), &host, Outcome::refused(vec![renumber()]));
+    let root = std::path::absolute(&c.root).unwrap();
+    assert_eq!(
+        next(&outcome.violations[0])[0]["argv"],
+        json!([
+            "cm",
+            "-C",
+            root.to_str().unwrap(),
+            "adopt",
+            "MAC-LANE.md:41",
+            "--feedback",
+            "FB-e-021"
+        ])
+    );
+}
+
+#[test]
+fn a_fenced_or_claimless_record_is_not_handed_the_live_claim() {
+    let c = Scratch::new(&[("01-a/u/run", "claude-cloud")]);
+    let kickoff = c.root.join("../kickoff.md");
+    fs::write(&kickoff, "Do it.\n").unwrap();
+    assert!(
+        c.cm(&[
+            "amend",
+            "01-a/u/run",
+            "--kickoff-file",
+            kickoff.to_str().unwrap()
+        ])
+        .status
+        .success()
+    );
+    assert!(
+        c.cm(&["launch", "01-a/u/run", "--coordinator", "session_x"])
+            .status
+            .success()
+    );
+    let shown: Value =
+        serde_json::from_slice(&c.cm(&["--json", "attempt", "01-a/u/run"]).stdout).unwrap();
+    let claim = shown["claim"].as_str().unwrap().to_owned();
+    for given in [vec!["--claim", "stale-claim"], vec![]] {
+        let mut args = vec!["--json", "attempt", "01-a/u/run", "record", "turn", "t-1"];
+        args.extend(given);
+        let refused = c.refused(&args);
+        let next = rule_next(&refused, "attempt-record");
+        assert_eq!(argvs(&next), [json!(["cm", "attempt", "01-a/u/run"])]);
+        assert!(
+            !refused
+                .to_string()
+                .contains(&format!("begin turn --claim {claim}"))
+        );
+    }
+}
