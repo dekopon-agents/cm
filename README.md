@@ -556,7 +556,7 @@ the turn read serves (at `launched`, one run for the turn read and its context);
 reads the last session the attempt recorded as it reads a lane driver's, with `{turn}` empty
 (below), also while a newer `begin session` waits for its id. The record holds the `session`
 read, its `used_tokens`, the `read_at` of the sync that recorded that value and, from the first
-sync that does not read it (the read fails, carries no value or is not run, no reader is
+sync that does not read it (the read fails, carries no value or is left no time, no reader is
 configured, or the attempt is no longer live), `unread_since`. A value with `unread_since` is
 stale until a read delivers one again. A later read within 10k tokens of the recorded value, on
 the same side of the cap, leaves the record as it is, so a working session's syncs rewrite no
@@ -585,9 +585,9 @@ reader configured, sync first takes the context lock, an flock on the `.cm` dire
 `cm attempt` and `cm advance` never wait on, and holds it from before its first reader run until
 it has written what it read, so concurrent syncs read and record context values one at a time,
 each over the one before. A sync that cannot take it within the shared deadline below runs its
-turn reads but no context read: each value it would read goes stale and warns
-`context not read: …`. A restart, or a newer turn or session recorded between a sync's read and
-its write, leaves that read unapplied.
+turn reads but no context read, and writes none of the values it would read: each stays as it
+is, and the sync warns `context not read: …`. A restart, or a newer turn or session recorded
+between a sync's read and its write, leaves that read unapplied.
 The reads this adds (an attempt at `pr-open` or with no turn, and each lane driver) share one
 deadline, 15 s from when sync starts waiting for the context lock, which the wait and the
 launched steps' own turn reads also spend. A read the deadline cuts warns `turn reader did not

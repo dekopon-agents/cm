@@ -252,7 +252,8 @@ struct Run<'a> {
     turn_commands: TurnCommands,
     turn_warnings: Vec<String>,
     lane_contexts: BTreeMap<String, ObservedContext>,
-    // None when another sync held the context lock past the deadline: no context read runs.
+    // None when another sync held the context lock past the deadline: no context read runs, and
+    // no value it would read is written.
     reader_deadline: Option<Instant>,
 }
 
@@ -993,15 +994,11 @@ impl<'a> Run<'a> {
         reader: &TurnProgram,
     ) -> Sample {
         let Some(deadline) = self.reader_deadline else {
-            let Some(session) = last_recorded_session(attempt) else {
-                return Sample::Unread;
-            };
-            self.turn_warnings
-                .push(format!("{target}: {}", context_lock_held()));
-            return Sample::Read {
-                session: session.to_owned(),
-                tokens: None,
-            };
+            if last_recorded_session(attempt).is_some() {
+                self.turn_warnings
+                    .push(format!("{target}: {}", context_lock_held()));
+            }
+            return Sample::Pending;
         };
         let (session, read, warned) = if let Some(turn) = remote_turn(attempt, Lane::ClaudeCloud) {
             let argv = reader.argv(turn.thread, turn.turn);
@@ -1105,7 +1102,11 @@ impl<'a> Run<'a> {
                     };
                     read
                 }
-                None => Err(context_lock_held()),
+                None => {
+                    self.turn_warnings
+                        .push(format!("lane {lane}: {}", context_lock_held()));
+                    continue;
+                }
             };
             let tokens = match read {
                 Ok(Some(tokens)) => Some(tokens),
@@ -1933,18 +1934,6 @@ fn run_sync(
             READERS,
         ),
     };
-    let deadline = Instant::now() + TURN_READER_TIMEOUT;
-    // Held from before the first reader run until this sync has written what it read, so syncs
-    // read and record context values one at a time, in order.
-    let context = if TurnCommands::read(root)
-        .for_lane(Lane::ClaudeCloud)
-        .is_some()
-    {
-        Some(store::context_lock(root, deadline)?)
-    } else {
-        None
-    };
-    let reader_deadline = (!matches!(context, Some(None))).then_some(deadline);
     let mut read = Run::new(
         root,
         Access::Read(forge),
@@ -1952,8 +1941,19 @@ fn run_sync(
         now,
         units,
         owner_unread,
-        reader_deadline,
+        None,
     );
+    let deadline = Instant::now() + TURN_READER_TIMEOUT;
+    // Held from before the first reader run until this sync has written what it read, so syncs
+    // read and record context values one at a time, in order. Taken on the read walk's own
+    // configuration, so no context read runs without it.
+    let context = if read.turn_commands.for_lane(Lane::ClaudeCloud).is_some() {
+        Some(store::context_lock(root, deadline)?)
+    } else {
+        None
+    };
+    let reader_deadline = (!matches!(context, Some(None))).then_some(deadline);
+    read.reader_deadline = reader_deadline;
     read.walk();
     // Sampled after the reads, so `used` counts this sync's own.
     let rate_limit = forge.rate_limit();

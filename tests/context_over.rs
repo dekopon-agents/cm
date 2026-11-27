@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use cm::attempt::Act;
 use cm::commands::{self, Declaration};
-use cm::forge::Gh;
+use cm::forge::{CheckState, CommitSha, Forge, ForgeError, Gh, GithubRepo, Pull, TagName};
 use cm::host::Host;
 use cm::outcome::Outcome;
 use cm::state::{AttemptOutcome, Evidence, Lane, Phase};
@@ -752,57 +752,50 @@ mod interleaved {
 
     use super::*;
 
-    // A gh whose rate-limit sample, taken after a sync's reads and before its lock, waits while a
-    // `hold` file is there, so another sync can start in between.
-    const HELD_GH: &str = r#"if [ "$1 $2" = "api rate_limit" ] && [ -f "$FAKE_GH/hold" ]; then
-    rm "$FAKE_GH/hold"
-    : > "$FAKE_GH/held"
-    while [ ! -f "$FAKE_GH/release" ]; do sleep 0.02; done
-fi
-exit 1"#;
-
-    fn until(what: &str, mut done: impl FnMut() -> bool) {
-        let start = Instant::now();
+    fn until(mut done: impl FnMut() -> bool) {
         while !done() {
-            assert!(start.elapsed() < Duration::from_secs(10), "{what}");
             std::thread::sleep(Duration::from_millis(10));
         }
     }
 
-    fn waits_on_context_lock(root: &Path) -> bool {
-        let inode = fs::metadata(root.join(".cm")).unwrap().ino();
+    fn waiters(path: &Path) -> usize {
+        let inode = format!(":{} ", fs::metadata(path).unwrap().ino());
         fs::read_to_string("/proc/locks")
             .unwrap()
             .lines()
-            .any(|line| line.contains("-> FLOCK ") && line.contains(&format!(":{inode} ")))
+            .filter(|line| line.contains("-> FLOCK ") && line.contains(&inode))
+            .count()
     }
 
-    fn hold(s: &Scratch) {
-        fs::write(s.gh.fixture().join("hold"), "").unwrap();
-    }
-
-    fn held(s: &Scratch) {
-        until("the older sync never reached its rate-limit sample", || {
-            s.gh.fixture().join("held").exists()
-        });
-    }
-
-    fn release(s: &Scratch, mut newer_done: impl FnMut() -> bool) {
-        until(
-            "the newer sync neither waited on the context lock nor finished",
-            || newer_done() || waits_on_context_lock(&s.c.root),
+    // After its reads a sync waits on `.cm/lock`, still holding the context lock, for as long as
+    // the test holds `.cm/lock`.
+    fn older_waits(s: &Scratch, mut finished: impl FnMut() -> bool) {
+        until(|| waiters(&s.c.root.join(".cm/lock")) == 1 || finished());
+        assert!(
+            !finished(),
+            "the older sync finished while .cm/lock was held"
         );
-        fs::write(s.gh.fixture().join("release"), "").unwrap();
+    }
+
+    fn newer_waits(s: &Scratch, mut finished: impl FnMut() -> bool) {
+        let (context, campaign) = (s.c.root.join(".cm"), s.c.root.join(".cm/lock"));
+        until(|| waiters(&context) + waiters(&campaign) > 1 || finished());
+        assert_eq!(
+            (waiters(&context), waiters(&campaign)),
+            (1, 1),
+            "the newer sync must wait on the context lock until the older one has written"
+        );
     }
 
     fn interleaved(s: &Scratch, older: &Fake, newer: &Fake, between: impl FnOnce()) {
-        hold(s);
         std::thread::scope(|scope| {
+            let campaign = cm::store::lock(&s.c.root).unwrap();
             let first = scope.spawn(|| s.serial_sync(older));
-            held(s);
+            older_waits(s, || first.is_finished());
             between();
             let second = scope.spawn(|| s.serial_sync(newer));
-            release(s, || second.is_finished());
+            newer_waits(s, || second.is_finished());
+            drop(campaign);
             first.join().unwrap();
             second.join().unwrap();
         });
@@ -810,7 +803,7 @@ exit 1"#;
 
     #[test]
     fn an_older_sync_never_overwrites_a_newer_syncs_value() {
-        let s = Scratch::with_gh(HELD_GH);
+        let s = Scratch::new();
         s.add_driver(DRIVER);
         s.reports("150000");
         interleaved(&s, &at(5), &at(6), || s.reports("250000"));
@@ -831,7 +824,7 @@ exit 1"#;
 
     #[test]
     fn an_older_failed_read_never_stales_a_newer_read_that_left_the_value_as_it_was() {
-        let s = Scratch::with_gh(HELD_GH);
+        let s = Scratch::new();
         s.add_driver(DRIVER);
         s.reports("250000");
         s.sync(&at(5));
@@ -848,7 +841,7 @@ exit 1"#;
 
     #[test]
     fn an_older_read_never_clears_a_newer_failed_reads_staleness() {
-        let s = Scratch::with_gh(HELD_GH);
+        let s = Scratch::new();
         s.add_driver(DRIVER);
         s.reports("250000");
         s.sync(&at(5));
@@ -865,7 +858,7 @@ exit 1"#;
 
     #[test]
     fn two_cm_sync_processes_record_their_reads_in_order() {
-        let s = Scratch::with_gh(HELD_GH);
+        let s = Scratch::new();
         s.add_driver(DRIVER);
         s.reports("250000");
         s.sync(&at(5));
@@ -877,12 +870,13 @@ exit 1"#;
                 .spawn()
                 .unwrap()
         };
-        hold(&s);
-        let older = sync();
-        held(&s);
+        let campaign = cm::store::lock(&s.c.root).unwrap();
+        let mut older = sync();
+        older_waits(&s, || older.try_wait().unwrap().is_some());
         s.reports("251000");
         let mut newer = sync();
-        release(&s, || newer.try_wait().unwrap().is_some());
+        newer_waits(&s, || newer.try_wait().unwrap().is_some());
+        drop(campaign);
         for child in [older, newer] {
             let out = child.wait_with_output().unwrap();
             assert!(out.status.success(), "{out:?}");
@@ -997,6 +991,8 @@ fn a_hung_reader_costs_a_sync_one_reader_timeout() {
     let s = Scratch::new();
     s.add_driver(DRIVER);
     s.reports("250000");
+    s.sync(&at(4));
+    s.runs();
     fs::write(s.file("hang"), "").unwrap();
     let start = Instant::now();
     let synced = s.serial_sync(&at(5));
@@ -1010,6 +1006,12 @@ fn a_hung_reader_costs_a_sync_one_reader_timeout() {
         ])
     );
     assert_eq!(s.runs(), ["session_worker/turn-1"]);
+    for context in [
+        s.attempt()["observed_context"].clone(),
+        s.lane_context()["tooling"].clone(),
+    ] {
+        assert_eq!(context["unread_since"], "2030-01-01T10:05Z", "{context}");
+    }
 }
 
 #[test]
@@ -1070,12 +1072,15 @@ fn a_session_recorded_again_in_its_cse_spelling_keeps_its_value() {
 }
 
 #[test]
-fn a_sync_that_cannot_take_the_context_lock_in_time_reads_no_context() {
+fn a_sync_that_cannot_take_the_context_lock_in_time_leaves_each_value_as_it_is() {
     let s = Scratch::new();
     s.add_driver(DRIVER);
     s.reports("250000");
     s.sync(&at(5));
     s.runs();
+    let lane_context = s.c.root.join(".cm/lane-context.json");
+    let (state, lanes) = (s.unit_state(), fs::read(&lane_context).unwrap());
+    s.reports("150000");
     let held = fs::File::open(s.c.root.join(".cm")).unwrap();
     rustix::fs::flock(&held, rustix::fs::FlockOperation::LockExclusive).unwrap();
     let synced = s.serial_sync(&at(6));
@@ -1092,16 +1097,12 @@ fn a_sync_that_cannot_take_the_context_lock_in_time_reads_no_context() {
         ["session_worker/turn-1"],
         "its turn read still runs"
     );
+    assert_eq!(s.unit_state(), state);
+    assert_eq!(fs::read(&lane_context).unwrap(), lanes);
     assert_eq!(
-        s.attempt()["observed_context"]["unread_since"],
-        "2030-01-01T10:06Z"
+        rules(&s.try_act(&at(7), begin("turn"))),
+        ["attempt-context-over"]
     );
-    assert_eq!(
-        s.lane_context()["tooling"]["unread_since"],
-        "2030-01-01T10:06Z"
-    );
-    let resumed = s.try_act(&at(7), begin("turn"));
-    assert!(resumed.ok(), "{:?}", resumed.violations);
 }
 
 #[test]
@@ -1276,6 +1277,96 @@ fn a_restart_clears_the_value() {
         },
     );
     assert_eq!(s.attempt()["observed_context"], Value::Null);
+}
+
+// Sync samples its rate limit after its reads and before it takes `.cm/lock`; this forge runs
+// `between` there.
+struct Between<'a> {
+    gh: Gh,
+    between: std::cell::Cell<Option<Box<dyn FnOnce() + 'a>>>,
+}
+
+impl Forge for Between<'_> {
+    fn pull(&self, url: &str) -> Result<Pull, ForgeError> {
+        self.gh.pull(url)
+    }
+
+    fn checks(&self, repo: &GithubRepo, sha: &CommitSha) -> Result<Vec<CheckState>, ForgeError> {
+        self.gh.checks(repo, sha)
+    }
+
+    fn rate_limit(&self) -> Option<String> {
+        if let Some(between) = self.between.take() {
+            between();
+        }
+        self.gh.rate_limit()
+    }
+
+    fn tag_exists(&self, repo: &GithubRepo, tag: &TagName) -> Result<bool, ForgeError> {
+        self.gh.tag_exists(repo, tag)
+    }
+
+    fn tag_contains(
+        &self,
+        repo: &GithubRepo,
+        tag: &TagName,
+        sha: &CommitSha,
+    ) -> Result<bool, ForgeError> {
+        self.gh.tag_contains(repo, tag, sha)
+    }
+}
+
+#[test]
+fn a_newer_record_between_a_syncs_read_and_its_write_leaves_that_read_unapplied() {
+    let read = json!({"session": WORKER, "used_tokens": 150000, "read_at": "2030-01-01T10:05Z"});
+    for case in ["restart", "turn", "session"] {
+        let s = Scratch::new();
+        s.reports("150000");
+        s.sync(&at(5));
+        s.reports("165000");
+        s.runs();
+        let record = || match case {
+            "restart" => {
+                s.act(
+                    &at(6),
+                    Act::End {
+                        outcome: AttemptOutcome::Unknown,
+                        file: None,
+                    },
+                );
+                s.act(
+                    &at(6),
+                    Act::Restart {
+                        lane: Lane::ClaudeCloud,
+                        file: None,
+                    },
+                );
+                s.record_session(&at(6), WORKER);
+                s.record_turn(&at(6), "turn-1");
+            }
+            "turn" => s.record_turn(&at(6), "turn-2"),
+            _ => s.record_session(&at(6), "session_second"),
+        };
+        let forge = Between {
+            gh: s.forge(),
+            between: std::cell::Cell::new(Some(Box::new(record))),
+        };
+        let synced = cm::sync::sync(&at(6), &forge, &s.c.root).unwrap();
+        assert!(synced.ok(), "{case}: {:?}", synced.violations);
+        assert_eq!(s.runs(), ["session_worker/turn-1"], "{case}");
+        let (kept, session) = match case {
+            "restart" => (Value::Null, WORKER),
+            "turn" => (read.clone(), WORKER),
+            _ => (read.clone(), "session_second"),
+        };
+        assert_eq!(s.attempt()["observed_context"], kept, "{case}");
+        s.sync(&at(7));
+        assert_eq!(
+            s.attempt()["observed_context"],
+            json!({"session": session, "used_tokens": 165000, "read_at": "2030-01-01T10:07Z"}),
+            "{case}: the next sync reads it"
+        );
+    }
 }
 
 #[test]
