@@ -505,6 +505,26 @@ fn with_the_journal_fallback_a_later_note_recalling_or_planning_the_unpause_reop
             RESUMED,
             "The previous coordinator set\n`paused = false` in LIMITS.toml.",
         ),
+        (
+            RESUMED,
+            "paused = false in LIMITS.toml? No; LIMITS.toml is unchanged this turn.",
+        ),
+        (
+            RESUMED,
+            "The previous coordinator wrote this yesterday; LIMITS.toml is unchanged this turn.\n\n```\npaused = false in LIMITS.toml.\n```",
+        ),
+        (
+            RESUMED,
+            "Quoted from yesterday:\n- ```\n  paused = false in LIMITS.toml.\n  ```",
+        ),
+        (
+            RESUMED,
+            "Yesterday's record:\n~~~\nResumed.\npaused = false in LIMITS.toml.\n~~~",
+        ),
+        (
+            "Coordinator: resumed from handoff after compaction",
+            "paused = false in LIMITS.toml.",
+        ),
     ] {
         let c = unpaused_in_the_journal("paused = false in LIMITS.toml.");
         journal(
@@ -527,6 +547,8 @@ fn with_the_journal_fallback_the_record_states_the_assignment_as_a_clause_of_its
     for body in [
         "Owner woke the coordinator by hand. paused = false in LIMITS.toml; hourly backstop re-enabled.",
         "Resumed from the handoff:\n\n- `paused=false` in LIMITS.toml\n- heartbeat re-armed",
+        "Owner woke the coordinator by hand\n\npaused = false in LIMITS.toml! Lanes next.",
+        "Resumed; ran\n```\ncm next --act\n```\npaused = false in LIMITS.toml.",
     ] {
         let c = unpaused_in_the_journal(body);
         let (code, lines, text) = act(&c.root);

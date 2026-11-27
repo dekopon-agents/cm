@@ -1901,16 +1901,31 @@ fn has_word(text: &str, word: &str) -> bool {
 // The resume record the owner's resume directive (2026-11-25T23:36Z) prescribes: an entry with this
 // exact title whose body states the assignment as a clause of its own. Any other coordinator
 // restart, and a sentence that recalls or plans the unpause, is none; a line break inside a
-// paragraph ends no clause, so a wrapped recollection stays one sentence.
+// paragraph ends no clause, so a wrapped recollection stays one sentence. A question states nothing
+// and fenced code quotes, so neither is the record.
 const RESUME_TITLE: &str = "Coordinator: resumed after quota reset";
 const ASSIGNMENT: [&str; 5] = ["paused", "=", "false", "in", "limits.toml"];
+const FENCES: [&str; 2] = ["```", "~~~"];
 
 fn states_unpause(body: &str) -> bool {
+    let mut fence: Option<&str> = None;
     let text = body
         .lines()
         .map(|line| {
             let line = line.trim();
-            match line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+            let item = line.strip_prefix("- ").or_else(|| line.strip_prefix("* "));
+            let content = item.unwrap_or(line).trim_start();
+            if let Some(open) = fence {
+                if content.starts_with(open) {
+                    fence = None;
+                }
+                return ";".to_owned();
+            }
+            if let Some(open) = FENCES.into_iter().find(|open| content.starts_with(open)) {
+                fence = Some(open);
+                return ";".to_owned();
+            }
+            match item {
                 Some(item) => format!("; {item}"),
                 None if line.is_empty() => ";".to_owned(),
                 None => line.to_owned(),
@@ -1928,7 +1943,7 @@ fn states_unpause(body: &str) -> bool {
             clause.push(bare);
         }
         if bare.len() < word.len() {
-            if clause == ASSIGNMENT {
+            if clause == ASSIGNMENT && !word[bare.len()..].contains('?') {
                 return true;
             }
             clause.clear();
