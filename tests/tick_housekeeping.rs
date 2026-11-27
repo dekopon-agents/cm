@@ -1,8 +1,10 @@
+use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 use std::time::Duration;
 
 use cm::tick::TickError;
@@ -71,9 +73,11 @@ fn script(path: &Path, body: &str) {
 }
 
 // A cm the pin phase staged in this process can still be open for writing in a sibling test's
-// fork that has not exec'd yet, so a run of it can meet ETXTBSY until that fork moves on.
+// fork that has not exec'd yet, so a run of it can meet ETXTBSY until that fork moves on, which
+// it does however slow the runner is: the run is tried again until then, never a fixed number of
+// times.
 fn spawn(cmd: &Cmd) -> cm::tick::Result<Ran> {
-    for _ in 0..1_000 {
+    loop {
         match SystemProc.run(cmd) {
             Err(TickError::Spawn { source, .. })
                 if source.kind() == std::io::ErrorKind::ExecutableFileBusy =>
@@ -83,7 +87,6 @@ fn spawn(cmd: &Cmd) -> cm::tick::Result<Ran> {
             other => return other,
         }
     }
-    SystemProc.run(cmd)
 }
 
 // A loaded runner can hold any phase a whole second past its budget, which adds the frame's
@@ -511,46 +514,114 @@ fn a_pull_cut_before_its_rebase_is_quit_and_its_autostash_kept_for_the_next_tick
     scratch.git(&ct, &["commit", "-qm", "local"]);
     scratch.push_from_other("STATE.md", "other\n");
     script(&ct.join(".git/hooks/pre-commit"), "exit 1\n");
-    script(&ct.join(".git/hooks/pre-rebase"), "exec sleep 60\n");
+    script(&ct.join(".git/hooks/pre-rebase"), "kill -TERM 0\n");
     let change = "card, in the autostash\n";
     write(&ct.join(EPOCH).join("CARD.md"), change);
-    let rebasing =
-        |ct: &Path| ct.join(".git/rebase-merge").exists() || ct.join(".git/rebase-apply").exists();
-    let survived = std::rc::Rc::new(std::cell::Cell::new(false));
+    let folder = ct.join(".git/rebase-merge");
+    let aborted = Rc::new(RefCell::new(Vec::new()));
     let proc = FakeProc::new({
-        let (base, ct, survived) = (scratch.proc(), ct.clone(), survived.clone());
+        let (base, folder, aborted) = (scratch.proc(), folder.clone(), aborted.clone());
         move |cmd| {
-            let ran = base.run(cmd);
             if cmd.line() == "git rebase --abort" {
-                survived.set(rebasing(&ct));
+                aborted
+                    .borrow_mut()
+                    .push(folder.exists().then(|| names(&folder)));
             }
-            ran
+            base.run(cmd)
         }
     });
-    let report = scratch.phase(&proc, Path::new("cm"), Duration::from_secs(2), |ctx| {
-        gitsync::sync(ctx, Mode::Always)
-    });
-    if survived.get() {
-        assert_eq!(report.lines, [COMMIT_FAILED, gitsync::QUIT, SYNC_FAILED]);
-        assert_eq!(scratch.status(), "");
+    let report = scratch.sync(&proc, Mode::Always);
+    assert_eq!(
+        *aborted.borrow(),
+        [Some(vec!["autostash".to_owned()]), None, None]
+    );
+    assert_eq!(report.lines, [COMMIT_FAILED, gitsync::QUIT, SYNC_FAILED]);
+    assert!(report.failed);
+    assert_eq!(
+        proc.log().into_iter().skip(4).collect::<Vec<_>>(),
+        [
+            "git pull -q --rebase --autostash origin main",
+            "git rebase --abort",
+            "git rev-parse --abbrev-ref HEAD",
+            "git rebase --quit",
+        ]
+        .repeat(3)
+    );
+    assert!(!folder.exists());
+    assert_eq!(
+        scratch.git(&ct, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "main\n"
+    );
+    assert_eq!(scratch.status(), "");
+    let stashed = || {
         assert_eq!(scratch.git(&ct, &["stash", "list"]).lines().count(), 1);
         assert_eq!(
             scratch.git(&ct, &["show", &format!("stash@{{0}}:{EPOCH}/CARD.md")]),
             change
         );
-    } else {
-        assert_eq!(report.lines, [COMMIT_FAILED, SYNC_FAILED]);
-        assert_eq!(
-            fs::read_to_string(ct.join(EPOCH).join("CARD.md")).unwrap(),
-            change
-        );
-    }
-    assert!(!rebasing(&ct));
+    };
+    stashed();
     for hook in ["pre-rebase", "pre-commit"] {
         fs::remove_file(ct.join(".git/hooks").join(hook)).unwrap();
     }
     assert_eq!(scratch.sync(&proc, Mode::Always), Report::default());
-    assert!(scratch.origin_log().contains(&"local".to_owned()));
+    assert_eq!(scratch.origin_log(), ["local", "other: STATE.md", "start"]);
+    assert_eq!(scratch.status(), "");
+    stashed();
+}
+
+#[test]
+fn a_rebase_stopped_at_a_conflict_whose_abort_fails_is_never_quit_and_the_next_abort_ends_it() {
+    let scratch = Scratch::new();
+    let ct = scratch.ct();
+    scratch.push_from_other("CARD.md", "card, theirs\n");
+    write(&ct.join(EPOCH).join("CARD.md"), "card, ours\n");
+    scratch.git(&ct, &["commit", "-qam", "local"]);
+    let lock = ct.join(".git/index.lock");
+    let aborts = Cell::new(0);
+    let proc = FakeProc::new({
+        let (base, lock) = (scratch.proc(), lock.clone());
+        move |cmd| {
+            if cmd.line() != "git rebase --abort" {
+                return base.run(cmd);
+            }
+            aborts.set(aborts.get() + 1);
+            if aborts.get() > 1 {
+                return base.run(cmd);
+            }
+            fs::write(&lock, "").unwrap();
+            let ran = base.run(cmd);
+            fs::remove_file(&lock).unwrap();
+            ran
+        }
+    });
+    let report = scratch.sync(&proc, Mode::Always);
+    assert_eq!(report.lines, [SYNC_FAILED]);
+    assert_eq!(
+        proc.log().into_iter().skip(2).collect::<Vec<_>>(),
+        [
+            "git pull -q --rebase --autostash origin main",
+            "git rebase --abort",
+            "git rev-parse --abbrev-ref HEAD",
+            "git pull -q --rebase --autostash origin main",
+            "git rebase --abort",
+            "git pull -q --rebase --autostash origin main",
+            "git rebase --abort",
+        ]
+    );
+    assert_eq!(
+        scratch.git(&ct, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "main\n"
+    );
+    assert!(!ct.join(".git/rebase-merge").exists());
+    assert_eq!(scratch.status(), "");
+    assert_eq!(scratch.git(&ct, &["stash", "list"]), "");
+    assert_eq!(
+        fs::read_to_string(ct.join(EPOCH).join("CARD.md")).unwrap(),
+        "card, ours\n"
+    );
+    assert_eq!(scratch.git(&ct, &["log", "-1", "--format=%s"]), "local\n");
+    assert_eq!(scratch.origin_log(), ["other: CARD.md", "start"]);
 }
 
 const STILL_BOUND: [&str; 4] = [
@@ -1008,37 +1079,33 @@ fn a_tmpdir_that_does_not_exist_refuses_the_pin_and_keeps_the_running_cm() {
 
 #[test]
 fn a_relative_tmpdir_refuses_the_pin_and_keeps_the_running_cm() {
-    let pinned = Pinned::released();
-    let ct = pinned.scratch.ct();
-    fs::create_dir(ct.join("tmp")).unwrap();
-    let env: Env = [
-        (
-            "HOME",
-            pinned.scratch.path().join("home").display().to_string(),
-        ),
-        ("TMPDIR", "tmp".to_owned()),
-    ]
-    .into_iter()
-    .collect();
-    let proc = pinned.scratch.proc();
-    let ctx = Ctx::new(
-        &ct,
-        Path::new(EPOCH),
-        &proc,
-        &env,
-        pinned.cm.as_os_str(),
-        MAX_BUDGET,
+    let pinned = Pinned::new(&format!(
+        "echo \"$3\" >> \"$TICK_FIXTURE/fetched\"; mkdir -p \"${{3%/*}}\" && {RELEASED}"
+    ));
+    let scratch = &pinned.scratch;
+    scratch.fake_git();
+    let output = scratch
+        .tick_command(Path::new(env!("CARGO_BIN_EXE_cm")))
+        .env("TMPDIR", "tmp")
+        .arg("--cm")
+        .arg(&pinned.cm)
+        .arg("--checkout")
+        .arg(scratch.ct())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let (lines, walls) = printed(&output.stdout);
+    assert_eq!(
+        lines,
+        [format!(
+            "heartbeat: cm {PINNED} (setup.sh's pin) could not be fetched or installed; still running cm 0.0.1"
+        )]
     );
-    pinned.left_alone(pin::run(&ctx));
-    assert_eq!(names(&ct.join("tmp")), Vec::<String>::new());
-    assert!(
-        !proc
-            .log()
-            .iter()
-            .any(|call| call.contains("--fetch-pinned")),
-        "{:?}",
-        proc.log()
-    );
+    assert!(walls.contains(&"pin".to_owned()), "{walls:?}");
+    assert_eq!(pinned.version(), "cm 0.0.1\n");
+    assert!(!scratch.path().join("fetched").exists());
+    assert_eq!(names(&scratch.path().join("bin")), ["cm", "git"]);
+    assert_eq!(names(&scratch.path().join("tmp")), Vec::<String>::new());
 }
 
 #[test]
@@ -1442,6 +1509,37 @@ fn a_boot_time_claude_md_the_tick_may_not_write_is_kept_with_the_line() {
         0o444
     );
     assert_eq!(names(claude.parent().unwrap()), ["CLAUDE.md"]);
+}
+
+#[test]
+fn a_claude_md_under_a_relative_home_is_read_in_the_checkout_and_named_as_home_spells_it() {
+    let scratch = Scratch::new();
+    scratch.fake_git();
+    script(
+        &scratch.path().join("bin/cm"),
+        "echo '{\"actionable\": []}'\n",
+    );
+    let claude = scratch.ct().join("h/.claude/CLAUDE.md");
+    write(&claude, &format!("{}\nold rules\n", claude_md::BOOT_TIME));
+    let old = fs::read(&claude).unwrap();
+    let folder = claude.parent().unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o444)).unwrap();
+    fs::set_permissions(folder, fs::Permissions::from_mode(0o555)).unwrap();
+    let mut command = scratch.tick_command(Path::new(env!("CARGO_BIN_EXE_cm")));
+    command
+        .env("HOME", "h")
+        .args(["--cm", "cm", "--checkout"])
+        .arg(scratch.ct());
+    scratch.unprivileged(&mut command);
+    let output = command.output().unwrap();
+    fs::set_permissions(folder, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        printed(&output.stdout).0,
+        ["heartbeat: could not write the COORDINATOR.md import to h/.claude/CLAUDE.md"]
+    );
+    assert_eq!(fs::read(&claude).unwrap(), old);
+    assert_eq!(names(folder), ["CLAUDE.md"]);
 }
 
 #[test]

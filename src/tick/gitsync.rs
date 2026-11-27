@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::tick::act::{Ctx, Report};
-use crate::tick::proc::{Cmd, Keep};
+use crate::tick::proc::{Cmd, Keep, Ran};
 
 pub const BUDGET: Duration = Duration::from_secs(60);
 
@@ -95,14 +95,19 @@ pub const QUIT: &str = "heartbeat: git rebase --abort could not end the rebase a
 // abort gets its own timeout rather than what is left of the spent budget. Cut before the rebase
 // wrote its state, the pull leaves a folder holding only the autostash, which the abort cannot
 // read and every later pull refuses: `--quit`, in the rest of the abort's time, removes it and
-// stores the autostash.
+// stores the autostash. A rebase moves HEAD off main only once its state is written, so the quit
+// runs only while HEAD is still on main: after the move, a quit would leave a stopped rebase's
+// HEAD detached on origin's commit and its conflicts in the tree, which the next try's or tick's
+// abort ends instead.
 fn abort(ctx: &Ctx, report: &mut Report) {
     let started = ctx.now();
-    if run_past_budget(ctx, "--abort", ABORT_TIMEOUT) {
+    if past_budget(ctx, &["rebase", "--abort"], ABORT_TIMEOUT).is_some() {
         return;
     }
-    let left = ABORT_TIMEOUT.saturating_sub(ctx.now().saturating_duration_since(started));
-    if !left.is_zero() && run_past_budget(ctx, "--quit", left) {
+    let left = || ABORT_TIMEOUT.saturating_sub(ctx.now().saturating_duration_since(started));
+    let on_main = past_budget(ctx, &["rev-parse", "--abbrev-ref", "HEAD"], left())
+        .is_some_and(|ran| ran.stdout_text().trim_end_matches('\n') == "main");
+    if on_main && past_budget(ctx, &["rebase", "--quit"], left()).is_some() {
         if !report.lines.iter().any(|line| line == QUIT) {
             report.lines.push(QUIT.to_owned());
         }
@@ -110,14 +115,14 @@ fn abort(ctx: &Ctx, report: &mut Report) {
     }
 }
 
-fn run_past_budget(ctx: &Ctx, rebase: &str, timeout: Duration) -> bool {
+fn past_budget(ctx: &Ctx, args: &[&str], timeout: Duration) -> Option<Ran> {
+    if timeout.is_zero() {
+        return None;
+    }
     ctx.proc
-        .run(
-            &command(&["rebase", rebase])
-                .cwd(ctx.checkout)
-                .timeout(timeout),
-        )
-        .is_ok_and(|ran| ran.exit.success())
+        .run(&command(args).cwd(ctx.checkout).timeout(timeout))
+        .ok()
+        .filter(|ran| ran.exit.success())
 }
 
 fn git(ctx: &Ctx, args: &[&str]) -> bool {
@@ -146,6 +151,7 @@ mod tests {
     const PULL: &str = "git pull -q --rebase --autostash origin main";
     const PUSH: &str = "git push -q origin main";
     const ABORT: &str = "git rebase --abort";
+    const ON_MAIN: &str = "git rev-parse --abbrev-ref HEAD";
     const QUIT_CALL: &str = "git rebase --quit";
     const FAILED: &str = "heartbeat: git pull --rebase and push to main failed 3 times; main does not have this checkout's commits";
 
@@ -153,6 +159,7 @@ mod tests {
 
     struct Git {
         branch: &'static str,
+        branch_after_an_abort: &'static str,
         status: &'static str,
         failing: &'static [&'static str],
         pick: &'static str,
@@ -160,11 +167,15 @@ mod tests {
 
     impl Git {
         fn proc(self) -> FakeProc {
+            let aborted = Cell::new(false);
             FakeProc::new(move |cmd| {
                 let line = cmd.line();
+                aborted.set(aborted.get() || line == ABORT);
                 Ok(if self.failing.iter().any(|call| line.starts_with(call)) {
                     Ran::code(1, "")
-                } else if line == "git rev-parse --abbrev-ref HEAD" {
+                } else if line == ON_MAIN && aborted.get() {
+                    Ran::code(0, self.branch_after_an_abort)
+                } else if line == ON_MAIN {
                     Ran::code(0, self.branch)
                 } else if line == "git status --porcelain" {
                     Ran::code(0, self.status)
@@ -179,6 +190,7 @@ mod tests {
 
     const CLEAN: Git = Git {
         branch: "main\n",
+        branch_after_an_abort: "main\n",
         status: "",
         failing: &[],
         pick: "ok store/epochs/eleemosynary-mnemosyne/handoff/coordinator-1.md\n",
@@ -367,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn an_abort_that_fails_is_followed_by_a_quit_in_the_rest_of_its_time() {
+    fn an_abort_that_fails_with_head_still_on_main_is_followed_by_a_quit_in_the_rest_of_its_time() {
         for (failing, said) in [
             (&[PULL, ABORT][..], &[QUIT, FAILED][..]),
             (&[PULL, ABORT, QUIT_CALL][..], &[FAILED][..]),
@@ -377,18 +389,74 @@ mod tests {
             assert_eq!(report.lines, said);
             assert!(report.failed);
             let tries: Vec<String> = checked(&proc).into_iter().skip(2).collect();
-            assert_eq!(tries, [PULL, ABORT, QUIT_CALL].repeat(3));
-            let quit = proc.calls().pop().unwrap();
-            assert_eq!(quit.cwd.as_deref(), Some(Path::new(".")));
-            assert!(quit.timeout > Duration::ZERO && quit.timeout <= ABORT_TIMEOUT);
+            assert_eq!(tries, [PULL, ABORT, ON_MAIN, QUIT_CALL].repeat(3));
+            let calls = proc.calls();
+            for call in &calls[calls.len() - 2..] {
+                assert_eq!(call.cwd.as_deref(), Some(Path::new(".")));
+                assert!(call.timeout > Duration::ZERO && call.timeout <= ABORT_TIMEOUT);
+            }
         }
+    }
+
+    #[test]
+    fn an_abort_that_fails_once_the_rebase_moved_head_off_main_is_never_followed_by_a_quit() {
+        for branch_after_an_abort in ["HEAD\n", ""] {
+            let proc = Git {
+                failing: &[PULL, ABORT],
+                branch_after_an_abort,
+                ..CLEAN
+            }
+            .proc();
+            let report = synced(&proc, Mode::Always);
+            assert_eq!(report.lines, [FAILED], "{branch_after_an_abort:?}");
+            assert!(report.failed);
+            let tries: Vec<String> = checked(&proc).into_iter().skip(2).collect();
+            assert_eq!(tries, [PULL, ABORT, ON_MAIN].repeat(3));
+        }
+    }
+
+    #[test]
+    fn a_quit_fails_the_sync_though_a_later_try_pushes() {
+        let pulls = Cell::new(0);
+        let proc = FakeProc::new(move |cmd| {
+            let line = cmd.line();
+            Ok(if line == ON_MAIN {
+                Ran::code(0, "main\n")
+            } else if line == PULL {
+                pulls.set(pulls.get() + 1);
+                Ran::code(if pulls.get() < 2 { 1 } else { 0 }, "")
+            } else if line == ABORT {
+                Ran::code(1, "")
+            } else if line.contains("handoff-pick.sh") {
+                Ran::code(0, CLEAN.pick)
+            } else {
+                Ran::code(0, "")
+            })
+        });
+        assert_eq!(
+            synced(&proc, Mode::Always),
+            Report {
+                lines: vec![QUIT.to_owned()],
+                failed: true
+            }
+        );
+        assert_eq!(
+            checked(&proc).into_iter().skip(2).collect::<Vec<_>>(),
+            [PULL, ABORT, ON_MAIN, QUIT_CALL, PULL, BOUND, PUSH]
+        );
     }
 
     #[test]
     fn gitsync_ends_at_most_40_s_past_its_budget() {
         let near = ABORT_TIMEOUT - Duration::from_millis(1);
-        for (abort, quits) in [(Some(near), true), (None, false)] {
+        let half = ABORT_TIMEOUT / 2;
+        for (abort, check_hangs, quits) in [
+            (Some(near), false, true),
+            (Some(half), true, false),
+            (None, false, false),
+        ] {
             let clock = Rc::new(Cell::new(Instant::now()));
+            let aborted = Cell::new(false);
             let proc = FakeProc::new({
                 let clock = clock.clone();
                 move |cmd| {
@@ -397,15 +465,19 @@ mod tests {
                         Ok(Ran::timed_out())
                     };
                     match cmd.line().as_str() {
-                        "git rev-parse --abbrev-ref HEAD" => Ok(Ran::code(0, "main\n")),
+                        ON_MAIN if check_hangs && aborted.get() => hang(),
+                        ON_MAIN => Ok(Ran::code(0, "main\n")),
                         PULL | QUIT_CALL => hang(),
-                        ABORT => match abort {
-                            Some(took) => {
-                                clock.set(clock.get() + took);
-                                Ok(Ran::code(1, ""))
+                        ABORT => {
+                            aborted.set(true);
+                            match abort {
+                                Some(took) => {
+                                    clock.set(clock.get() + took);
+                                    Ok(Ran::code(1, ""))
+                                }
+                                None => hang(),
                             }
-                            None => hang(),
-                        },
+                        }
                         _ => Ok(Ran::code(0, "")),
                     }
                 }
@@ -424,6 +496,10 @@ mod tests {
             let report = sync(&ctx, Mode::Always);
             assert_eq!(report.lines, [FAILED]);
             assert_eq!(proc.log().contains(&QUIT_CALL.to_owned()), quits);
+            assert_eq!(
+                proc.log().iter().filter(|call| *call == ON_MAIN).count(),
+                if abort.is_some() { 2 } else { 1 }
+            );
             assert_eq!(clock.get() - start, BUDGET + Duration::from_secs(40));
         }
     }

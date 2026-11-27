@@ -15,7 +15,7 @@ pub const BOOT_TIME: &str = "# dekopon-coordinator cloud environment";
 pub const IMPORT: &str = "@/home/user/campaign-trail/tools/cloud-env/COORDINATOR.md";
 
 pub fn run(ctx: &Ctx) -> Report {
-    let Some(path) = claude_md(ctx.checkout, ctx.env) else {
+    let Some((path, spelled)) = claude_md(ctx.checkout, ctx.env) else {
         return Report::default();
     };
     if !boot_time(&path) {
@@ -30,19 +30,21 @@ pub fn run(ctx: &Ctx) -> Report {
         },
         Err(_) => Report {
             lines: vec![format!(
-                "heartbeat: could not write the COORDINATOR.md import to {}",
-                path.display()
+                "heartbeat: could not write the COORDINATOR.md import to {spelled}"
             )],
             failed: true,
         },
     }
 }
 
-// `$HOME/.claude/CLAUDE.md` as heartbeat.sh spelled it: an empty HOME is `/.claude/CLAUDE.md`,
-// and a relative one is read in the checkout, where the script had moved.
-fn claude_md(checkout: &Path, env: &Env) -> Option<PathBuf> {
-    env.get("HOME")
-        .map(|home| checkout.join(format!("{home}/.claude/CLAUDE.md")))
+// `$HOME/.claude/CLAUDE.md` as heartbeat.sh spelled it, which is how its line names it: an empty
+// HOME is `/.claude/CLAUDE.md`, and a relative one is read and written in the checkout, where the
+// script had moved.
+fn claude_md(checkout: &Path, env: &Env) -> Option<(PathBuf, String)> {
+    env.get("HOME").map(|home| {
+        let spelled = format!("{home}/.claude/CLAUDE.md");
+        (checkout.join(&spelled), spelled)
+    })
 }
 
 fn boot_time(path: &Path) -> bool {
@@ -166,22 +168,23 @@ mod tests {
     }
 
     #[test]
-    fn the_file_is_home_s_claude_md_and_an_empty_home_is_the_root_s() {
+    fn the_file_is_home_s_claude_md_named_as_home_spells_it_and_an_empty_home_is_the_root_s() {
         let env =
             |home: Option<&str>| -> Env { home.map(|home| ("HOME", home)).into_iter().collect() };
         let ct = Path::new("/ct");
+        let file = |path: &str, spelled: &str| Some((PathBuf::from(path), spelled.to_owned()));
         assert_eq!(claude_md(ct, &env(None)), None);
         assert_eq!(
             claude_md(ct, &env(Some(""))),
-            Some(PathBuf::from("/.claude/CLAUDE.md"))
+            file("/.claude/CLAUDE.md", "/.claude/CLAUDE.md")
         );
         assert_eq!(
             claude_md(ct, &env(Some("/h"))),
-            Some(PathBuf::from("/h/.claude/CLAUDE.md"))
+            file("/h/.claude/CLAUDE.md", "/h/.claude/CLAUDE.md")
         );
         assert_eq!(
             claude_md(ct, &env(Some("h"))),
-            Some(PathBuf::from("/ct/h/.claude/CLAUDE.md"))
+            file("/ct/h/.claude/CLAUDE.md", "h/.claude/CLAUDE.md")
         );
     }
 
