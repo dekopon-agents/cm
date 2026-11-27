@@ -594,7 +594,7 @@ fn steps(units: &Units) -> impl Iterator<Item = (String, &Step)> {
     })
 }
 
-fn active_attempt(step: &Step) -> Option<&Attempt> {
+pub(crate) fn active_attempt(step: &Step) -> Option<&Attempt> {
     step.attempt.as_ref().filter(|attempt| {
         attempt.ended.is_none() && matches!(step.track.resting(), Phase::Launched | Phase::PrOpen)
     })
@@ -699,6 +699,7 @@ enum ActionKind {
     MergeReady,
     StaleBlock,
     ReleasedUndeployed,
+    ContextOver,
 }
 
 impl From<ActionKind> for &'static str {
@@ -717,6 +718,7 @@ impl From<ActionKind> for &'static str {
             ActionKind::MergeReady => "merge-ready",
             ActionKind::StaleBlock => "stale-block",
             ActionKind::ReleasedUndeployed => "released-undeployed",
+            ActionKind::ContextOver => "context-over",
         }
     }
 }
@@ -736,7 +738,8 @@ impl ActionKind {
             | Self::ExpiredWatch
             | Self::MergeReady
             | Self::StaleBlock
-            | Self::ReleasedUndeployed => 2,
+            | Self::ReleasedUndeployed
+            | Self::ContextOver => 2,
         }
     }
 
@@ -805,7 +808,7 @@ impl Action {
         let kind = <&str>::from(self.kind);
         let detail = self.description.replace(char::is_control, " ");
         let prefix = format!("{kind} {}: {detail}", self.target);
-        if self.kind == ActionKind::TurnEnded {
+        if matches!(self.kind, ActionKind::TurnEnded | ActionKind::ContextOver) {
             prefix
         } else {
             format!(
@@ -847,6 +850,59 @@ fn waiting_counts(root: &Path, units: &Units, actions: &mut [Action]) {
             seen.len() - 1
         });
     }
+}
+
+fn context_over(context: &crate::state::ObservedContext, remedy: &str) -> String {
+    let stale = context
+        .unread_since
+        .as_deref()
+        .map(|since| format!("; stale: unread since {since}"))
+        .unwrap_or_default();
+    format!(
+        "{} at {}k > {}k cap (read {}{stale}); {remedy}",
+        context.session,
+        context.kilotokens(),
+        limits::CONTEXT_CAP_TOKENS / 1000,
+        context.read_at
+    )
+}
+
+// The registry is caller-relative, so CARD.md, which reads no registry, lists none of these.
+fn drivers_over_cap(root: &Path, inputs: &ActionInputs) -> Vec<Action> {
+    if inputs.turn_commands.for_lane(Lane::ClaudeCloud).is_none() {
+        return Vec::new();
+    }
+    let contexts: BTreeMap<String, crate::state::ObservedContext> =
+        store::read_json(&crate::sync::lane_context_path(root)).unwrap_or_default();
+    inputs
+        .drivers
+        .drivers
+        .iter()
+        .filter_map(|(lane, driver)| {
+            let context = contexts.get(lane).filter(|context| {
+                context.session == crate::attempt::session_label(&driver.session)
+                    && context.over_cap()
+            })?;
+            let units: String = driver
+                .units
+                .iter()
+                .map(|unit| format!(" --unit {}", shell_word(unit)))
+                .collect();
+            Some(Action::new(
+                ActionKind::ContextOver,
+                &format!("lane:{lane}"),
+                &context.read_at,
+                format!(
+                    "cm lane driver add {} --session '<fresh-session>'{units}",
+                    shell_word(lane)
+                ),
+                context_over(
+                    context,
+                    "hand off to a fresh driver session from the lane's handoff",
+                ),
+            ))
+        })
+        .collect()
 }
 
 /// A launched step with no PR whose last attempt has ended: the coordinator owes the next move.
@@ -1437,6 +1493,20 @@ fn actionable(
                 format!("thread {} completed {completed_at}, no PR", turn.thread),
             ));
         }
+        if let Some(attempt) = active_attempt(step)
+            && attempt.lane.or(step.lane) == Some(Lane::ClaudeCloud)
+            && inputs.turn_commands.for_lane(Lane::ClaudeCloud).is_some()
+            && let Some(context) = crate::attempt::current_context(attempt)
+            && context.over_cap()
+        {
+            actions.push(Action::new(
+                ActionKind::ContextOver,
+                &target,
+                &context.read_at,
+                format!("cm attempt {} begin session", shell_word(&target)),
+                context_over(context, crate::attempt::FRESH_SESSION),
+            ));
+        }
         let mut review = |part: Option<&str>, track: &Track| {
             let Some(pr) = track.evidence.pr.as_deref() else {
                 return;
@@ -1584,6 +1654,7 @@ fn actionable(
             format!("{condition} holds"),
         ));
     }
+    actions.extend(drivers_over_cap(root, inputs));
     waiting_counts(root, units, &mut actions);
     actions.extend(releasing);
     actions.extend(deploying);

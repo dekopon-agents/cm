@@ -7,11 +7,11 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::attempt::{recorded_id, remote_turn};
+use crate::attempt::{Drivers, recorded_id, remote_turn, session_label};
 use crate::commands::{check_release_pr, closed, is_pr_url, write_unit};
 use crate::forge::{
     CheckState, CommitSha, Forge, ForgeError, GithubRepo, MergeableState, Pull, PullState,
-    TURN_READER_TIMEOUT, TagName, TurnRead, ci_green, read_remote_turn,
+    TURN_READER_TIMEOUT, TagName, TurnRead, ci_green, read_remote_turn, read_session_context,
 };
 use crate::host::{Host, stamp};
 use crate::journal;
@@ -20,7 +20,7 @@ use crate::outcome::{Outcome, Violation};
 use crate::plan::{self, Units};
 use crate::render;
 use crate::state::{
-    Evidence, Lane, Move, ObservedTurn, Phase, Release, Step, Track, Version, Work,
+    Evidence, Lane, Move, ObservedContext, ObservedTurn, Phase, Release, Step, Track, Version, Work,
 };
 use crate::store::{self, lock, parse_target, write_atomic};
 
@@ -41,6 +41,7 @@ pub struct Moved {
 
 type Read<T> = Result<T, ForgeError>;
 type TurnQuery = (String, String, String, Vec<String>);
+type SessionQuery = (String, String, Vec<String>);
 
 const PULL_MAX_AGE: jiff::SignedDuration = jiff::SignedDuration::from_mins(30);
 
@@ -48,6 +49,8 @@ const PULL_MAX_AGE: jiff::SignedDuration = jiff::SignedDuration::from_mins(30);
 pub const PULLS_READ: &str = "pulls-read.json";
 
 const UNREADABLE_NOTIFIED: &str = "unreadable-notified.json";
+
+const LANE_CONTEXT: &str = "lane-context.json";
 
 // A PR's 304 restores the stored observation, so its ETag goes out only while `.cm/pulls.json`
 // holds the one it validated; a check page's ETag is keyed by its own head's URL.
@@ -92,6 +95,7 @@ struct OpenChecks {
 struct Reads {
     branch_pulls: BTreeMap<(String, GithubRepo, String), Read<Option<String>>>,
     turns: BTreeMap<TurnQuery, Result<TurnRead, String>>,
+    sessions: BTreeMap<SessionQuery, Result<Option<u64>, String>>,
     pulls: BTreeMap<String, Read<PullRead>>,
     open_checks: BTreeMap<(GithubRepo, CommitSha), Read<OpenChecks>>,
     tags: BTreeMap<(GithubRepo, TagName), Read<bool>>,
@@ -236,6 +240,7 @@ struct Run<'a> {
     discovery_warnings: Vec<String>,
     turn_commands: TurnCommands,
     turn_warnings: Vec<String>,
+    lane_contexts: BTreeMap<String, ObservedContext>,
 }
 
 struct Tracked {
@@ -304,6 +309,7 @@ impl<'a> Run<'a> {
             discovery_warnings: Vec::new(),
             turn_commands,
             turn_warnings,
+            lane_contexts: store::read_json(&lane_context_path(root)).unwrap_or_default(),
         }
     }
 
@@ -351,6 +357,8 @@ impl<'a> Run<'a> {
 
     fn walk(&mut self) {
         self.observe_turns();
+        self.observe_contexts();
+        self.observe_drivers();
         self.discover_pulls();
         self.merges();
         self.tags();
@@ -900,6 +908,133 @@ impl<'a> Run<'a> {
                 attempt.observed_turn = observed;
                 self.dirty.insert(unit.to_owned());
             }
+        }
+    }
+
+    fn observe_contexts(&mut self) {
+        if self.planning() {
+            return;
+        }
+        let lane = Lane::ClaudeCloud;
+        let Some(programs) = self.turn_commands.for_lane(lane) else {
+            return;
+        };
+        let reader = programs.reader.clone();
+        let live: Vec<_> = self
+            .units
+            .iter()
+            .flat_map(|(unit, state)| {
+                state.steps.iter().filter_map(move |(name, step)| {
+                    let attempt = plan::active_attempt(step)?;
+                    (attempt.lane.or(step.lane) == Some(lane))
+                        .then(|| (format!("{unit}/{name}"), step.clone(), attempt.clone()))
+                })
+            })
+            .collect();
+        for (target, step, attempt) in live {
+            let Some(turn) = remote_turn(&attempt, lane) else {
+                continue;
+            };
+            let argv = reader.argv(turn.thread, turn.turn);
+            // The key observe_turns reads under, so a launched step's reader runs once a sync.
+            let key = (
+                attempt.id.clone(),
+                turn.thread.to_owned(),
+                turn.turn.to_owned(),
+                argv.clone(),
+            );
+            let (thread, turn_id) = (key.1.clone(), key.2.clone());
+            let tokens = match self.read(
+                "turn",
+                |reads| &mut reads.turns,
+                key,
+                move |_| read_remote_turn(&argv, &thread, &turn_id, TURN_READER_TIMEOUT),
+            ) {
+                Some(Ok(read)) => {
+                    let tokens = read.context_tokens();
+                    if tokens.is_none() {
+                        self.turn_warnings
+                            .push(missing_context(&target, turn.thread));
+                    }
+                    tokens
+                }
+                Some(Err(error)) => {
+                    if step.track.state != Phase::Launched {
+                        self.turn_warnings.push(format!("{target}: {error}"));
+                    }
+                    None
+                }
+                None => continue,
+            };
+            let observed = ObservedContext::after_read(
+                attempt.observed_context.as_ref(),
+                turn.thread,
+                tokens,
+                &self.at,
+            );
+            if observed != attempt.observed_context {
+                let (unit, name) = plan::split(&target).expect("step target has a unit and name");
+                let attempt = self
+                    .units
+                    .get_mut(unit)
+                    .expect("scanned unit")
+                    .steps
+                    .get_mut(name)
+                    .expect("scanned step")
+                    .attempt
+                    .as_mut()
+                    .expect("scanned attempt");
+                attempt.observed_context = observed;
+                self.dirty.insert(unit.to_owned());
+            }
+        }
+    }
+
+    fn observe_drivers(&mut self) {
+        if self.planning() {
+            return;
+        }
+        let Some(programs) = self.turn_commands.for_lane(Lane::ClaudeCloud) else {
+            return;
+        };
+        let Ok(drivers) = Drivers::read(self.root) else {
+            return;
+        };
+        let reader = programs.reader.clone();
+        self.lane_contexts
+            .retain(|lane, _| drivers.drivers.contains_key(lane));
+        for (lane, driver) in drivers.drivers {
+            let session = session_label(&driver.session);
+            let argv = reader.argv(&session, "");
+            let key = (lane.clone(), session.clone(), argv.clone());
+            let wanted = session.clone();
+            let tokens = match self.read(
+                "session",
+                |reads| &mut reads.sessions,
+                key,
+                move |_| read_session_context(&argv, &wanted, TURN_READER_TIMEOUT),
+            ) {
+                Some(Ok(Some(tokens))) => Some(tokens),
+                Some(Ok(None)) => {
+                    self.turn_warnings
+                        .push(missing_context(&format!("lane {lane}"), &session));
+                    None
+                }
+                Some(Err(error)) => {
+                    self.turn_warnings.push(format!("lane {lane}: {error}"));
+                    None
+                }
+                None => continue,
+            };
+            match ObservedContext::after_read(
+                self.lane_contexts.get(&lane),
+                &session,
+                tokens,
+                &self.at,
+            ) {
+                Some(observed) => self.lane_contexts.insert(lane, observed),
+                None => self.lane_contexts.remove(&lane),
+            };
         }
     }
 
@@ -1498,6 +1633,17 @@ impl<'a> Run<'a> {
 
 // EPOCH.md's `epoch` slug, else a fixed name: a checkout under another folder name renders the
 // same card.
+fn missing_context(subject: &str, session: &str) -> String {
+    format!(
+        "{subject}: turn reader reported no integer context_used_tokens for {session}; its {}k context cap is unchecked",
+        crate::limits::CONTEXT_CAP_TOKENS / 1000
+    )
+}
+
+pub(crate) fn lane_context_path(root: &Path) -> std::path::PathBuf {
+    root.join(store::CM_DIR).join(LANE_CONTEXT)
+}
+
 fn card_name(root: &Path) -> String {
     let declared = std::fs::read_to_string(root.join(crate::epoch::EPOCH))
         .ok()
@@ -1726,6 +1872,12 @@ fn run_sync(
         }
     }
     last_read.retain(|url, _| open.contains_key(url));
+    let lane_context = lane_context_path(root);
+    let recorded: BTreeMap<String, ObservedContext> =
+        store::read_json(&lane_context).unwrap_or_default();
+    if run.lane_contexts != recorded {
+        store::write_json(&lane_context, &run.lane_contexts)?;
+    }
     let mut campaign = store::load_campaign(root)?;
     campaign.schema = crate::state::SCHEMA;
     store::write_json(&store::state_path(root), &campaign)?;

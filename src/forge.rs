@@ -823,9 +823,49 @@ pub(crate) struct TurnRead {
     turn_id: Option<String>,
     pub completed_at: Option<String>,
     pub pr_url: Option<String>,
+    // Raw, so a malformed value costs the context record only, never the turn read.
+    #[serde(default)]
+    context_used_tokens: Option<serde_json::Value>,
+}
+
+impl TurnRead {
+    pub(crate) fn context_tokens(&self) -> Option<u64> {
+        self.context_used_tokens.as_ref()?.as_u64()
+    }
 }
 
 pub(crate) const TURN_READER_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub(crate) fn read_session_context(
+    argv: &[String],
+    session: &str,
+    timeout: Duration,
+) -> Result<Option<u64>, String> {
+    #[derive(Deserialize)]
+    struct SessionRead {
+        thread_id: Option<String>,
+        #[serde(default)]
+        context_used_tokens: Option<serde_json::Value>,
+    }
+    let read = || {
+        let (program, args) = argv.split_first().ok_or(ForgeError::Spawn)?;
+        let args: Vec<_> = args.iter().map(String::as_str).collect();
+        let output = run(Path::new(program), &args, timeout, None)?;
+        if !output.status.success() {
+            return Err(ForgeError::Exit(output.status.code()));
+        }
+        let read: SessionRead =
+            serde_json::from_slice(&output.stdout).map_err(|_| ForgeError::Json)?;
+        if read.thread_id.as_deref().is_some_and(|id| id != session) {
+            return Err(ForgeError::Json);
+        }
+        Ok(read
+            .context_used_tokens
+            .as_ref()
+            .and_then(serde_json::Value::as_u64))
+    };
+    read().map_err(|error| fmt::from_fn(|f| error.fmt_program("turn reader", f)).to_string())
+}
 
 pub(crate) fn read_remote_turn(
     argv: &[String],

@@ -28,6 +28,8 @@ pub struct Limits {
 /// `codex_stall_hours` when LIMITS.toml leaves it out.
 pub const CODEX_STALL_HOURS: f64 = 2.0;
 
+pub(crate) const CONTEXT_CAP_TOKENS: u64 = 200_000;
+
 /// Keys a campaign may leave out; each is checked when present.
 const OPTIONAL: [(&str, Shape); 3] = [
     ("codex_stall_hours", Shape::Number),
@@ -82,6 +84,7 @@ impl StallLimits {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct TurnProgram(Vec<String>);
 
 impl TurnProgram {

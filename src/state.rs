@@ -1072,7 +1072,60 @@ pub struct Attempt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) observed_turn: Option<ObservedTurn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) observed_context: Option<ObservedContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended: Option<Ended>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ObservedContext {
+    pub session: String,
+    pub used_tokens: u64,
+    // A later read of the same value keeps this stamp, so an unchanged session rewrites no state.
+    pub read_at: String,
+    // Set by the first sync whose read of the session failed or carried no value; a value with
+    // it set is stale and never refuses a resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_since: Option<String>,
+}
+
+impl ObservedContext {
+    pub(crate) fn over_cap(&self) -> bool {
+        self.used_tokens > crate::limits::CONTEXT_CAP_TOKENS
+    }
+
+    pub(crate) fn fresh(&self) -> bool {
+        self.unread_since.is_none()
+    }
+
+    pub(crate) fn after_read(
+        earlier: Option<&Self>,
+        session: &str,
+        tokens: Option<u64>,
+        at: &str,
+    ) -> Option<Self> {
+        let same = earlier.filter(|earlier| earlier.session == session);
+        match (tokens, same) {
+            (Some(tokens), Some(earlier)) if earlier.used_tokens == tokens && earlier.fresh() => {
+                Some(earlier.clone())
+            }
+            (Some(tokens), _) => Some(Self {
+                session: session.to_owned(),
+                used_tokens: tokens,
+                read_at: at.to_owned(),
+                unread_since: None,
+            }),
+            (None, Some(earlier)) => Some(Self {
+                unread_since: earlier.unread_since.clone().or_else(|| Some(at.to_owned())),
+                ..earlier.clone()
+            }),
+            (None, None) => earlier.cloned(),
+        }
+    }
+
+    pub(crate) fn kilotokens(&self) -> u64 {
+        self.used_tokens.div_ceil(1000)
+    }
 }
 
 /// A status sync observed for the turn identified by the current attempt's records.

@@ -377,7 +377,8 @@ Campaign `.cm/state.json`:
 
 `closed` appears only after `cm close`. Optional `owner_queue_read` records the read stamp and heading identities; only an explicit queue read writes it. Beside it, `.cm/verdicts.json` is the computed-verdict
 ledger (see [Review verdicts](#review-verdicts)), `.cm/lane-drivers.json` the registered lane
-drivers (see [Lane drivers](#lane-drivers)) and `.cm/pulls.json` the open PRs the last
+drivers (see [Lane drivers](#lane-drivers)), `.cm/lane-context.json` their sessions' context
+sizes the last `cm sync` read (see [Context caps](#context-caps)) and `.cm/pulls.json` the open PRs the last
 `cm sync` saw (optional `base`, `ci_head` and `ci_base` remember its base and last completed CI observation); a campaign without them reads as having none. `written` are files cm wrote, `adopted` are files that existed and linted clean at `cm init`.
 `journal.baseline_lines` is where cm's stamped region starts; an adopted journal keeps its old
 headings.
@@ -538,6 +539,48 @@ It returns `done`, `successful`, and `turn_status` as JSON, with optional `compl
 `pr_url`. A PR URL from the reader must match the step’s repository and, when a branch was
 recorded at launch, GitHub must report that branch as the PR head. Sync reports unparseable
 LIMITS.toml, invalid command pairs, and reader failures in `turn_reader_warnings`.
+A Claude Cloud reader also returns the session's context size as an optional
+`context_used_tokens` integer (see [Context caps](#context-caps)).
+
+### Context caps
+
+A Claude Cloud session over the 200k-token context cap is never resumed: its next round starts in
+a fresh session, briefed from the step's handoff, open findings, head and the diff since the last
+reviewed head. cm holds no credential for the sessions API; the operator's
+`claude_cloud_turn_reader` reports the size, and with no reader configured nothing below is read,
+listed or refused.
+
+`cm sync` runs the reader for each live Claude Cloud attempt at `launched` or `pr-open` (one run
+for a launched step's turn read and its context) and records `observed_context` on the attempt:
+the `session` read, its `used_tokens`, the `read_at` of the sync that read that value (a later read
+of the same value leaves it, so a quiet sync rewrites no state) and, once a later read fails or
+carries no value, `unread_since`. A value with `unread_since` is stale until a read delivers one
+again. A missing, negative, fractional or non-integer `context_used_tokens` records nothing,
+leaves the turn read as it was and adds one `turn_reader_warnings` entry per step per sync;
+`completed_at`, `pr_url` and `turn-ended` do not depend on it. A newer `session` (or `thread`)
+recorded on the attempt is a different session: an earlier session's value does not apply to it.
+
+For each registered lane driver, sync also runs the Claude Cloud reader with `{thread}` the
+driver's session and `{turn}` empty, and reads only `context_used_tokens` (and, when present,
+`thread_id`, which must name that session) from its answer, into `.cm/lane-context.json` keyed by
+lane name. A failure keeps the earlier value stale, as for attempts; a removed driver's value goes.
+
+`cm next --act` lists `context-over` (below) for a live attempt or a registered driver whose
+current session's value exceeds 200000 tokens, stale ones included, which say so:
+
+```text
+context-over 01-a/u/cloud: session_worker at 250k > 200k cap (read 2030-01-01T10:05Z); start a fresh session from the step's handoff, open findings, head and the diff since the last reviewed head — `cm attempt 01-a/u/cloud begin session`
+context-over lane:tooling: session_driver at 260k > 200k cap (read 2030-01-01T10:10Z; stale: unread since 2030-01-01T10:20Z); hand off to a fresh driver session from the lane's handoff — `cm lane driver add tooling --session '<fresh-session>' --unit 01-a/u`
+```
+
+Sizes round up to the next thousand tokens. A driver line's target is `lane:<name>`; CARD.md,
+which reads no lane-driver registry, neither lists nor counts it.
+
+`cm attempt` refuses a resume of a session whose value the last sync read (not a stale one) over
+the cap, as `attempt-context-over`, naming the fresh-session commands: `begin turn` while the
+attempt's current session is that one, and `record session <id>` (or `record thread <id>`) that
+names it again. `begin session` is never refused, and nor is `record turn`: by then the turn was
+sent, and its id is what the attempt must keep.
 
 `cm next --act` prints only actionable lines, each starting with `<kind> <step>:`. It lists
 `turn-ended` first, then `review-owed`, then the other kinds by the number of steps waiting
@@ -572,6 +615,7 @@ its own checklist contradicts (an empty `files:` included) as `weight-contradict
 | `unblock-now` | each `unblock now` line `cm next` prints | its `cm unblock <step>` |
 | `expired-watch` | an unresolved watch is past its deadline | `cm watch <step> resolve <id> --evidence …` (or `withdraw <id> --reason …`) |
 | `merge-ready` | a `pr-open` PR whose observed head is the head CI completed green at (`ci_green` in `.cm/pulls.json`: sync re-reads finished CI in full with each full PR read, at least every 30 minutes, and clears the value on a read that finds checks still running or fails, and when the PR itself goes unread), whose `mergeable_state` is `clean`, and whose merge gate has no gaps there (only a script pin, a rollout named `…/pin` or `…/deploy`, needs no review). Before `cm next` lists it, a fresh read of GitHub must find the PR still open at that head, `mergeable_state` clean and CI green there; a failed read or no GitHub drops the line. A blocked step merges none of its parts. Each action carries its `part`. A red check leaves `mergeable_state` unstable or blocked, so a known-red merge never shows here; it stays with `cm advance … merged`. Quiet while `paused = true`, the owner's stop; the Codex quota hold, which holds dispatch only, does not quiet it | `cm advance <step> merged --pr <url> --sha '<merge-sha>'` after the merge |
+| `context-over` | a live Claude Cloud attempt's current session, or a registered lane driver's, read over the 200k-token context cap ([Context caps](#context-caps)) | `cm attempt <step> begin session`, or `cm lane driver add <name> --session '<fresh-session>' --unit …` |
 | `stale-block` | a free-text `blocked:` older than 24 h: lint's `block-stale`, without lint's journal-mention silencer. Reviewer waits (`EVIDENCE-BLOCKED`, `REVIEW_BLOCKED`) are `review_waits` timers, not owed blocks | `cm unblock <step> --evidence …` |
 
 `pr-open-unreviewed` is the old name of `review-owed`, which now also covers a new head after a
@@ -718,6 +762,9 @@ takes the winner's state. An omitted `--coordinator` defaults to trimmed
 `CLAUDE_CODE_REMOTE_SESSION_ID`, with a leading `cse_` mapped to `session_`. When that variable
 is unset or whitespace-only, `claim` still requires `--coordinator` (a usage error without it);
 `cm launch` keeps its `—` fallback. Explicit labels take precedence and are used as given.
+On the Claude Cloud lane, a session `cm sync` read over the context cap is not resumed:
+`begin turn` on it and `record session` naming it again are `attempt-context-over` (see
+[Context caps](#context-caps)).
 
 A step still at `launched` can launch again once its last attempt has `ended` recorded:
 `cm launch <step>` picks the newest `resume*.md` when present (otherwise `kickoff.md`),
