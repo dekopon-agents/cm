@@ -1175,6 +1175,8 @@ pub struct Asked<'a> {
     pub part: Option<&'a str>,
     // The evidence flags the caller gave: a suggested move keeps those its state takes.
     pub given: &'a [Flag],
+    // The merge-gate flags the caller gave, by name and clap id: kept only for a gated merge.
+    pub gate: &'a [(&'static str, &'static str)],
     pub repo: bool,
     pub by: bool,
 }
@@ -1327,6 +1329,14 @@ pub fn advance_state(
         .copied()
         .filter(|flag| !required.contains(flag) && !optional.contains(flag))
         .collect();
+    // `advance_held` takes --head, --ci-verified and --override only for a gated merge.
+    let gated = to == Phase::Merged
+        && !(track.state == Phase::Merged
+            && asked.part.is_none()
+            && Release::of_target(&step).is_some())
+        && !(matches!(track.state, Phase::Blocked(_)) && track.resting() == &to)
+        && declared.is_some_and(|declared| merge_gated(&step, declared));
+    let gate_dropped: &[(&str, &str)] = if gated { &[] } else { asked.gate };
     let carries = |flag: Flag| {
         required.contains(&flag) || (asked.given.contains(&flag) && !dropped.contains(&flag))
     };
@@ -1350,24 +1360,27 @@ pub fn advance_state(
     let tag = Release::of_target(&path)
         .zip(declared)
         .map(|(release, declared)| declared.release_tag(&release));
-    let cause = match dropped.as_slice() {
+    let names: Vec<&str> = dropped
+        .iter()
+        .map(|flag| flag.name())
+        .chain(gate_dropped.iter().map(|(name, _)| *name))
+        .collect();
+    let cause = match names.as_slice() {
         [] => cause,
-        dropped => format!(
+        names => format!(
             "{cause}, which takes no {}, so the move drops it",
-            dropped
-                .iter()
-                .map(|flag| flag.name())
-                .collect::<Vec<_>>()
-                .join(" or ")
+            names.join(" or ")
         ),
     };
     let moves = host
         .argv()
         .and_then(|argv| crate::cli::replaced(&argv, Slot::Positional("state"), &to.to_string()))
         .map(|argv| {
-            dropped.iter().fold(argv, |argv, flag| {
-                crate::cli::without(&argv, flag.name().trim_start_matches('-'))
-            })
+            dropped
+                .iter()
+                .map(|flag| flag.name().trim_start_matches('-'))
+                .chain(gate_dropped.iter().map(|(_, id)| *id))
+                .fold(argv, |argv, id| crate::cli::without(&argv, id))
         })
         .map(outcome::Move::again)
         .map(|again| {

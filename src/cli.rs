@@ -1215,9 +1215,18 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             .into_iter()
             .filter_map(|(flag, given)| given.then_some(flag))
             .collect();
+            let gate: Vec<(&'static str, &'static str)> = [
+                ("--head", "head", head.is_some()),
+                ("--ci-verified", "ci_verified", ci_verified.is_some()),
+                ("--override", "waiver", waiver.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(name, id, given)| given.then_some((name, id)))
+            .collect();
             let asked = commands::Asked {
                 part: part.as_deref(),
                 given: &given,
+                gate: &gate,
                 repo: repo.is_some(),
                 by: !by.is_empty(),
             };

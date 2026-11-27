@@ -42,8 +42,8 @@ pub enum Arg {
 }
 
 // No variant may name a value cm can read itself (a step, unit, item number, claim, head, path,
-// or a PR or tag it recorded): those are written in as `Arg::Lit`. `Pr`, `Tag` and `Digest` are
-// the evidence a caller brings to a state cm has not seen yet.
+// or a PR or tag it recorded or declared): those are written in as `Arg::Lit`. `Pr`, `Tag` and
+// `Digest` are the evidence a caller brings to a state cm has not seen yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Input {
     Title,

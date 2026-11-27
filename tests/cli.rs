@@ -1829,7 +1829,7 @@ fn each_suggested_state_names_the_evidence_its_advance_requires() {
         "<checkout>",
     ];
     let merged: &[&str] = &["merged", "--sha", "<revision>", "--repo", "<checkout>"];
-    let cases: [Case; 11] = [
+    let cases: [Case; 15] = [
         (
             "build",
             Phase::Launched,
@@ -1876,6 +1876,48 @@ fn each_suggested_state_names_the_evidence_its_advance_requires() {
             true,
             &["mergd"],
             merged,
+            &["revision", "checkout"],
+        ),
+        // A merge-gate flag is taken only by a gated merge, so a move to pr-open drops it.
+        (
+            "cx",
+            Phase::Launched,
+            false,
+            &["mergd", "--head", rev],
+            pr_open,
+            &["pr", "revision", "checkout"],
+        ),
+        (
+            "cx",
+            Phase::Launched,
+            false,
+            &["mergd", "--ci-verified", "ev.md"],
+            pr_open,
+            &["pr", "revision", "checkout"],
+        ),
+        (
+            "cx",
+            Phase::Launched,
+            false,
+            &["mergd", "--override", "ev.md"],
+            pr_open,
+            &["pr", "revision", "checkout"],
+        ),
+        // A codex step's merge is gated, so its move keeps the gate flag.
+        (
+            "cx",
+            Phase::PrOpen,
+            true,
+            &["relased", "--head", rev],
+            &[
+                "merged",
+                "--head",
+                rev,
+                "--sha",
+                "<revision>",
+                "--repo",
+                "<checkout>",
+            ],
             &["revision", "checkout"],
         ),
         // A given flag the suggested state takes no is dropped, and the cause says so.
@@ -1947,12 +1989,17 @@ fn each_suggested_state_names_the_evidence_its_advance_requires() {
             report["violations"][0]["rule"], "advance-refused",
             "{typed:?}: {report}"
         );
-        if typed.contains(&"--tag") {
-            let cause = report["violations"][0]["message"].as_str().unwrap();
-            assert!(
-                cause.ends_with("takes no --tag, so the move drops it"),
-                "{cause}"
-            );
+        let cause = report["violations"][0]["message"].as_str().unwrap();
+        for flag in ["--tag", "--head", "--ci-verified", "--override"] {
+            if typed.contains(&flag) && !suggested.contains(&flag) {
+                assert!(
+                    cause.ends_with(&format!("takes no {flag}, so the move drops it")),
+                    "{cause}"
+                );
+            }
+        }
+        if typed.iter().all(|word| !word.starts_with("--")) || suggested.contains(&"--head") {
+            assert!(!cause.contains("takes no"), "{cause}");
         }
         let mut wanted = vec!["cm", "advance", &step];
         wanted.extend(suggested);
