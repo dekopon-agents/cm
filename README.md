@@ -623,8 +623,9 @@ reader configured, sync first takes the context lock, an flock on the `.cm` dire
 it has written what it read, so concurrent syncs read and record context values one at a time,
 each over the one before. A sync that cannot take it within the shared deadline below runs its
 turn reads but no context read, and writes none of the values it would read: each stays as it
-is, and the sync warns `context not read: …`. A restart, or a newer turn or session recorded
-between a sync's read and its write, leaves that read unapplied.
+is, and the sync warns `context not read: …`. A restart, a newer turn or session recorded, or a
+newer session registered for a lane driver, between a sync's read and its write, leaves that read
+unapplied.
 The reads this adds (an attempt at `pr-open` or with no turn, and each lane driver) share one
 deadline, 15 s from when sync starts waiting for the context lock, which the wait and the
 launched steps' own turn reads also spend. A read the deadline cuts warns `turn reader did not
@@ -632,7 +633,10 @@ answer by this sync's shared 15s reader deadline`, one it leaves no time for is 
 `turn reader not run: …`, and both leave the value stale, so a hung reader costs a sync one 15 s
 timeout, not one per read. The reads must fit in those 15 s together: with two in a sync, such
 as one launched step's turn read and a lane driver's, a reader slower than 7.5 s a call leaves
-the second too little time on every sync, and its value stays stale.
+the second too little time on every sync, and its value stays stale. Set
+`claude_cloud_context_deadline_secs` in LIMITS.toml, a whole number of seconds from 1 to 86400,
+to give the deadline another length, which its warnings then name; any other value warns in
+`turn_reader_warnings` and the deadline stays 15 s.
 
 `cm next --act` lists `context-over` (below) for a live attempt or a registered driver whose
 current session's value exceeds 200000 tokens, stale ones included, which say so:

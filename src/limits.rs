@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use toml::{Table, Value};
 
+use crate::forge::TURN_READER_TIMEOUT;
 use crate::outcome::Violation;
 use crate::state::Lane;
 
@@ -179,7 +181,30 @@ const TURN_READER_LANES: [Lane; 2] = [Lane::Codex, Lane::ClaudeCloud];
 
 type TurnSetup = Result<Option<TurnPair>, Vec<String>>;
 
-pub(crate) struct TurnCommands(Result<[TurnSetup; TURN_READER_LANES.len()], String>);
+const CONTEXT_DEADLINE_KEY: &str = "claude_cloud_context_deadline_secs";
+const CONTEXT_DEADLINE_MAX_SECS: u64 = 86_400;
+
+fn context_deadline(table: &Table) -> Result<Duration, String> {
+    let Some(value) = table.get(CONTEXT_DEADLINE_KEY) else {
+        return Ok(TURN_READER_TIMEOUT);
+    };
+    value
+        .as_integer()
+        .and_then(|secs| u64::try_from(secs).ok())
+        .filter(|secs| (1..=CONTEXT_DEADLINE_MAX_SECS).contains(secs))
+        .map(Duration::from_secs)
+        .ok_or_else(|| {
+            format!(
+                "LIMITS.toml `{CONTEXT_DEADLINE_KEY}` must be a whole number of seconds from 1 to {CONTEXT_DEADLINE_MAX_SECS}; the deadline stays {}s",
+                TURN_READER_TIMEOUT.as_secs()
+            )
+        })
+}
+
+pub(crate) struct TurnCommands {
+    lanes: Result<[TurnSetup; TURN_READER_LANES.len()], String>,
+    context_deadline: Result<Duration, String>,
+}
 
 impl TurnCommands {
     pub(crate) fn read(root: &Path) -> Self {
@@ -190,22 +215,40 @@ impl TurnCommands {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Table::new()),
             Err(error) => Err(format!("cannot read LIMITS.toml: {error}")),
         };
-        Self(table.map(|table| TURN_READER_LANES.map(|lane| TurnPair::read(&table, lane))))
+        Self {
+            context_deadline: table
+                .as_ref()
+                .map_or(Ok(TURN_READER_TIMEOUT), context_deadline),
+            lanes: table.map(|table| TURN_READER_LANES.map(|lane| TurnPair::read(&table, lane))),
+        }
     }
 
     pub(crate) fn for_lane(&self, lane: Lane) -> Option<&TurnPair> {
         let index = TURN_READER_LANES.iter().position(|known| *known == lane)?;
-        self.0.as_ref().ok()?[index].as_ref().ok()?.as_ref()
+        self.lanes.as_ref().ok()?[index].as_ref().ok()?.as_ref()
+    }
+
+    // The shared deadline of a sync's context reads and its context lock wait.
+    pub(crate) fn context_deadline(&self) -> Duration {
+        *self
+            .context_deadline
+            .as_ref()
+            .unwrap_or(&TURN_READER_TIMEOUT)
     }
 
     pub(crate) fn errors(&self) -> impl Iterator<Item = &String> {
-        self.0.as_ref().err().into_iter().chain(
-            self.0
-                .iter()
-                .flatten()
-                .filter_map(|configured| configured.as_ref().err())
-                .flatten(),
-        )
+        self.lanes
+            .as_ref()
+            .err()
+            .into_iter()
+            .chain(
+                self.lanes
+                    .iter()
+                    .flatten()
+                    .filter_map(|configured| configured.as_ref().err())
+                    .flatten(),
+            )
+            .chain(self.context_deadline.as_ref().err())
     }
 }
 

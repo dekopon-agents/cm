@@ -179,6 +179,15 @@ esac
         .unwrap();
     }
 
+    fn context_deadline(&self, secs: &str) {
+        let original = fs::read_to_string(self.limits()).unwrap();
+        fs::write(
+            self.limits(),
+            format!("{original}claude_cloud_context_deadline_secs = {secs}\n"),
+        )
+        .unwrap();
+    }
+
     fn remove_reader(&self) {
         let kept: String = fs::read_to_string(self.limits())
             .unwrap()
@@ -752,19 +761,40 @@ mod interleaved {
 
     use super::*;
 
+    // No sync here can reach its context deadline, so only the locks order them.
+    fn scratch() -> Scratch {
+        let s = Scratch::new();
+        s.context_deadline("86400");
+        s.add_driver(DRIVER);
+        s
+    }
+
     fn until(mut done: impl FnMut() -> bool) {
         while !done() {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
 
-    fn waiters(path: &Path) -> usize {
+    fn flocks(path: &Path, waiting: bool) -> usize {
         let inode = format!(":{} ", fs::metadata(path).unwrap().ino());
         fs::read_to_string("/proc/locks")
             .unwrap()
             .lines()
-            .filter(|line| line.contains("-> FLOCK ") && line.contains(&inode))
+            .filter(|line| {
+                line.contains("FLOCK ") && line.contains(" -> ") == waiting && line.contains(&inode)
+            })
             .count()
+    }
+
+    fn waiters(path: &Path) -> usize {
+        flocks(path, true)
+    }
+
+    // Each poll below finds its lock in /proc/locks by inode, so first see a held one there.
+    fn hold_campaign(s: &Scratch) -> cm::store::Lock {
+        let campaign = cm::store::lock(&s.c.root).unwrap();
+        assert_eq!(flocks(&s.c.root.join(".cm/lock"), false), 1, "/proc/locks");
+        campaign
     }
 
     // After its reads a sync waits on `.cm/lock`, still holding the context lock, for as long as
@@ -774,6 +804,11 @@ mod interleaved {
         assert!(
             !finished(),
             "the older sync finished while .cm/lock was held"
+        );
+        assert_eq!(
+            flocks(&s.c.root.join(".cm"), false),
+            1,
+            "the older sync holds the context lock while it waits"
         );
     }
 
@@ -789,7 +824,7 @@ mod interleaved {
 
     fn interleaved(s: &Scratch, older: &Fake, newer: &Fake, between: impl FnOnce()) {
         std::thread::scope(|scope| {
-            let campaign = cm::store::lock(&s.c.root).unwrap();
+            let campaign = hold_campaign(s);
             let first = scope.spawn(|| s.serial_sync(older));
             older_waits(s, || first.is_finished());
             between();
@@ -803,8 +838,7 @@ mod interleaved {
 
     #[test]
     fn an_older_sync_never_overwrites_a_newer_syncs_value() {
-        let s = Scratch::new();
-        s.add_driver(DRIVER);
+        let s = scratch();
         s.reports("150000");
         interleaved(&s, &at(5), &at(6), || s.reports("250000"));
         assert_eq!(
@@ -824,8 +858,7 @@ mod interleaved {
 
     #[test]
     fn an_older_failed_read_never_stales_a_newer_read_that_left_the_value_as_it_was() {
-        let s = Scratch::new();
-        s.add_driver(DRIVER);
+        let s = scratch();
         s.reports("250000");
         s.sync(&at(5));
         s.fails();
@@ -841,8 +874,7 @@ mod interleaved {
 
     #[test]
     fn an_older_read_never_clears_a_newer_failed_reads_staleness() {
-        let s = Scratch::new();
-        s.add_driver(DRIVER);
+        let s = scratch();
         s.reports("250000");
         s.sync(&at(5));
         s.fails();
@@ -858,8 +890,7 @@ mod interleaved {
 
     #[test]
     fn two_cm_sync_processes_record_their_reads_in_order() {
-        let s = Scratch::new();
-        s.add_driver(DRIVER);
+        let s = scratch();
         s.reports("250000");
         s.sync(&at(5));
         s.fails();
@@ -870,7 +901,7 @@ mod interleaved {
                 .spawn()
                 .unwrap()
         };
-        let campaign = cm::store::lock(&s.c.root).unwrap();
+        let campaign = hold_campaign(&s);
         let mut older = sync();
         older_waits(&s, || older.try_wait().unwrap().is_some());
         s.reports("251000");
@@ -1103,6 +1134,53 @@ fn a_sync_that_cannot_take_the_context_lock_in_time_leaves_each_value_as_it_is()
         rules(&s.try_act(&at(7), begin("turn"))),
         ["attempt-context-over"]
     );
+}
+
+#[test]
+fn a_context_deadline_set_in_limits_bounds_the_lock_wait_and_any_other_value_warns() {
+    let lost = |secs: u64| {
+        format!(
+            "01-a/u/cloud: context not read: another cm sync held the context lock past this sync's shared {secs}s reader deadline"
+        )
+    };
+    let invalid = "LIMITS.toml `claude_cloud_context_deadline_secs` must be a whole number of seconds from 1 to 86400; the deadline stays 15s";
+    for (value, warnings) in [("1", json!([lost(1)])), ("0", json!([invalid, lost(15)]))] {
+        let s = Scratch::new();
+        s.reports("150000");
+        s.context_deadline(value);
+        let held = fs::File::open(s.c.root.join(".cm")).unwrap();
+        rustix::fs::flock(&held, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let synced = s.serial_sync(&at(5));
+        assert_eq!(synced.fields["turn_reader_warnings"], warnings, "{value}");
+    }
+    let s = Scratch::session_only("exit 1");
+    s.reports("150000");
+    s.context_deadline("1");
+    fs::write(s.file("hang"), "").unwrap();
+    let synced = s.serial_sync(&at(5));
+    let cut = "01-a/u/cloud: turn reader did not answer by this sync's shared 1s reader deadline";
+    let not_run = "01-a/u/cloud: turn reader not run: this sync's reader runs passed their shared 1s deadline";
+    assert!(
+        [json!([cut]), json!([not_run])].contains(&synced.fields["turn_reader_warnings"]),
+        "{:?}",
+        synced.fields["turn_reader_warnings"]
+    );
+    for value in ["86401", "-1", "1.5", "\"15\""] {
+        let s = Scratch::new();
+        s.reports("150000");
+        s.context_deadline(value);
+        let synced = s.serial_sync(&at(5));
+        assert_eq!(
+            synced.fields["turn_reader_warnings"],
+            json!([invalid]),
+            "{value}"
+        );
+        assert_eq!(
+            s.attempt()["observed_context"]["used_tokens"],
+            150000,
+            "{value}"
+        );
+    }
 }
 
 #[test]
@@ -1367,6 +1445,33 @@ fn a_newer_record_between_a_syncs_read_and_its_write_leaves_that_read_unapplied(
             "{case}: the next sync reads it"
         );
     }
+}
+
+#[test]
+fn a_driver_session_registered_between_a_syncs_read_and_its_write_leaves_that_read_unapplied() {
+    let s = Scratch::new();
+    s.add_driver(DRIVER);
+    s.reports("150000");
+    s.sync(&at(5));
+    s.reports("165000");
+    s.runs();
+    let forge = Between {
+        gh: s.forge(),
+        between: std::cell::Cell::new(Some(Box::new(|| s.add_driver("session_second")))),
+    };
+    let synced = cm::sync::sync(&at(6), &forge, &s.c.root).unwrap();
+    assert!(synced.ok(), "{:?}", synced.violations);
+    assert_eq!(s.runs(), ["session_worker/turn-1", "session_driver/"]);
+    assert_eq!(
+        s.lane_context(),
+        json!({"tooling": {"session": DRIVER, "used_tokens": 150000, "read_at": "2030-01-01T10:05Z"}})
+    );
+    s.sync(&at(7));
+    assert_eq!(
+        s.lane_context(),
+        json!({"tooling": {"session": "session_second", "used_tokens": 165000, "read_at": "2030-01-01T10:07Z"}}),
+        "the next sync reads it"
+    );
 }
 
 #[test]

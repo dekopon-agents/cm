@@ -252,9 +252,22 @@ struct Run<'a> {
     turn_commands: TurnCommands,
     turn_warnings: Vec<String>,
     lane_contexts: BTreeMap<String, ObservedContext>,
-    // None when another sync held the context lock past the deadline: no context read runs, and
-    // no value it would read is written.
-    reader_deadline: Option<Instant>,
+    reader_deadline: ReaderDeadline,
+}
+
+#[derive(Clone, Copy)]
+struct ReaderDeadline {
+    // None when another sync held the context lock past it: no context read runs, and no value
+    // it would read is written.
+    at: Option<Instant>,
+    length: Duration,
+}
+
+impl ReaderDeadline {
+    const UNSET: Self = Self {
+        at: None,
+        length: TURN_READER_TIMEOUT,
+    };
 }
 
 struct Tracked {
@@ -295,7 +308,7 @@ impl<'a> Run<'a> {
         now: jiff::Timestamp,
         units: Units,
         owner_unread: Vec<String>,
-        reader_deadline: Option<Instant>,
+        reader_deadline: ReaderDeadline,
     ) -> Self {
         let turn_commands = TurnCommands::read(root);
         let turn_warnings = turn_commands.errors().cloned().collect();
@@ -993,10 +1006,11 @@ impl<'a> Run<'a> {
         attempt: &Attempt,
         reader: &TurnProgram,
     ) -> Sample {
-        let Some(deadline) = self.reader_deadline else {
+        let ReaderDeadline { at, length } = self.reader_deadline;
+        let Some(deadline) = at else {
             if last_recorded_session(attempt).is_some() {
                 self.turn_warnings
-                    .push(format!("{target}: {}", context_lock_held()));
+                    .push(format!("{target}: {}", context_lock_held(length)));
             }
             return Sample::Pending;
         };
@@ -1015,7 +1029,7 @@ impl<'a> Run<'a> {
                 |reads| &mut reads.turns,
                 key,
                 move |_| {
-                    within(deadline, |timeout| {
+                    within(deadline, length, |timeout| {
                         read_remote_turn(&argv, &thread, &turn_id, timeout)
                     })
                 },
@@ -1034,7 +1048,7 @@ impl<'a> Run<'a> {
                 |reads| &mut reads.sessions,
                 key,
                 move |_| {
-                    within(deadline, |timeout| {
+                    within(deadline, length, |timeout| {
                         read_session_context(&argv, &wanted, timeout)
                     })
                 },
@@ -1082,7 +1096,8 @@ impl<'a> Run<'a> {
             .retain(|lane, _| drivers.drivers.contains_key(lane));
         for (lane, driver) in drivers.drivers {
             let session = session_label(&driver.session);
-            let read = match self.reader_deadline {
+            let ReaderDeadline { at, length } = self.reader_deadline;
+            let read = match at {
                 Some(deadline) => {
                     let argv = reader.argv(&session, "");
                     let key = (format!("lane:{lane}"), session.clone(), argv.clone());
@@ -1092,7 +1107,7 @@ impl<'a> Run<'a> {
                         |reads| &mut reads.sessions,
                         key,
                         move |_| {
-                            within(deadline, |timeout| {
+                            within(deadline, length, |timeout| {
                                 read_session_context(&argv, &wanted, timeout)
                             })
                         },
@@ -1104,7 +1119,7 @@ impl<'a> Run<'a> {
                 }
                 None => {
                     self.turn_warnings
-                        .push(format!("lane {lane}: {}", context_lock_held()));
+                        .push(format!("lane {lane}: {}", context_lock_held(length)));
                     continue;
                 }
             };
@@ -1728,10 +1743,10 @@ fn missing_context(subject: &str, session: &str) -> String {
     )
 }
 
-fn context_lock_held() -> String {
+fn context_lock_held(length: Duration) -> String {
     format!(
         "context not read: another cm sync held the context lock past this sync's shared {}s reader deadline",
-        TURN_READER_TIMEOUT.as_secs()
+        length.as_secs()
     )
 }
 
@@ -1740,9 +1755,10 @@ fn context_lock_held() -> String {
 // reader timeouts.
 fn within<T>(
     deadline: Instant,
+    length: Duration,
     read: impl FnOnce(Duration) -> Result<T, ForgeError>,
 ) -> Result<T, String> {
-    let shared = TURN_READER_TIMEOUT.as_secs();
+    let shared = length.as_secs();
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
         return Err(format!(
@@ -1839,7 +1855,7 @@ fn prefetch(
             now,
             units.clone(),
             owner_unread.to_vec(),
-            None,
+            ReaderDeadline::UNSET,
         );
         plan.walk();
         reads = std::mem::take(&mut plan.reads);
@@ -1941,9 +1957,10 @@ fn run_sync(
         now,
         units,
         owner_unread,
-        None,
+        ReaderDeadline::UNSET,
     );
-    let deadline = Instant::now() + TURN_READER_TIMEOUT;
+    let length = read.turn_commands.context_deadline();
+    let deadline = Instant::now() + length;
     // Held from before the first reader run until this sync has written what it read, so syncs
     // read and record context values one at a time, in order. Taken on the read walk's own
     // configuration, so no context read runs without it.
@@ -1952,7 +1969,10 @@ fn run_sync(
     } else {
         None
     };
-    let reader_deadline = (!matches!(context, Some(None))).then_some(deadline);
+    let reader_deadline = ReaderDeadline {
+        at: (!matches!(context, Some(None))).then_some(deadline),
+        length,
+    };
     read.reader_deadline = reader_deadline;
     read.walk();
     // Sampled after the reads, so `used` counts this sync's own.
