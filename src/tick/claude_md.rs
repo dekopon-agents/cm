@@ -63,7 +63,9 @@ fn begins_with_boot_time(file: impl Read) -> bool {
 // Renamed over from a staged file, so a failed write leaves the boot-time rules for the next
 // tick to replace. heartbeat.sh's `printf >` wrote in place, which kept the file's owner, group
 // and other links: a file whose owner or group is not this process's, one with another link, or
-// one the staged write fails for (a full disk) is written in place, never cut short first.
+// one the staged write fails for (a full disk) is written in place, never cut short first. It is
+// replaced at all only when this process may write the file itself, as `printf >` needed: the
+// file's own access decides, not its folder's.
 fn import(path: &Path) -> std::io::Result<()> {
     import_by(path, staged)
 }
@@ -73,6 +75,12 @@ fn import_by(
     stage: impl FnOnce(&Path, &str, Permissions) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let path = std::fs::canonicalize(path)?;
+    rustix::fs::accessat(
+        rustix::fs::CWD,
+        &path,
+        rustix::fs::Access::WRITE_OK,
+        rustix::fs::AtFlags::EACCESS,
+    )?;
     let text = format!("{IMPORT}\n");
     let meta = std::fs::metadata(&path)?;
     if meta.uid() != rustix::process::geteuid().as_raw()
@@ -315,6 +323,49 @@ mod tests {
     }
 
     #[test]
+    fn a_boot_time_claude_md_is_replaced_only_when_this_process_may_write_the_file_itself() {
+        let home = own_dir();
+        let claude = home.path().join(".claude");
+        fs::create_dir(&claude).unwrap();
+        let path = claude.join("CLAUDE.md");
+        let old = format!("{BOOT_TIME}\nold rules\n");
+        fs::write(&path, &old).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        let may_write = rustix::fs::accessat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::Access::WRITE_OK,
+            rustix::fs::AtFlags::EACCESS,
+        )
+        .is_ok();
+        let report = tick(Some(home.path()));
+        if may_write {
+            assert_eq!(
+                report.lines,
+                ["rules: now imported from tools/cloud-env/COORDINATOR.md; read it"]
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), format!("{IMPORT}\n"));
+        } else {
+            assert_eq!(
+                report.lines,
+                [format!(
+                    "heartbeat: could not write the COORDINATOR.md import to {}",
+                    path.display()
+                )]
+            );
+            assert!(report.failed);
+            assert_eq!(fs::read_to_string(&path).unwrap(), old);
+        }
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o444);
+        let left: Vec<_> = fs::read_dir(&claude)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["CLAUDE.md"]);
+    }
+
+    #[test]
     fn a_claude_folder_that_refuses_a_staged_file_still_gets_the_import() {
         let home = own_dir();
         let claude = home.path().join(".claude");
@@ -348,7 +399,17 @@ mod tests {
 
     type Shape = (&'static str, bool, fn(u64) -> Box<dyn Read>);
 
-    const FILES: [Shape; 5] = [
+    const FILES: [Shape; 6] = [
+        (
+            "the boot-time line with a NUL in it, then the rest",
+            false,
+            |size| {
+                Box::new(
+                    std::io::Cursor::new(format!("{BOOT_TIME}\0\n"))
+                        .chain(std::io::repeat(b'x').take(size)),
+                )
+            },
+        ),
         ("one line with no line end", false, |size| {
             Box::new(std::io::repeat(b'x').take(size))
         }),

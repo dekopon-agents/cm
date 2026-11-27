@@ -3263,9 +3263,9 @@ fn the_built_cm_tick_leaves_a_bare_cm_to_the_default_search_path_when_path_is_un
     // With PATH unset the tick's git is the system one, which reads only this repository, so the
     // tick is bound and reaches the act loop. Only the fake handoff-pick.sh logs: once for
     // `--check-bound`, and three times a tick, at the frame's check, at gitsync's `still_bound`
-    // after its pull, and at the frame's re-check. What the real gitsync prints there depends on
-    // the system git's identity, which this environment does not set, so its lines and the
-    // frame's wall-time lines are left out.
+    // after its pull, and at the frame's re-check. Whether the real gitsync's commit fails there
+    // depends on the system git's identity, which this environment does not set, so gitsync's
+    // own two lines, that failure and its wall-time line, are left out, and nothing else.
     let git_dir = main_repository(&harness.ct.path().join("git"));
     script(
         &harness.ct.path().join(beat::HANDOFF_PICK),
@@ -3292,7 +3292,10 @@ fn the_built_cm_tick_leaves_a_bare_cm_to_the_default_search_path_when_path_is_un
             .unwrap()
             .iter()
             .map(|line| line.as_str().unwrap())
-            .filter(|line| !(line.starts_with("heartbeat: git ") || line.starts_with("tick: ")))
+            .filter(|line| {
+                *line != "heartbeat: git commit of the tree's changes failed; commit them by hand"
+                    && !line.starts_with("tick: gitsync phase took ")
+            })
             .collect();
         let could_not_run = format!("heartbeat: cm --json next --act could not run: {cm}: ");
         if ran {
@@ -4714,29 +4717,36 @@ fn the_built_cm_tick_binds_a_stale_head_at_any_age() {
 #[test]
 fn the_built_cm_tick_counts_a_failed_fetch_as_bound() {
     let origin = Origin::new();
-    origin.git(
-        &origin.ct(),
-        &["remote", "set-url", "origin", "../no-such-origin.git"],
+    // Only the check's `git fetch` fails: gitsync's pull fetches through git's own exec path,
+    // not PATH, so it pulls and pushes with no retry, and stdout is exactly the act lines.
+    let bin = origin.path("fetch-fails");
+    script(
+        &bin.join("git"),
+        "[ \"$1\" = fetch ] && exit 1\nexec /usr/bin/git \"$@\"\n",
     );
-    // The real gitsync's pull fails on the missing origin as the fetch did, so its line comes
-    // first; the frame's wall-time line for it is left out.
-    let output = origin.tick(Some("cse_01abc"), &[]);
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert!(output.stderr.is_empty(), "{output:?}");
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let lines: Vec<&str> = stdout
-        .lines()
-        .filter(|line| !line.starts_with("tick: "))
-        .collect();
-    assert_eq!(
-        lines,
-        [
-            &["heartbeat: git pull --rebase and push to main failed 3 times; main does not have this checkout's commits"][..],
-            &PRINTED[..],
-        ]
-        .concat()
-    );
-    assert_eq!(origin.check_bound(Some("cse_01abc")), Some(0));
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    for check in [false, true] {
+        let mut command = origin.command(env!("CARGO_BIN_EXE_cm"));
+        command
+            .env("PATH", &path)
+            .env("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_01abc")
+            .args(["tick", "--cm"])
+            .arg(origin.cm())
+            .arg("--checkout")
+            .arg(origin.ct());
+        if check {
+            command.arg("--check-bound");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let printed = if check {
+            String::new()
+        } else {
+            format!("{}\n", PRINTED.join("\n"))
+        };
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), printed);
+    }
 }
 
 #[test]

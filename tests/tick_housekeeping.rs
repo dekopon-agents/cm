@@ -644,6 +644,55 @@ fn a_pull_that_retires_the_session_costs_three_handoff_picks_and_the_tick_says_n
     assert!(!scratch.path().join("cm.log").exists());
 }
 
+// The check's second pick (gitsync's, after the pull) first pushes a successor's handoff to
+// origin, and its fourth (the frame's re-check) first moves origin away, so that re-check's fetch
+// fails and counts as bound: the tick goes on to its act loop where heartbeat.sh, retired by the
+// check after the pull, stopped. The IfDirty sync after executors meets the same rule.
+#[test]
+fn a_re_check_whose_fetch_fails_counts_bound_after_a_check_that_retired_the_session() {
+    let scratch = Scratch::new();
+    let ct = scratch.ct();
+    let next = "coordinator-2026-11-26T0100Z.md";
+    write(
+        &scratch.path().join("successor.md"),
+        &handoff_by("session_01xyz", "none", &format!(" supersedes={OURS}")),
+    );
+    write(&scratch.path().join("picks"), "0\n");
+    script(
+        &scratch.path().join("successor.sh"),
+        &format!(
+            "cd \"$TICK_FIXTURE/other\" && git pull -q --rebase origin main && cp \"$TICK_FIXTURE/successor.md\" {EPOCH}/handoff/{next} && git add -A && git commit -qm successor && git push -q origin main\n"
+        ),
+    );
+    write(
+        &ct.join("tools/cloud-env/handoff-pick.sh"),
+        &format!(
+            "n=$(($(cat \"$TICK_FIXTURE/picks\") + 1))\necho \"$n\" > \"$TICK_FIXTURE/picks\"\ncase $n in\n  2) \"$TICK_FIXTURE/successor.sh\" >/dev/null 2>&1 ;;\n  4) mv \"$TICK_FIXTURE/origin.git\" \"$TICK_FIXTURE/origin.gone\" ;;\nesac\n{HANDOFF_PICK}"
+        ),
+    );
+    script(
+        &scratch.path().join("bin/cm"),
+        "echo \"cm $*\" >> \"$TICK_FIXTURE/cm.log\"\necho '{\"actionable\": []}'\n",
+    );
+    write(&ct.join(EPOCH).join("CARD.md"), "card, synced\n");
+    assert_eq!(scratch.tick_with_logging_cm(), Vec::<String>::new());
+    assert_eq!(scratch.picks(), "4\n");
+    assert_eq!(
+        fs::read_to_string(scratch.path().join("cm.log")).unwrap(),
+        format!("cm --json next -C {EPOCH} --act\n"),
+        "the act loop ran"
+    );
+    let origin = scratch.git(
+        &scratch.path().join("origin.gone"),
+        &["log", "--format=%s", "main"],
+    );
+    assert_eq!(origin, "successor\nstart\n", "nothing of ours was pushed");
+    assert_eq!(
+        scratch.git(&ct, &["log", "--format=%s", "-1"]),
+        "chore(mnemosyne): heartbeat sync\n"
+    );
+}
+
 const RELEASED: &str = "cp \"$TICK_FIXTURE/release.tar.gz\" \"$3\"";
 
 struct Pinned {
@@ -836,6 +885,31 @@ fn the_pinned_cm_is_fetched_into_a_fresh_folder_under_tmpdir_that_is_then_remove
             .starts_with("cm-pin-")
     );
     assert!(!folder.exists());
+}
+
+#[test]
+fn a_tmpdir_that_does_not_exist_refuses_the_pin_and_keeps_the_running_cm() {
+    let pinned = Pinned::released();
+    let root = pinned.scratch.path();
+    let env: Env = [
+        ("HOME", root.join("home")),
+        ("TMPDIR", root.join("nowhere")),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
+    .collect();
+    let proc = pinned.scratch.proc();
+    let ct = pinned.scratch.ct();
+    let ctx = Ctx::new(
+        &ct,
+        Path::new(EPOCH),
+        &proc,
+        &env,
+        pinned.cm.as_os_str(),
+        MAX_BUDGET,
+    );
+    pinned.left_alone(pin::run(&ctx));
+    assert!(!root.join("nowhere").exists());
 }
 
 #[test]

@@ -880,6 +880,57 @@ mod tests {
     }
 
     #[test]
+    fn a_pickup_marker_without_its_em_dash_picks_nothing_up() {
+        for marker in [
+            "Directive picked up: ",
+            "- Directive picked up: ",
+            "-- Directive picked up: ",
+            "— Directive picked up:",
+        ] {
+            let text = below_stamp(format!(
+                "## 1 — Owner directive: a\n{marker}1 — Owner directive: a\n"
+            ));
+            assert_eq!(
+                listed(&text, STAMP),
+                Some(vec!["owner-directive: 1 — Owner directive: a".to_owned()]),
+                "{marker:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stamp_is_matched_as_written_not_as_a_pattern() {
+        let text = "## 2026-11-19T17:38Z — s\n## 1 — Owner directive: x\n## aaa — t\n## 1 — Owner directive: y\n## a[b — u\n## 1 — Owner directive: z\n## a\\b — v\n## 1 — Owner directive: w\n";
+        assert_eq!(listed(text, "2026-11-19T17.38Z"), None);
+        assert_eq!(listed(text, "a*"), None);
+        assert_eq!(
+            listed(text, "a[b"),
+            Some(vec![
+                "owner-directive: 1 — Owner directive: z".to_owned(),
+                "owner-directive: 1 — Owner directive: w".to_owned()
+            ])
+        );
+        assert_eq!(
+            listed(text, "a\\b"),
+            Some(vec!["owner-directive: 1 — Owner directive: w".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_nul_in_the_journal_or_a_handoff_is_a_byte_like_any_other() {
+        let text = format!("## {STAMP} — s\0\n## 1 — Owner directive: a\0b\n");
+        assert_eq!(
+            listed(&text, STAMP),
+            Some(vec![
+                "owner-directive: 1 — Owner directive: a\0b".to_owned()
+            ])
+        );
+        let mut found = HashSet::new();
+        stamps_in(&b"Handoff: x\0y stamp_entry=S\0T\n"[..], &mut found).unwrap();
+        assert_eq!(sorted(found), [b"S\0T".to_vec()]);
+    }
+
+    #[test]
     fn a_hash_match_counts_only_when_the_bytes_agree_and_every_heading_with_that_hash_is_tried() {
         let one = "1 — Owner directive: ";
         for (base, first, second) in [(1, "ab", "ba"), (0, "xa", "ya")] {

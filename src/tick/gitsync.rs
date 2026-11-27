@@ -111,12 +111,15 @@ fn output(ctx: &Ctx, args: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::ffi::OsStr;
     use std::path::Path;
-    use std::time::Duration;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::tick::act::Env;
+    use crate::tick::act::{Env, Ticking};
+    use crate::tick::beat::FRAME_CAP;
     use crate::tick::proc::{FakeProc, KILL_AFTER, Ran};
 
     const PULL: &str = "git pull -q --rebase --autostash origin main";
@@ -366,6 +369,65 @@ mod tests {
                 .map(|cmd| cmd.timeout + KILL_AFTER)
                 .sum::<Duration>();
         assert_eq!(past, Duration::from_secs(40));
+    }
+
+    // On a clock that moves only by what each child takes, the worst README names: each try's
+    // pull succeeds and its check's fetch hangs to its cap and grace, time that is not the
+    // phase's; the last pull takes the whole budget, its push is cut and its abort hangs.
+    #[test]
+    fn gitsync_ends_at_most_40_s_past_its_budget_and_the_time_of_its_three_checks() {
+        let clock = Rc::new(Cell::new(Instant::now()));
+        let (pulls, checks) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let proc = FakeProc::new({
+            let (clock, pulls, checks) = (clock.clone(), pulls.clone(), checks.clone());
+            move |cmd| {
+                let line = cmd.line();
+                let last = pulls.get() == TRIES;
+                let hang = |ran: Ran| {
+                    clock.set(clock.get() + cmd.timeout + KILL_AFTER);
+                    Ok(ran)
+                };
+                if line == "git rev-parse --abbrev-ref HEAD" {
+                    Ok(Ran::code(0, "main\n"))
+                } else if line.contains("handoff-pick.sh") {
+                    Ok(Ran::code(0, CLEAN.pick))
+                } else if line.starts_with("git fetch ") {
+                    checks.set(checks.get() + 1);
+                    hang(Ran::timed_out())
+                } else if line == PULL {
+                    pulls.set(pulls.get() + 1);
+                    if pulls.get() == TRIES {
+                        clock.set(clock.get() + cmd.timeout - Duration::from_millis(1));
+                    }
+                    Ok(Ran::code(0, ""))
+                } else if line == PUSH && !last {
+                    Ok(Ran::code(1, ""))
+                } else if line == PUSH || (line == ABORT && last) {
+                    hang(Ran::timed_out())
+                } else {
+                    Ok(Ran::code(0, ""))
+                }
+            }
+        });
+        let (env, ticking) = (session(), Ticking(clock.clone()));
+        let ctx = Ctx::new(
+            Path::new("."),
+            Path::new("store/epochs/eleemosynary-mnemosyne"),
+            &proc,
+            &env,
+            OsStr::new("cm"),
+            Duration::ZERO,
+        )
+        .clocked(&ticking, BUDGET);
+        let start = clock.get();
+        assert!(sync(&ctx, Mode::Always).failed);
+        let check = FRAME_CAP + KILL_AFTER;
+        assert_eq!(checks.get(), TRIES);
+        assert_eq!(ctx.checking(), check * TRIES);
+        assert_eq!(
+            clock.get() - start,
+            BUDGET + Duration::from_secs(40) + check * TRIES
+        );
     }
 
     #[test]
