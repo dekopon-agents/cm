@@ -1115,8 +1115,6 @@ impl ObservedContext {
         earlier.map(|earlier| earlier.staled(at))
     }
 
-    // What a sync records after reading `session`: an earlier session's value is not this
-    // sync's read, so it goes.
     pub(crate) fn after_read(
         earlier: Option<&Self>,
         session: &str,

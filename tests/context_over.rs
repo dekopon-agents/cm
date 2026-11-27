@@ -95,6 +95,7 @@ impl Scratch {
 dir='{dir}'
 echo "$1/$2" >> "$dir/runs"
 [ -f "$dir/hang" ] && exec sleep 30
+[ -f "$dir/hang-$1" ] && exec sleep 30
 [ -f "$dir/fail" ] && exit 9
 [ -f "$dir/fail-$1" ] && exit 9
 tokens=$(cat "$dir/tokens")
@@ -273,15 +274,19 @@ esac
     }
 
     fn cm_as(&self, viewer: &str, args: &[&str]) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_cm"))
+        self.command(viewer, args).output().unwrap()
+    }
+
+    fn command(&self, viewer: &str, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cm"));
+        command
             .arg("-C")
             .arg(&self.c.root)
             .args(args)
             .env("CLAUDE_CODE_REMOTE_SESSION_ID", viewer)
             .env_remove("CM_CODEX_WEEKLY_PCT")
-            .env("PATH", self.gh.path())
-            .output()
-            .unwrap()
+            .env("PATH", self.gh.path());
+        command
     }
 
     fn act_lines(&self) -> Vec<String> {
@@ -338,6 +343,21 @@ fn launch(host: &Fake, c: &Campaign, step: &str) -> String {
         .as_str()
         .unwrap()
         .to_owned()
+}
+
+fn launch_with(s: &Scratch, step: &str, acts: impl IntoIterator<Item = Act>) {
+    let claim = launch(&at(0), &s.c, step);
+    for act in acts {
+        let outcome = cm::attempt::attempt(
+            &at(0),
+            &s.c.root,
+            &parse_target(step, true).unwrap(),
+            Some(&claim),
+            &act,
+        )
+        .unwrap();
+        assert!(outcome.ok(), "{:?}", outcome.violations);
+    }
 }
 
 fn rules(outcome: &Outcome) -> Vec<&'static str> {
@@ -559,11 +579,28 @@ fn a_missing_or_non_integer_value_records_nothing_and_warns_once_per_sync() {
 #[test]
 fn a_sync_that_reads_an_unchanged_value_rewrites_no_state() {
     let s = Scratch::new();
+    s.add_driver(DRIVER);
     s.reports("250000");
     s.sync(&at(5));
-    let before = s.unit_state();
+    campaign_fixture::git(&s.c.root, &["add", "-A"]);
+    campaign_fixture::git(&s.c.root, &["commit", "-qm", "synced"]);
+    let stamps = || -> Vec<_> {
+        s.c.files()
+            .into_keys()
+            .map(|path| {
+                let modified = fs::metadata(s.c.root.join(&path)).unwrap().modified();
+                (path, modified.unwrap())
+            })
+            .collect()
+    };
+    let (before, written) = (s.unit_state(), stamps());
     s.sync(&at(10));
     assert_eq!(s.unit_state(), before);
+    assert_eq!(stamps(), written, "a quiet sync rewrites no file");
+    assert_eq!(
+        campaign_fixture::git(&s.c.root, &["status", "--porcelain"]),
+        ""
+    );
     s.reports("260000");
     s.sync(&at(15));
     assert_eq!(
@@ -596,34 +633,42 @@ fn with_no_reader_configured_a_recorded_value_is_neither_listed_nor_refused() {
     );
 }
 
-#[test]
-fn a_fix_round_at_pr_open_is_read_and_its_resume_refused() {
-    let checkout = tempfile::tempdir().unwrap();
-    let (repo, sha) = campaign_fixture::repo(checkout.path());
-    let s = Scratch::with_gh(&format!(
+fn open_pr_gh(sha: &str) -> String {
+    format!(
         r#"case "$*" in
     'api repos/o/r/pulls/7 --include')
         echo '{{"state":"open","merged":false,"merge_commit_sha":null,"mergeable_state":"blocked","head":{{"sha":"{sha}","ref":"work"}},"base":{{"sha":"{sha}"}}}}' ;;
     *) exit 1 ;;
 esac"#
-    ));
-    s.reports("150000");
-    s.sync(&at(5));
+    )
+}
+
+fn open_pr(s: &Scratch, host: &Fake, step: &str, repo: &Path, sha: &str) {
     let opened = commands::advance(
-        &at(6),
+        host,
         &s.c.root,
-        &parse_target(STEP, true).unwrap(),
+        &parse_target(step, true).unwrap(),
         &Phase::PrOpen,
         &Evidence {
             pr: Some("https://github.com/o/r/pull/7".to_owned()),
-            sha: Some(sha),
+            sha: Some(sha.to_owned()),
             ..Evidence::default()
         },
         None,
-        Some(&repo),
+        Some(repo),
     )
     .unwrap();
     assert!(opened.ok(), "{:?}", opened.violations);
+}
+
+#[test]
+fn a_fix_round_at_pr_open_is_read_and_its_resume_refused() {
+    let checkout = tempfile::tempdir().unwrap();
+    let (repo, sha) = campaign_fixture::repo(checkout.path());
+    let s = Scratch::with_gh(&open_pr_gh(&sha));
+    s.reports("150000");
+    s.sync(&at(5));
+    open_pr(&s, &at(6), STEP, &repo, &sha);
     s.reports("250000");
     s.sync(&at(10));
     assert_eq!(s.attempt()["observed_context"]["used_tokens"], 250000);
@@ -700,78 +745,168 @@ fn record(kind: &str, id: &str) -> Act {
     }
 }
 
-// A gh whose rate-limit sample, taken after a sync's reads and before its lock, waits while a
-// `hold` file is there, so another sync can run in between.
-const HELD_GH: &str = r#"if [ "$1 $2" = "api rate_limit" ] && [ -f "$FAKE_GH/hold" ]; then
+#[cfg(target_os = "linux")]
+mod interleaved {
+    use std::os::unix::fs::MetadataExt;
+    use std::process::Stdio;
+
+    use super::*;
+
+    // A gh whose rate-limit sample, taken after a sync's reads and before its lock, waits while a
+    // `hold` file is there, so another sync can start in between.
+    const HELD_GH: &str = r#"if [ "$1 $2" = "api rate_limit" ] && [ -f "$FAKE_GH/hold" ]; then
     rm "$FAKE_GH/hold"
     : > "$FAKE_GH/held"
     while [ ! -f "$FAKE_GH/release" ]; do sleep 0.02; done
 fi
 exit 1"#;
 
-fn overtaken(s: &Scratch, host: &Fake, between: impl FnOnce()) {
-    let fixture = s.gh.fixture();
-    fs::write(fixture.join("hold"), "").unwrap();
-    std::thread::scope(|scope| {
-        let older = scope.spawn(|| s.serial_sync(host));
+    fn until(what: &str, mut done: impl FnMut() -> bool) {
         let start = Instant::now();
-        while !fixture.join("held").exists() {
-            assert!(
-                start.elapsed() < Duration::from_secs(10),
-                "the older sync never reached its rate-limit sample"
-            );
+        while !done() {
+            assert!(start.elapsed() < Duration::from_secs(10), "{what}");
             std::thread::sleep(Duration::from_millis(10));
         }
-        between();
-        fs::write(fixture.join("release"), "").unwrap();
-        older.join().unwrap();
-    });
-}
+    }
 
-#[test]
-fn an_older_sync_never_overwrites_a_newer_syncs_value() {
-    let s = Scratch::with_gh(HELD_GH);
-    s.add_driver(DRIVER);
-    s.reports("150000");
-    overtaken(&s, &at(5), || {
+    fn waits_on_context_lock(root: &Path) -> bool {
+        let inode = fs::metadata(root.join(".cm")).unwrap().ino();
+        fs::read_to_string("/proc/locks")
+            .unwrap()
+            .lines()
+            .any(|line| line.contains("-> FLOCK ") && line.contains(&format!(":{inode} ")))
+    }
+
+    fn hold(s: &Scratch) {
+        fs::write(s.gh.fixture().join("hold"), "").unwrap();
+    }
+
+    fn held(s: &Scratch) {
+        until("the older sync never reached its rate-limit sample", || {
+            s.gh.fixture().join("held").exists()
+        });
+    }
+
+    fn release(s: &Scratch, mut newer_done: impl FnMut() -> bool) {
+        until(
+            "the newer sync neither waited on the context lock nor finished",
+            || newer_done() || waits_on_context_lock(&s.c.root),
+        );
+        fs::write(s.gh.fixture().join("release"), "").unwrap();
+    }
+
+    fn interleaved(s: &Scratch, older: &Fake, newer: &Fake, between: impl FnOnce()) {
+        hold(s);
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| s.serial_sync(older));
+            held(s);
+            between();
+            let second = scope.spawn(|| s.serial_sync(newer));
+            release(s, || second.is_finished());
+            first.join().unwrap();
+            second.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn an_older_sync_never_overwrites_a_newer_syncs_value() {
+        let s = Scratch::with_gh(HELD_GH);
+        s.add_driver(DRIVER);
+        s.reports("150000");
+        interleaved(&s, &at(5), &at(6), || s.reports("250000"));
+        assert_eq!(
+            s.attempt()["observed_context"],
+            json!({"session": WORKER, "used_tokens": 250000, "read_at": "2030-01-01T10:06Z"})
+        );
+        assert_eq!(
+            s.lane_context(),
+            json!({"tooling": {"session": DRIVER, "used_tokens": 250000, "read_at": "2030-01-01T10:06Z"}})
+        );
+        assert_eq!(s.context_lines().len(), 2, "{:?}", s.act_lines());
+        assert_eq!(
+            rules(&s.try_act(&at(7), begin("turn"))),
+            ["attempt-context-over"]
+        );
+    }
+
+    #[test]
+    fn an_older_failed_read_never_stales_a_newer_read_that_left_the_value_as_it_was() {
+        let s = Scratch::with_gh(HELD_GH);
+        s.add_driver(DRIVER);
         s.reports("250000");
-        s.serial_sync(&at(6));
-    });
-    assert_eq!(
-        s.attempt()["observed_context"],
-        json!({"session": WORKER, "used_tokens": 250000, "read_at": "2030-01-01T10:06Z"})
-    );
-    assert_eq!(
-        s.lane_context(),
-        json!({"tooling": {"session": DRIVER, "used_tokens": 250000, "read_at": "2030-01-01T10:06Z"}})
-    );
-    assert_eq!(s.context_lines().len(), 2, "{:?}", s.act_lines());
-    assert_eq!(
-        rules(&s.try_act(&at(7), begin("turn"))),
-        ["attempt-context-over"]
-    );
-}
-
-#[test]
-fn an_older_read_never_clears_a_newer_failed_reads_staleness() {
-    let s = Scratch::with_gh(HELD_GH);
-    s.add_driver(DRIVER);
-    s.reports("250000");
-    s.sync(&at(5));
-    overtaken(&s, &at(6), || {
+        s.sync(&at(5));
         s.fails();
-        s.serial_sync(&at(7));
-    });
-    assert_eq!(
-        s.attempt()["observed_context"]["unread_since"],
-        "2030-01-01T10:07Z"
-    );
-    assert_eq!(
-        s.lane_context()["tooling"]["unread_since"],
-        "2030-01-01T10:07Z"
-    );
-    let resumed = s.try_act(&at(8), begin("turn"));
-    assert!(resumed.ok(), "{:?}", resumed.violations);
+        interleaved(&s, &at(6), &at(7), || s.reports("250000"));
+        let fresh = |session: &str| json!({"session": session, "used_tokens": 250000, "read_at": "2030-01-01T10:07Z"});
+        assert_eq!(s.attempt()["observed_context"], fresh(WORKER));
+        assert_eq!(s.lane_context()["tooling"], fresh(DRIVER));
+        assert_eq!(
+            rules(&s.try_act(&at(8), begin("turn"))),
+            ["attempt-context-over"]
+        );
+    }
+
+    #[test]
+    fn an_older_read_never_clears_a_newer_failed_reads_staleness() {
+        let s = Scratch::with_gh(HELD_GH);
+        s.add_driver(DRIVER);
+        s.reports("250000");
+        s.sync(&at(5));
+        s.fails();
+        s.sync(&at(6));
+        s.reports("250000");
+        interleaved(&s, &at(7), &at(8), || s.fails());
+        let stale = |session: &str| json!({"session": session, "used_tokens": 250000, "read_at": "2030-01-01T10:07Z", "unread_since": "2030-01-01T10:08Z"});
+        assert_eq!(s.attempt()["observed_context"], stale(WORKER));
+        assert_eq!(s.lane_context()["tooling"], stale(DRIVER));
+        let resumed = s.try_act(&at(9), begin("turn"));
+        assert!(resumed.ok(), "{:?}", resumed.violations);
+    }
+
+    #[test]
+    fn two_cm_sync_processes_record_their_reads_in_order() {
+        let s = Scratch::with_gh(HELD_GH);
+        s.add_driver(DRIVER);
+        s.reports("250000");
+        s.sync(&at(5));
+        s.fails();
+        let sync = || {
+            s.command("cse_current", &["sync"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        hold(&s);
+        let older = sync();
+        held(&s);
+        s.reports("251000");
+        let mut newer = sync();
+        release(&s, || newer.try_wait().unwrap().is_some());
+        for child in [older, newer] {
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "{out:?}");
+        }
+        for context in [
+            s.attempt()["observed_context"].clone(),
+            s.lane_context()["tooling"].clone(),
+        ] {
+            assert_eq!(context["used_tokens"], 251000, "{context}");
+            assert_eq!(context["unread_since"], Value::Null, "{context}");
+        }
+        let lines = s.context_lines();
+        assert_eq!(lines.len(), 2, "{:?}", s.act_lines());
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.contains(" at 251k > 200k cap (read ") && !line.contains("stale")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            rules(&s.try_act(&at(8), begin("turn"))),
+            ["attempt-context-over"]
+        );
+    }
 }
 
 #[test]
@@ -849,7 +984,12 @@ fn a_session_only_attempt_is_read_with_an_empty_turn() {
         "the fresh session the remedy names is read"
     );
     assert!(s.context_lines().is_empty(), "{:?}", s.act_lines());
-    s.act(&at(11), begin("turn"));
+    s.fails();
+    assert_eq!(
+        s.sync(&at(11)).fields["turn_reader_warnings"],
+        json!(["01-a/u/cloud: turn reader exited 9; check access with turn reader"])
+    );
+    s.act(&at(12), begin("turn"));
 }
 
 #[test]
@@ -870,6 +1010,98 @@ fn a_hung_reader_costs_a_sync_one_reader_timeout() {
         ])
     );
     assert_eq!(s.runs(), ["session_worker/turn-1"]);
+}
+
+#[test]
+fn a_read_the_shared_deadline_cuts_says_so_and_the_reads_after_it_are_not_run() {
+    let checkout = tempfile::tempdir().unwrap();
+    let (repo, sha) = campaign_fixture::repo(checkout.path());
+    let s = Scratch::with_gh(&open_pr_gh(&sha));
+    s.add_driver(DRIVER);
+    s.reports("150000");
+    launch_with(
+        &s,
+        "01-a/u/solo",
+        [begin("session"), record("session", "session_solo")],
+    );
+    launch_with(
+        &s,
+        "01-a/u/zz",
+        [
+            begin("session"),
+            record("session", "session_zz"),
+            begin("turn"),
+            record("turn", "turn-1"),
+        ],
+    );
+    open_pr(&s, &at(1), "01-a/u/zz", &repo, &sha);
+    fs::write(s.file("hang-session_solo"), "").unwrap();
+    let start = Instant::now();
+    let synced = s.serial_sync(&at(5));
+    let took = start.elapsed();
+    assert!(took < Duration::from_secs(25), "{took:?}");
+    let not_run = "turn reader not run: this sync's reader runs passed their shared 15s deadline";
+    assert_eq!(
+        synced.fields["turn_reader_warnings"],
+        json!([
+            "01-a/u/solo: turn reader did not answer by this sync's shared 15s reader deadline",
+            format!("01-a/u/zz: {not_run}"),
+            format!("lane tooling: {not_run}"),
+        ])
+    );
+    assert_eq!(s.runs(), ["session_worker/turn-1", "session_solo/"]);
+}
+
+#[test]
+fn a_session_recorded_again_in_its_cse_spelling_keeps_its_value() {
+    let s = Scratch::session_only("exit 1");
+    s.reports("150000");
+    s.sync(&at(5));
+    s.record_session(&at(6), "cse_worker");
+    let before = s.unit_state();
+    s.sync(&at(10));
+    assert_eq!(s.unit_state(), before);
+    s.fails();
+    s.sync(&at(15));
+    assert_eq!(
+        s.attempt()["observed_context"],
+        json!({"session": WORKER, "used_tokens": 150000, "read_at": "2030-01-01T10:05Z", "unread_since": "2030-01-01T10:15Z"})
+    );
+}
+
+#[test]
+fn a_sync_that_cannot_take_the_context_lock_in_time_reads_no_context() {
+    let s = Scratch::new();
+    s.add_driver(DRIVER);
+    s.reports("250000");
+    s.sync(&at(5));
+    s.runs();
+    let held = fs::File::open(s.c.root.join(".cm")).unwrap();
+    rustix::fs::flock(&held, rustix::fs::FlockOperation::LockExclusive).unwrap();
+    let synced = s.serial_sync(&at(6));
+    let lost = "context not read: another cm sync held the context lock past this sync's shared 15s reader deadline";
+    assert_eq!(
+        synced.fields["turn_reader_warnings"],
+        json!([
+            format!("01-a/u/cloud: {lost}"),
+            format!("lane tooling: {lost}")
+        ])
+    );
+    assert_eq!(
+        s.runs(),
+        ["session_worker/turn-1"],
+        "its turn read still runs"
+    );
+    assert_eq!(
+        s.attempt()["observed_context"]["unread_since"],
+        "2030-01-01T10:06Z"
+    );
+    assert_eq!(
+        s.lane_context()["tooling"]["unread_since"],
+        "2030-01-01T10:06Z"
+    );
+    let resumed = s.try_act(&at(7), begin("turn"));
+    assert!(resumed.ok(), "{:?}", resumed.violations);
 }
 
 #[test]
@@ -900,24 +1132,16 @@ fn the_capped_session_is_refused_as_a_thread_and_by_its_cse_label() {
 #[test]
 fn context_over_follows_turn_ended_and_the_kinds_before_it_on_its_own_step() {
     let s = Scratch::new();
-    let other = "01-a/u/zz";
-    let claim = launch(&at(0), &s.c, other);
-    for act in [
-        begin("session"),
-        record("session", "session_zz"),
-        begin("turn"),
-        record("turn", "turn-1"),
-    ] {
-        let outcome = cm::attempt::attempt(
-            &at(0),
-            &s.c.root,
-            &parse_target(other, true).unwrap(),
-            Some(&claim),
-            &act,
-        )
-        .unwrap();
-        assert!(outcome.ok(), "{:?}", outcome.violations);
-    }
+    launch_with(
+        &s,
+        "01-a/u/zz",
+        [
+            begin("session"),
+            record("session", "session_zz"),
+            begin("turn"),
+            record("turn", "turn-1"),
+        ],
+    );
     s.reports("150000");
     s.reports_for(WORKER, "250000");
     fs::write(s.file("ended-session_zz"), "").unwrap();
@@ -1153,6 +1377,7 @@ fn a_sync_while_a_fresh_session_is_created_keeps_reading_the_capped_one() {
     s.sync(&at(5));
     s.runs();
     s.act(&at(6), begin("session"));
+    assert!(s.context_lines().is_empty(), "{:?}", s.act_lines());
     s.sync(&at(10));
     assert_eq!(s.runs(), ["session_worker/", "session_worker/"]);
     assert_eq!(

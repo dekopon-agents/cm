@@ -580,13 +580,22 @@ report `done`, `successful` or `turn_status`, which cm ignores there. A nonzero 
 parse, or a `thread_id` naming another session is a failed read; a missing or
 non-integer `context_used_tokens` records nothing and warns as for attempts.
 
-These reads run before sync takes the campaign lock, as the turn reads do. Under the lock, sync
-records a value only while the attempt's (or the lane's) value is still the one it saw before
-reading: a value another sync recorded in between, or a restart cleared, is newer and stays.
+These reads run before sync takes the campaign lock, as the turn reads do. With a Claude Cloud
+reader configured, sync first takes the context lock, an flock on the `.cm` directory that
+`cm attempt` and `cm advance` never wait on, and holds it from before its first reader run until
+it has written what it read, so concurrent syncs read and record context values one at a time,
+each over the one before. A sync that cannot take it within the shared deadline below runs its
+turn reads but no context read: each value it would read goes stale and warns
+`context not read: …`. A restart, or a newer turn or session recorded between a sync's read and
+its write, leaves that read unapplied.
 The reads this adds (an attempt at `pr-open` or with no turn, and each lane driver) share one
-deadline, 15 s from the start of the sync's reads, which the launched steps' own turn reads also
-spend; a read the deadline leaves no time for is not run, warns `turn reader not run: …` and
-leaves the value stale, so a hung reader costs a sync one 15 s timeout, not one per read.
+deadline, 15 s from when sync starts waiting for the context lock, which the wait and the
+launched steps' own turn reads also spend. A read the deadline cuts warns `turn reader did not
+answer by this sync's shared 15s reader deadline`, one it leaves no time for is not run and warns
+`turn reader not run: …`, and both leave the value stale, so a hung reader costs a sync one 15 s
+timeout, not one per read. The reads must fit in those 15 s together: with two in a sync, such
+as one launched step's turn read and a lane driver's, a reader slower than 7.5 s a call leaves
+the second too little time on every sync, and its value stays stale.
 
 `cm next --act` lists `context-over` (below) for a live attempt or a registered driver whose
 current session's value exceeds 200000 tokens, stale ones included, which say so:

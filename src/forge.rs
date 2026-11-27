@@ -845,26 +845,26 @@ pub(crate) fn read_session_context(
     argv: &[String],
     session: &str,
     timeout: Duration,
-) -> Result<Option<u64>, String> {
+) -> Result<Option<u64>, ForgeError> {
     #[derive(Deserialize)]
     struct SessionRead {
         thread_id: Option<String>,
     }
-    let read = || {
-        let (program, args) = argv.split_first().ok_or(ForgeError::Spawn)?;
-        let args: Vec<_> = args.iter().map(String::as_str).collect();
-        let output = run(Path::new(program), &args, timeout, None)?;
-        if !output.status.success() {
-            return Err(ForgeError::Exit(output.status.code()));
-        }
-        let read: SessionRead =
-            serde_json::from_slice(&output.stdout).map_err(|_| ForgeError::Json)?;
-        if read.thread_id.as_deref().is_some_and(|id| id != session) {
-            return Err(ForgeError::Json);
-        }
-        Ok(context_used_tokens(&output.stdout))
-    };
-    read().map_err(|error| fmt::from_fn(|f| error.fmt_program("turn reader", f)).to_string())
+    let (program, args) = argv.split_first().ok_or(ForgeError::Spawn)?;
+    let args: Vec<_> = args.iter().map(String::as_str).collect();
+    let output = run(Path::new(program), &args, timeout, None)?;
+    if !output.status.success() {
+        return Err(ForgeError::Exit(output.status.code()));
+    }
+    let read: SessionRead = serde_json::from_slice(&output.stdout).map_err(|_| ForgeError::Json)?;
+    if read.thread_id.as_deref().is_some_and(|id| id != session) {
+        return Err(ForgeError::Json);
+    }
+    Ok(context_used_tokens(&output.stdout))
+}
+
+pub(crate) fn reader_error(error: &ForgeError) -> String {
+    fmt::from_fn(|f| error.fmt_program("turn reader", f)).to_string()
 }
 
 pub(crate) fn read_remote_turn(
@@ -872,27 +872,24 @@ pub(crate) fn read_remote_turn(
     thread: &str,
     turn: &str,
     timeout: Duration,
-) -> Result<TurnRead, String> {
-    let read = || {
-        let (program, args) = argv.split_first().ok_or(ForgeError::Spawn)?;
-        let args: Vec<_> = args.iter().map(String::as_str).collect();
-        let output = run(Path::new(program), &args, timeout, None)?;
-        if !output.status.success() {
-            return Err(ForgeError::Exit(output.status.code()));
-        }
-        let mut status: TurnRead =
-            serde_json::from_slice(&output.stdout).map_err(|_| ForgeError::Json)?;
-        status.context_used_tokens = context_used_tokens(&output.stdout);
-        if status.turn_status.trim().is_empty()
-            || (status.successful && !status.done)
-            || status.thread_id.as_deref().is_some_and(|id| id != thread)
-            || status.turn_id.as_deref().is_some_and(|id| id != turn)
-        {
-            return Err(ForgeError::Json);
-        }
-        Ok(status)
-    };
-    read().map_err(|error| fmt::from_fn(|f| error.fmt_program("turn reader", f)).to_string())
+) -> Result<TurnRead, ForgeError> {
+    let (program, args) = argv.split_first().ok_or(ForgeError::Spawn)?;
+    let args: Vec<_> = args.iter().map(String::as_str).collect();
+    let output = run(Path::new(program), &args, timeout, None)?;
+    if !output.status.success() {
+        return Err(ForgeError::Exit(output.status.code()));
+    }
+    let mut status: TurnRead =
+        serde_json::from_slice(&output.stdout).map_err(|_| ForgeError::Json)?;
+    status.context_used_tokens = context_used_tokens(&output.stdout);
+    if status.turn_status.trim().is_empty()
+        || (status.successful && !status.done)
+        || status.thread_id.as_deref().is_some_and(|id| id != thread)
+        || status.turn_id.as_deref().is_some_and(|id| id != turn)
+    {
+        return Err(ForgeError::Json);
+    }
+    Ok(status)
 }
 
 fn crate_read(
@@ -1465,9 +1462,11 @@ mod tests {
         let start = Instant::now();
         let result = read_remote_turn(&argv, "thread", "turn", timeout);
         assert!((timeout..Duration::from_secs(2)).contains(&start.elapsed()));
-        let error = result
-            .err()
-            .expect("held stdout must time out even after valid JSON");
+        let error = reader_error(
+            &result
+                .err()
+                .expect("held stdout must time out even after valid JSON"),
+        );
         assert!(error.starts_with("turn reader did not answer"), "{error}");
     }
 
