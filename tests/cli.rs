@@ -1571,8 +1571,6 @@ fn no_repair_offers_a_step_a_gate_or_block_on_itself_nor_reads_another_condition
         "blocked:until:epoch:working",
         "blocked:until:ownerqueue:3",
         "blocked:until:pin:build@abc1234",
-        "blocked:until:pr-open:build",
-        "blocked:until:build",
     ] {
         let refused = cm(root, &["--json", "advance", STEP, state]);
         assert_eq!(refused.status.code(), Some(1), "{state}: {refused:?}");
@@ -1625,10 +1623,7 @@ fn no_repair_offers_a_step_a_gate_or_block_on_itself_nor_reads_another_condition
 }
 
 #[test]
-fn a_block_on_an_undeclared_step_or_release_is_written_as_at_base_and_only_a_self_block_is_refused()
-{
-    // Base 60be060 exits 0 on each of these and writes the state on the right; the live epoch
-    // writes the descriptive form to wait.
+fn a_block_on_an_undeclared_step_a_release_or_the_step_itself_is_written_as_at_base() {
     let unit = "09-daemon/chart-termination";
     for (state, written) in [
         ("blocked:until:prbe", format!("blocked:until:{unit}/prbe")),
@@ -1656,6 +1651,15 @@ fn a_block_on_an_undeclared_step_or_release_is_written_as_at_base_and_only_a_sel
             "blocked:until:deployed:dekopon@0.100.0",
             "blocked:until:deployed:dekopon@0.100.0".to_owned(),
         ),
+        ("blocked:until:build", format!("blocked:until:{unit}/build")),
+        (
+            "blocked:until:pr-open:build",
+            format!("blocked:until:pr-open:{unit}/build"),
+        ),
+        (
+            "blocked:until:09-daemon/chart-termination/build",
+            format!("blocked:until:{unit}/build"),
+        ),
     ] {
         let temp = chart_campaign();
         let root = temp.path();
@@ -1667,28 +1671,28 @@ fn a_block_on_an_undeclared_step_or_release_is_written_as_at_base_and_only_a_sel
             .to_string();
         assert_eq!(state_now, written, "{state}");
     }
-    let temp = chart_campaign();
-    let root = temp.path();
-    let before = files(root);
+    let release = "00-release/dekopon/0.100.0";
     for state in [
-        "blocked:until:build",
-        "blocked:until:pr-open:build",
-        "blocked:until:09-daemon/chart-termination/build",
+        "blocked:until:tag:dekopon@0.100.0",
+        "blocked:until:deployed:dekopon@0.100.0",
     ] {
-        let refused = cm(root, &["--json", "advance", STEP, state]);
-        assert_eq!(refused.status.code(), Some(1), "{state}: {refused:?}");
-        let report = json(&refused);
-        assert_eq!(report["violations"][0]["rule"], "block-condition");
+        let temp = chart_campaign();
+        let root = temp.path();
         assert!(
-            report["violations"][0]["message"]
-                .as_str()
-                .unwrap()
-                .ends_with("cannot move on while it waits on itself"),
-            "{report}"
+            cm(root, &["init", release, "--lane", "claude-cloud"])
+                .status
+                .success()
         );
-        assert_eq!(argvs(&report).last().unwrap(), &add_block(), "{state}");
+        let out = cm(root, &["--json", "advance", release, state]);
+        assert_eq!(out.status.code(), Some(0), "{state}: {out:?}");
+        let state_now = cm::store::load_unit(&root.join("00-release/dekopon"))
+            .unwrap()
+            .steps["0.100.0"]
+            .track
+            .state
+            .to_string();
+        assert_eq!(state_now, state);
     }
-    assert_eq!(files(root), before);
 }
 
 #[test]
@@ -1878,7 +1882,6 @@ fn each_suggested_state_names_the_evidence_its_advance_requires() {
             merged,
             &["revision", "checkout"],
         ),
-        // A merge-gate flag is taken only by a gated merge, so a move to pr-open drops it.
         (
             "cx",
             Phase::Launched,
@@ -1903,7 +1906,6 @@ fn each_suggested_state_names_the_evidence_its_advance_requires() {
             pr_open,
             &["pr", "revision", "checkout"],
         ),
-        // A codex step's merge is gated, so its move keeps the gate flag.
         (
             "cx",
             Phase::PrOpen,
@@ -1920,7 +1922,6 @@ fn each_suggested_state_names_the_evidence_its_advance_requires() {
             ],
             &["revision", "checkout"],
         ),
-        // A given flag the suggested state takes no is dropped, and the cause says so.
         (
             "build",
             Phase::PrOpen,
@@ -1937,7 +1938,6 @@ fn each_suggested_state_names_the_evidence_its_advance_requires() {
             merged,
             &["revision", "checkout"],
         ),
-        // A merged step's PR names the repo its tag is read from.
         (
             "build",
             Phase::Merged,
@@ -2035,7 +2035,6 @@ fn each_suggested_state_names_the_evidence_its_advance_requires() {
             assert_eq!(ran["ok"], true, "{name} {typed:?}: {ran}");
         }
     }
-    // A recorded worktree that exists resolves --sha, so the move names no checkout.
     at("build", Phase::Launched, false);
     set_state(root, "build", |each| each.worktree = checkout.to_owned());
     let report = json(&cm(root, &["--json", "advance", STEP, "pr-opn"]));
@@ -2052,6 +2051,77 @@ fn each_suggested_state_names_the_evidence_its_advance_requires() {
             "<revision>"
         ])]
     );
+}
+
+#[test]
+fn a_suggested_done_or_launch_takes_the_evidence_file_or_checkout_cm_already_has() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    assert!(cm(root, &["init"]).status.success());
+    let mac = "09-daemon/x/mac";
+    let pi = "09-daemon/x/pi";
+    assert!(cm(root, &["init", mac, "--lane", "mac"]).status.success());
+    assert!(cm(root, &["init", pi, "--lane", "pi"]).status.success());
+    let asks = json(&cm(root, &["--json", "advance", mac, "dne"]));
+    assert_eq!(
+        argvs(&asks),
+        [serde_json::json!([
+            "cm",
+            "advance",
+            mac,
+            "done",
+            "--evidence",
+            "<evidence-file>"
+        ])]
+    );
+    fs::create_dir_all(root.join(mac).join("evidence")).unwrap();
+    fs::write(root.join(mac).join("evidence/done.md"), "Done.\n").unwrap();
+    let has = json(&cm(root, &["--json", "advance", mac, "dne"]));
+    let done = serde_json::json!(["cm", "advance", mac, "done"]);
+    assert_eq!(argvs(&has), std::slice::from_ref(&done));
+    assert_eq!(
+        has["violations"][0]["next"][0]["inputs"],
+        serde_json::json!([])
+    );
+    let mut run = vec![Value::from("cm"), Value::from("--json")];
+    run.extend(done.as_array().unwrap()[1..].iter().cloned());
+    let ran = json(&run_argv(root, &Value::Array(run)));
+    assert_eq!(ran["ok"], true, "{ran}");
+
+    let unknown = json(&cm(root, &["--json", "advance", pi, "lanched"]));
+    assert_eq!(
+        argvs(&unknown),
+        [serde_json::json!([
+            "cm",
+            "launch",
+            pi,
+            "--worktree",
+            "<checkout>"
+        ])]
+    );
+    let wt = root.join("wt");
+    fs::create_dir_all(wt.join(".git")).unwrap();
+    let wt = wt.to_str().unwrap();
+    let known = json(&cm(
+        root,
+        &["--json", "advance", pi, "lanched", "--repo", wt],
+    ));
+    let launch = serde_json::json!(["cm", "launch", pi, "--worktree", wt]);
+    assert_eq!(argvs(&known), std::slice::from_ref(&launch));
+    assert_eq!(
+        known["violations"][0]["next"][0]["inputs"],
+        serde_json::json!([])
+    );
+    fs::write(root.join("k.md"), "Do it.\n").unwrap();
+    assert!(
+        cm(root, &["amend", pi, "--kickoff-file", "k.md"])
+            .status
+            .success()
+    );
+    let mut run = vec![Value::from("cm"), Value::from("--json")];
+    run.extend(launch.as_array().unwrap()[1..].iter().cloned());
+    let ran = json(&run_argv(root, &Value::Array(run)));
+    assert_eq!(ran["ok"], true, "{ran}");
 }
 
 #[test]
@@ -2103,7 +2173,6 @@ fn a_release_steps_suggested_released_carries_its_declared_tag() {
             ));
             json(&run_argv(root, &Value::Array(run)))
         };
-    // From merged the tag is the one declared at `cm init`, the only one the advance takes.
     set(Phase::Merged, true);
     let merged = json(&cm(root, &["--json", "advance", release, "relased"]));
     assert_eq!(
@@ -2121,7 +2190,6 @@ fn a_release_steps_suggested_released_carries_its_declared_tag() {
     );
     let ran = fill(&argvs(&merged)[0]);
     assert_eq!(ran["ok"], true, "{ran}");
-    // From drafted or launched the release step is released from its tag alone.
     for phase in [Phase::Drafted, Phase::Launched] {
         set(phase.clone(), false);
         let early = json(&cm(root, &["--json", "advance", release, "relased"]));

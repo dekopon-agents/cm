@@ -1227,7 +1227,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                 part: part.as_deref(),
                 given: &given,
                 gate: &gate,
-                repo: repo.is_some(),
+                repo: repo.as_deref(),
                 by: !by.is_empty(),
             };
             let state =
@@ -1683,8 +1683,6 @@ enum Role {
     Unknown,
 }
 
-// Each word's role as clap's parser assigns it: a repair edits the argument it means and a usage
-// error names the subcommand clap was in, whatever text the other arguments hold.
 fn roles(argv: &[String]) -> Vec<Role> {
     let mut command = Cli::command();
     command.build();
@@ -1934,7 +1932,6 @@ fn usage(args: &[OsString], error: &clap::Error) -> ExitCode {
     misused(args, verbs, cause, line)
 }
 
-// A misuse cm itself finds after clap accepted the words; it names its own verbs.
 #[derive(Debug)]
 struct Misuse {
     verbs: &'static [&'static str],

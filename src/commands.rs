@@ -1021,8 +1021,6 @@ fn named_step<'a>(text: &'a str, unit: &str) -> Option<Named<'a>> {
 }
 
 impl Named<'_> {
-    // A pin keeps its revision only when it is a commit, else takes the head `near` recorded, so
-    // the suggestion never repeats what was refused.
     fn on(&self, near: &str, units: &Units, pin: bool) -> Option<String> {
         match self.pin {
             Some(sha) if pin => {
@@ -1138,9 +1136,6 @@ pub(crate) fn block_refusal(
         Ok(gate) => {
             let named = After::parse(&gate, &target.unit).map(|after| after.target());
             match named {
-                Ok(named) if named == step => format!(
-                    "`{condition}` names {step} itself, which cannot move on while it waits on itself"
-                ),
                 Ok(named) => format!("`{condition}` names {named}, which is not declared"),
                 Err(message) => format!("{message}; {BLOCK_FORMS}"),
             }
@@ -1161,27 +1156,14 @@ pub(crate) fn block_refusal(
     Violation::refuse_printed(path, "block-condition", cause, choice(moves))
 }
 
-// A block on the blocked step itself never clears: the step cannot move while it waits. A block
-// on a step or release no unit declares is the coordinator's wait idiom and stays accepted.
-fn blocks_on_itself(target: &Target, reason: &str) -> bool {
-    reason
-        .strip_prefix("until:")
-        .and_then(|condition| plan::block_condition(condition, &target.unit).ok())
-        .and_then(|gate| After::parse(&gate, &target.unit).ok())
-        .is_some_and(|after| after.target() == whole(target))
-}
-
 pub struct Asked<'a> {
     pub part: Option<&'a str>,
-    // The evidence flags the caller gave: a suggested move keeps those its state takes.
     pub given: &'a [Flag],
-    // The merge-gate flags the caller gave, by name and clap id: kept only for a gated merge.
     pub gate: &'a [(&'static str, &'static str)],
-    pub repo: bool,
+    pub repo: Option<&'a Path>,
     pub by: bool,
 }
 
-// A move `advance_held` would take, so a suggested state is never refused by the next run.
 fn admits(track: &Track, to: &Phase, finish: Finish, target: &Target, part: Option<&str>) -> bool {
     if part.is_some()
         && !matches!(
@@ -1203,14 +1185,12 @@ fn admits(track: &Track, to: &Phase, finish: Finish, target: &Target, part: Opti
     track.check(to, finish).is_ok()
 }
 
-// A release step not yet at pr-open is released from its tag alone.
 fn tag_only(to: &Phase, track: &Track, full: &str) -> bool {
     *to == Phase::Released
         && Release::of_target(full).is_some()
         && matches!(track.resting(), Phase::Drafted | Phase::Launched)
 }
 
-// The evidence flags a move to `to` requires and allows, as `advance_held` checks them.
 fn evidence_taken(
     to: &Phase,
     finish: Finish,
@@ -1234,9 +1214,6 @@ pub fn advance_state(
     text: &str,
 ) -> std::result::Result<Phase, Violation> {
     let message = match text.parse::<Phase>() {
-        Ok(Phase::Blocked(reason)) if blocks_on_itself(target, &reason) => {
-            return Err(block_refusal(host, root, target, asked.part, &reason));
-        }
         Ok(phase) => return Ok(phase),
         Err(message) => message,
     };
@@ -1311,7 +1288,11 @@ pub fn advance_state(
         let next = host.prefix().map(|prefix| {
             let mut launch = vec!["launch".into(), step.as_str().into()];
             if local {
-                launch.extend(["--worktree".into(), Input::Checkout.into()]);
+                let worktree = match asked.repo {
+                    Some(repo) => repo.display().to_string().into(),
+                    None => Input::Checkout.into(),
+                };
+                launch.extend(["--worktree".into(), worktree]);
             }
             Next::run(outcome::cm(prefix, launch))
         });
@@ -1329,7 +1310,6 @@ pub fn advance_state(
         .copied()
         .filter(|flag| !required.contains(flag) && !optional.contains(flag))
         .collect();
-    // `advance_held` takes --head, --ci-verified and --override only for a gated merge.
     let gated = to == Phase::Merged
         && !(track.state == Phase::Merged
             && asked.part.is_none()
@@ -1342,7 +1322,7 @@ pub fn advance_state(
     };
     // `advance_held` resolves --sha and --tag in --repo, else the recorded worktree, else (for
     // released) the PR's or the declared GitHub repo; with none of them the move names a checkout.
-    let checkout = !asked.repo
+    let checkout = asked.repo.is_none()
         && (carries(Flag::Sha) || carries(Flag::Tag))
         && !unit.as_ref().is_some_and(|unit| {
             evidence_repos(None, unit, target)
@@ -1365,6 +1345,9 @@ pub fn advance_state(
         .map(|flag| flag.name())
         .chain(gate_dropped.iter().map(|(name, _)| *name))
         .collect();
+    let single = (to == Phase::Done && finish == Finish::Evidence)
+        .then(|| crate::ledger::single_evidence(root, target))
+        .flatten();
     let cause = match names.as_slice() {
         [] => cause,
         names => format!(
@@ -1387,6 +1370,7 @@ pub fn advance_state(
             required
                 .iter()
                 .filter(|flag| !asked.given.contains(flag))
+                .filter(|flag| !(**flag == Flag::File && single.is_some()))
                 .fold(again, |again, flag| {
                     again.set(flag.name(), evidence_value(*flag, &to, track, tag.as_ref()))
                 })
@@ -1401,8 +1385,6 @@ pub fn advance_state(
     Err(refuse_moves(path, "advance-refused", cause, moves))
 }
 
-// What a suggested state's required evidence flag takes: the value cm holds where it is the
-// one the move needs, else an input only the caller has.
 fn evidence_value(flag: Flag, to: &Phase, track: &Track, tag: Option<&TagName>) -> outcome::Arg {
     let recorded = match (flag, to) {
         (Flag::Pr, _) => track.evidence.pr.as_deref(),
