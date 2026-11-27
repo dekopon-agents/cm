@@ -1614,7 +1614,7 @@ fn the_fix_pass_cap_ignores_accepts_second_reviewers_and_earlier_prs() {
     assert_eq!(rules(&refused), vec!["review-cap"]);
     assert_eq!(
         refused.violations[0].message,
-        "session cap of 10 passes; an 11th fix pass on the current PR is refused"
+        "session cap of 10 passes; an 11th fix pass on the current PR is refused; an owner ruling raises it: `cm review cap-raise <step> --by <1-3> --ruling <file>`"
     );
     assert_eq!(paths.map(|path| sha256(&c.root.join(path))), before);
     assert!(
@@ -4776,4 +4776,160 @@ fn a_report_recorded_before_pr_open_is_not_recorded_again_as_another_family() {
         rules(&record(&host, &c, &astra, "claude")),
         ["review-duplicate"]
     );
+}
+
+fn ten_passes(host: &Fake, c: &Campaign, step: &store::Target) {
+    for round in 1..=10 {
+        let report = c.report(
+            &format!("{}-p{round}", step.step.as_deref().unwrap()),
+            &format!("{round:040x}"),
+            &review_fixture::BLOCKING[..1],
+            "FIX REQUIRED",
+        );
+        let recorded = verdict::record(host, &c.root, step, &report, Some("astra"), None).unwrap();
+        assert!(recorded.ok(), "{:?}", recorded.violations);
+    }
+}
+
+fn fix_pass(host: &Fake, c: &Campaign, name: &str, head: &str) -> Outcome {
+    let report = c.report(name, head, &review_fixture::BLOCKING[..1], "FIX REQUIRED");
+    record(host, c, &report, "astra")
+}
+
+fn commit_ruling(c: &Campaign, name: &str) -> PathBuf {
+    let path = c.write(name, "The owner allows more passes.\n");
+    git(&c.root, &["add", name]);
+    git(&c.root, &["commit", "-q", "-m", name]);
+    path
+}
+
+#[test]
+fn the_cap_of_ten_refuses_the_eleventh_fix_pass_without_a_raise() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    ten_passes(&host, &c, &target());
+    let refused = fix_pass(&host, &c, "eleventh", "bbbbbbb1");
+    assert_eq!(rules(&refused), vec!["review-cap"]);
+    assert!(
+        refused.violations[0]
+            .message
+            .contains("cm review cap-raise")
+    );
+}
+
+#[test]
+fn a_raise_of_one_lets_the_eleventh_pass_record_and_refuses_the_twelfth() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    ten_passes(&host, &c, &target());
+    let ruling = commit_ruling(&c, "rulings/more.md");
+    let raised = verdict::cap_raise(&host, &c.root, &target(), 1, &ruling).unwrap();
+    assert!(raised.ok(), "{:?}", raised.violations);
+    assert_eq!(raised.fields["cap"], 11);
+    let eleventh = fix_pass(&host, &c, "eleventh", "bbbbbbb1");
+    assert!(eleventh.ok(), "{:?}", eleventh.violations);
+    assert_eq!(eleventh.fields["passes"], 11);
+    let twelfth = fix_pass(&host, &c, "twelfth", "bbbbbbb2");
+    assert_eq!(rules(&twelfth), vec!["review-cap"]);
+    assert!(twelfth.violations[0].message.contains("session cap of 11"));
+}
+
+#[test]
+fn a_missing_or_uncommitted_ruling_raises_nothing() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    ten_passes(&host, &c, &target());
+    let missing =
+        verdict::cap_raise(&host, &c.root, &target(), 1, &c.root.join("none.md")).unwrap();
+    assert_eq!(rules(&missing), vec!["cap-ruling"]);
+    let loose = c.write("rulings/loose.md", "Not committed.\n");
+    let uncommitted = verdict::cap_raise(&host, &c.root, &target(), 1, &loose).unwrap();
+    assert_eq!(rules(&uncommitted), vec!["cap-ruling"]);
+    git(&c.root, &["add", "rulings/loose.md"]);
+    git(&c.root, &["commit", "-q", "-m", "loose"]);
+    c.write("rulings/loose.md", "Edited after the commit.\n");
+    let edited = verdict::cap_raise(&host, &c.root, &target(), 1, &loose).unwrap();
+    assert_eq!(rules(&edited), vec!["cap-ruling"]);
+    assert!(verdict::load(&c.root).unwrap().cap_raises.is_empty());
+    assert_eq!(
+        rules(&fix_pass(&host, &c, "eleventh", "bbbbbbb1")),
+        vec!["review-cap"]
+    );
+}
+
+#[test]
+fn a_second_raise_from_the_same_ruling_is_refused_naming_the_first() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let ruling = commit_ruling(&c, "rulings/once.md");
+    let first = verdict::cap_raise(&host, &c.root, &target(), 2, &ruling).unwrap();
+    assert!(first.ok(), "{:?}", first.violations);
+    let again = verdict::cap_raise(&host, &c.root, &target(), 1, &ruling).unwrap();
+    assert_eq!(rules(&again), vec!["cap-raise-done"]);
+    assert!(again.violations[0].message.contains("by 2"));
+    let other = commit_ruling(&c, "rulings/twice.md");
+    assert!(
+        verdict::cap_raise(&host, &c.root, &target(), 1, &other)
+            .unwrap()
+            .ok()
+    );
+    assert_eq!(verdict::load(&c.root).unwrap().cap_raises.len(), 2);
+}
+
+#[test]
+fn a_raise_leaves_another_steps_cap_at_ten() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let declaration = Declaration {
+        lane: Some(Lane::Codex),
+        ..Declaration::default()
+    };
+    let second = parse_target("01-a/u/S2", true).unwrap();
+    assert!(
+        commands::declare(&host, &c.root.join("01-a/u/S2"), &declaration)
+            .unwrap()
+            .ok()
+    );
+    fs::write(
+        c.root.join("01-a/u/S2/kickoff.md"),
+        "Build the other thing.\n",
+    )
+    .unwrap();
+    let remote = Remote {
+        no_parts: None,
+        coordinator: Some("session_a".into()),
+        cap_min: None,
+    };
+    let launched = commands::launch_remote(&host, &c.root, &second, None, &remote).unwrap();
+    assert!(launched.ok(), "{:?}", launched.violations);
+    let opened = commands::advance(
+        &host,
+        &c.root,
+        &second,
+        &Phase::PrOpen,
+        &Evidence {
+            pr: Some("https://github.com/o/r/pull/9".into()),
+            sha: Some(c.head()),
+            ..Evidence::default()
+        },
+        None,
+        Some(&c.repo),
+    )
+    .unwrap();
+    assert!(opened.ok(), "{:?}", opened.violations);
+    let ruling = commit_ruling(&c, "rulings/s1.md");
+    assert!(
+        verdict::cap_raise(&host, &c.root, &target(), 3, &ruling)
+            .unwrap()
+            .ok()
+    );
+    ten_passes(&host, &c, &second);
+    let report = c.report(
+        "s2-eleventh",
+        "bbbbbbb1",
+        &review_fixture::BLOCKING[..1],
+        "FIX REQUIRED",
+    );
+    let refused = verdict::record(&host, &c.root, &second, &report, Some("astra"), None).unwrap();
+    assert_eq!(rules(&refused), vec!["review-cap"]);
 }

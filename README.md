@@ -843,6 +843,7 @@ Each distinct reviewed head of the current PR with a computed FIX REQUIRED verdi
 pass, however many reviewers reviewed it. ACCEPT reports and reports on earlier PRs do not
 consume passes. `rounds` counts fix passes for the selected part; `passes` counts them for the
 step's current PR. A new 11th fix pass is refused with `review-cap`: `session cap of 10 passes`.
+`cm review cap-raise <step> --by <1-3> --ruling <file>` raises that one step's cap by N once an owner ruling file is committed in the campaign (`cap-ruling` otherwise); a ruling file raises once (`cap-raise-done`), raises add up, and the raise is kept in `.cm/verdicts.json` and journaled (`the_cap_of_ten_refuses_the_eleventh_fix_pass_without_a_raise`, `a_raise_of_one_lets_the_eleventh_pass_record_and_refuses_the_twelfth`, `a_raise_leaves_another_steps_cap_at_ten`).
 Final ACCEPT reports and additional reviewers at an existing head can still be recorded.
 
 An ordinary review round fails to converge when it has more blocking findings than the previous
