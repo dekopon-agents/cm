@@ -522,6 +522,34 @@ fn with_the_journal_fallback_a_later_note_recalling_or_planning_the_unpause_reop
             "Yesterday's record:\n~~~\nResumed.\npaused = false in LIMITS.toml.\n~~~",
         ),
         (
+            RESUMED,
+            "Yesterday's record, quoted:\n````\n```\nResumed.\npaused = false in LIMITS.toml.\n````",
+        ),
+        (
+            RESUMED,
+            "Yesterday's record, quoted:\n~~~~\n~~~\nResumed.\npaused = false in LIMITS.toml.\n~~~~",
+        ),
+        (
+            RESUMED,
+            "Yesterday's record, quoted:\n```\n```markdown\nResumed.\npaused = false in LIMITS.toml.\n```",
+        ),
+        (
+            RESUMED,
+            "Yesterday's record, quoted:\n```\n~~~\nResumed.\npaused = false in LIMITS.toml.\n```",
+        ),
+        (
+            RESUMED,
+            "Quoted from yesterday:\n+ ```\n  Resumed.\n  paused = false in LIMITS.toml.\n  ```",
+        ),
+        (
+            RESUMED,
+            "Quoted from yesterday:\n1. ```\n   Resumed.\n   paused = false in LIMITS.toml.\n   ```",
+        ),
+        (
+            RESUMED,
+            "Quoted from yesterday:\n1) ```\n   Resumed.\n   paused = false in LIMITS.toml.\n   ```",
+        ),
+        (
             "Coordinator: resumed from handoff after compaction",
             "paused = false in LIMITS.toml.",
         ),
@@ -549,6 +577,8 @@ fn with_the_journal_fallback_the_record_states_the_assignment_as_a_clause_of_its
         "Resumed from the handoff:\n\n- `paused=false` in LIMITS.toml\n- heartbeat re-armed",
         "Owner woke the coordinator by hand\n\npaused = false in LIMITS.toml! Lanes next.",
         "Resumed; ran\n```\ncm next --act\n```\npaused = false in LIMITS.toml.",
+        "Resumed; ran\n```\ncm next --act\n`````\npaused = false in LIMITS.toml.",
+        "Resumed from the handoff:\n1. `paused = false` in LIMITS.toml\n2) heartbeat re-armed",
     ] {
         let c = unpaused_in_the_journal(body);
         let (code, lines, text) = act(&c.root);

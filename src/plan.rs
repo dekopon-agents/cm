@@ -1905,24 +1905,40 @@ fn has_word(text: &str, word: &str) -> bool {
 // and fenced code quotes, so neither is the record.
 const RESUME_TITLE: &str = "Coordinator: resumed after quota reset";
 const ASSIGNMENT: [&str; 5] = ["paused", "=", "false", "in", "limits.toml"];
-const FENCES: [&str; 2] = ["```", "~~~"];
 
+fn list_item(line: &str) -> Option<&str> {
+    let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let rest = match digits {
+        0 => line.strip_prefix(['-', '*', '+']),
+        1..=9 => line[digits..].strip_prefix(['.', ')']),
+        _ => None,
+    }?;
+    rest.starts_with([' ', '\t']).then(|| rest.trim_start())
+}
+
+fn fence_run(line: &str) -> Option<(char, usize)> {
+    let mark = line.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let len = line.len() - line.trim_start_matches(mark).len();
+    (len >= 3).then_some((mark, len))
+}
+
+// A fence closes only on a run of its own character at least as long as the opener, with nothing
+// after it: a shorter run or one followed by text is fenced content, as CommonMark reads it.
 fn states_unpause(body: &str) -> bool {
-    let mut fence: Option<&str> = None;
+    let mut fence: Option<(char, usize)> = None;
     let text = body
         .lines()
         .map(|line| {
             let line = line.trim();
-            let item = line.strip_prefix("- ").or_else(|| line.strip_prefix("* "));
-            let content = item.unwrap_or(line).trim_start();
-            if let Some(open) = fence {
-                if content.starts_with(open) {
+            let item = list_item(line);
+            if let Some((mark, open)) = fence {
+                if line.len() >= open && line.chars().all(|c| c == mark) {
                     fence = None;
                 }
                 return ";".to_owned();
             }
-            if let Some(open) = FENCES.into_iter().find(|open| content.starts_with(open)) {
-                fence = Some(open);
+            if let Some(run) = fence_run(item.unwrap_or(line)) {
+                fence = Some(run);
                 return ";".to_owned();
             }
             match item {
