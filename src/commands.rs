@@ -5,6 +5,7 @@ use std::process::Command;
 
 use anyhow::Result;
 
+use crate::cli::Slot;
 use crate::evidence::CampaignFile;
 use crate::forge::{CheckState, CommitSha, Forge, GithubRepo, PullState, TagName, ci_green};
 use crate::host::{Host, stamp};
@@ -521,9 +522,20 @@ fn init_step(
     let artifacts = parse_artifacts(&full, &declaration.artifacts, &mut violations);
     let units: Units = plan::load_units(root)?;
     let mut parsed = Vec::new();
-    for text in &declaration.after {
+    for (nth, text) in declaration.after.iter().enumerate() {
         match After::parse(text, unit_name) {
-            Err(message) => violations.push(Violation::new(&full, "after-parse", message)),
+            Err(message) => violations.push(after_refusal(
+                host,
+                root,
+                (&full, unit_name),
+                Gate {
+                    id: "after",
+                    nth,
+                    text,
+                },
+                message,
+                None,
+            )),
             Ok(after) if after.target() == full => violations.push(Violation::new(
                 &full,
                 "after-unknown",
@@ -843,18 +855,67 @@ pub(crate) fn packet_kickoff(host: &dyn Host, step_dir: &str, step: &str) -> Vio
     )
 }
 
-// A block holds a whole step or a unit, never a part, and `--block` takes only a step.
-fn owner_queue_not_open(
-    host: &dyn Host,
-    root: &Path,
-    target: &Target,
-    part: Option<&str>,
-    number: u32,
-) -> Violation {
-    let step = match &target.step {
+fn whole(target: &Target) -> String {
+    match &target.step {
         Some(step) => format!("{}/{step}", target.unit),
         None => target.unit.clone(),
+    }
+}
+
+fn with_part(target: &Target, part: Option<&str>) -> String {
+    match part {
+        Some(part) => format!("{}#{part}", whole(target)),
+        None => whole(target),
+    }
+}
+
+// `Next::either` takes two moves or more; a lone move needs no condition.
+pub(crate) fn choice(moves: Vec<(String, outcome::Move)>) -> Option<Next> {
+    match moves.len() {
+        0 => None,
+        1 => moves.into_iter().next().map(|(_, only)| only.into()),
+        _ => Some(Next::either(moves)),
+    }
+}
+
+pub(crate) fn again(host: &dyn Host, slot: Slot, to: &str) -> Option<outcome::Move> {
+    crate::cli::replaced(&host.argv()?, slot, to).map(outcome::Move::again)
+}
+
+fn again_dropping(host: &dyn Host, id: &str, nth: usize) -> Option<outcome::Move> {
+    crate::cli::dropped(&host.argv()?, id, nth)
+        .filter(|argv| !crate::cli::amends_nothing(argv))
+        .map(outcome::Move::again)
+}
+
+// The invocation's moves need its argv; without one (an argument that is not UTF-8) the
+// refusal says so rather than print a command that would differ from it.
+pub(crate) fn refuse_moves(
+    path: impl Into<String>,
+    rule: &'static str,
+    cause: impl Into<String>,
+    moves: Vec<(String, outcome::Move)>,
+) -> Violation {
+    match choice(moves) {
+        Some(next) => Violation::refuse(path, rule, cause, next),
+        None => Violation::refuse(
+            path,
+            rule,
+            format!(
+                "{}; no next move is printed: the invocation is not UTF-8",
+                cause.into()
+            ),
+            Next::Run(Vec::new()),
+        ),
+    }
+}
+
+// A block holds a whole step or a unit, never a part, and `--block` takes only a step.
+fn owner_moves(host: &dyn Host, root: &Path, target: &Target) -> Vec<(String, outcome::Move)> {
+    let Some(prefix) = host.prefix() else {
+        return Vec::new();
     };
+    let step = whole(target);
     let mut add = vec![
         "owner-queue".into(),
         "add".into(),
@@ -869,54 +930,576 @@ fn owner_queue_not_open(
     if target.step.is_some() {
         add.extend(["--block".into(), step.as_str().into()]);
     }
+    let mut moves = vec![(
+        "to file a new question for the owner".to_owned(),
+        outcome::Move::new(outcome::cm(prefix.clone(), add)),
+    )];
+    for (open, title) in crate::ledger::open_titles(root) {
+        let argv = outcome::cm(
+            prefix.clone(),
+            [
+                "advance".into(),
+                step.as_str().into(),
+                format!("blocked:until:owner-queue:{open}").into(),
+            ],
+        );
+        moves.push((
+            format!("when the step waits on item {open}, `{title}`"),
+            outcome::Move::new(argv),
+        ));
+    }
+    moves
+}
+
+fn open_listed(root: &Path) -> Option<String> {
     let open = crate::ledger::open_titles(root);
-    let full = match part {
-        Some(part) => format!("{step}#{part}"),
-        None => step.clone(),
+    (!open.is_empty()).then(|| {
+        open.iter()
+            .map(|(open, title)| format!("{open}. {title}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
+fn owner_queue_not_open(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    part: Option<&str>,
+    number: u32,
+) -> Violation {
+    let cause = match open_listed(root) {
+        None => format!("OWNER-QUEUE.md has no open item {number}, and no item is open"),
+        Some(listed) => {
+            format!("OWNER-QUEUE.md has no open item {number}; the open items are {listed}")
+        }
     };
-    let prefix = host.prefix();
-    let add = prefix
-        .clone()
-        .map(|prefix| outcome::Move::new(outcome::cm(prefix, add)));
-    if open.is_empty() {
-        return Violation::refuse_printed(
-            full,
-            "owner-queue-not-open",
-            format!("OWNER-QUEUE.md has no open item {number}, and no item is open"),
-            add.map(Into::into),
+    Violation::refuse_printed(
+        with_part(target, part),
+        "owner-queue-not-open",
+        cause,
+        choice(owner_moves(host, root, target)),
+    )
+}
+
+const BLOCK_FORMS: &str = "a block waits on <step>, pr-open:<step>, tag:<repo>@<version>, deployed:<repo>@<version>, owner-queue:<N> or epoch:WORKING";
+
+const GATE_FORMS: &str = "a gate is <step>, <NN-name>/<unit>/<step>, pr-open:<step>, pin:<step>@<sha>, tag:<repo>@<version> or deployed:<repo>@<version>";
+
+struct Named<'a> {
+    step: String,
+    pr_open: bool,
+    pin: Option<&'a str>,
+}
+
+fn named_step<'a>(text: &'a str, unit: &str) -> Option<Named<'a>> {
+    if text.starts_with("tag:") || text.starts_with("deployed:") {
+        return None;
+    }
+    let (pr_open, rest) = match text.strip_prefix("pr-open:") {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (rest, pin) = match rest.strip_prefix("pin:") {
+        Some(pin) => match pin.rsplit_once('@') {
+            Some((step, sha)) => (step, Some(sha)),
+            None => (pin, Some("")),
+        },
+        None => (rest, None),
+    };
+    // A step id holds no `:`, so a text that still does is a condition of another kind.
+    if rest.contains(':') {
+        return None;
+    }
+    let rest = rest.trim_matches('/');
+    let step = if rest.contains('/') {
+        rest.to_owned()
+    } else {
+        format!("{unit}/{rest}")
+    };
+    Some(Named { step, pr_open, pin })
+}
+
+impl Named<'_> {
+    fn on(&self, near: &str, units: &Units, pin: bool) -> Option<String> {
+        match self.pin {
+            Some(sha) if pin => {
+                let sha = Some(sha)
+                    .filter(|sha| crate::state::is_commit(sha))
+                    .map(str::to_owned)
+                    .or_else(|| plan::track(units, near)?.evidence.sha.clone())?;
+                Some(format!("pin:{near}@{sha}"))
+            }
+            _ if self.pr_open => Some(format!("pr-open:{near}")),
+            _ => Some(near.to_owned()),
+        }
+    }
+}
+
+fn track_of<'a>(
+    unit: Option<&'a UnitState>,
+    target: &Target,
+    part: Option<&str>,
+) -> Option<&'a Track> {
+    let unit = unit?;
+    match (&target.step, part) {
+        (None, _) => Some(&unit.track),
+        (Some(step), None) => Some(&unit.steps.get(step)?.track),
+        (Some(step), Some(part)) => unit.steps.get(step)?.parts.get(part),
+    }
+}
+
+pub(crate) fn block_refusal(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    part: Option<&str>,
+    reason: &str,
+) -> Violation {
+    let path = with_part(target, part);
+    let step = whole(target);
+    let unit = store::load_unit(&root.join(&target.unit)).ok();
+    if let Some(track) = track_of(unit.as_ref(), target, None)
+        && track.state.is_final()
+    {
+        return Violation::refuse(
+            path,
+            "block-condition",
+            format!("`blocked:{reason}` names no block a final track can take"),
+            Next::settled(format!("{step} is {}, which is final", track.state)),
         );
     }
-    let listed: Vec<String> = open
-        .iter()
-        .map(|(open, title)| format!("{open}. {title}"))
-        .collect();
-    let next = prefix.zip(add).map(|(prefix, add)| {
-        let mut moves = vec![("to file a new question for the owner".to_owned(), add)];
-        for (open, title) in &open {
-            let argv = outcome::cm(
-                prefix.clone(),
-                [
-                    "advance".into(),
-                    step.as_str().into(),
-                    format!("blocked:until:owner-queue:{open}").into(),
-                ],
-            );
-            moves.push((
-                format!("when the step waits on item {open}, `{title}`"),
-                outcome::Move::new(argv),
-            ));
+    let prefix = host.prefix();
+    let advance = |state: String| {
+        let admitted = match state.strip_prefix("blocked:until:") {
+            Some(condition) => plan::block_condition(condition, &target.unit).is_ok(),
+            None => state.parse::<Phase>().is_ok(),
+        };
+        prefix.clone().filter(|_| admitted).map(|prefix| {
+            outcome::Move::new(outcome::cm(
+                prefix,
+                ["advance".into(), step.as_str().into(), state.into()],
+            ))
+        })
+    };
+    let Some(condition) = reason.strip_prefix("until:") else {
+        let mut slug = String::new();
+        for c in reason.chars() {
+            if c.is_ascii_alphanumeric() || "._".contains(c) {
+                slug.push(c);
+            } else if !slug.is_empty() && !slug.ends_with('-') {
+                slug.push('-');
+            }
         }
-        Next::either(moves)
+        let slug = slug.trim_end_matches('-');
+        let mut moves: Vec<(String, outcome::Move)> = (!slug.is_empty())
+            .then(|| advance(format!("blocked:{slug}")))
+            .flatten()
+            .map(|only| ("to block on that reason as one word".to_owned(), only))
+            .into_iter()
+            .collect();
+        moves.extend(owner_moves(host, root, target));
+        return Violation::refuse_printed(
+            path,
+            "block-condition",
+            format!(
+                "`blocked:{reason}`: a blocked reason is one word of letters, digits, `.`, `_` or `-`"
+            ),
+            choice(moves),
+        );
+    };
+    if condition.starts_with("owner-queue:") {
+        let cause = match open_listed(root) {
+            None => format!(
+                "`{condition}` is not an item number, and OWNER-QUEUE.md has no open numbered item"
+            ),
+            Some(listed) => {
+                format!("`{condition}` is not an item number; the open items are {listed}")
+            }
+        };
+        return Violation::refuse_printed(
+            path,
+            "block-condition",
+            cause,
+            choice(owner_moves(host, root, target)),
+        );
+    }
+    let units = plan::load_units(root).unwrap_or_default();
+    // The step parser's refusal lists gate forms, pin among them, which a block does not take.
+    let cause = match plan::block_condition(condition, &target.unit) {
+        Err(_)
+            if After::parse(condition, &target.unit).is_err() && After::refuses_step(condition) =>
+        {
+            format!("`{condition}` names no block condition; {BLOCK_FORMS}")
+        }
+        Err(message) => format!("{message}; {BLOCK_FORMS}"),
+        Ok(gate) => {
+            let named = After::parse(&gate, &target.unit).map(|after| after.target());
+            match named {
+                Ok(named) => format!("`{condition}` names {named}, which is not declared"),
+                Err(message) => format!("{message}; {BLOCK_FORMS}"),
+            }
+        }
+    };
+    let mut moves = Vec::new();
+    if let Some(named) = named_step(condition, &target.unit) {
+        for near in plan::nearest(&units, &named.step, true) {
+            let Some(gate) = named.on(&near, &units, false).filter(|_| near != step) else {
+                continue;
+            };
+            if let Some(each) = advance(format!("blocked:until:{gate}")) {
+                moves.push((format!("when the step waits on `{gate}`"), each));
+            }
+        }
+    }
+    moves.extend(owner_moves(host, root, target));
+    Violation::refuse_printed(path, "block-condition", cause, choice(moves))
+}
+
+pub struct Asked<'a> {
+    pub part: Option<&'a str>,
+    pub given: &'a [Flag],
+    pub gate: &'a [(&'static str, &'static str)],
+    pub repo: Option<&'a Path>,
+    pub by: bool,
+}
+
+fn admits(track: &Track, to: &Phase, finish: Finish, target: &Target, part: Option<&str>) -> bool {
+    if part.is_some()
+        && !matches!(
+            to,
+            Phase::PrOpen | Phase::Merged | Phase::Released | Phase::Deployed
+        )
+    {
+        return false;
+    }
+    if *to == Phase::Launched {
+        return target.step.is_some()
+            && part.is_none()
+            && finish != Finish::Evidence
+            && track.state == Phase::Drafted;
+    }
+    if tag_only(to, track, &with_part(target, part)) {
+        return !track.state.is_final();
+    }
+    track.check(to, finish).is_ok()
+}
+
+fn tag_only(to: &Phase, track: &Track, full: &str) -> bool {
+    *to == Phase::Released
+        && Release::of_target(full).is_some()
+        && matches!(track.resting(), Phase::Drafted | Phase::Launched)
+}
+
+fn evidence_taken(
+    to: &Phase,
+    finish: Finish,
+    track: &Track,
+    full: &str,
+) -> (&'static [Flag], &'static [Flag]) {
+    if resumes(to, track) {
+        (&[], &[])
+    } else if tag_only(to, track, full) {
+        (&[Flag::Tag, Flag::Sha], &[Flag::Digest])
+    } else {
+        evidence_for(to, finish)
+    }
+}
+
+pub fn advance_state(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    asked: &Asked,
+    text: &str,
+) -> std::result::Result<Phase, Violation> {
+    let message = match text.parse::<Phase>() {
+        Ok(phase) => return Ok(phase),
+        Err(message) => message,
+    };
+    if let Some(reason) = text.strip_prefix("blocked:") {
+        return Err(block_refusal(host, root, target, asked.part, reason));
+    }
+    let path = with_part(target, asked.part);
+    let step = whole(target);
+    let unit = store::load_unit(&root.join(&target.unit)).ok();
+    let declared = unit
+        .as_ref()
+        .and_then(|unit| unit.steps.get(target.step.as_deref()?));
+    let finish = declared.map_or(Finish::Shipped, |declared| {
+        declared.finish(Release::of_target(&step).is_some())
     });
-    Violation::refuse_printed(
-        full,
-        "owner-queue-not-open",
-        format!(
-            "OWNER-QUEUE.md has no open item {number}; the open items are {}",
-            listed.join("; ")
+    let Some(track) = track_of(unit.as_ref(), target, asked.part) else {
+        let next = host
+            .prefix()
+            .map(|prefix| Next::run(outcome::cm(prefix, ["next".into()])));
+        return Err(Violation::refuse_printed(
+            path,
+            "advance-refused",
+            message,
+            next,
+        ));
+    };
+    let wanted: Vec<Phase> = if asked.by {
+        vec![Phase::Superseded]
+    } else {
+        let mut near: Vec<(usize, Phase)> = crate::state::ORDER
+            .iter()
+            .chain([&Phase::Superseded])
+            .map(|phase| (plan::distance(&phase.to_string(), text), phase.clone()))
+            .filter(|(edits, _)| *edits <= 2)
+            .collect();
+        near.sort_by_key(|(edits, _)| *edits);
+        near.into_iter().map(|(_, phase)| phase).collect()
+    };
+    let legal = match (asked.part, finish) {
+        (None, Finish::Evidence) if !track.state.is_final() => Some(Phase::Done),
+        _ => track.next_state(finish),
+    };
+    let Some(to) = wanted
+        .into_iter()
+        .chain(legal)
+        .find(|to| admits(track, to, finish, target, asked.part))
+    else {
+        let why = match asked.part {
+            _ if track.state.is_final() => format!("{path} is {}, which is final", track.state),
+            Some(_) => format!(
+                "{path} is {}, the last state a part reaches; {step} moves on as a whole",
+                track.state
+            ),
+            None => format!("{path} is {} and has no move to name", track.state),
+        };
+        return Err(Violation::refuse(
+            path,
+            "advance-refused",
+            message,
+            Next::settled(why),
+        ));
+    };
+    let cause = format!(
+        "{message}; {path} is {}, and its next state is {to}",
+        track.state
+    );
+    if to == Phase::Launched {
+        let local = declared
+            .and_then(|declared| declared.lane)
+            .is_some_and(Lane::is_local);
+        let next = host.prefix().and_then(|prefix| {
+            let mut launch = vec!["launch".into(), step.as_str().into()];
+            if local {
+                match asked.repo {
+                    Some(repo) => launch.extend(outcome::option("--worktree", repo.to_str()?)),
+                    None => launch.extend(["--worktree".into(), Input::Checkout.into()]),
+                }
+            }
+            Some(Next::run(outcome::cm(prefix, launch)))
+        });
+        return Err(Violation::refuse_printed(
+            path,
+            "advance-refused",
+            cause,
+            next,
+        ));
+    }
+    let (required, optional) = evidence_taken(&to, finish, track, &path);
+    let dropped: Vec<Flag> = asked
+        .given
+        .iter()
+        .copied()
+        .filter(|flag| !required.contains(flag) && !optional.contains(flag))
+        .collect();
+    let gated = gate_applies(&to, track, asked.part, &step, declared);
+    let gate_dropped: &[(&str, &str)] = if gated { &[] } else { asked.gate };
+    let carries = |flag: Flag| {
+        required.contains(&flag) || (asked.given.contains(&flag) && !dropped.contains(&flag))
+    };
+    // `advance_held` resolves --sha and --tag in --repo, else the recorded worktree, else (for
+    // released) the PR's or the declared GitHub repo; with none of them the move names a checkout.
+    let checkout = asked.repo.is_none()
+        && (carries(Flag::Sha) || carries(Flag::Tag))
+        && !unit.as_ref().is_some_and(|unit| {
+            evidence_repos(None, unit, target)
+                .iter()
+                .any(|repo| repo.exists())
+        })
+        && !(to == Phase::Released
+            && (track
+                .evidence
+                .pr
+                .as_deref()
+                .and_then(GithubRepo::of_pr)
+                .is_some()
+                || declared.is_some_and(|declared| declared.github.is_some())));
+    let tag = Release::of_target(&path)
+        .zip(declared)
+        .map(|(release, declared)| declared.release_tag(&release));
+    let names: Vec<&str> = dropped
+        .iter()
+        .map(|flag| flag.name())
+        .chain(gate_dropped.iter().map(|(name, _)| *name))
+        .collect();
+    let single = (to == Phase::Done && finish == Finish::Evidence)
+        .then(|| crate::ledger::single_evidence(root, target))
+        .flatten();
+    let cause = match names.as_slice() {
+        [] => cause,
+        names => format!(
+            "{cause}, which takes no {}, so the move drops it",
+            names.join(" or ")
         ),
-        next,
-    )
+    };
+    let moves = host
+        .argv()
+        .and_then(|argv| crate::cli::replaced(&argv, Slot::Positional("state"), &to.to_string()))
+        .map(|argv| {
+            dropped
+                .iter()
+                .map(|flag| flag.name().trim_start_matches('-'))
+                .chain(gate_dropped.iter().map(|(_, id)| *id))
+                .fold(argv, |argv, id| crate::cli::without(&argv, id))
+        })
+        .map(outcome::Move::again)
+        .map(|again| {
+            required
+                .iter()
+                .filter(|flag| !asked.given.contains(flag))
+                .filter(|flag| !(**flag == Flag::File && single.is_some()))
+                .fold(again, |again, flag| {
+                    again.set(flag.name(), evidence_value(*flag, &to, track, tag.as_ref()))
+                })
+        })
+        .map(|again| match checkout {
+            true => again.set("--repo", Input::Checkout),
+            false => again,
+        })
+        .map(|again| (format!("to move {path} to {to}"), again))
+        .into_iter()
+        .collect();
+    Err(refuse_moves(path, "advance-refused", cause, moves))
+}
+
+fn evidence_value(flag: Flag, to: &Phase, track: &Track, tag: Option<&TagName>) -> outcome::Arg {
+    let recorded = match (flag, to) {
+        (Flag::Pr, _) => track.evidence.pr.as_deref(),
+        // A release step's tag is declared at `cm init`, and `advance_held` takes no other.
+        (Flag::Tag, _) => tag.map(TagName::as_str),
+        // A rollout deploys the merge it recorded; the merge itself is a new revision.
+        (Flag::Sha, Phase::Deployed) => track.evidence.sha.as_deref(),
+        _ => None,
+    };
+    match (recorded, flag) {
+        (Some(value), _) => value.into(),
+        (None, Flag::Sha) => Input::Revision.into(),
+        (None, Flag::Pr) => Input::Pr.into(),
+        (None, Flag::Tag) => Input::Tag.into(),
+        (None, Flag::Digest) => Input::Digest.into(),
+        (None, Flag::File) => Input::EvidenceFile.into(),
+    }
+}
+
+pub(crate) struct Gate<'a> {
+    pub id: &'a str,
+    pub nth: usize,
+    pub text: &'a str,
+}
+
+pub(crate) fn after_refusal(
+    host: &dyn Host,
+    root: &Path,
+    (path, unit): (&str, &str),
+    gate: Gate,
+    message: String,
+    existing: Option<&[After]>,
+) -> Violation {
+    let cause = if After::refuses_step(gate.text) {
+        message
+    } else {
+        format!("{message}; {GATE_FORMS}")
+    };
+    let slot = Slot::Option(gate.id, gate.nth);
+    let until = gate.id == "until";
+    let units = plan::load_units(root).unwrap_or_default();
+    let candidates: Vec<String> = match existing {
+        Some(gates) => {
+            let mut ranked: Vec<(usize, String)> = gates
+                .iter()
+                .map(|after| {
+                    (
+                        plan::distance(&after.to_string(), gate.text),
+                        after.to_string(),
+                    )
+                })
+                .collect();
+            ranked.sort();
+            ranked.into_iter().map(|(_, after)| after).take(5).collect()
+        }
+        None => named_step(gate.text, unit)
+            .map(|named| {
+                plan::nearest(&units, &named.step, true)
+                    .iter()
+                    .filter(|near| *near != path)
+                    .filter_map(|near| named.on(near, &units, !until))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    let mut moves = Vec::new();
+    for candidate in candidates {
+        let fits = match After::parse(&candidate, unit) {
+            Ok(After::Pin(_)) => !until,
+            Ok(_) => true,
+            Err(_) => false,
+        };
+        if fits
+            && candidate != gate.text
+            && let Some(each) = again(host, slot, &candidate)
+        {
+            moves.push((format!("when you meant `{candidate}`"), each));
+        }
+    }
+    if !until {
+        moves.extend(
+            again_dropping(host, gate.id, gate.nth)
+                .map(|without| (format!("to go on without `{}`", gate.text), without)),
+        );
+    }
+    if moves.is_empty()
+        && let Some(prefix) = host.prefix().filter(|_| host.argv().is_some())
+    {
+        moves.push((
+            "to see each declared step and what it waits on".to_owned(),
+            outcome::Move::new(outcome::cm(prefix, ["next".into()])),
+        ));
+    }
+    refuse_moves(path, "after-parse", cause, moves)
+}
+
+pub(crate) fn nearest_refusal(
+    host: &dyn Host,
+    root: &Path,
+    (path, rule): (&str, &'static str),
+    (text, slot, with_step): (&str, Slot, bool),
+    cause: String,
+    otherwise: Vec<(String, outcome::Move)>,
+) -> Violation {
+    let units = plan::load_units(root).unwrap_or_default();
+    let nearest = plan::nearest(&units, text, with_step);
+    let cause = if nearest.is_empty() {
+        cause
+    } else {
+        format!(
+            "{cause}; the nearest declared ids are {}",
+            nearest.join(", ")
+        )
+    };
+    let mut moves: Vec<(String, outcome::Move)> = nearest
+        .iter()
+        .filter_map(|near| {
+            again(host, slot, near).map(|each| (format!("when you meant `{near}`"), each))
+        })
+        .collect();
+    moves.extend(otherwise);
+    refuse_moves(path, rule, cause, moves)
 }
 
 pub(crate) fn shell_word(text: &str) -> String {
@@ -1441,16 +2024,51 @@ pub struct MergeGate<'a> {
 }
 
 impl MergeGate<'_> {
-    fn given(&self) -> Vec<&'static str> {
+    pub fn flags(&self) -> Vec<(&'static str, &'static str)> {
         [
-            (self.head.is_some(), "--head"),
-            (self.ci_verified.is_some(), "--ci-verified"),
-            (self.waiver.is_some(), "--override"),
+            (self.head.is_some(), "--head", "head"),
+            (self.ci_verified.is_some(), "--ci-verified", "ci_verified"),
+            (self.waiver.is_some(), "--override", "waiver"),
         ]
         .into_iter()
-        .filter_map(|(given, flag)| given.then_some(flag))
+        .filter_map(|(given, name, id)| given.then_some((name, id)))
         .collect()
     }
+
+    fn given(&self) -> Vec<&'static str> {
+        self.flags().into_iter().map(|(name, _)| name).collect()
+    }
+}
+
+fn remerges(
+    to: &Phase,
+    track: &Track,
+    part: Option<&str>,
+    step_full: &str,
+    declared: bool,
+) -> bool {
+    *to == Phase::Merged
+        && track.state == Phase::Merged
+        && part.is_none()
+        && declared
+        && Release::of_target(step_full).is_some()
+}
+
+fn resumes(to: &Phase, track: &Track) -> bool {
+    matches!(track.state, Phase::Blocked(_)) && track.resting() == to
+}
+
+fn gate_applies(
+    to: &Phase,
+    track: &Track,
+    part: Option<&str>,
+    step_full: &str,
+    declared: Option<&Step>,
+) -> bool {
+    *to == Phase::Merged
+        && !remerges(to, track, part, step_full, declared.is_some())
+        && !resumes(to, track)
+        && declared.is_some_and(|step| merge_gated(step_full, step))
 }
 
 /// What GitHub says of a PR for its merge gate, read before cm takes the lock.
@@ -1880,7 +2498,7 @@ pub(crate) fn advance_held(
                 }
                 let tag = step.release_tag(&release);
                 let track = &step.track;
-                let resuming = matches!(track.state, Phase::Blocked(_)) && track.resting() == to;
+                let resuming = resumes(to, track);
                 let tag_only = matches!(track.resting(), Phase::Drafted | Phase::Launched);
                 let sha = if tag_only {
                     given.sha.as_deref()
@@ -1953,11 +2571,27 @@ pub(crate) fn advance_held(
     }
     let unit_dir = root.join(&target.unit);
     if !store::is_unit(&unit_dir) {
-        violations.push(Violation::new(
-            &target.unit,
-            "unit-missing",
-            format!("no unit state; run `cm init {}`", target.unit),
-        ));
+        violations.push(match host.prefix() {
+            Some(prefix) if target.step.is_some() => nearest_refusal(
+                host,
+                root,
+                (&target.unit, "unit-missing"),
+                (&step_full, Slot::Positional("target"), true),
+                format!("{} has no unit state", target.unit),
+                vec![(
+                    format!("to create {}", target.unit),
+                    outcome::Move::new(outcome::cm(
+                        prefix,
+                        ["init".into(), target.unit.as_str().into()],
+                    )),
+                )],
+            ),
+            _ => Violation::new(
+                &target.unit,
+                "unit-missing",
+                format!("no unit state; run `cm init {}`", target.unit),
+            ),
+        });
         return Ok(Outcome::refused(violations));
     }
     let mut unit = store::load_unit(&unit_dir)?;
@@ -1984,10 +2618,25 @@ pub(crate) fn advance_held(
                 },
             },
             None => {
-                violations.push(Violation::new(
-                    &full,
-                    "step-unknown",
-                    "the step has not launched; `cm launch` it first",
+                let declare = host.prefix().map(|prefix| {
+                    let argv = outcome::cm(
+                        prefix,
+                        [
+                            "init".into(),
+                            step_full.as_str().into(),
+                            "--lane".into(),
+                            Input::Lane.into(),
+                        ],
+                    );
+                    (format!("to declare {step_full}"), outcome::Move::new(argv))
+                });
+                violations.push(nearest_refusal(
+                    host,
+                    root,
+                    (&full, "step-unknown"),
+                    (&step_full, Slot::Positional("target"), true),
+                    format!("{} declares no step `{step}`", target.unit),
+                    declare.into_iter().collect(),
                 ));
                 return Ok(Outcome::refused(violations));
             }
@@ -2076,14 +2725,8 @@ pub(crate) fn advance_held(
             ),
         )
     };
-    let tag_only = *to == Phase::Released
-        && Release::of_target(&full).is_some()
-        && matches!(track.resting(), Phase::Drafted | Phase::Launched);
-    let remerge = *to == Phase::Merged
-        && track.state == Phase::Merged
-        && part.is_none()
-        && declared.is_some()
-        && Release::of_target(&step_full).is_some();
+    let tag_only = tag_only(to, &track, &full);
+    let remerge = remerges(to, &track, part, &step_full, declared.is_some());
     match track.check(to, finish) {
         Err(_) if remerge => {}
         Err(_) if tag_only && !track.state.is_final() => {}
@@ -2100,14 +2743,8 @@ pub(crate) fn advance_held(
         let units = plan::load_units(root)?;
         violations.extend(plan::unmet(&full, &plan::gates(root, &units, step)));
     }
-    let resuming = matches!(track.state, Phase::Blocked(_)) && track.resting() == to;
-    let (required, optional) = if resuming {
-        (&[][..], &[][..])
-    } else if tag_only {
-        (&[Flag::Tag, Flag::Sha][..], &[Flag::Digest][..])
-    } else {
-        evidence_for(to, finish)
-    };
+    let resuming = resumes(to, &track);
+    let (required, optional) = evidence_taken(to, finish, &track, &full);
     for flag in required {
         if !flag.given(given, file) {
             violations.push(Violation::new(
@@ -2433,12 +3070,7 @@ pub(crate) fn advance_held(
             )),
         }
     }
-    let gated = *to == Phase::Merged
-        && !remerge
-        && !resuming
-        && declared
-            .as_ref()
-            .is_some_and(|step| merge_gated(&step_full, step));
+    let gated = gate_applies(to, &track, part, &step_full, declared.as_ref());
     let mut gate_lines = Vec::new();
     let mut waived = Vec::new();
     if gated {
@@ -2681,8 +3313,21 @@ fn unit_of(
     Ok(Some((store::load_unit(&unit_dir)?, full)))
 }
 
-fn step_unknown(full: &str) -> Violation {
-    Violation::new(full, "step-unknown", "the step is not declared")
+fn step_unknown(host: &dyn Host, root: &Path, full: &str) -> Violation {
+    let list = host.prefix().map(|prefix| {
+        (
+            "to see each declared step's next move".to_owned(),
+            outcome::Move::new(outcome::cm(prefix, ["next".into()])),
+        )
+    });
+    nearest_refusal(
+        host,
+        root,
+        (full, "step-unknown"),
+        (full, Slot::Positional("target"), true),
+        "the step is not declared".to_owned(),
+        list.into_iter().collect(),
+    )
 }
 
 fn track_mut<'a>(unit: &'a mut UnitState, target: &Target) -> Option<&'a mut Track> {
@@ -2709,7 +3354,7 @@ pub fn unblock(
         return Ok(Outcome::refused(violations));
     };
     let Some(current) = track_mut(&mut unit, target) else {
-        violations.push(step_unknown(&full));
+        violations.push(step_unknown(host, root, &full));
         return Ok(Outcome::refused(violations));
     };
     let track = current.clone();
@@ -2976,7 +3621,7 @@ pub fn amend(
     };
     let units = plan::load_units(root)?;
     let Some(step) = unit.steps.get(step_name).cloned() else {
-        violations.push(step_unknown(&full));
+        violations.push(step_unknown(host, root, &full));
         return Ok(Outcome::refused(violations));
     };
     if step.lane.is_none() {
@@ -3130,9 +3775,20 @@ pub fn amend(
             step.lane.map_or("—", Lane::name)
         ));
     }
-    for text in &amendment.drop_after {
+    for (nth, text) in amendment.drop_after.iter().enumerate() {
         match After::parse(text, &target.unit) {
-            Err(message) => violations.push(Violation::new(&full, "after-parse", message)),
+            Err(message) => violations.push(after_refusal(
+                host,
+                root,
+                (&full, &target.unit),
+                Gate {
+                    id: "drop_after",
+                    nth,
+                    text,
+                },
+                message,
+                Some(&next.after),
+            )),
             Ok(after) => {
                 if next.after.contains(&after) {
                     next.after.retain(|gate| gate != &after);
@@ -3147,9 +3803,20 @@ pub fn amend(
             }
         }
     }
-    for text in &amendment.after {
+    for (nth, text) in amendment.after.iter().enumerate() {
         match After::parse(text, &target.unit) {
-            Err(message) => violations.push(Violation::new(&full, "after-parse", message)),
+            Err(message) => violations.push(after_refusal(
+                host,
+                root,
+                (&full, &target.unit),
+                Gate {
+                    id: "after",
+                    nth,
+                    text,
+                },
+                message,
+                None,
+            )),
             Ok(after) if next.after.contains(&after) => {}
             Ok(after) => {
                 changes.push(format!("- after: + {after}"));

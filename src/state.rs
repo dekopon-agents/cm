@@ -273,7 +273,10 @@ impl Track {
         }
     }
 
-    fn successor(&self, finish: Finish) -> Option<Phase> {
+    pub fn next_state(&self, finish: Finish) -> Option<Phase> {
+        if self.state.is_final() {
+            return None;
+        }
         match (self.resting(), finish) {
             (Phase::Merged, Finish::Rollout) => Some(Phase::Deployed),
             (phase, _) => phase.successor(),
@@ -325,7 +328,7 @@ impl Track {
         if blocked && to == resting {
             return Ok(());
         }
-        let next = self.successor(finish);
+        let next = self.next_state(finish);
         if next.as_ref() == Some(to) {
             return Ok(());
         }
@@ -671,6 +674,21 @@ impl After {
             }));
         }
         step(text).map(After::Merged)
+    }
+
+    // Whether a text `parse` refuses was refused for its step id: that refusal alone lists every
+    // gate form. It follows `parse`'s own order of prefixes.
+    pub(crate) fn refuses_step(text: &str) -> bool {
+        if text.starts_with("tag:") || text.starts_with("deployed:") {
+            return false;
+        }
+        if text.starts_with("pr-open:") {
+            return true;
+        }
+        match text.strip_prefix("pin:") {
+            Some(pin) => pin.rsplit_once('@').is_some_and(|(_, sha)| is_commit(sha)),
+            None => true,
+        }
     }
 
     pub fn target(&self) -> String {
@@ -1317,7 +1335,7 @@ impl Step {
     ) -> Option<(Phase, Phase)> {
         let reach = self.parts_reach()?;
         let from = self.track.state.clone();
-        let next = self.track.successor(self.finish(release));
+        let next = self.track.next_state(self.finish(release));
         if next.as_ref() != Some(&reach)
             || self.track.blocked_from.is_some()
             || self.track.check(&reach, self.finish(release)).is_err()

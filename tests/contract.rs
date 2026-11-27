@@ -937,7 +937,7 @@ fn a_non_utf8_campaign_path_prints_no_move_rather_than_a_substituted_one() {
         violation["message"]
             .as_str()
             .unwrap()
-            .ends_with("no next move is printed: the campaign path is not UTF-8"),
+            .ends_with("no next move is printed: a path it would name is not UTF-8"),
         "{violation}"
     );
     assert!(!refused.to_string().contains('\u{fffd}'), "{refused}");

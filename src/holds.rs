@@ -336,7 +336,18 @@ pub fn known_red(
         }
         Ok(until) => Some(until),
         Err(message) => {
-            violations.push(Violation::new(&full, "after-parse", message));
+            violations.push(crate::commands::after_refusal(
+                host,
+                root,
+                (&full, &target.unit),
+                crate::commands::Gate {
+                    id: "until",
+                    nth: 0,
+                    text: args.until,
+                },
+                message,
+                None,
+            ));
             None
         }
     };

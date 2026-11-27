@@ -1,4 +1,5 @@
 #![allow(deprecated)]
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -13,8 +14,8 @@ use crate::forge::GithubRepo;
 use crate::host::{Host, Invoked};
 use crate::idea::{self, Maturity, Word};
 use crate::lint;
-use crate::outcome::{Outcome, Violation};
-use crate::state::{Evidence, LANES, Lane, Phase, Work};
+use crate::outcome::{Arg, Input, Move, Next, Outcome, Violation};
+use crate::state::{Evidence, Flag, LANES, Lane, Phase, Work};
 use crate::store::{self, Target, parse_target};
 use crate::tick::proc::FileSizeLimit;
 
@@ -59,7 +60,7 @@ enum Commands {
         #[arg(default_value = ".")]
         dir: PathBuf,
         #[arg(long, help = format!("The step's lane. Choose from {}.", LANES.map(Lane::name).join(", ")))]
-        lane: Option<Lane>,
+        lane: Option<String>,
         /// The step is a study: it ships no PR and finishes with `cm advance <step> done --evidence <path>`.
         #[arg(long)]
         study: bool,
@@ -85,11 +86,10 @@ enum Commands {
     /// List the launchable steps (drafted, `--after` met, kickoff written, no pause or quota hold), or, given one, refuse it unless it is next.
     Next {
         /// <NN-name>/<unit>/<step>: check this step only.
-        #[arg(value_parser = step_target)]
-        target: Option<Target>,
+        target: Option<String>,
         /// Only steps in this lane.
         #[arg(long)]
-        lane: Option<Lane>,
+        lane: Option<String>,
         /// Print only coordinator actions, launchable steps among them. Exit 1 when any remain.
         #[arg(long)]
         act: bool,
@@ -107,7 +107,7 @@ enum Commands {
     /// Move EPOCH.md along OPEN → PLANNING → WORKING → CLOSED, stamping the date. Refuses a null pin.
     Epoch {
         /// planning, working or closed.
-        status: Status,
+        status: String,
         /// The skill revision to pin (`skill_revision`).
         #[arg(long, value_name = "REV")]
         skill_revision: Option<String>,
@@ -148,8 +148,7 @@ enum Commands {
         #[arg(long, value_name = "REASON")]
         no_parts: Option<String>,
         /// <NN-name>/<unit>/<step>
-        #[arg(value_parser = step_target)]
-        target: Target,
+        target: String,
         /// The step's worktree, which must already exist; required for the local pi lane and undeclared steps.
         #[arg(long, value_name = "PATH")]
         worktree: Option<PathBuf>,
@@ -164,8 +163,7 @@ enum Commands {
     /// Release a blocked unit or step to the state it was blocked from, with the evidence that cleared it.
     Unblock {
         /// <NN-name>/<unit> or <NN-name>/<unit>/<step>
-        #[arg(value_parser = any_target)]
-        target: Target,
+        target: String,
         /// A non-empty campaign file showing what cleared the block; optional when a step's until condition holds.
         #[arg(long, value_name = "PATH")]
         evidence: Option<PathBuf>,
@@ -173,8 +171,7 @@ enum Commands {
     /// Change a drafted or launched step's declaration. Release --github/--tag/--artifact/--drop-artifact also allow pr-open or merged. --part alone also amends a step that moved on.
     Amend {
         /// <NN-name>/<unit>/<step>, or <NN-name>/<unit> with --priority
-        #[arg(value_parser = any_target)]
-        target: Target,
+        target: String,
         /// A unit's priority: `now` sorts its lines first in `cm next`, `--act` and CARD.
         #[arg(long, value_enum)]
         priority: Option<crate::state::Priority>,
@@ -183,7 +180,7 @@ enum Commands {
         study: bool,
         /// The step's new lane.
         #[arg(long)]
-        lane: Option<Lane>,
+        lane: Option<String>,
         /// A gate to add, as `cm init --after` takes it. Repeat for each.
         #[arg(long, value_name = "AFTER")]
         after: Vec<String>,
@@ -212,8 +209,7 @@ enum Commands {
     /// Show, claim or extend a remote launch's attempt record; every external action is recorded before the next.
     Attempt {
         /// <NN-name>/<unit>/<step>
-        #[arg(value_parser = step_target)]
-        target: Target,
+        target: String,
         /// The claim token `cm launch` or `claim` printed; begin, record and end need the current one.
         #[arg(long, global = true, value_name = "TOKEN")]
         claim: Option<String>,
@@ -230,10 +226,9 @@ enum Commands {
     /// Move a unit or step to its next state with that state's evidence.
     Advance {
         /// <NN-name>/<unit> or <NN-name>/<unit>/<step>
-        #[arg(value_parser = any_target)]
-        target: Target,
+        target: String,
         /// pr-open, merged, released, deployed, done, superseded or blocked:<reason>. A Mac-lane, non-rollout owner-lane or study step moves to done with --evidence.
-        state: Phase,
+        state: String,
         /// A commit: the PR head for pr-open, the merge commit for merged.
         #[arg(long)]
         sha: Option<String>,
@@ -271,8 +266,7 @@ enum Commands {
     /// Record a known-red exception: the merge gate accepts this check failing at one commit or, with --standing, across PR heads until the closing condition holds. Refused for a check that is cancelled, timed out or unrun, or green at the PR's base.
     KnownRed {
         /// <NN-name>/<unit>/<step>
-        #[arg(value_parser = step_target)]
-        target: Target,
+        target: String,
         /// The PR head the check failed at, all 40 hex digits.
         #[arg(
             long,
@@ -303,8 +297,7 @@ enum Commands {
     /// Hold a step below deployed until a live read lands: `add` records the stored signal and its deadline, `resolve` closes it with evidence, `withdraw` closes it with a reason, and `amend` corrects its signal. Past the deadline it reads expired: unresolved, never a pass.
     Watch {
         /// <NN-name>/<unit>/<step>
-        #[arg(value_parser = step_target)]
-        target: Target,
+        target: String,
         #[command(subcommand)]
         act: WatchAct,
     },
@@ -338,8 +331,7 @@ enum Commands {
     /// Write <step>/evidence/<NAME>.md once from a non-empty body.
     Evidence {
         /// <NN-name>/<unit>/<step>
-        #[arg(value_parser = step_target)]
-        target: Target,
+        target: String,
         #[arg(long, value_name = "NAME")]
         name: String,
         /// A file holding the body; `-` reads stdin.
@@ -358,8 +350,8 @@ enum Commands {
         #[command(subcommand)]
         act: Option<ReviewAct>,
         /// <NN-name>/<unit>/<step>
-        #[arg(value_parser = step_target, required_unless_present = "import")]
-        target: Option<Target>,
+        #[arg(required_unless_present = "import")]
+        target: Option<String>,
         #[arg(long, conflicts_with = "target")]
         import: bool,
         #[arg(long, required_unless_present = "import")]
@@ -390,16 +382,14 @@ enum Commands {
     /// Append a dated ruling to <step>/evidence/coordinator-scope.md, creating it if missing.
     Ruling {
         /// <NN-name>/<unit>/<step>
-        #[arg(value_parser = step_target)]
-        target: Target,
+        target: String,
         /// The ruling, one line.
         text: String,
     },
     /// Print the step's kickoff, then its coordinator-scope.md under a fixed heading: a reviewer's brief.
     Brief {
         /// <NN-name>/<unit>/<step>
-        #[arg(value_parser = step_target)]
-        target: Target,
+        target: String,
     },
     /// List the non-blocking findings recorded by `cm review record`, or close one.
     Followups {
@@ -539,7 +529,7 @@ enum AttemptAct {
     /// End an unknown attempt as relaned and dispatch its successor under the same claim and cap.
     Restart {
         #[arg(long)]
-        lane: crate::state::Lane,
+        lane: String,
         #[arg(long, value_name = "PATH")]
         evidence: Option<PathBuf>,
     },
@@ -624,8 +614,7 @@ enum DriverAct {
 enum ReviewAct {
     /// Block until this review round is recorded or the absolute deadline passes.
     Wait {
-        #[arg(value_parser = step_target)]
-        target: Target,
+        target: String,
         #[arg(long, value_parser = commit_sha)]
         head: String,
         #[arg(long, value_parser = reviewer_name)]
@@ -640,8 +629,7 @@ enum ReviewAct {
     /// Parse a report's `cm-review` block, compute its verdict and record it under the step's evidence.
     Record {
         /// <NN-name>/<unit>/<step>
-        #[arg(value_parser = step_target)]
-        target: Target,
+        target: String,
         /// The review report, ending with its `cm-review` block.
         report: PathBuf,
         /// Who reviewed: astra, claude, …
@@ -655,8 +643,8 @@ enum ReviewAct {
         about = "Raise this step's 10-pass review cap by 1 to 3 passes, on an owner ruling committed in the campaign"
     )]
     CapRaise {
-        #[arg(value_parser = step_target, help = "<NN-name>/<unit>/<step>")]
-        target: Target,
+        #[arg(help = "<NN-name>/<unit>/<step>")]
+        target: String,
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=3), value_name = "N")]
         by: u32,
         #[arg(long, value_name = "FILE")]
@@ -665,8 +653,7 @@ enum ReviewAct {
     /// Record what resolved a blocking finding: a commit, or a ruling file in the campaign.
     Resolve {
         /// <NN-name>/<unit>/<step>
-        #[arg(value_parser = step_target)]
-        target: Target,
+        target: String,
         /// The finding: R<n>.<id>, or <id> in the step's latest review holding it.
         finding: String,
         #[arg(long, value_name = "COMMIT|RULING-FILE")]
@@ -699,8 +686,8 @@ enum QueueAct {
         #[arg(long)]
         recommendation: String,
         /// Also block this step on the new item (`blocked:until:owner-queue:N`), in the same write.
-        #[arg(long, value_name = "STEP", value_parser = step_target)]
-        block: Option<Target>,
+        #[arg(long, value_name = "STEP")]
+        block: Option<String>,
     },
     /// Journal the answer and remove the numbered item.
     Answer {
@@ -739,8 +726,8 @@ enum MacLaneAct {
         #[arg(long, value_name = "FILE")]
         body_file: Option<PathBuf>,
         /// Link the item to a declared step.
-        #[arg(long, value_parser = step_target, value_name = "NN-name/unit/step")]
-        step: Option<Target>,
+        #[arg(long, value_name = "NN-name/unit/step")]
+        step: Option<String>,
     },
     /// Stamp item N `**DONE <date>** (<receipt>).`, replacing a leading PARTIAL, HELD, RUNNING or Receipt span.
     Done {
@@ -764,12 +751,85 @@ fn reviewer_name(text: &str) -> Result<String, String> {
         .ok_or_else(|| "expected a reviewer name of letters, digits, `.`, `_` and `-`".into())
 }
 
-fn step_target(text: &str) -> Result<Target, String> {
-    parse_target(text, true)
+#[derive(Debug)]
+struct Refused(Vec<Violation>);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let rules: Vec<&str> = self.0.iter().map(|violation| violation.rule).collect();
+        write!(f, "refused: {}", rules.join(", "))
+    }
 }
 
-fn any_target(text: &str) -> Result<Target, String> {
-    parse_target(text, false)
+impl std::error::Error for Refused {}
+
+fn refused(violation: Violation) -> anyhow::Error {
+    Refused(vec![violation]).into()
+}
+
+fn target(
+    host: &dyn Host,
+    root: &Path,
+    (text, slot): (&str, Slot),
+    with_step: bool,
+) -> std::result::Result<Target, Violation> {
+    parse_target(text, with_step).map_err(|cause| {
+        let list = host.prefix().map(|prefix| {
+            (
+                "to see each declared step's next move".to_owned(),
+                Move::new(crate::outcome::cm(prefix, ["next".into()])),
+            )
+        });
+        commands::nearest_refusal(
+            host,
+            root,
+            (text, "step-unknown"),
+            (text, slot, with_step),
+            cause,
+            list.into_iter().collect(),
+        )
+    })
+}
+
+const TARGET: Slot = Slot::Positional("target");
+
+fn step_target(host: &dyn Host, root: &Path, text: &str) -> Result<Target> {
+    target(host, root, (text, TARGET), true).map_err(refused)
+}
+
+fn any_target(host: &dyn Host, root: &Path, text: &str) -> Result<Target> {
+    target(host, root, (text, TARGET), false).map_err(refused)
+}
+
+fn step_option(host: &dyn Host, root: &Path, text: &str, id: &str) -> Result<Target> {
+    target(host, root, (text, Slot::Option(id, 0)), true).map_err(refused)
+}
+
+fn lane(host: &dyn Host, path: &str, text: &str) -> Result<Lane> {
+    text.parse::<Lane>().map_err(|cause| {
+        let mut moves = Vec::new();
+        if let Some(near) = LANES
+            .into_iter()
+            .map(|lane| (crate::plan::distance(lane.name(), text), lane))
+            .filter(|(edits, _)| *edits <= 2)
+            .min_by_key(|(edits, _)| *edits)
+            .map(|(_, lane)| lane)
+            && let Some(each) = commands::again(host, Slot::Option("lane", 0), near.name())
+        {
+            moves.push((format!("when you meant {near}"), each));
+        }
+        if let Some(argv) = host.argv() {
+            moves.push((
+                "for another lane".to_owned(),
+                Move::again(argv).set("--lane", Input::Lane),
+            ));
+        }
+        refused(commands::refuse_moves(path, "lane-unknown", cause, moves))
+    })
+}
+
+fn lanes(host: &dyn Host, path: &str, text: Option<&String>) -> Result<Option<Lane>> {
+    text.map(|text| lane(host, path, text)).transpose()
 }
 
 fn ideas_folder(cli: &Cli, given: &Option<PathBuf>) -> Result<PathBuf> {
@@ -914,7 +974,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             let declaration = commands::Declaration {
                 artifacts: artifact.clone(),
                 parts: part.clone(),
-                lane: *lane,
+                lane: lanes(host, &dir.to_string_lossy(), lane.as_ref())?,
                 after: after.clone(),
                 ships: commands::Ships {
                     github: github.clone(),
@@ -935,21 +995,23 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             commands::declare(host, &under_root(cli, dir), &declaration)
         }
         Commands::Next { target, lane, act } => {
+            let root = root()?;
+            let path = target.as_deref().unwrap_or("cm next");
+            let lane = lanes(host, path, lane.as_ref())?;
+            let target = target
+                .as_deref()
+                .map(|text| step_target(host, &root, text))
+                .transpose()?;
             if *act {
                 let forge = crate::forge::Gh::default();
-                let (outcome, actionable) = crate::plan::next_act(
-                    &root()?,
-                    target.as_ref(),
-                    *lane,
-                    host.now(),
-                    Some(&forge),
-                )?;
+                let (outcome, actionable) =
+                    crate::plan::next_act(&root, target.as_ref(), lane, host.now(), Some(&forge))?;
                 return Ok((outcome, ExitCode::from(u8::from(actionable))));
             }
             crate::plan::next_with(
-                &root()?,
+                &root,
                 target.as_ref(),
-                *lane,
+                lane,
                 host.now(),
                 Some(&crate::forge::Gh::default()),
             )
@@ -964,13 +1026,20 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             status,
             skill_revision,
             plan_revision,
-        } => epoch::epoch(
-            host,
-            &root()?,
-            *status,
-            skill_revision.as_deref(),
-            plan_revision.as_deref(),
-        ),
+        } => {
+            let root = root()?;
+            let to = status.parse::<Status>().map_err(|cause| {
+                let given = (skill_revision.is_some(), plan_revision.is_some());
+                refused(epoch::move_refusal(host, &root, given, cause))
+            })?;
+            epoch::epoch(
+                host,
+                &root,
+                to,
+                skill_revision.as_deref(),
+                plan_revision.as_deref(),
+            )
+        }
         Commands::Journal { title, body_file } => {
             let body = body_file
                 .as_deref()
@@ -984,20 +1053,29 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             worktree,
             coordinator,
             cap_min,
-        } => commands::launch_remote(
-            host,
-            &root()?,
-            target,
-            worktree.as_deref(),
-            &commands::Remote {
-                no_parts: no_parts.clone(),
-                coordinator: coordinator_label(coordinator),
-                cap_min: *cap_min,
-            },
-        ),
+        } => {
+            let root = root()?;
+            commands::launch_remote(
+                host,
+                &root,
+                &step_target(host, &root, target)?,
+                worktree.as_deref(),
+                &commands::Remote {
+                    no_parts: no_parts.clone(),
+                    coordinator: coordinator_label(coordinator),
+                    cap_min: *cap_min,
+                },
+            )
+        }
         Commands::Unblock { target, evidence } => {
             let file = evidence.as_ref().map(|path| under_root(cli, path));
-            commands::unblock(host, &root()?, target, file.as_deref())
+            let root = root()?;
+            commands::unblock(
+                host,
+                &root,
+                &any_target(host, &root, target)?,
+                file.as_deref(),
+            )
         }
         Commands::Amend {
             target,
@@ -1012,31 +1090,38 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             kickoff_file,
             github,
             tag,
-        } => commands::amend(
-            host,
-            &root()?,
-            target,
-            &commands::Amendment {
-                study: *study,
-                lane: *lane,
-                after: after.clone(),
-                drop_after: drop_after.clone(),
-                artifacts: artifact.clone(),
-                drop_artifacts: drop_artifact.clone(),
-                parts: part.clone(),
-                kickoff: kickoff_file
-                    .as_deref()
-                    .map(|path| read_body(path, Some(KICKOFF_MAX_BYTES)))
-                    .transpose()?,
-                ships: commands::Ships {
-                    github: github.clone(),
-                    tag: tag.clone(),
+        } => {
+            let root = root()?;
+            let parsed = any_target(host, &root, target)?;
+            commands::amend(
+                host,
+                &root,
+                &parsed,
+                &commands::Amendment {
+                    study: *study,
+                    lane: lanes(host, target, lane.as_ref())?,
+                    after: after.clone(),
+                    drop_after: drop_after.clone(),
+                    artifacts: artifact.clone(),
+                    drop_artifacts: drop_artifact.clone(),
+                    parts: part.clone(),
+                    kickoff: kickoff_file
+                        .as_deref()
+                        .map(|path| read_body(path, Some(KICKOFF_MAX_BYTES)))
+                        .transpose()?,
+                    ships: commands::Ships {
+                        github: github.clone(),
+                        tag: tag.clone(),
+                    },
+                    priority: *priority,
                 },
-                priority: *priority,
-            },
-        ),
+            )
+        }
         Commands::Attempt { target, claim, act } => {
             use crate::attempt::Act;
+            let root = root()?;
+            let text = target;
+            let target = step_target(host, &root, text)?;
             let act = match act {
                 None => Act::Status,
                 Some(AttemptAct::Claim {
@@ -1047,8 +1132,11 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                         .expect("clap requires --coordinator without a session default"),
                     expect: *expect,
                 },
-                Some(AttemptAct::Restart { lane, evidence }) => Act::Restart {
-                    lane: *lane,
+                Some(AttemptAct::Restart {
+                    lane: given,
+                    evidence,
+                }) => Act::Restart {
+                    lane: lane(host, text, given)?,
                     file: evidence.as_deref().map(|file| under_root(cli, file)),
                 },
                 Some(AttemptAct::Begin { kind }) => Act::Begin { kind: kind.clone() },
@@ -1061,7 +1149,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                     file: evidence.as_deref().map(|file| under_root(cli, file)),
                 },
             };
-            crate::attempt::attempt(host, &root()?, target, claim.as_deref(), &act)
+            crate::attempt::attempt(host, &root, &target, claim.as_deref(), &act)
         }
         Commands::Lane {
             act:
@@ -1115,6 +1203,42 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             waiver,
             part,
         } => {
+            let root = root()?;
+            let target = any_target(host, &root, target)?;
+            let given: Vec<Flag> = [
+                (Flag::Sha, sha.is_some()),
+                (Flag::Pr, pr.is_some()),
+                (Flag::Tag, tag.is_some()),
+                (Flag::Digest, digest.is_some()),
+                (Flag::File, file.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(flag, given)| given.then_some(flag))
+            .collect();
+            let forge = crate::forge::Gh::default();
+            let gate = commands::MergeGate {
+                forge: Some(&forge),
+                head: head.clone(),
+                ci_verified: ci_verified.as_deref().map(|file| under_root(cli, file)),
+                waiver: waiver.as_deref().map(|file| under_root(cli, file)),
+            };
+            let flags = gate.flags();
+            let asked = commands::Asked {
+                part: part.as_deref(),
+                given: &given,
+                gate: &flags,
+                repo: repo.as_deref(),
+                by: !by.is_empty(),
+            };
+            let state =
+                commands::advance_state(host, &root, &target, &asked, state).map_err(refused)?;
+            if asked.by && state != Phase::Superseded {
+                return Err(Misuse {
+                    verbs: &["advance"],
+                    message: "--by applies only to superseded",
+                }
+                .into());
+            }
             let evidence = Evidence {
                 sha: sha.clone(),
                 pr: pr.clone(),
@@ -1123,19 +1247,12 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                 ..Evidence::default()
             };
             let file = file.as_deref().map(|file| under_root(cli, file));
-            let forge = crate::forge::Gh::default();
-            let gate = commands::MergeGate {
-                forge: Some(&forge),
-                head: head.clone(),
-                ci_verified: ci_verified.as_deref().map(|file| under_root(cli, file)),
-                waiver: waiver.as_deref().map(|file| under_root(cli, file)),
-            };
             commands::advance_gated(
                 host,
-                &root()?,
-                target,
+                &root,
+                &target,
                 commands::Advance {
-                    to: state,
+                    to: &state,
                     given: &evidence,
                     file: file.as_deref(),
                     repo: repo.as_deref(),
@@ -1154,37 +1271,46 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             reason,
             owner,
             until,
-        } => crate::holds::known_red(
-            host,
-            &crate::forge::Gh::default(),
-            &root()?,
-            target,
-            &crate::holds::KnownRedArgs {
-                commit: commit.as_deref().unwrap_or_default(),
-                standing: *standing,
-                campaign: scope == "campaign",
-                check,
-                reason,
-                owner,
-                until,
-            },
-        ),
-        Commands::Watch {
-            target,
-            act: WatchAct::Add { signal, deadline },
-        } => crate::holds::watch_add(host, &root()?, target, signal, deadline),
-        Commands::Watch {
-            target,
-            act: WatchAct::Resolve { id, evidence },
-        } => crate::holds::watch_resolve(host, &root()?, target, *id, &under_root(cli, evidence)),
-        Commands::Watch {
-            target,
-            act: WatchAct::Withdraw { id, reason },
-        } => crate::holds::watch_withdraw(host, &root()?, target, *id, reason),
-        Commands::Watch {
-            target,
-            act: WatchAct::Amend { id, signal },
-        } => crate::holds::watch_amend(host, &root()?, target, *id, signal),
+        } => {
+            let root = root()?;
+            crate::holds::known_red(
+                host,
+                &crate::forge::Gh::default(),
+                &root,
+                &step_target(host, &root, target)?,
+                &crate::holds::KnownRedArgs {
+                    commit: commit.as_deref().unwrap_or_default(),
+                    standing: *standing,
+                    campaign: scope == "campaign",
+                    check,
+                    reason,
+                    owner,
+                    until,
+                },
+            )
+        }
+        Commands::Watch { target, act } => {
+            let root = root()?;
+            let target = step_target(host, &root, target)?;
+            match act {
+                WatchAct::Add { signal, deadline } => {
+                    crate::holds::watch_add(host, &root, &target, signal, deadline)
+                }
+                WatchAct::Resolve { id, evidence } => crate::holds::watch_resolve(
+                    host,
+                    &root,
+                    &target,
+                    *id,
+                    &under_root(cli, evidence),
+                ),
+                WatchAct::Withdraw { id, reason } => {
+                    crate::holds::watch_withdraw(host, &root, &target, *id, reason)
+                }
+                WatchAct::Amend { id, signal } => {
+                    crate::holds::watch_amend(host, &root, &target, *id, signal)
+                }
+            }
+        }
         Commands::Feedback {
             title,
             urgency,
@@ -1214,17 +1340,24 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                     recommendation,
                     block,
                 },
-        } => crate::ledger::owner_queue_add_blocking(
-            host,
-            &root()?,
-            &crate::ledger::QueueItem {
-                title,
-                context,
-                question,
-                recommendation,
-            },
-            block.as_ref(),
-        ),
+        } => {
+            let root = root()?;
+            let block = block
+                .as_deref()
+                .map(|text| step_option(host, &root, text, "block"))
+                .transpose()?;
+            crate::ledger::owner_queue_add_blocking(
+                host,
+                &root,
+                &crate::ledger::QueueItem {
+                    title,
+                    context,
+                    question,
+                    recommendation,
+                },
+                block.as_ref(),
+            )
+        }
         Commands::OwnerQueue {
             act: QueueAct::Answer { number, body_file },
         } => {
@@ -1252,9 +1385,14 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                 .as_deref()
                 .map(|path| read_body(path, None))
                 .transpose()?;
+            let root = root()?;
+            let step = step
+                .as_deref()
+                .map(|text| step_option(host, &root, text, "step"))
+                .transpose()?;
             crate::ledger::mac_lane_add_with_step(
                 host,
-                &root()?,
+                &root,
                 title,
                 body.as_deref().unwrap_or_default(),
                 step.as_ref(),
@@ -1281,12 +1419,14 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                 candidate: candidate.as_deref(),
                 harness: harness.as_deref(),
             };
-            crate::ledger::evidence_pinned(host, &root()?, target, name, &body, &pin)
+            let root = root()?;
+            let target = step_target(host, &root, target)?;
+            crate::ledger::evidence_pinned(host, &root, &target, name, &body, &pin)
         }
         Commands::Review {
             act:
                 Some(ReviewAct::Wait {
-                    target,
+                    target: text,
                     head,
                     reviewer,
                     deadline,
@@ -1295,10 +1435,15 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             ..
         } => {
             let waited = match crate::review::wait_root(cli.root.as_deref()) {
-                Ok(Some(root)) => {
-                    crate::review::wait(&root, target, head, reviewer, part.as_deref(), *deadline)
-                        .unwrap_or_else(crate::review::WaitOutcome::unreadable)
-                }
+                Ok(Some(root)) => crate::review::wait(
+                    &root,
+                    &step_target(host, &root, text)?,
+                    head,
+                    reviewer,
+                    part.as_deref(),
+                    *deadline,
+                )
+                .unwrap_or_else(crate::review::WaitOutcome::unreadable),
                 Ok(None) => crate::review::WaitOutcome::refused(
                     ".cm",
                     "no-campaign",
@@ -1317,18 +1462,25 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                     part,
                 }),
             ..
-        } => crate::verdict::record(
-            host,
-            &root()?,
-            target,
-            &under_root(cli, report),
-            reviewer.as_deref(),
-            part.as_deref(),
-        ),
+        } => {
+            let root = root()?;
+            crate::verdict::record(
+                host,
+                &root,
+                &step_target(host, &root, target)?,
+                &under_root(cli, report),
+                reviewer.as_deref(),
+                part.as_deref(),
+            )
+        }
         Commands::Review {
             act: Some(ReviewAct::CapRaise { target, by, ruling }),
             ..
-        } => crate::verdict::cap_raise(host, &root()?, target, *by, &under_root(cli, ruling)),
+        } => {
+            let root = root()?;
+            let target = step_target(host, &root, target)?;
+            crate::verdict::cap_raise(host, &root, &target, *by, &under_root(cli, ruling))
+        }
         Commands::Review {
             act:
                 Some(ReviewAct::Resolve {
@@ -1337,14 +1489,17 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                     by,
                 }),
             ..
-        } => crate::verdict::resolve(
-            host,
-            &root()?,
-            target,
-            finding,
-            by,
-            &under_root(cli, Path::new(by)),
-        ),
+        } => {
+            let root = root()?;
+            crate::verdict::resolve(
+                host,
+                &root,
+                &step_target(host, &root, target)?,
+                finding,
+                by,
+                &under_root(cli, Path::new(by)),
+            )
+        }
         Commands::Review {
             act: Some(ReviewAct::Render),
             ..
@@ -1378,13 +1533,25 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                 wall: &wall,
                 delta: delta.as_deref(),
             };
-            let target = target
-                .clone()
-                .expect("clap requires a target without --import");
-            crate::review::review(host, &root()?, &target, &args)
+            let root = root()?;
+            let target = step_target(
+                host,
+                &root,
+                target
+                    .as_deref()
+                    .expect("clap requires a target without --import"),
+            )?;
+            crate::review::review(host, &root, &target, &args)
         }
-        Commands::Ruling { target, text } => crate::verdict::ruling(host, &root()?, target, text),
-        Commands::Brief { target } => crate::verdict::brief(&root()?, target),
+        Commands::Ruling { target, text } => {
+            let root = root()?;
+            let target = step_target(host, &root, target)?;
+            crate::verdict::ruling(host, &root, &target, text)
+        }
+        Commands::Brief { target } => {
+            let root = root()?;
+            crate::verdict::brief(&root, &step_target(host, &root, target)?)
+        }
         Commands::Followups { epoch, act: None } => crate::verdict::followups(&root()?, *epoch),
         Commands::Followups {
             act: Some(FollowupAct::Close { id, by }),
@@ -1496,26 +1663,453 @@ pub fn resolved(root: Option<&Path>, host: &dyn Host, mut outcome: Outcome) -> O
     outcome
 }
 
-pub fn main() -> ExitCode {
-    let cli = Cli::parse();
-    if let Commands::Advance { state, by, .. } = &cli.command
-        && !by.is_empty()
-        && *state != Phase::Superseded
-    {
-        Cli::command()
-            .error(
-                clap::error::ErrorKind::ArgumentConflict,
-                "--by applies only to superseded",
-            )
-            .exit();
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Role {
+    Program,
+    Verb(String),
+    Flag(String),
+    Inline(String),
+    Switch(String),
+    Value(String),
+    Positional(String),
+    End,
+    Unknown,
+}
+
+fn roles(argv: &[String]) -> Vec<Role> {
+    let mut command = Cli::command();
+    command.build();
+    let mut roles = vec![Role::Program];
+    let (mut slot, mut found, mut ended) = (0, false, false);
+    let mut words = argv.iter().skip(1).peekable();
+    while let Some(word) = words.next() {
+        let option = |test: &dyn Fn(&clap::Arg) -> bool| {
+            command
+                .get_arguments()
+                .find(|arg| !arg.is_positional() && test(arg))
+                .map(|arg| (arg.get_id().to_string(), arg.get_action().takes_values()))
+        };
+        let short = word
+            .strip_prefix('-')
+            .filter(|rest| !rest.is_empty() && !rest.starts_with('-'));
+        let role = if ended {
+            None
+        } else if word == "--" {
+            ended = true;
+            Some(Role::End)
+        } else if let Some(long) = word.strip_prefix("--") {
+            let (name, inline) = match long.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (long, false),
+            };
+            Some(match option(&|arg| arg.get_long() == Some(name)) {
+                Some((id, true)) if inline => Role::Inline(id),
+                Some((id, true)) => Role::Flag(id),
+                Some((id, false)) => Role::Switch(id),
+                None => Role::Unknown,
+            })
+        } else if let Some(rest) = short {
+            let letter = rest.chars().next();
+            Some(match option(&|arg| arg.get_short() == letter) {
+                Some((id, true)) if rest.len() > 1 => Role::Inline(id),
+                Some((id, true)) => Role::Flag(id),
+                Some((id, false)) => Role::Switch(id),
+                None => Role::Unknown,
+            })
+        } else if !(command.is_args_conflicts_with_subcommands_set() && found)
+            && let Some(sub) = command.find_subcommand(word).cloned()
+        {
+            command = sub;
+            (slot, found) = (0, false);
+            Some(Role::Verb(command.get_name().to_owned()))
+        } else {
+            None
+        };
+        let role = role.unwrap_or_else(|| {
+            let positionals: Vec<&clap::Arg> = command.get_positionals().collect();
+            let Some(arg) = positionals.get(slot) else {
+                return Role::Unknown;
+            };
+            found = true;
+            if arg
+                .get_num_args()
+                .is_none_or(|range| range.max_values() <= 1)
+            {
+                slot += 1;
+            }
+            Role::Positional(arg.get_id().to_string())
+        });
+        let value = match &role {
+            Role::Flag(id) => Some(id.clone()),
+            _ => None,
+        };
+        roles.push(role);
+        // As clap reads it: a word that begins with `-`, other than `-` alone, is never a value.
+        if let Some(id) = value
+            && words
+                .next_if(|next| !next.starts_with('-') || *next == "-")
+                .is_some()
+        {
+            roles.push(Role::Value(id));
+        }
     }
+    roles
+}
+
+fn lossy(args: &[OsString]) -> Vec<String> {
+    args.iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn json_wanted(args: &[OsString]) -> bool {
+    roles(&lossy(args)).contains(&Role::Switch("json".to_owned()))
+}
+
+fn verbs(args: &[OsString]) -> Vec<String> {
+    roles(&lossy(args))
+        .into_iter()
+        .filter_map(|role| match role {
+            Role::Verb(verb) => Some(verb),
+            _ => None,
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Slot<'a> {
+    Positional(&'a str),
+    Option(&'a str, usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    Inline,
+    Next,
+    Missing,
+}
+
+fn option_at(roles: &[Role], id: &str, nth: usize) -> Option<(usize, Held)> {
+    roles
+        .iter()
+        .enumerate()
+        .filter_map(|(at, role)| match role {
+            Role::Flag(flag) if flag == id => Some(match roles.get(at + 1) {
+                Some(Role::Value(value)) if value == id => (at, Held::Next),
+                _ => (at, Held::Missing),
+            }),
+            Role::Inline(flag) if flag == id => Some((at, Held::Inline)),
+            _ => None,
+        })
+        .nth(nth)
+}
+
+// A positional value cannot begin with `-` without `--`, so none is offered there; an option's
+// is attached to its flag.
+pub(crate) fn replaced(argv: &[String], slot: Slot, to: &str) -> Option<Vec<String>> {
+    let roles = roles(argv);
+    let mut argv = argv.to_vec();
+    match slot {
+        Slot::Positional(id) => {
+            let at = roles
+                .iter()
+                .position(|role| *role == Role::Positional(id.to_owned()))?;
+            if to.starts_with('-') {
+                return None;
+            }
+            argv[at] = to.to_owned();
+        }
+        Slot::Option(id, nth) => {
+            let (at, held) = option_at(&roles, id, nth)?;
+            match held {
+                Held::Inline => {
+                    let (flag, _) = argv[at].split_once('=')?;
+                    argv[at] = format!("{flag}={to}");
+                }
+                _ if to.starts_with('-') => {
+                    argv[at] = format!("{}={to}", argv[at]);
+                    if held == Held::Next {
+                        argv.remove(at + 1);
+                    }
+                }
+                Held::Next => argv[at + 1] = to.to_owned(),
+                Held::Missing => argv.insert(at + 1, to.to_owned()),
+            }
+        }
+    }
+    Some(argv)
+}
+
+pub(crate) fn dropped(argv: &[String], id: &str, nth: usize) -> Option<Vec<String>> {
+    let (at, held) = option_at(&roles(argv), id, nth)?;
+    let mut argv = argv.to_vec();
+    argv.drain(at..if held == Held::Next { at + 2 } else { at + 1 });
+    Some(argv)
+}
+
+// `cm amend` refuses a call that changes nothing, so dropping its only change is no move.
+pub(crate) fn amends_nothing(argv: &[String]) -> bool {
+    let roles = roles(argv);
+    roles.contains(&Role::Verb("amend".to_owned()))
+        && roles.iter().all(|role| match role {
+            Role::Flag(id) | Role::Inline(id) | Role::Switch(id) => id == "json" || id == "root",
+            _ => true,
+        })
+}
+
+pub(crate) fn without(argv: &[String], id: &str) -> Vec<String> {
+    let mut argv = argv.to_vec();
+    while let Some(fewer) = dropped(&argv, id, 0) {
+        argv = fewer;
+    }
+    argv
+}
+
+fn usage_line(verbs: &[String]) -> (String, Vec<String>) {
+    let mut at = Cli::command();
+    at.build();
+    for verb in verbs {
+        match at.find_subcommand(verb) {
+            Some(sub) => at = sub.clone(),
+            None => break,
+        }
+    }
+    let subcommands = at
+        .get_subcommands()
+        .map(|sub| sub.get_name().to_owned())
+        .filter(|name| name != "help")
+        .collect();
+    let usage = at.render_usage().to_string();
+    let usage = usage.strip_prefix("Usage: ").unwrap_or(&usage).trim();
+    (usage.to_owned(), subcommands)
+}
+
+fn usage_cause(error: &clap::Error, path: &str, subcommands: &[String]) -> String {
+    if error.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
+        return format!("{path} takes a subcommand: {}", subcommands.join(", "));
+    }
+    let text = error.render().to_string();
+    let mut lines = text.lines().map(str::trim);
+    let first: Vec<&str> = lines.by_ref().take_while(|line| !line.is_empty()).collect();
+    let mut cause = first.join(" ");
+    if let Some(rest) = cause.strip_prefix("error: ") {
+        cause = rest.to_owned();
+    }
+    for tip in lines.filter(|line| line.starts_with("tip: ")) {
+        cause.push_str("; ");
+        cause.push_str(tip);
+    }
+    cause
+}
+
+fn usage(args: &[OsString], error: &clap::Error) -> ExitCode {
+    use clap::error::{ContextKind, ErrorKind};
+    if matches!(
+        error.kind(),
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+    ) {
+        let _ = error.print();
+        return ExitCode::SUCCESS;
+    }
+    let verbs = verbs(args);
+    let (_, subcommands) = usage_line(&verbs);
+    let cause = usage_cause(error, &path_of(&verbs), &subcommands);
+    let line = error.get(ContextKind::Usage).map(|usage| {
+        let usage = usage.to_string();
+        usage
+            .strip_prefix("Usage: ")
+            .unwrap_or(&usage)
+            .trim()
+            .to_owned()
+    });
+    misused(args, verbs, cause, line)
+}
+
+#[derive(Debug)]
+struct Misuse {
+    verbs: &'static [&'static str],
+    message: &'static str,
+}
+
+impl std::fmt::Display for Misuse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+
+impl std::error::Error for Misuse {}
+
+fn misused(args: &[OsString], verbs: Vec<String>, cause: String, line: Option<String>) -> ExitCode {
+    let path = path_of(&verbs);
+    let line = line.unwrap_or_else(|| usage_line(&verbs).0);
+    // The usage line keeps clap's `<…>` and `[…]` words, so it is no command line the parse
+    // check could accept.
+    let shape = Move {
+        when: None,
+        argv: line.split_whitespace().map(Arg::from).collect(),
+    };
+    let violation = Violation::refuse(path, "usage", cause, shape.into());
+    if json_wanted(args) {
+        let command = verbs.first().map_or("cm", String::as_str);
+        println!("{}", Outcome::refused(vec![violation]).to_json(command));
+    } else {
+        eprintln!("{violation}");
+    }
+    ExitCode::from(2)
+}
+
+fn path_of(verbs: &[String]) -> String {
+    std::iter::once("cm")
+        .chain(verbs.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shown(path: &Path, cwd: &Path) -> Option<String> {
+    let common = cwd
+        .ancestors()
+        .find(|dir| path.starts_with(dir) && dir.parent().is_some());
+    let Some(common) = common else {
+        return path.to_str().map(str::to_owned);
+    };
+    let mut relative = PathBuf::new();
+    for _ in cwd.strip_prefix(common).ok()?.components() {
+        relative.push("..");
+    }
+    relative.push(path.strip_prefix(common).ok()?);
+    let relative = relative.to_str()?;
+    Some(if relative.is_empty() { "." } else { relative }.to_owned())
+}
+
+fn current_dir() -> PathBuf {
+    std::env::current_dir()
+        .map(|dir| store::absolute(&dir))
+        .unwrap_or_default()
+}
+
+// The live epoch is the one heartbeat.sh would choose, read by the tick's own lookup.
+fn no_campaign(missing: &store::NoCampaign, cli: &Cli, host: &dyn Host) -> Violation {
+    let start = store::absolute(&missing.start);
+    let path = missing.start.display().to_string();
+    let cause = format!("no campaign folder at or above {}", start.display());
+    let live = start
+        .ancestors()
+        .find(|dir| dir.join("store").join("epochs").is_dir())
+        .and_then(|checkout| {
+            let live = crate::tick::beat::live_epochs(checkout).ok()?;
+            (!live.is_empty()).then(|| (checkout.to_path_buf(), live))
+        });
+    let Some((checkout, live)) = live else {
+        let next = cli
+            .root
+            .as_deref()
+            .map_or(Some("."), Path::to_str)
+            .map(|dir| {
+                let mut init = vec!["init".into()];
+                init.extend(crate::outcome::last(dir));
+                Next::run(crate::outcome::cm(vec!["cm".to_owned()], init))
+            });
+        return Violation::refuse_printed(path, "io", cause, next);
+    };
+    let cwd = current_dir();
+    let rest = host.argv().map(|argv| without(&argv, "root").split_off(1));
+    let names: Vec<String> = live
+        .iter()
+        .map(|epoch| epoch.display().to_string())
+        .collect();
+    let moves = live
+        .iter()
+        .zip(&names)
+        .filter_map(|(epoch, name)| {
+            let dir = shown(&checkout.join(epoch), &cwd)?;
+            let mut argv = vec!["cm".to_owned()];
+            if dir.starts_with('-') {
+                argv.push(format!("--root={dir}"));
+            } else {
+                argv.extend(["-C".to_owned(), dir]);
+            }
+            argv.extend(rest.clone()?);
+            Some((
+                format!("when the work belongs to {name}"),
+                Move::again(argv),
+            ))
+        })
+        .collect();
+    let cause = match &names[..] {
+        [one] => format!(
+            "{cause}; the live epoch of the campaign-trail checkout at {} is {one}",
+            checkout.display()
+        ),
+        several => format!(
+            "{cause}; the campaign-trail checkout at {} has {} live epochs, {}",
+            checkout.display(),
+            several.len(),
+            several.join(" and ")
+        ),
+    };
+    commands::refuse_moves(path, "io", cause, moves)
+}
+
+fn io_refusal(error: &anyhow::Error, cli: &Cli, host: &dyn Host, command: &str) -> Violation {
+    let cause = format!("{error:#}");
+    let again = || {
+        host.argv()
+            .map(|argv| ("to run it again".to_owned(), Move::again(argv)))
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    if let Some(missing) = error.downcast_ref::<store::NoCampaign>() {
+        return no_campaign(missing, cli, host);
+    }
+    let root = store::root_or_cwd(cli.root.as_deref()).ok();
+    let inside = |path: &Path| {
+        root.as_deref()
+            .filter(|root| path.starts_with(root))
+            .and_then(|root| path.strip_prefix(root).ok())
+            .map(|relative| relative.display().to_string())
+            .unwrap_or_else(|| path.display().to_string())
+    };
+    if let Some(broken) = error.downcast_ref::<store::Unreadable>()
+        && let Some(holder) = broken
+            .path
+            .parent()
+            .filter(|dir| dir.file_name() == Some(std::ffi::OsStr::new(store::CM_DIR)))
+            .and_then(Path::parent)
+    {
+        let base = root
+            .clone()
+            .filter(|root| broken.path.starts_with(root))
+            .unwrap_or_else(|| holder.to_path_buf());
+        let file = broken.path.strip_prefix(&base).unwrap_or(&broken.path);
+        let next = file.to_str().zip(base.to_str()).map(|(file, dir)| {
+            let mut argv = vec!["git".to_owned()];
+            if base != current_dir() {
+                argv.extend(["-C".to_owned(), dir.to_owned()]);
+            }
+            argv.extend(["checkout", "HEAD", "--", file].map(str::to_owned));
+            // A git command, which the cm parse check every other move runs cannot read.
+            Next::from(Move {
+                when: None,
+                argv: argv.into_iter().map(Arg::from).collect(),
+            })
+        });
+        return Violation::refuse_printed(file.display().to_string(), "io", cause, next);
+    }
+    if let Some(locking) = error.downcast_ref::<store::Locking>() {
+        return commands::refuse_moves(inside(&locking.path), "io", cause, again());
+    }
+    commands::refuse_moves(format!("cm {command}"), "io", cause, again())
+}
+
+pub fn main() -> ExitCode {
+    let args: Vec<OsString> = std::env::args_os().collect();
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(error) => return usage(&args, &error),
+    };
     if matches!(cli.command, Commands::Tick { .. }) && cli.root.is_some() {
-        Cli::command()
-            .error(
-                clap::error::ErrorKind::ArgumentConflict,
-                "cm tick chooses its own epoch: name the checkout with --checkout, not -C",
-            )
-            .exit();
+        let cause = "cm tick chooses its own epoch: name the checkout with --checkout, not -C";
+        return misused(&args, vec!["tick".to_owned()], cause.to_owned(), None);
     }
     if let Commands::Tick {
         checkout,
@@ -1530,7 +2124,7 @@ pub fn main() -> ExitCode {
         };
     }
     let command = name(&cli.command);
-    let mut host = Invoked::record(std::env::args_os());
+    let mut host = Invoked::record(args.iter().cloned());
     if cli.root.is_some()
         && let Ok(root) = store::root_or_cwd(cli.root.as_deref())
     {
@@ -1547,7 +2141,9 @@ pub fn main() -> ExitCode {
                 ExitCode::from(1),
             ));
         }
-        Err(error)
+        error
+            .downcast::<Refused>()
+            .map(|Refused(violations)| (Outcome::refused(violations), ExitCode::from(1)))
     });
     match outcome {
         Ok((outcome, exit)) => {
@@ -1575,15 +2171,143 @@ pub fn main() -> ExitCode {
             exit
         }
         Err(error) => {
+            if let Some(misuse) = error.downcast_ref::<Misuse>() {
+                let verbs = misuse.verbs.iter().map(|verb| (*verb).to_owned()).collect();
+                return misused(&args, verbs, misuse.message.to_owned(), None);
+            }
+            let violation = io_refusal(&error, &cli, &host, command);
             if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({ "command": command, "ok": false, "violations": [], "error": format!("{error:#}") })
-                );
+                let mut outcome = Outcome::refused(vec![violation]);
+                outcome.field("error", format!("{error:#}"));
+                println!("{}", outcome.to_json(command));
             } else {
-                eprintln!("cm {command}: {error:#}");
+                eprintln!("{violation}");
             }
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    #[test]
+    fn an_option_value_that_names_a_subcommand_is_read_as_the_value() {
+        let words = argv(&["cm", "review", "--model", "wait", "--bogus"]);
+        let verbs: Vec<Role> = roles(&words)
+            .into_iter()
+            .filter(|role| matches!(role, Role::Verb(_)))
+            .collect();
+        assert_eq!(verbs, [Role::Verb("review".to_owned())]);
+    }
+
+    #[test]
+    fn a_dash_led_option_value_is_attached_and_a_positional_one_is_not_offered() {
+        let words = argv(&["cm", "init", "01-a/u/s", "--lane", "x", "--after", "a"]);
+        assert_eq!(
+            replaced(&words, Slot::Option("after", 0), "-b").unwrap(),
+            argv(&["cm", "init", "01-a/u/s", "--lane", "x", "--after=-b"])
+        );
+        assert_eq!(replaced(&words, Slot::Positional("dir"), "-b"), None);
+        assert_eq!(
+            dropped(&words, "lane", 0).unwrap(),
+            argv(&["cm", "init", "01-a/u/s", "--after", "a"])
+        );
+    }
+
+    #[test]
+    fn a_repeated_value_is_edited_at_the_occurrence_named() {
+        let words = argv(&["cm", "amend", "01-a/u/s", "--after", "g", "--after=g"]);
+        assert_eq!(
+            replaced(&words, Slot::Option("after", 1), "h").unwrap(),
+            argv(&["cm", "amend", "01-a/u/s", "--after", "g", "--after=h"])
+        );
+        assert_eq!(
+            replaced(&words, Slot::Positional("target"), "01-a/u/t").unwrap(),
+            argv(&["cm", "amend", "01-a/u/t", "--after", "g", "--after=g"])
+        );
+    }
+
+    fn paths(
+        command: &clap::Command,
+        at: Vec<String>,
+        all: &mut Vec<(Vec<String>, clap::Command)>,
+    ) {
+        all.push((at.clone(), command.clone()));
+        for sub in command.get_subcommands() {
+            let mut next = at.clone();
+            next.push(sub.get_name().to_owned());
+            paths(sub, next, all);
+        }
+    }
+
+    #[test]
+    fn a_value_option_followed_by_a_flag_holds_no_value_at_every_option_of_every_verb() {
+        let mut command = Cli::command();
+        command.build();
+        let mut all = Vec::new();
+        paths(&command, Vec::new(), &mut all);
+        let mut checked = 0;
+        for (path, at) in all {
+            for arg in at.get_arguments() {
+                if arg.is_positional() || !arg.get_action().takes_values() {
+                    continue;
+                }
+                let flag = match (arg.get_long(), arg.get_short()) {
+                    (Some(long), _) => format!("--{long}"),
+                    (None, Some(short)) => format!("-{short}"),
+                    (None, None) => continue,
+                };
+                let id = arg.get_id().to_string();
+                let mut words = vec!["cm".to_owned()];
+                words.extend(path.iter().cloned());
+                words.extend([flag.clone(), "--json".to_owned()]);
+                let read = roles(&words);
+                assert!(
+                    read.contains(&Role::Switch("json".to_owned())),
+                    "{words:?}: {read:?}"
+                );
+                assert!(!read.contains(&Role::Value(id.clone())), "{words:?}");
+                let lossy: Vec<OsString> = words.iter().map(OsString::from).collect();
+                assert_eq!(verbs(&lossy), path, "{words:?}");
+                assert_eq!(
+                    replaced(&words, Slot::Option(&id, 0), "v").unwrap(),
+                    [
+                        &words[..words.len() - 1],
+                        &["v".to_owned(), "--json".to_owned()]
+                    ]
+                    .concat(),
+                    "{words:?}"
+                );
+                assert_eq!(
+                    dropped(&words, &id, 0).unwrap(),
+                    [&words[..words.len() - 2], &["--json".to_owned()]].concat(),
+                    "{words:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 50, "{checked}");
+        let lone = argv(&["cm", "journal", "t", "--body-file", "-", "--json"]);
+        assert!(roles(&lone).contains(&Role::Value("body_file".to_owned())));
+        assert!(roles(&lone).contains(&Role::Switch("json".to_owned())));
+    }
+
+    #[test]
+    fn words_after_the_end_of_options_are_positionals() {
+        let words = argv(&["cm", "journal", "--", "--json"]);
+        assert!(!roles(&words).contains(&Role::Switch("json".to_owned())));
+        assert_eq!(
+            without(
+                &argv(&["cm", "-C", "x", "--root=y", "journal", "t"]),
+                "root"
+            ),
+            argv(&["cm", "journal", "t"])
+        );
     }
 }
