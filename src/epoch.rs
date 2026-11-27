@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use std::fmt;
 use std::fs;
 use std::path::Path;

@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! The review ledger: REVIEW-OFF.md rendered from `.cm/reviews.json`, appended by `cm review`.
 
 use std::fs;

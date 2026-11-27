@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,7 +11,7 @@ use crate::host::{Host, stamp};
 use crate::journal;
 use crate::limits::{self, Limits};
 use crate::lint::{self, packet_files, packet_paths};
-use crate::outcome::{Outcome, Violation};
+use crate::outcome::{self, Input, Next, Outcome, Violation};
 use crate::plan::{self, Units};
 use crate::render;
 use crate::state::{
@@ -823,6 +824,101 @@ pub fn journal(host: &dyn Host, root: &Path, title: &str, body: Option<&str>) ->
     Ok(outcome)
 }
 
+pub(crate) fn packet_kickoff(host: &dyn Host, step_dir: &str, step: &str) -> Violation {
+    Violation::refuse_printed(
+        step_dir,
+        "packet-kickoff",
+        "the step folder has no kickoff.md",
+        host.prefix().map(|prefix| {
+            Next::run(outcome::cm(
+                prefix,
+                [
+                    "amend".into(),
+                    step.into(),
+                    "--kickoff-file".into(),
+                    Input::KickoffFile.into(),
+                ],
+            ))
+        }),
+    )
+}
+
+// A block holds a whole step or a unit, never a part, and `--block` takes only a step.
+fn owner_queue_not_open(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    part: Option<&str>,
+    number: u32,
+) -> Violation {
+    let step = match &target.step {
+        Some(step) => format!("{}/{step}", target.unit),
+        None => target.unit.clone(),
+    };
+    let mut add = vec![
+        "owner-queue".into(),
+        "add".into(),
+        Input::Title.into(),
+        "--context".into(),
+        Input::Context.into(),
+        "--question".into(),
+        Input::Question.into(),
+        "--recommendation".into(),
+        Input::Recommendation.into(),
+    ];
+    if target.step.is_some() {
+        add.extend(["--block".into(), step.as_str().into()]);
+    }
+    let open = crate::ledger::open_titles(root);
+    let full = match part {
+        Some(part) => format!("{step}#{part}"),
+        None => step.clone(),
+    };
+    let prefix = host.prefix();
+    let add = prefix
+        .clone()
+        .map(|prefix| outcome::Move::new(outcome::cm(prefix, add)));
+    if open.is_empty() {
+        return Violation::refuse_printed(
+            full,
+            "owner-queue-not-open",
+            format!("OWNER-QUEUE.md has no open item {number}, and no item is open"),
+            add.map(Into::into),
+        );
+    }
+    let listed: Vec<String> = open
+        .iter()
+        .map(|(open, title)| format!("{open}. {title}"))
+        .collect();
+    let next = prefix.zip(add).map(|(prefix, add)| {
+        let mut moves = vec![("to file a new question for the owner".to_owned(), add)];
+        for (open, title) in &open {
+            let argv = outcome::cm(
+                prefix.clone(),
+                [
+                    "advance".into(),
+                    step.as_str().into(),
+                    format!("blocked:until:owner-queue:{open}").into(),
+                ],
+            );
+            moves.push((
+                format!("when the step waits on item {open}, `{title}`"),
+                outcome::Move::new(argv),
+            ));
+        }
+        Next::either(moves)
+    });
+    Violation::refuse_printed(
+        full,
+        "owner-queue-not-open",
+        format!(
+            "OWNER-QUEUE.md has no open item {number}; the open items are {}",
+            listed.join("; ")
+        ),
+        next,
+    )
+}
+
 pub(crate) fn shell_word(text: &str) -> String {
     if !text.is_empty()
         && text
@@ -1064,11 +1160,7 @@ pub fn launch_remote(
         _ => None,
     };
     if prompt.is_none() {
-        violations.push(Violation::new(
-            relative(root, &step_dir),
-            "packet-kickoff",
-            "the step folder has no kickoff.md",
-        ));
+        violations.push(packet_kickoff(host, &relative(root, &step_dir), &full));
     }
     let (checked, missing) = packet_paths(root, &files, lint::home().as_deref());
     violations.extend(missing);
@@ -1854,13 +1946,7 @@ pub(crate) fn advance_held(
         && held.is_none_or(|held| held.pending != number)
         && !crate::ledger::open_items(root).contains(&number)
     {
-        violations.push(Violation::new(
-            &full,
-            "owner-queue-not-open",
-            format!(
-                "OWNER-QUEUE.md has no open item {number}; file the question with `cm owner-queue add <title> … --block {full}`"
-            ),
-        ));
+        violations.push(owner_queue_not_open(host, root, target, part, number));
     }
     if *to == Phase::Merged || Release::of_target(&step_full).is_some() {
         violations.extend(crate::ledger::owner_queue_refusal(root, &full)?);
@@ -2966,12 +3052,6 @@ pub fn amend(
 
     violations.extend(check_kickoff(&full, amendment.kickoff.as_deref()));
     if amendment.kickoff.is_some() {
-        if !root.join(&full).is_dir() {
-            violations.push(Violation::new(
-                &full, "kickoff-file",
-                "the step folder is missing; repeat its `cm init` declaration to repair it before amending the kickoff",
-            ));
-        }
         changes.push(format!("- kickoff: {full}/kickoff.md"));
     }
     if amendment.ships.given() {
@@ -3127,6 +3207,8 @@ pub fn amend(
         });
     }
     if let Some(kickoff) = &amendment.kickoff {
+        // git keeps no empty folder, so a declared step's folder is absent in a fresh checkout.
+        fs::create_dir_all(root.join(&full))?;
         write_atomic(&root.join(&full).join("kickoff.md"), kickoff.as_bytes())?;
     }
     unit.steps.insert(step_name.to_owned(), next);

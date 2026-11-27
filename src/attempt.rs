@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -9,7 +10,7 @@ use crate::commands::{closed, write_unit};
 use crate::evidence::CampaignFile;
 use crate::host::{Host, stamp};
 use crate::journal;
-use crate::outcome::{Outcome, Violation};
+use crate::outcome::{self, Next, Outcome, Violation};
 use crate::state::{Attempt, AttemptOutcome, Ended, External, Lane, ObservedContext, ObservedTurn};
 use crate::store::{self, CM_DIR, Target, is_name, is_subcampaign_name, lock};
 
@@ -391,12 +392,46 @@ pub fn attempt(
             ))
         }
         Act::Record { kind, id } => {
-            if pending.is_none_or(|action| action.kind != *kind) {
-                violations.push(Violation::new(
+            match pending {
+                None if claim != Some(attempt.claim.as_str()) => {
+                    violations.push(Violation::refuse_printed(
+                        &full,
+                        "attempt-record",
+                        format!("no {kind} has begun without an id; its begin comes first"),
+                        host.prefix().map(|prefix| {
+                            Next::run(outcome::cm(prefix, ["attempt".into(), (&full).into()]))
+                        }),
+                    ))
+                }
+                None => {
+                    let mut begin = vec!["attempt".into(), (&full).into(), "begin".into()];
+                    if kind.starts_with('-') {
+                        begin.extend(outcome::option("--claim", &attempt.claim));
+                        begin.extend(outcome::last(kind));
+                    } else {
+                        begin.push(kind.into());
+                        begin.extend(outcome::option("--claim", &attempt.claim));
+                    }
+                    violations.push(Violation::refuse_printed(
+                        &full,
+                        "attempt-record",
+                        format!("no {kind} has begun without an id; its begin comes first"),
+                        host.prefix()
+                            .map(|prefix| Next::run(outcome::cm(prefix, begin))),
+                    ))
+                }
+                Some(action) if action.kind != *kind => violations.push(Violation::refuse_printed(
                     &full,
                     "attempt-record",
-                    format!("no {kind} has begun without an id; `cm attempt <step> begin {kind}` comes first"),
-                ));
+                    format!(
+                        "{} began at {} and has no id yet, so no {kind} can be recorded",
+                        action.kind, action.began
+                    ),
+                    host.prefix().map(|prefix| {
+                        Next::run(outcome::cm(prefix, ["attempt".into(), (&full).into()]))
+                    }),
+                )),
+                Some(_) => {}
             }
             if id.is_empty() || id.contains(char::is_whitespace) {
                 violations.push(Violation::new(&full, "attempt-record", "an id is one word"));

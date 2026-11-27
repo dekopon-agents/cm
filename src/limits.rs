@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

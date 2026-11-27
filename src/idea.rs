@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
