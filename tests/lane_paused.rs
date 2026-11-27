@@ -225,12 +225,6 @@ fn eleven_26(names: &[&str]) -> Campaign {
         );
     }
     commit_paused(&c.root, false, "2026-11-26T22:16:05Z");
-    journal(
-        &c.root,
-        "2026-11-26T22:16Z",
-        "Coordinator: resumed after quota reset",
-        "paused = false in LIMITS.toml.",
-    );
     c
 }
 
@@ -405,332 +399,78 @@ fn a_registered_driver_is_a_lane_and_its_session_is_the_one_woken() {
 }
 
 #[test]
-fn with_no_limits_history_the_journal_names_the_unpause_or_no_line_is_given() {
+fn with_no_limits_history_a_paused_lane_stays_listed_until_it_journals_a_resume() {
     let c = outside_git();
     lane(&c.root, "tooling", "session_tooling");
     pause_entry(&c.root, "tooling", "2026-11-25T23:29Z");
-    // No commit and no journal entry names the unpause: never a guessed time.
-    let (code, lines, _) = act(&c.root);
-    assert_eq!((code, lines.len()), (Some(0), 0), "{lines:?}");
-
-    // The lane's own entries are not the unpause, even naming `paused = false`.
-    journal(
-        &c.root,
-        "2026-11-26T00:05Z",
-        "Lane tooling: noted",
-        "waiting until `paused = false`",
-    );
-    assert_eq!(act(&c.root).1.len(), 0);
-
-    journal(
-        &c.root,
-        "2026-11-26T21:00Z",
-        "Owner: the resume plan",
-        "At the reset the coordinator sets `paused = false` in LIMITS.toml.",
-    );
-    journal(
-        &c.root,
-        "2026-11-26T21:30Z",
-        "Coordinator: resumed from its handoff after compaction",
-        "`paused = false` waits for the reset.",
-    );
-    assert_eq!(act(&c.root).1.len(), 0);
-
-    journal(
-        &c.root,
-        "2026-11-26T22:16Z",
-        "Coordinator: resumed after quota reset",
-        "`paused = false` in LIMITS.toml.",
-    );
     let (code, lines, text) = act(&c.root);
-    assert_eq!(code, Some(1), "{text}");
-    assert_eq!(lines.len(), 1, "{lines:?}");
-    assert_eq!(lines[0]["since"], "2026-11-26T22:16:00Z");
+    assert_eq!((code, lines.len()), (Some(1), 1), "{text}");
+    assert_eq!(lines[0]["since"], "2026-11-25T23:29:00Z");
     assert!(
-        text.contains("(journal 2026-11-26T22:16Z `Coordinator: resumed after quota reset`; `git log` cannot read LIMITS.toml's history)"),
+        text.contains("the unpause cannot be dated (`git log` cannot read LIMITS.toml's history), so the pause stands"),
         "{text}"
     );
 
-    journal(
-        &c.root,
-        "2026-11-27T01:06Z",
-        "Owner: notes on the 11-26 resume",
-        "The coordinator set `paused = false` in LIMITS.toml at 22:16Z.",
-    );
+    journal(&c.root, "2026-11-26T23:59Z", "Lane tooling: noted", "");
     journal(
         &c.root,
         "2026-11-27T01:10Z",
-        "Coordinator: resumed the prep thread",
-        "LIMITS.toml unchanged.",
+        "Coordinator: resumed after quota reset",
+        "paused = false in LIMITS.toml.",
     );
-    let (_, lines, text) = act(&c.root);
-    assert_eq!(lines.len(), 1, "{text}");
-    assert_eq!(lines[0]["since"], "2026-11-26T22:16:00Z");
-}
+    let (code, lines, text) = act(&c.root);
+    assert_eq!((code, lines.len()), (Some(1), 1), "{text}");
+    assert_eq!(lines[0]["since"], "2026-11-25T23:29:00Z");
 
-const RESUMED: &str = "Coordinator: resumed after quota reset";
-
-fn unpaused_in_the_journal(body: &str) -> Campaign {
-    let c = outside_git();
-    lane(&c.root, "tooling", "session_tooling");
-    pause_entry(&c.root, "tooling", "2026-11-25T23:29Z");
-    journal(&c.root, "2026-11-26T22:16Z", RESUMED, body);
-    c
+    journal(&c.root, "2026-11-27T01:20Z", "Lane tooling: resumed", "");
+    let (code, lines, text) = act(&c.root);
+    assert_eq!((code, lines.len()), (Some(0), 0), "{text}");
 }
 
 #[test]
-fn with_the_journal_fallback_a_later_note_recalling_or_planning_the_unpause_reopens_no_lane() {
-    for (title, body) in [
-        (
-            "Owner: a paused lane must not outlive the pause",
-            "The coordinator resumed at 22:16Z (`paused = false` in LIMITS.toml) and the lane waited.",
-        ),
-        (
-            "Coordinator: resumed from handoff after compaction",
-            "The previous coordinator set paused = false in LIMITS.toml at 22:16Z yesterday; LIMITS.toml is unchanged this turn.",
-        ),
-        (
-            "Coordinator: resumed the prep thread",
-            "Do not set paused = false in LIMITS.toml until the next reset.",
-        ),
-        (
-            RESUMED,
-            "The previous coordinator set paused = false in LIMITS.toml at 22:16Z yesterday.",
-        ),
-        (
-            RESUMED,
-            "Do not set `paused = false` in LIMITS.toml until the next reset.",
-        ),
-        (
-            RESUMED,
-            "The previous coordinator set\n`paused = false` in LIMITS.toml.",
-        ),
-        (
-            RESUMED,
-            "paused = false in LIMITS.toml? No; LIMITS.toml is unchanged this turn.",
-        ),
-        (
-            RESUMED,
-            "The previous coordinator wrote this yesterday; LIMITS.toml is unchanged this turn.\n\n```\npaused = false in LIMITS.toml.\n```",
-        ),
-        (
-            RESUMED,
-            "Quoted from yesterday:\n- ```\n  paused = false in LIMITS.toml.\n  ```",
-        ),
-        (
-            RESUMED,
-            "Yesterday's record:\n~~~\nResumed.\npaused = false in LIMITS.toml.\n~~~",
-        ),
-        (
-            RESUMED,
-            "Yesterday's record, quoted:\n````\n```\nResumed.\npaused = false in LIMITS.toml.\n````",
-        ),
-        (
-            RESUMED,
-            "Yesterday's record, quoted:\n~~~~\n~~~\nResumed.\npaused = false in LIMITS.toml.\n~~~~",
-        ),
-        (
-            RESUMED,
-            "Yesterday's record, quoted:\n```\n```markdown\nResumed.\npaused = false in LIMITS.toml.\n```",
-        ),
-        (
-            RESUMED,
-            "Yesterday's record, quoted:\n```\n~~~\nResumed.\npaused = false in LIMITS.toml.\n```",
-        ),
-        (
-            RESUMED,
-            "~~~~\n~~~\npaused = false in LIMITS.toml.\n~~~\n~~~~",
-        ),
-        (
-            RESUMED,
-            "Yesterday's record, quoted:\n```\n    ```\nResumed.\npaused = false in LIMITS.toml.\n```",
-        ),
-        (
-            RESUMED,
-            "Yesterday's record, quoted:\n\n    Resumed.\n    paused = false in LIMITS.toml.",
-        ),
-        (
-            RESUMED,
-            "Yesterday's coordinator wrote:\n\n    paused = false in LIMITS.toml.",
-        ),
-        (
-            RESUMED,
-            "   ~~~\n    ~~~\npaused = false in LIMITS.toml.\n   ~~~",
-        ),
-        (RESUMED, "1. ~~~\n~~~\npaused = false in LIMITS.toml.\n~~~"),
-        (
-            RESUMED,
-            "Quoted from yesterday:\n* ```\n  Resumed.\n  paused = false in LIMITS.toml.\n  ```",
-        ),
-        (
-            RESUMED,
-            "- notes.\n    ```\n  paused = false in LIMITS.toml.\n    ```",
-        ),
-        (
-            RESUMED,
-            "1. notes.\n    ~~~\n   paused = false in LIMITS.toml.\n    ~~~",
-        ),
-        (
-            RESUMED,
-            "- notes.\n    - ```\n  paused = false in LIMITS.toml.\n    ```",
-        ),
-        (
-            RESUMED,
-            "- notes\n  ~~~\n~~~\npaused = false in LIMITS.toml.\n~~~",
-        ),
-        (
-            RESUMED,
-            "1. notes\n   ~~~\n~~~\npaused = false in LIMITS.toml.\n~~~",
-        ),
-        (
-            RESUMED,
-            "-\t~~~\n  ~~~\npaused = false in LIMITS.toml.\n  ~~~",
-        ),
-        (
-            RESUMED,
-            "1.\t~~~\n   ~~~\npaused = false in LIMITS.toml.\n   ~~~",
-        ),
-        (
-            RESUMED,
-            "Quoted:\n```\nResumed.\n```\u{a0}\npaused = false in LIMITS.toml.\n```",
-        ),
-        (
-            RESUMED,
-            "Quoted:\n```\nResumed.\n\u{a0}```\npaused = false in LIMITS.toml.\n```",
-        ),
-        (
-            RESUMED,
-            "Resumed by hand\n    and then\npaused = false in LIMITS.toml.",
-        ),
-        (
-            RESUMED,
-            "1. ~~~\n~~~~\n   ~~~\npaused = false in LIMITS.toml.\n~~~~",
-        ),
-        (
-            RESUMED,
-            "- ```\n````\n  ```\npaused = false in LIMITS.toml.\n````",
-        ),
-        (
-            RESUMED,
-            "Quoted:\n- ```\n```\nResumed.\npaused = false in LIMITS.toml.\n```",
-        ),
-        (
-            RESUMED,
-            "Yesterday's record, quoted:\n\n\tResumed.\n\tpaused = false in LIMITS.toml.",
-        ),
-        (
-            RESUMED,
-            "Quoted from yesterday:\n+ ```\n  Resumed.\n  paused = false in LIMITS.toml.\n  ```",
-        ),
-        (
-            RESUMED,
-            "Quoted from yesterday:\n1. ```\n   Resumed.\n   paused = false in LIMITS.toml.\n   ```",
-        ),
-        (
-            RESUMED,
-            "Quoted from yesterday:\n1) ```\n   Resumed.\n   paused = false in LIMITS.toml.\n   ```",
-        ),
-        (
-            "Coordinator: resumed from handoff after compaction",
-            "paused = false in LIMITS.toml.",
-        ),
-    ] {
-        let c = unpaused_in_the_journal("paused = false in LIMITS.toml.");
-        journal(
-            &c.root,
-            "2026-11-26T23:59Z",
-            "Lane tooling: a fix round sent",
-            "",
-        );
-        let (code, lines, text) = act(&c.root);
-        assert_eq!((code, lines.len()), (Some(0), 0), "{text}");
-
-        journal(&c.root, "2026-11-27T01:10Z", title, body);
-        let (code, lines, text) = act(&c.root);
-        assert_eq!((code, lines.len()), (Some(0), 0), "{title}: {body}: {text}");
-    }
-}
-
-#[test]
-fn with_the_journal_fallback_the_record_states_the_assignment_as_a_clause_of_its_own() {
-    for body in [
-        "Owner woke the coordinator by hand. paused = false in LIMITS.toml; hourly backstop re-enabled.",
-        "Resumed from the handoff:\n\n- `paused=false` in LIMITS.toml\n- heartbeat re-armed",
-        "Owner woke the coordinator by hand\n\npaused = false in LIMITS.toml! Lanes next.",
-        "Resumed; ran\n```\ncm next --act\n```\npaused = false in LIMITS.toml.",
-        "Resumed; ran\n```\ncm next --act\n`````\npaused = false in LIMITS.toml.",
-        "Resumed from the handoff:\n1. `paused = false` in LIMITS.toml\n2) heartbeat re-armed",
-        "```a`b\n\npaused = false in LIMITS.toml.",
-        "  ```\ncm next --act\n```\n\npaused = false in LIMITS.toml.",
-        "  ~~~\ncm next --act\n  ~~~\npaused = false in LIMITS.toml.",
-        "Ran:\n\n    ```\n\npaused = false in LIMITS.toml.",
-        "- ran cm next\n```\n  cm next --act\n```\n\npaused = false in LIMITS.toml.",
-        "> note\n  ```\n  cm next --act\n  ```\n\npaused = false in LIMITS.toml.",
-    ] {
-        let c = unpaused_in_the_journal(body);
-        let (code, lines, text) = act(&c.root);
-        assert_eq!(code, Some(1), "{body}: {text}");
-        assert_eq!(lines.len(), 1, "{body}: {text}");
-        assert_eq!(lines[0]["since"], "2026-11-26T22:16:00Z");
-    }
-}
-
-#[test]
-fn with_the_journal_fallback_a_record_shaped_plan_or_restatement_is_taken_as_the_unpause() {
-    for body in [
-        "Next:\n- paused = false in LIMITS.toml",
-        "Plan for the next reset:\n- paused = false in LIMITS.toml.",
-        "Yesterday's record, restated. paused = false in LIMITS.toml.",
-    ] {
-        let c = unpaused_in_the_journal("paused = false in LIMITS.toml.");
-        journal(
-            &c.root,
-            "2026-11-26T23:59Z",
-            "Lane tooling: a fix round sent",
-            "",
-        );
-        journal(&c.root, "2026-11-27T01:10Z", RESUMED, body);
-        let (code, lines, text) = act(&c.root);
-        assert_eq!((code, lines.len()), (Some(1), 1), "{body}: {text}");
-        assert_eq!(lines[0]["since"], "2026-11-27T01:10:00Z", "{body}");
-    }
-}
-
-#[test]
-fn with_the_journal_fallback_a_fence_inside_a_list_item_or_quote_makes_no_record() {
-    for body in [
-        "Resumed:\n1. ran\n   ```\n   cm next --act\n   ```\n\npaused = false in LIMITS.toml.",
-        "Ran:\n10. ```\n    cm next --act\n    ```\n\npaused = false in LIMITS.toml.",
-        "Ran:\n- ```\n  cm next --act\n\n  cm lint\n  ```\n\npaused = false in LIMITS.toml.",
-        "- a\n  - ```\n    cm next --act\n    ```\n\npaused = false in LIMITS.toml.",
-        "> ```\n> cm next --act\n> ```\n\npaused = false in LIMITS.toml.",
-        "-\tran cm next\n\npaused = false in LIMITS.toml.",
-        "-     cm next --act\n\npaused = false in LIMITS.toml.",
-    ] {
-        let c = unpaused_in_the_journal(body);
-        let (code, lines, text) = act(&c.root);
-        assert_eq!((code, lines.len()), (Some(0), 0), "{body}: {text}");
-    }
-}
-
-#[test]
-fn with_the_journal_fallback_an_html_block_is_read_as_text() {
-    let c = unpaused_in_the_journal("paused = false in LIMITS.toml.");
+fn restated_unpause_text_in_the_journal_does_not_count() {
+    let c = eleven_26(&["tooling"]);
     journal(
         &c.root,
         "2026-11-26T23:59Z",
         "Lane tooling: a fix round sent",
         "",
     );
+    assert_eq!(act(&c.root).1.len(), 0);
+
     journal(
         &c.root,
         "2026-11-27T01:10Z",
-        RESUMED,
-        "<pre>\nResumed.\npaused = false in LIMITS.toml.\n</pre>",
+        "Coordinator: resumed after quota reset",
+        "paused = false in LIMITS.toml.",
+    );
+    journal(
+        &c.root,
+        "2026-11-27T01:11Z",
+        "Owner: notes",
+        "The coordinator set `paused = false` in LIMITS.toml at 01:10Z.",
     );
     let (code, lines, text) = act(&c.root);
+    assert_eq!((code, lines.len()), (Some(0), 0), "{text}");
+}
+
+#[test]
+fn a_re_pause_is_quiet_and_the_next_unpause_dates_the_line() {
+    let c = eleven_26(&["tooling"]);
+    journal(
+        &c.root,
+        "2026-11-26T23:59Z",
+        "Lane tooling: a fix round sent",
+        "",
+    );
+    commit_paused(&c.root, true, "2026-11-27T00:30:00Z");
+    let (code, lines, text) = act(&c.root);
+    assert_eq!((code, lines.len()), (Some(0), 0), "{text}");
+
+    commit_paused(&c.root, false, "2026-11-27T02:00:05Z");
+    let (code, lines, text) = act(&c.root);
     assert_eq!((code, lines.len()), (Some(1), 1), "{text}");
-    assert_eq!(lines[0]["since"], "2026-11-27T01:10:00Z");
+    assert_eq!(lines[0]["since"], "2026-11-27T02:00:05Z");
 }
 
 #[test]
@@ -812,14 +552,14 @@ fn an_unpause_a_merge_commit_makes_is_read_from_first_parent_history() {
 }
 
 #[test]
-fn an_uncommitted_or_shallow_unpause_falls_back_to_the_journal() {
+fn an_uncommitted_or_shallow_unpause_leaves_the_lane_listed_as_paused() {
     let c = eleven_26(&["tooling"]);
     // Back to a committed pause, then `paused = false` only in the working tree.
     commit_paused(&c.root, true, "2026-11-26T23:00:00Z");
     set_paused(&c.root, false);
     let (_, lines, text) = act(&c.root);
     assert_eq!(lines.len(), 1, "{text}");
-    assert_eq!(lines[0]["since"], "2026-11-26T22:16:00Z");
+    assert_eq!(lines[0]["since"], "2026-11-25T23:29:00Z");
     assert!(text.contains("`paused = false` is not committed"), "{text}");
 
     // A shallow clone holding only the unpause commit cannot tell when it happened.
@@ -835,7 +575,7 @@ fn an_uncommitted_or_shallow_unpause_falls_back_to_the_journal() {
     fs::copy(c.root.join("JOURNAL.md"), clone.join("JOURNAL.md")).unwrap();
     let (_, lines, text) = act(&clone);
     assert_eq!(lines.len(), 1, "{text}");
-    assert_eq!(lines[0]["since"], "2026-11-26T22:16:00Z");
+    assert_eq!(lines[0]["since"], "2026-11-25T23:29:00Z");
     assert!(text.contains("not in this clone (shallow?)"), "{text}");
 }
 
@@ -851,21 +591,4 @@ fn a_title_naming_both_words_is_a_resume() {
     );
     let (code, lines, _) = act(&c.root);
     assert_eq!((code, lines.len()), (Some(0), 0), "{lines:?}");
-}
-
-#[test]
-fn with_the_journal_fallback_a_lane_entry_in_the_unpause_minute_is_no_resume() {
-    let c = outside_git();
-    lane(&c.root, "tooling", "session_tooling");
-    pause_entry(&c.root, "tooling", "2026-11-25T23:29Z");
-    journal(
-        &c.root,
-        "2026-11-26T22:16Z",
-        "Coordinator: resumed after quota reset",
-        "`paused = false` in LIMITS.toml.",
-    );
-    journal(&c.root, "2026-11-26T22:16Z", "Lane tooling: reading", "");
-    assert_eq!(act(&c.root).1.len(), 1);
-    journal(&c.root, "2026-11-26T22:17Z", "Lane tooling: resumed", "");
-    assert_eq!(act(&c.root).1.len(), 0);
 }

@@ -20,10 +20,6 @@ pub(crate) struct Fences {
 }
 
 impl Fences {
-    pub(crate) fn is_open(&self) -> bool {
-        self.open.is_some()
-    }
-
     pub(crate) fn contains(&mut self, line: &str) -> bool {
         let trimmed = line.trim_start_matches(' ');
         if line.len() - trimmed.len() > 3 {

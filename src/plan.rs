@@ -1969,124 +1969,6 @@ fn has_word(text: &str, word: &str) -> bool {
         .any(|token| token.eq_ignore_ascii_case(word))
 }
 
-// The resume record the owner's resume directive (2026-11-25T23:36Z) prescribes: an entry with this
-// exact title whose body states the assignment as a clause of its own. Any other coordinator
-// restart, and a sentence that recalls or plans the unpause, is none; a line break inside a
-// paragraph ends no clause, so a wrapped recollection stays one sentence. A question states nothing
-// and code quotes (a fence, or a line indented four columns), so neither is the record. The record
-// is read by its form: a clause of that form that plans or restates the unpause still counts, since
-// without history cm cannot tell it from the transition.
-const RESUME_TITLE: &str = "Coordinator: resumed after quota reset";
-const ASSIGNMENT: [&str; 5] = ["paused", "=", "false", "in", "limits.toml"];
-
-fn list_item(line: &str) -> Option<&str> {
-    let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-    let rest = match digits {
-        0 => line.strip_prefix(['-', '*', '+']),
-        1..=9 => line[digits..].strip_prefix(['.', ')']),
-        _ => None,
-    }?;
-    rest.starts_with([' ', '\t']).then(|| rest.trim_start())
-}
-
-fn opens_fence(text: &str) -> bool {
-    text.starts_with("```") || text.starts_with("~~~")
-}
-
-// A line's text after its quote and list markers, and whether it has markers and the first is a
-// list item's; None when a marker is followed by a tab, or a list marker by five spaces, which move
-// the content column in ways this reading does not follow.
-fn after_markers(line: &str) -> Option<(&str, Option<bool>)> {
-    let mut rest = line;
-    let mut first = None;
-    loop {
-        let (after, item) = if let Some(after) = rest.strip_prefix('>') {
-            (after, false)
-        } else {
-            let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-            let after = match digits {
-                0 => rest.strip_prefix(['-', '*', '+']),
-                1..=9 => rest[digits..].strip_prefix(['.', ')']),
-                _ => None,
-            };
-            match after {
-                Some(after) if after.is_empty() || after.starts_with([' ', '\t']) => (after, true),
-                _ => break,
-            }
-        };
-        first.get_or_insert(item);
-        let padding = after.len() - after.trim_start_matches([' ', '\t']).len();
-        if after[..padding].contains('\t') || (item && padding >= 5) {
-            return None;
-        }
-        rest = &after[padding..];
-    }
-    Some((rest, first))
-}
-
-// Only fences outside list items and quotes are followed, by the rules cm's other Markdown checks
-// use (`markdown::Fences`). A fence inside a list item or quote (on the item's line, or indented
-// after a list item), or a marker followed by a tab or a list marker by five spaces, would need
-// container columns this reading does not model, so such a body states nothing. A line indented
-// four columns, or by a tab, is code or list text; it is not read and closes no clause.
-fn states_unpause(body: &str) -> bool {
-    let mut fences = crate::markdown::Fences::default();
-    let mut in_list = false;
-    let mut text = String::new();
-    for raw in body.lines() {
-        let opening = !fences.is_open();
-        if fences.contains(raw) {
-            if opening && in_list && raw.starts_with(' ') {
-                return false;
-            }
-            text.push_str(" ;");
-            continue;
-        }
-        let lead = raw.len() - raw.trim_start_matches([' ', '\t']).len();
-        let line = raw[lead..].trim_end_matches([' ', '\t']);
-        let indented = lead >= 4 || raw[..lead].contains('\t');
-        if indented && !in_list {
-            continue;
-        }
-        let Some((content, marker)) = after_markers(line) else {
-            return false;
-        };
-        if (indented || marker.is_some()) && opens_fence(content) {
-            return false;
-        }
-        if indented {
-            continue;
-        }
-        in_list |= marker == Some(true);
-        match list_item(line) {
-            Some(item) => {
-                text.push_str(" ; ");
-                text.push_str(item);
-            }
-            None if line.is_empty() => text.push_str(" ;"),
-            None => {
-                text.push(' ');
-                text.push_str(line);
-            }
-        }
-    }
-    let text = text.replace('`', "").replace('=', " = ").to_lowercase();
-    let mut clause = Vec::new();
-    for word in text.split_whitespace() {
-        let bare = word.trim_end_matches(['.', ';', '!', '?']);
-        if !bare.is_empty() {
-            clause.push(bare);
-        }
-        if bare.len() < word.len() {
-            if clause == ASSIGNMENT && !word[bare.len()..].contains('?') {
-                return true;
-            }
-            clause.clear();
-        }
-    }
-    clause == ASSIGNMENT
-}
-
 fn handoff_paths(line: &str) -> impl Iterator<Item = &str> {
     line.split(|c: char| c.is_whitespace() || "`()[],;\"'".contains(c))
         .map(|word| word.trim_end_matches(['.', ':']))
@@ -2108,94 +1990,47 @@ struct LaneRecord {
     latest: Option<Timestamp>,
 }
 
-struct ResumeRecord {
-    at: Timestamp,
-    stamp: String,
-}
-
-enum Reading {
-    Other,
-    Pause(String),
-    Resume(ResumeRecord, String),
-}
-
-#[derive(Default)]
-struct LaneJournal {
-    lanes: BTreeMap<String, LaneRecord>,
-    resume: Option<ResumeRecord>,
-}
-
-impl LaneJournal {
-    // One pass that keeps per lane only its open pause and newest stamp: the journal only grows.
-    fn read(root: &Path, lanes: &BTreeSet<String>) -> Option<Self> {
-        let file = fs::File::open(root.join(store::JOURNAL)).ok()?;
-        let mut journal = Self::default();
-        let mut reading = Reading::Other;
-        for line in BufReader::new(file).lines() {
-            let line = line.ok()?;
-            let Some((stamp, title)) = crate::journal::split_heading(&line) else {
-                match &mut reading {
-                    Reading::Pause(lane) => {
-                        if let Some(pause) = journal
-                            .lanes
-                            .get_mut(lane)
-                            .and_then(|record| record.pause.as_mut())
-                        {
-                            pause
-                                .handoffs
-                                .extend(handoff_paths(&line).map(str::to_owned));
-                        }
-                    }
-                    Reading::Resume(_, body) => {
-                        body.push_str(&line);
-                        body.push('\n');
-                    }
-                    Reading::Other => {}
-                }
-                continue;
-            };
-            journal.close(std::mem::replace(&mut reading, Reading::Other));
-            let at = instant(stamp);
-            if let Some(lane) = entry_lane(title, lanes) {
-                let record = journal.lanes.entry(lane.to_owned()).or_default();
-                record.latest = record.latest.max(at);
-                // `resumed` wins: "resumed after the paused window" is no pause.
-                if has_word(title, "resumed") {
-                    record.pause = None;
-                } else if has_word(title, "paused") {
-                    record.pause = Some(Pause {
-                        at,
-                        stamp: stamp.to_owned(),
-                        title: title.to_owned(),
-                        handoffs: Vec::new(),
-                    });
-                    reading = Reading::Pause(lane.to_owned());
-                }
-            } else if title == RESUME_TITLE
-                && let Some(at) = at
-            {
-                let record = ResumeRecord {
-                    at,
-                    stamp: stamp.to_owned(),
-                };
-                reading = Reading::Resume(record, String::new());
-            }
-        }
-        journal.close(reading);
-        Some(journal)
-    }
-
-    fn close(&mut self, reading: Reading) {
-        if let Reading::Resume(record, body) = reading
-            && states_unpause(&body)
-            && self
-                .resume
+// One pass that keeps per lane only its open pause and newest stamp: the journal only grows. Only
+// the lanes' own entry titles are read; no entry's text dates the unpause.
+fn lane_journal(root: &Path, lanes: &BTreeSet<String>) -> Option<BTreeMap<String, LaneRecord>> {
+    let file = fs::File::open(root.join(store::JOURNAL)).ok()?;
+    let mut records = BTreeMap::<String, LaneRecord>::new();
+    let mut reading: Option<String> = None;
+    for line in BufReader::new(file).lines() {
+        let line = line.ok()?;
+        let Some((stamp, title)) = crate::journal::split_heading(&line) else {
+            if let Some(pause) = reading
                 .as_ref()
-                .is_none_or(|newest| record.at >= newest.at)
-        {
-            self.resume = Some(record);
+                .and_then(|lane| records.get_mut(lane))
+                .and_then(|record| record.pause.as_mut())
+            {
+                pause
+                    .handoffs
+                    .extend(handoff_paths(&line).map(str::to_owned));
+            }
+            continue;
+        };
+        reading = None;
+        let at = instant(stamp);
+        let Some(lane) = entry_lane(title, lanes) else {
+            continue;
+        };
+        let record = records.entry(lane.to_owned()).or_default();
+        record.latest = record.latest.max(at);
+        // `resumed` wins: "resumed after the paused window" is no pause.
+        if has_word(title, "resumed") {
+            record.pause = None;
+        } else if has_word(title, "paused") {
+            record.pause = Some(Pause {
+                at,
+                stamp: stamp.to_owned(),
+                title: title.to_owned(),
+                handoffs: Vec::new(),
+            });
+            reading = Some(lane.to_owned());
         }
     }
+    Some(records)
 }
 
 fn lane_handoff(root: &Path, paths: &[String], lane: &str) -> Option<(String, Option<String>)> {
@@ -2222,39 +2057,42 @@ fn lane_paused(root: &Path, inputs: &ActionInputs) -> Vec<Action> {
     if lanes.is_empty() {
         return Vec::new();
     }
-    let Some(LaneJournal { lanes, resume }) = LaneJournal::read(root, &lanes) else {
+    let Some(lanes) = lane_journal(root, &lanes) else {
         return Vec::new();
     };
     if lanes.values().all(|record| record.pause.is_none()) {
         return Vec::new();
     }
-    let (unpaused, source) = match limits::unpause(root) {
-        Ok(unpause) => (
-            unpause.at,
-            format!(
-                "LIMITS.toml commit {}",
-                unpause.sha.chars().take(12).collect::<String>()
-            ),
-        ),
-        Err(why) => {
-            let Some(resume) = resume else {
-                return Vec::new();
-            };
-            (
-                resume.at,
-                format!("journal {} `{RESUME_TITLE}`; {why}", resume.stamp),
-            )
-        }
-    };
+    // The unpause is the commit that set it: with no such commit to date it, a pause cannot be
+    // shown to predate it or a lane entry to follow it, so the pause stands until the lane resumes.
+    let unpause = limits::unpause(root);
     let mut out = Vec::new();
     for (lane, record) in &lanes {
         let Some(pause) = &record.pause else {
             continue;
         };
-        if pause.at.is_none_or(|at| at >= unpaused) || record.latest.is_some_and(|at| at > unpaused)
-        {
-            continue;
-        }
+        let (since, reason) = match &unpause {
+            Ok(unpause) => {
+                if pause.at.is_none_or(|at| at >= unpause.at)
+                    || record.latest.is_some_and(|at| at > unpause.at)
+                {
+                    continue;
+                }
+                (
+                    unpause.at.to_string(),
+                    format!(
+                        "no lane entry after the unpause (LIMITS.toml commit {})",
+                        unpause.sha.chars().take(12).collect::<String>()
+                    ),
+                )
+            }
+            Err(why) => (
+                pause
+                    .at
+                    .map_or_else(|| pause.stamp.clone(), |at| at.to_string()),
+                format!("the unpause cannot be dated ({why}), so the pause stands"),
+            ),
+        };
         let handoff = lane_handoff(root, &pause.handoffs, lane);
         let session = inputs
             .drivers
@@ -2279,10 +2117,10 @@ fn lane_paused(root: &Path, inputs: &ActionInputs) -> Vec<Action> {
         let mut action = Action::new(
             ActionKind::LanePaused,
             lane,
-            &unpaused.to_string(),
+            &since,
             command,
             format!(
-                "paused at {} (`{}`), no lane entry after the unpause ({source})",
+                "paused at {} (`{}`), {reason}",
                 pause.stamp,
                 pause.title.replace('`', "'")
             ),
