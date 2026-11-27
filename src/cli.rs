@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -9,7 +10,7 @@ use crate::attempt::coordinator_label;
 use crate::commands;
 use crate::epoch::{self, Status};
 use crate::forge::GithubRepo;
-use crate::host::{Host, System};
+use crate::host::{Host, Invoked};
 use crate::idea::{self, Maturity, Word};
 use crate::lint;
 use crate::outcome::{Outcome, Violation};
@@ -1482,6 +1483,10 @@ fn name(command: &Commands) -> &'static str {
     }
 }
 
+pub fn parses(argv: &[String]) -> bool {
+    Cli::try_parse_from(argv).is_ok()
+}
+
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Commands::Advance { state, by, .. } = &cli.command
@@ -1516,7 +1521,8 @@ pub fn main() -> ExitCode {
         };
     }
     let command = name(&cli.command);
-    let outcome = run(&cli, &System).or_else(|error| {
+    let host = Invoked::record(std::env::args());
+    let outcome = run(&cli, &host).or_else(|error| {
         if let Some(large) = error.downcast_ref::<InputTooLarge>() {
             return Ok((
                 Outcome::refused(vec![Violation::new(
@@ -1530,7 +1536,10 @@ pub fn main() -> ExitCode {
         Err(error)
     });
     match outcome {
-        Ok((outcome, exit)) => {
+        Ok((mut outcome, exit)) => {
+            if let Ok(root) = store::root_or_cwd(cli.root.as_deref()) {
+                outcome.resolve_missing(&root);
+            }
             if cli.json && matches!(cli.command, Commands::Tick { .. }) {
                 // A closed stdout must not turn a tick whose moves ran into a panic. The object is
                 // streamed, never copied into one string: only its length is needed for a limit.

@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -111,6 +112,20 @@ pub fn feedback_headings(text: &str) -> Vec<FeedbackHeading> {
             })
         })
         .collect()
+}
+
+pub(crate) fn missing_command_entry(root: &Path, what: &str) -> Option<String> {
+    let text = fs::read_to_string(root.join(FEEDBACK)).ok()?;
+    let wanted = format!("missing command: {}", what.trim());
+    headings(&text)
+        .into_iter()
+        .filter(|heading| heading.level == 3)
+        .find_map(|heading| {
+            let mut words = heading.text.split_whitespace();
+            let id = words.next().filter(|word| feedback_id(word).is_some())?;
+            let title = heading.text.rsplit(" · ").next()?.trim();
+            (words.next() != Some("follow-up") && title == wanted).then(|| id.to_owned())
+        })
 }
 
 pub fn lint_feedback(root: &Path) -> Vec<Violation> {
@@ -404,12 +419,20 @@ fn item_heading(text: &str) -> Option<u32> {
 
 /// The numbers of the items open in OWNER-QUEUE.md.
 pub(crate) fn open_items(root: &Path) -> std::collections::BTreeSet<u32> {
+    open_titles(root).into_keys().collect()
+}
+
+pub(crate) fn open_titles(root: &Path) -> std::collections::BTreeMap<u32, String> {
     fs::read_to_string(root.join(QUEUE_FILE))
         .map(|text| {
             headings(&text)
                 .iter()
                 .filter(|heading| heading.level == 2)
-                .filter_map(|heading| item_heading(heading.text))
+                .filter_map(|heading| {
+                    let number = item_heading(heading.text)?;
+                    let title = heading.text.split_once(". ")?.1.trim().to_owned();
+                    Some((number, title))
+                })
                 .collect()
         })
         .unwrap_or_default()

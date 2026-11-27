@@ -12,9 +12,48 @@ pub trait Host {
     fn github_rate_limit(&self) -> Option<String> {
         None
     }
+    // The invocation as `cm …`, without `--json`, for a refusal that re-issues it.
+    fn argv(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 pub struct System;
+
+pub struct Invoked {
+    pub argv: Vec<String>,
+}
+
+impl Invoked {
+    pub fn record(args: impl IntoIterator<Item = String>) -> Self {
+        let argv = std::iter::once("cm".to_owned())
+            .chain(args.into_iter().skip(1).filter(|arg| arg != "--json"))
+            .collect();
+        Invoked { argv }
+    }
+}
+
+impl Host for Invoked {
+    fn now(&self) -> Timestamp {
+        System.now()
+    }
+
+    fn free_bytes(&self, volume: &Path) -> io::Result<u64> {
+        System.free_bytes(volume)
+    }
+
+    fn heavy_builds(&self) -> io::Result<u32> {
+        System.heavy_builds()
+    }
+
+    fn github_rate_limit(&self) -> Option<String> {
+        System.github_rate_limit()
+    }
+
+    fn argv(&self) -> Vec<String> {
+        self.argv.clone()
+    }
+}
 
 impl Host for System {
     fn github_rate_limit(&self) -> Option<String> {

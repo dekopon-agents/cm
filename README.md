@@ -48,6 +48,28 @@ Every command takes `--json` (one JSON object on stdout with `ok` and `violation
 success, 1 is a refusal or violations (every one listed, never only the first), 2 is a usage
 error. `review wait` additionally uses 3 for its deadline and 4 for unreadable campaign/unit/review state in that command.
 
+A refusal prints `path[:line]: rule: cause` as its first line, then its next move(s), indented: the
+exact command with cm's real values filled in (step, claim, item number), and a quoted
+`'<placeholder>'` only for what the caller alone has (a title, a reason, a file it writes). When
+there are several moves, each sits under its condition (`next, when …:`). `missing-command:` names
+a change no cm verb makes and the FEEDBACK.md entry that records it, or, when none does, the
+`cm feedback 'missing command: …' --urgency queued --body-file '<body-file>'` recipe. `next: nothing;
+<why>` means what the caller wanted already holds. Nothing runs a move for you. Refusals not yet
+migrated to this contract print only the first line.
+
+Under `--json`, each `violations[]` object has `path`, `line` (when known), `rule`, `message` and
+`next`, a list (empty for an unmigrated refusal):
+
+| `kind` | Fields |
+|---|---|
+| `run` | `when` (the condition, or null for a lone move), `argv` (placeholders as `<name>`), `inputs` (the placeholder names; `[]` means it runs as is), `command` (quoted as `cm next` quotes) |
+| `missing-command` | `what`, `recorded` (the FEEDBACK.md id, or null), `argv`, `inputs`, `command` (the adopt when recorded, else the `cm feedback` recipe) |
+| `settled` | `why` |
+
+`jq '.violations[].next[] | select(.kind == "missing-command")'` lists the gaps that bite. A usage
+error (exit 2) still prints clap's message on stderr, and an I/O or other internal error prints
+`{"ok": false, "violations": [], "error": …}` with exit 1.
+
 | Command | Contract |
 |---|---|
 | `cm init [DIR]` | Writes `RESUME.md`, `JOURNAL.md`, `LIMITS.toml`, `OWNER-QUEUE.md` and `.cm/state.json` from templates embedded in the binary. Never overwrites: in an existing folder it writes only what is missing and adopts each existing file as the baseline once it lints clean. `cm init <NN-name>/<unit>` inside a campaign writes the unit's `.cm/state.json` and its rendered `STATE.md`. |

@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};

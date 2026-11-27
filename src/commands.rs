@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,7 +11,7 @@ use crate::host::{Host, stamp};
 use crate::journal;
 use crate::limits::{self, Limits};
 use crate::lint::{self, packet_files, packet_paths};
-use crate::outcome::{Outcome, Violation};
+use crate::outcome::{self, Arg, Input, Next, Outcome, Violation};
 use crate::plan::{self, Units};
 use crate::render;
 use crate::state::{
@@ -823,6 +824,80 @@ pub fn journal(host: &dyn Host, root: &Path, title: &str, body: Option<&str>) ->
     Ok(outcome)
 }
 
+pub(crate) fn packet_kickoff(step_dir: &str, step: &str) -> Violation {
+    Violation::refuse(
+        step_dir,
+        "packet-kickoff",
+        "the step folder has no kickoff.md",
+        Next::run(vec![
+            "cm".into(),
+            "amend".into(),
+            step.into(),
+            "--kickoff-file".into(),
+            Input::KickoffFile.into(),
+        ]),
+    )
+}
+
+fn owner_queue_not_open(root: &Path, step: &str, part: Option<&str>, number: u32) -> Violation {
+    let add = outcome::Move::new(vec![
+        "cm".into(),
+        "owner-queue".into(),
+        "add".into(),
+        Input::Title.into(),
+        "--context".into(),
+        Input::Context.into(),
+        "--question".into(),
+        Input::Question.into(),
+        "--recommendation".into(),
+        Input::Recommendation.into(),
+        "--block".into(),
+        step.into(),
+    ]);
+    let open = crate::ledger::open_titles(root);
+    let full = match part {
+        Some(part) => format!("{step}#{part}"),
+        None => step.to_owned(),
+    };
+    if open.is_empty() {
+        return Violation::refuse(
+            full,
+            "owner-queue-not-open",
+            format!("OWNER-QUEUE.md has no open item {number}, and no item is open"),
+            add.into(),
+        );
+    }
+    let listed: Vec<String> = open
+        .iter()
+        .map(|(open, title)| format!("{open}. {title}"))
+        .collect();
+    let mut moves = vec![("to file a new question for the owner".to_owned(), add)];
+    for (open, title) in &open {
+        let mut argv: Vec<Arg> = vec![
+            "cm".into(),
+            "advance".into(),
+            step.into(),
+            format!("blocked:until:owner-queue:{open}").into(),
+        ];
+        if let Some(part) = part {
+            argv.extend(["--part".into(), part.into()]);
+        }
+        moves.push((
+            format!("when the step waits on item {open}, `{title}`"),
+            outcome::Move::new(argv),
+        ));
+    }
+    Violation::refuse(
+        full,
+        "owner-queue-not-open",
+        format!(
+            "OWNER-QUEUE.md has no open item {number}; the open items are {}",
+            listed.join("; ")
+        ),
+        Next::either(moves),
+    )
+}
+
 pub(crate) fn shell_word(text: &str) -> String {
     if !text.is_empty()
         && text
@@ -1064,11 +1139,7 @@ pub fn launch_remote(
         _ => None,
     };
     if prompt.is_none() {
-        violations.push(Violation::new(
-            relative(root, &step_dir),
-            "packet-kickoff",
-            "the step folder has no kickoff.md",
-        ));
+        violations.push(packet_kickoff(&relative(root, &step_dir), &full));
     }
     let (checked, missing) = packet_paths(root, &files, lint::home().as_deref());
     violations.extend(missing);
@@ -1853,13 +1924,7 @@ pub(crate) fn advance_held(
         && held.is_none_or(|held| held.pending != number)
         && !crate::ledger::open_items(root).contains(&number)
     {
-        violations.push(Violation::new(
-            &full,
-            "owner-queue-not-open",
-            format!(
-                "OWNER-QUEUE.md has no open item {number}; file the question with `cm owner-queue add <title> … --block {full}`"
-            ),
-        ));
+        violations.push(owner_queue_not_open(root, &step_full, part, number));
     }
     if *to == Phase::Merged || Release::of_target(&step_full).is_some() {
         violations.extend(crate::ledger::owner_queue_refusal(root, &full)?);

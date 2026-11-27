@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -9,7 +10,7 @@ use crate::commands::{closed, write_unit};
 use crate::evidence::CampaignFile;
 use crate::host::{Host, stamp};
 use crate::journal;
-use crate::outcome::{Outcome, Violation};
+use crate::outcome::{Next, Outcome, Violation};
 use crate::state::{Attempt, AttemptOutcome, Ended, External, Lane, ObservedTurn};
 use crate::store::{self, CM_DIR, Target, is_name, is_subcampaign_name, lock};
 
@@ -335,12 +336,31 @@ pub fn attempt(
             ))
         }
         Act::Record { kind, id } => {
-            if pending.is_none_or(|action| action.kind != *kind) {
-                violations.push(Violation::new(
+            match pending {
+                None => violations.push(Violation::refuse(
                     &full,
                     "attempt-record",
-                    format!("no {kind} has begun without an id; `cm attempt <step> begin {kind}` comes first"),
-                ));
+                    format!("no {kind} has begun without an id; its begin comes first"),
+                    Next::run(vec![
+                        "cm".into(),
+                        "attempt".into(),
+                        (&full).into(),
+                        "begin".into(),
+                        kind.into(),
+                        "--claim".into(),
+                        (&attempt.claim).into(),
+                    ]),
+                )),
+                Some(action) if action.kind != *kind => violations.push(Violation::refuse(
+                    &full,
+                    "attempt-record",
+                    format!(
+                        "{} began at {} and has no id yet, so no {kind} can be recorded",
+                        action.kind, action.began
+                    ),
+                    Next::run(vec!["cm".into(), "attempt".into(), (&full).into()]),
+                )),
+                Some(_) => {}
             }
             if id.is_empty() || id.contains(char::is_whitespace) {
                 violations.push(Violation::new(&full, "attempt-record", "an id is one word"));
