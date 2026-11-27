@@ -106,10 +106,16 @@ fn install(ctx: &Ctx, pin: &Pin) -> bool {
     if !target.is_absolute() {
         return false;
     }
-    let Ok(tmp) = tempfile::Builder::new().prefix("cm-pin-").tempdir_in(
-        ctx.checkout
-            .join(ctx.env.non_empty("TMPDIR").unwrap_or("/tmp")),
-    ) else {
+    // Under a relative TMPDIR heartbeat.sh's fetch was given a path relative to the folder it
+    // had moved into, so it fetched nothing and kept the running cm.
+    let tmpdir = Path::new(ctx.env.non_empty("TMPDIR").unwrap_or("/tmp"));
+    if !tmpdir.is_absolute() {
+        return false;
+    }
+    let Ok(tmp) = tempfile::Builder::new()
+        .prefix("cm-pin-")
+        .tempdir_in(tmpdir)
+    else {
         return false;
     };
     let asset = tmp.path().join(name);

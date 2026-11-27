@@ -3227,6 +3227,12 @@ fn main_repository(dir: &Path) -> PathBuf {
         os("origin.git"),
     ]);
     git(&[os("init"), os("-q"), os("-b"), os("main"), os("repo")]);
+    for (key, value) in [
+        ("user.name", "cm tick test"),
+        ("user.email", "tick@example.invalid"),
+    ] {
+        git(&[os("-C"), os("repo"), os("config"), os(key), os(value)]);
+    }
     git(&[
         os("-C"),
         os("repo"),
@@ -3261,11 +3267,7 @@ fn main_repository(dir: &Path) -> PathBuf {
 fn the_built_cm_tick_leaves_a_bare_cm_to_the_default_search_path_when_path_is_unset() {
     let harness = Harness::new(1, &act(lines()), PICK_OK);
     // With PATH unset the tick's git is the system one, which reads only this repository, so the
-    // tick is bound and reaches the act loop. Only the fake handoff-pick.sh logs: once for
-    // `--check-bound`, and three times a tick, at the frame's check, at gitsync's `still_bound`
-    // after its pull, and at the frame's re-check. Whether the real gitsync's commit fails there
-    // depends on the system git's identity, which this environment does not set, so gitsync's
-    // own two lines, that failure and its wall-time line, are left out, and nothing else.
+    // tick is bound and reaches the act loop.
     let git_dir = main_repository(&harness.ct.path().join("git"));
     script(
         &harness.ct.path().join(beat::HANDOFF_PICK),
@@ -3292,10 +3294,6 @@ fn the_built_cm_tick_leaves_a_bare_cm_to_the_default_search_path_when_path_is_un
             .unwrap()
             .iter()
             .map(|line| line.as_str().unwrap())
-            .filter(|line| {
-                *line != "heartbeat: git commit of the tree's changes failed; commit them by hand"
-                    && !line.starts_with("tick: gitsync phase took ")
-            })
             .collect();
         let could_not_run = format!("heartbeat: cm --json next --act could not run: {cm}: ");
         if ran {
@@ -4717,8 +4715,7 @@ fn the_built_cm_tick_binds_a_stale_head_at_any_age() {
 #[test]
 fn the_built_cm_tick_counts_a_failed_fetch_as_bound() {
     let origin = Origin::new();
-    // Only the check's `git fetch` fails: gitsync's pull fetches through git's own exec path,
-    // not PATH, so it pulls and pushes with no retry, and stdout is exactly the act lines.
+    // gitsync's pull runs its fetch from git's exec path, not PATH, so only the check's fails.
     let bin = origin.path("fetch-fails");
     script(
         &bin.join("git"),
@@ -4747,6 +4744,11 @@ fn the_built_cm_tick_counts_a_failed_fetch_as_bound() {
         };
         assert_eq!(String::from_utf8(output.stdout).unwrap(), printed);
     }
+    origin.git(
+        &origin.ct(),
+        &["remote", "set-url", "origin", "../no-such-origin.git"],
+    );
+    assert_eq!(origin.check_bound(Some("cse_01abc")), Some(0));
 }
 
 #[test]

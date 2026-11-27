@@ -24,6 +24,9 @@ tempfile = "3"
 thiserror = "2"
 toml = "1"
 
+[dev-dependencies]
+rustix = { version = "1", features = ["thread"] }
+
 [profile.release]
 codegen-units = 1
 lto = true

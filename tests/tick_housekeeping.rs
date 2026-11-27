@@ -454,7 +454,6 @@ fn a_pull_killed_mid_rebase_is_aborted_with_the_tree_as_it_was_and_the_next_try_
     scratch.git(&ct, &["commit", "-qm", "local"]);
     scratch.push_from_other("STATE.md", "other\n");
     script(&ct.join(".git/hooks/pre-commit"), "exit 1\n");
-    // The rebase's first checkout kills the pull's whole process group, as a budget cut would.
     script(
         &ct.join(".git/hooks/post-checkout"),
         "[ -e \"$TICK_FIXTURE/killed\" ] && exit 0\ntouch \"$TICK_FIXTURE/killed\"\nkill -TERM 0\n",
@@ -503,6 +502,44 @@ fn a_pull_killed_mid_rebase_is_aborted_with_the_tree_as_it_was_and_the_next_try_
     );
 }
 
+#[test]
+fn a_pull_cut_or_refused_before_its_rebase_is_quit_and_its_autostash_kept_for_the_next_tick() {
+    for (hook, budget) in [
+        ("exec sleep 60\n", Duration::from_secs(2)),
+        ("exit 1\n", MAX_BUDGET),
+    ] {
+        let scratch = Scratch::new();
+        let ct = scratch.ct();
+        write(&ct.join(EPOCH).join("NOTES.md"), "local, unpushed\n");
+        scratch.git(&ct, &["add", "-A"]);
+        scratch.git(&ct, &["commit", "-qm", "local"]);
+        scratch.push_from_other("STATE.md", "other\n");
+        script(&ct.join(".git/hooks/pre-commit"), "exit 1\n");
+        script(&ct.join(".git/hooks/pre-rebase"), hook);
+        write(&ct.join(EPOCH).join("CARD.md"), "card, in the autostash\n");
+        let proc = scratch.proc();
+        let report = scratch.phase(&proc, Path::new("cm"), budget, |ctx| {
+            gitsync::sync(ctx, Mode::Always)
+        });
+        assert_eq!(
+            report.lines,
+            [COMMIT_FAILED, gitsync::QUIT, SYNC_FAILED],
+            "{hook}"
+        );
+        assert!(proc.log().contains(&"git rebase --quit".to_owned()));
+        assert!(!ct.join(".git/rebase-merge").exists(), "{hook}");
+        assert_eq!(scratch.status(), "");
+        assert_eq!(scratch.git(&ct, &["stash", "list"]).lines().count(), 1);
+        assert_eq!(
+            scratch.git(&ct, &["show", &format!("stash@{{0}}:{EPOCH}/CARD.md")]),
+            "card, in the autostash\n"
+        );
+        fs::remove_file(ct.join(".git/hooks/pre-rebase")).unwrap();
+        assert_eq!(scratch.sync(&proc, Mode::Always), Report::default());
+        assert_eq!(scratch.origin_log(), ["local", "other: STATE.md", "start"]);
+    }
+}
+
 const STILL_BOUND: [&str; 4] = [
     "git rev-parse --abbrev-ref HEAD",
     "sh tools/cloud-env/handoff-pick.sh store/epochs/eleemosynary-mnemosyne coordinator --lineage session_01abc --max-age-hours 24",
@@ -510,9 +547,6 @@ const STILL_BOUND: [&str; 4] = [
     "git diff --name-only -z --no-renames --diff-filter=A HEAD origin/main -- store/epochs/eleemosynary-mnemosyne/handoff/",
 ];
 
-// Twin campaigns, each with its own bare origin, whose pull lands a newer handoff superseding
-// this lineage's: a successor's retires the session, as heartbeat.sh's `is_bound || exit 0` did,
-// so nothing is pushed and nothing is said; this lineage's own keeps it bound, and it pushes.
 #[test]
 fn a_pull_that_lands_a_successor_s_handoff_pushes_nothing_and_says_nothing_where_its_twin_pushes() {
     let next = "handoff/coordinator-2026-11-26T0100Z.md";
@@ -559,8 +593,11 @@ fn a_pull_that_lands_a_successor_s_handoff_pushes_nothing_and_says_nothing_where
     }
 }
 
+const GATE: &str = "01-a/u/s/evidence/astra-u-1-r1";
+
 // A handoff-pick.sh that answers each call in turn from `$TICK_FIXTURE/answers`, `ok` past
-// its end, and counts its calls in `$TICK_FIXTURE/picks`; a cm that logs its calls.
+// its end, and counts its calls in `$TICK_FIXTURE/picks`; a cm, setup.sh and astra-review.sh that
+// log their calls, and one gate for the collect phase.
 fn picking(answers: &str) -> Scratch {
     let scratch = Scratch::new();
     let ct = scratch.ct();
@@ -575,6 +612,18 @@ fn picking(answers: &str) -> Scratch {
     script(
         &scratch.path().join("bin/cm"),
         "echo \"cm $*\" >> \"$TICK_FIXTURE/cm.log\"\necho '{\"actionable\": []}'\n",
+    );
+    write(
+        &ct.join(pin::SETUP),
+        "echo \"setup.sh $*\" >> \"$TICK_FIXTURE/phases.log\"\n",
+    );
+    script(
+        &ct.join("tools/cloud-env/astra-review.sh"),
+        "echo \"astra-review.sh $*\" >> \"$TICK_FIXTURE/phases.log\"\n",
+    );
+    write(
+        &ct.join(EPOCH).join(GATE).join("request.json"),
+        "{\"mode\": \"pr\", \"requested\": {\"model\": \"gpt-6-astra\"}}\n",
     );
     write(&ct.join(EPOCH).join("handoff").join(OURS), &handoff(STAMP));
     let journal = ct.join(EPOCH).join("JOURNAL.md");
@@ -605,17 +654,22 @@ impl Scratch {
     fn picks(&self) -> String {
         fs::read_to_string(self.path().join("picks")).unwrap()
     }
+
+    fn phases(&self) -> String {
+        fs::read_to_string(self.path().join("phases.log")).unwrap_or_default()
+    }
 }
 
-// The check runs afresh each time, so it can answer unbound after gitsync's pull and bound at
-// the frame's re-check: heartbeat.sh exited at the first answer, the tick goes on with this
-// turn's commit unpushed, and the next turn pushes it.
 #[test]
 fn a_check_that_answers_unbound_after_the_pull_and_bound_at_the_re_check_leaves_the_commit_for_the_next_tick()
  {
     let scratch = picking("ok\nmissing\nok\n");
     assert_eq!(scratch.tick_with_logging_cm(), [LISTED]);
     assert_eq!(scratch.picks(), "3\n");
+    assert_eq!(
+        scratch.phases(),
+        format!("setup.sh --list-pins\nastra-review.sh collect {EPOCH}/{GATE}\n")
+    );
     assert_eq!(scratch.origin_log(), ["start"]);
     assert_eq!(
         scratch.git(&scratch.ct(), &["log", "--format=%s", "-1"]),
@@ -633,8 +687,6 @@ fn a_check_that_answers_unbound_after_the_pull_and_bound_at_the_re_check_leaves_
     );
 }
 
-// heartbeat.sh checked twice, before its sync and after the pull, and exited; the tick checks a
-// third time at the frame's re-check before it stops.
 #[test]
 fn a_pull_that_retires_the_session_costs_three_handoff_picks_and_the_tick_says_nothing() {
     let scratch = picking("ok\nmissing\nmissing\n");
@@ -642,12 +694,33 @@ fn a_pull_that_retires_the_session_costs_three_handoff_picks_and_the_tick_says_n
     assert_eq!(scratch.picks(), "3\n");
     assert_eq!(scratch.origin_log(), ["start"]);
     assert!(!scratch.path().join("cm.log").exists());
+    assert_eq!(scratch.phases(), "");
 }
 
-// The check's second pick (gitsync's, after the pull) first pushes a successor's handoff to
-// origin, and its fourth (the frame's re-check) first moves origin away, so that re-check's fetch
-// fails and counts as bound: the tick goes on to its act loop where heartbeat.sh, retired by the
-// check after the pull, stopped. The IfDirty sync after executors meets the same rule.
+#[test]
+fn the_built_cm_tick_without_home_syncs_and_lists_where_heartbeat_sh_stopped_at_once() {
+    let scratch = picking("");
+    let output = scratch
+        .tick_command(&PathBuf::from(env!("CARGO_BIN_EXE_cm")))
+        .env_remove("HOME")
+        .arg("--cm")
+        .arg(scratch.path().join("bin/cm"))
+        .arg("--checkout")
+        .arg(scratch.ct())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(printed(&output.stdout).0, [LISTED]);
+    assert_eq!(
+        scratch.origin_log(),
+        ["chore(mnemosyne): heartbeat sync", "start"]
+    );
+    assert_eq!(
+        fs::read_to_string(scratch.path().join("cm.log")).unwrap(),
+        format!("cm --json next -C {EPOCH} --act\n")
+    );
+}
+
 #[test]
 fn a_re_check_whose_fetch_fails_counts_bound_after_a_check_that_retired_the_session() {
     let scratch = Scratch::new();
@@ -691,6 +764,14 @@ fn a_re_check_whose_fetch_fails_counts_bound_after_a_check_that_retired_the_sess
         scratch.git(&ct, &["log", "--format=%s", "-1"]),
         "chore(mnemosyne): heartbeat sync\n"
     );
+    fs::rename(
+        scratch.path().join("origin.gone"),
+        scratch.path().join("origin.git"),
+    )
+    .unwrap();
+    assert_eq!(scratch.tick_with_logging_cm(), Vec::<String>::new());
+    assert_eq!(scratch.picks(), "6\n");
+    assert_eq!(scratch.origin_log(), ["successor", "start"]);
 }
 
 const RELEASED: &str = "cp \"$TICK_FIXTURE/release.tar.gz\" \"$3\"";
@@ -913,6 +994,41 @@ fn a_tmpdir_that_does_not_exist_refuses_the_pin_and_keeps_the_running_cm() {
 }
 
 #[test]
+fn a_relative_tmpdir_refuses_the_pin_and_keeps_the_running_cm() {
+    let pinned = Pinned::released();
+    let ct = pinned.scratch.ct();
+    fs::create_dir(ct.join("tmp")).unwrap();
+    let env: Env = [
+        (
+            "HOME",
+            pinned.scratch.path().join("home").display().to_string(),
+        ),
+        ("TMPDIR", "tmp".to_owned()),
+    ]
+    .into_iter()
+    .collect();
+    let proc = pinned.scratch.proc();
+    let ctx = Ctx::new(
+        &ct,
+        Path::new(EPOCH),
+        &proc,
+        &env,
+        pinned.cm.as_os_str(),
+        MAX_BUDGET,
+    );
+    pinned.left_alone(pin::run(&ctx));
+    assert_eq!(names(&ct.join("tmp")), Vec::<String>::new());
+    assert!(
+        !proc
+            .log()
+            .iter()
+            .any(|call| call.contains("--fetch-pinned")),
+        "{:?}",
+        proc.log()
+    );
+}
+
+#[test]
 fn two_cm_pins_install_nothing_and_print_the_line() {
     let pinned = Pinned::released();
     let setup = pinned.scratch.ct().join(pin::SETUP);
@@ -1036,6 +1152,42 @@ fn handoffs_naming_two_stamp_entries_list_no_directive() {
 }
 
 #[test]
+fn stamps_that_bash_would_glob_or_take_as_echo_options_are_named_as_written() {
+    for (stamp, named) in [
+        ("*", format!("* {STAMP}")),
+        ("C*", format!("{STAMP} C*")),
+        ("-n", format!("-n {STAMP}")),
+    ] {
+        let directives = Directives::new();
+        directives.append(&format!("\n{OPEN}"));
+        directives.handoff("coordinator-2026-11-25T0100Z.md", &handoff(stamp));
+        assert_eq!(
+            directives.run().lines,
+            [format!(
+                "heartbeat: coordinator handoffs name more than one stamp_entry ({named}); owner directives not listed"
+            )]
+        );
+    }
+}
+
+#[test]
+fn an_empty_stamp_beside_a_real_one_is_no_stamp() {
+    let directives = Directives::new();
+    fs::write(
+        directives.epoch().join("JOURNAL.md"),
+        format!(
+            "# journal\n\n## 2026-11-18T09:00Z — epoch planning\n\n## 2026-11-18T10:00Z — Owner directive: above the stamp\n\n## {STAMP} — epoch working\n\n{OPEN}"
+        ),
+    )
+    .unwrap();
+    directives.handoff(
+        "coordinator-2026-11-24T2030Z.md",
+        &handoff_by("session_01abc", "", &format!(" stamp_entry={STAMP}")),
+    );
+    assert_eq!(directives.run().lines, [LISTED]);
+}
+
+#[test]
 fn a_stamp_entry_with_no_journal_heading_lists_no_directive() {
     let directives = Directives::new();
     directives.handoff(
@@ -1113,6 +1265,21 @@ impl Scratch {
             .unwrap()
     }
 
+    fn tick_command(&self, program: &Path) -> Command {
+        let mut command = Command::new(program);
+        command
+            .env_clear()
+            .envs(self.child_env())
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", self.path().join("bin").display()),
+            )
+            .env("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_01abc")
+            .arg("tick")
+            .current_dir(self.path());
+        command
+    }
+
     fn fake_git(&self) {
         script(
             &self.path().join("bin/git"),
@@ -1181,6 +1348,36 @@ fn the_built_cm_tick_syncs_refreshes_its_pin_lists_directives_and_imports_the_ru
 }
 
 #[test]
+fn the_built_cm_tick_run_through_a_symlink_on_path_refreshes_the_file_it_links_to() {
+    let pinned = Pinned::new("cp \"$TICK_FIXTURE/other.tar.gz\" \"$3\"");
+    let scratch = &pinned.scratch;
+    let ct = scratch.ct();
+    let setup = ct.join(pin::SETUP);
+    let text = fs::read_to_string(&setup)
+        .unwrap()
+        .replace(&format!("cm|{PINNED}|"), "cm|9.9.9|");
+    fs::write(&setup, text).unwrap();
+    scratch.git(&ct, &["commit", "-qam", "pin 9.9.9"]);
+    scratch.git(&ct, &["push", "-q", "origin", "main"]);
+    let real = scratch.path().join("real/cm");
+    fs::create_dir_all(real.parent().unwrap()).unwrap();
+    if fs::hard_link(env!("CARGO_BIN_EXE_cm"), &real).is_err() {
+        fs::copy(env!("CARGO_BIN_EXE_cm"), &real).unwrap();
+    }
+    fs::remove_file(&pinned.cm).unwrap();
+    std::os::unix::fs::symlink(&real, &pinned.cm).unwrap();
+    let output = scratch
+        .tick_command(&pinned.cm)
+        .arg("--checkout")
+        .arg(&ct)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(fs::read_link(&pinned.cm).unwrap(), real);
+    assert_eq!(pinned.version(), "cm 9.9.9\n");
+}
+
+#[test]
 fn a_claude_md_import_that_cannot_be_written_is_one_line_and_keeps_the_old_rules() {
     let scratch = Scratch::new();
     scratch.fake_git();
@@ -1194,8 +1391,6 @@ fn a_claude_md_import_that_cannot_be_written_is_one_line_and_keeps_the_old_rules
     let import = claude_md::IMPORT.len() + 1;
     let fsize = |bytes: usize| format!("prlimit --pid $$ --fsize={bytes}:{bytes}");
     let link = scratch.path().join("home/rules");
-    // A second link sends any tick to the in-place write; a folder that refuses a staged file
-    // sends an unprivileged one there too.
     for (mode, linked) in [(0o755, false), (0o555, false), (0o755, true)] {
         if linked {
             fs::hard_link(&claude, &link).unwrap();
@@ -1259,13 +1454,10 @@ fn a_claude_md_import_that_cannot_be_written_is_one_line_and_keeps_the_old_rules
 #[test]
 fn a_pin_past_the_file_size_limit_keeps_the_running_cm_and_the_tick_alive() {
     let fetched = Pinned::released();
-    // The fetch links a 1 MiB file where the unpacked cm goes, writing no byte of it, so only the
-    // copy into the staged cm is past the limit.
     let linked = Pinned::new(
         "cp \"$TICK_FIXTURE/nocm.tar.gz\" \"$3\" && mkdir -p cm-0.17.1-x86_64-unknown-linux-musl && ln \"$TICK_FIXTURE/big\" cm-0.17.1-x86_64-unknown-linux-musl/cm",
     );
     fs::write(linked.scratch.path().join("big"), vec![b'#'; 1 << 20]).unwrap();
-    // At 0 the fetch child dies writing the tarball; at 64 KiB everything but that copy fits.
     for (pinned, limit) in [(&fetched, "ulimit -f 0"), (&linked, "ulimit -f 64")] {
         pinned.scratch.fake_git();
         let output = pinned.scratch.tick(
@@ -1328,6 +1520,40 @@ fn a_journal_line_of_ten_thousand_pickups_is_read_in_a_128_mib_address_space() {
     );
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(printed(&output.stdout).0, [LISTED]);
+}
+
+#[test]
+fn a_journal_line_of_pickups_past_half_a_128_mib_address_space_ends_the_tick() {
+    use std::os::unix::process::ExitStatusExt;
+    let scratch = Scratch::new();
+    scratch.fake_git();
+    script(
+        &scratch.path().join("bin/cm"),
+        "echo '{\"actionable\": []}'\n",
+    );
+    write(
+        &scratch.ct().join(EPOCH).join("handoff").join(OURS),
+        &handoff(STAMP),
+    );
+    let marker = "— Directive picked up: ";
+    write(
+        &scratch.ct().join(EPOCH).join("JOURNAL.md"),
+        &format!(
+            "## {STAMP} — stamp\n{OPEN}{}\n",
+            marker.repeat((70 << 20) / marker.len())
+        ),
+    );
+    let output = scratch.tick(
+        Some("ulimit -v 131072"),
+        &[
+            OsStr::new("--cm"),
+            OsStr::new("cm"),
+            OsStr::new("--checkout"),
+            scratch.ct().as_os_str(),
+        ],
+    );
+    assert_eq!(output.status.signal(), Some(6), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
 }
 
 #[test]

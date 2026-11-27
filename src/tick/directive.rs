@@ -908,9 +908,78 @@ mod tests {
         assert!(!index.scan(&second));
         assert!(index.picked(&directives[0]));
         assert!(!index.picked(&directives[1]));
+        let mut index = Pickups::of(&directives, BASE, 3);
+        assert!(index.scan(&first));
+        assert!(!index.scan(&second));
+        assert!(!index.picked(&directives[1]));
         let mut index = Pickups::of(&directives, BASE, 4);
         assert!(index.scan(&first) && index.scan(&second));
         assert!(index.picked(&directives[1]));
+    }
+
+    #[test]
+    fn the_note_names_the_first_pickup_line_the_budget_left_and_how_many_there_are() {
+        let headings = numbered(200, |n| {
+            format!("## 1 — Owner directive: {}\n", "a".repeat(n + 1))
+        });
+        let cheap = format!("{MARKER}x\n");
+        let text = below_stamp(format!("{headings}{cheap}{}\n{cheap}", MARKER.repeat(300)));
+        let lines = unpicked_by(text.as_slice(), STAMP.as_bytes(), BASE, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lines[0],
+            "heartbeat: pickups in JOURNAL.md from line 203 on (2 line(s)) were not checked: the scan stops at 1 probes per byte; some owner directives below may be picked up already"
+        );
+        assert_eq!(lines.len(), 201);
+    }
+
+    #[test]
+    fn the_probe_budget_is_64_per_byte() {
+        assert_eq!(PROBES_PER_BYTE, 64);
+    }
+
+    #[test]
+    fn a_coordinator_handoff_that_cannot_be_read_is_named_and_lists_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let ct = tempfile::Builder::new()
+            .prefix("directive-test-")
+            .tempdir_in(std::env::current_exe().unwrap().parent().unwrap())
+            .unwrap();
+        let epoch = Path::new("store/epochs/e");
+        let handoff = ct.path().join(epoch).join("handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        let named = format!("Handoff: role=coordinator stamp_entry={STAMP}\n");
+        std::fs::write(handoff.join("coordinator-a.md"), &named).unwrap();
+        let unreadable = handoff.join("coordinator-b.md");
+        std::fs::write(&unreadable, &named).unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::write(
+            ct.path().join(epoch).join("JOURNAL.md"),
+            journal("## 2026-11-25T04:05Z — Owner directive: open\n"),
+        )
+        .unwrap();
+        let _held = crate::tick::claude_md::Unprivileged::new();
+        let proc = crate::tick::proc::FakeProc::new(|cmd| panic!("no child runs: {}", cmd.line()));
+        let env = crate::tick::act::Env::default();
+        let ctx = Ctx::new(
+            ct.path(),
+            epoch,
+            &proc,
+            &env,
+            std::ffi::OsStr::new("cm"),
+            BUDGET,
+        );
+        assert_eq!(
+            run(&ctx),
+            Report {
+                lines: vec![format!(
+                    "heartbeat: could not read {}: Permission denied (os error 13); owner directives not listed",
+                    unreadable.display()
+                )],
+                failed: true
+            }
+        );
     }
 
     #[test]

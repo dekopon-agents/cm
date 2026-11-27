@@ -73,7 +73,7 @@ fn push(ctx: &Ctx, report: &mut Report) {
                 return;
             }
         }
-        abort(ctx);
+        abort(ctx, report);
     }
     report.lines.push(format!(
         "heartbeat: git pull --rebase and push to main failed {TRIES} times; main does not have this checkout's commits"
@@ -89,14 +89,35 @@ fn command(args: &[&str]) -> Cmd {
     Cmd::new("git").args(args).keep(Keep::Head, Keep::Tail)
 }
 
+pub const QUIT: &str = "heartbeat: git rebase --abort could not end the rebase a pull left; git rebase --quit did, and the tree's autostashed changes, if any, are in git stash list";
+
 // A pull the budget cut can stop mid-rebase, with the tree's change in the autostash, so the
-// abort gets its own timeout rather than what is left of the spent budget.
-fn abort(ctx: &Ctx) {
-    let _ = ctx.proc.run(
-        &command(&["rebase", "--abort"])
-            .cwd(ctx.checkout)
-            .timeout(ABORT_TIMEOUT),
-    );
+// abort gets its own timeout rather than what is left of the spent budget. Cut before the rebase
+// wrote its state, the pull leaves a folder holding only the autostash, which the abort cannot
+// read and every later pull refuses: `--quit`, in the rest of the abort's time, removes it and
+// stores the autostash.
+fn abort(ctx: &Ctx, report: &mut Report) {
+    let started = ctx.now();
+    if run_past_budget(ctx, "--abort", ABORT_TIMEOUT) {
+        return;
+    }
+    let left = ABORT_TIMEOUT.saturating_sub(ctx.now().saturating_duration_since(started));
+    if !left.is_zero() && run_past_budget(ctx, "--quit", left) {
+        if !report.lines.iter().any(|line| line == QUIT) {
+            report.lines.push(QUIT.to_owned());
+        }
+        report.failed = true;
+    }
+}
+
+fn run_past_budget(ctx: &Ctx, rebase: &str, timeout: Duration) -> bool {
+    ctx.proc
+        .run(
+            &command(&["rebase", rebase])
+                .cwd(ctx.checkout)
+                .timeout(timeout),
+        )
+        .is_ok_and(|ran| ran.exit.success())
 }
 
 fn git(ctx: &Ctx, args: &[&str]) -> bool {
@@ -125,6 +146,8 @@ mod tests {
     const PULL: &str = "git pull -q --rebase --autostash origin main";
     const PUSH: &str = "git push -q origin main";
     const ABORT: &str = "git rebase --abort";
+    const QUIT_CALL: &str = "git rebase --quit";
+    const FAILED: &str = "heartbeat: git pull --rebase and push to main failed 3 times; main does not have this checkout's commits";
 
     const BOUND: &str = "still_bound";
 
@@ -343,37 +366,68 @@ mod tests {
         assert!(proc.pauses().is_empty());
     }
 
-    // README's bound: a try the deadline cuts ends within its grace, and past the deadline only
-    // the abort starts, with a timeout and a grace of its own.
     #[test]
-    fn gitsync_ends_at_most_40_s_past_its_budget() {
-        let proc = Git {
-            failing: &[PULL],
-            ..CLEAN
+    fn an_abort_that_fails_is_followed_by_a_quit_in_the_rest_of_its_time() {
+        for (failing, said) in [
+            (&[PULL, ABORT][..], &[QUIT, FAILED][..]),
+            (&[PULL, ABORT, QUIT_CALL][..], &[FAILED][..]),
+        ] {
+            let proc = Git { failing, ..CLEAN }.proc();
+            let report = synced(&proc, Mode::Always);
+            assert_eq!(report.lines, said);
+            assert!(report.failed);
+            let tries: Vec<String> = checked(&proc).into_iter().skip(2).collect();
+            assert_eq!(tries, [PULL, ABORT, QUIT_CALL].repeat(3));
+            let quit = proc.calls().pop().unwrap();
+            assert_eq!(quit.cwd.as_deref(), Some(Path::new(".")));
+            assert!(quit.timeout > Duration::ZERO && quit.timeout <= ABORT_TIMEOUT);
         }
-        .proc();
-        let env = Env::default();
-        let spent = Ctx::new(
-            Path::new("/ct"),
-            Path::new("store/epochs/eleemosynary-mnemosyne"),
-            &proc,
-            &env,
-            OsStr::new("cm"),
-            Duration::ZERO,
-        );
-        push(&spent, &mut Report::default());
-        let past: Duration = KILL_AFTER
-            + proc
-                .calls()
-                .iter()
-                .map(|cmd| cmd.timeout + KILL_AFTER)
-                .sum::<Duration>();
-        assert_eq!(past, Duration::from_secs(40));
     }
 
-    // On a clock that moves only by what each child takes, the worst README names: each try's
-    // pull succeeds and its check's fetch hangs to its cap and grace, time that is not the
-    // phase's; the last pull takes the whole budget, its push is cut and its abort hangs.
+    #[test]
+    fn gitsync_ends_at_most_40_s_past_its_budget() {
+        let near = ABORT_TIMEOUT - Duration::from_millis(1);
+        for (abort, quits) in [(Some(near), true), (None, false)] {
+            let clock = Rc::new(Cell::new(Instant::now()));
+            let proc = FakeProc::new({
+                let clock = clock.clone();
+                move |cmd| {
+                    let hang = || {
+                        clock.set(clock.get() + cmd.timeout + KILL_AFTER);
+                        Ok(Ran::timed_out())
+                    };
+                    match cmd.line().as_str() {
+                        "git rev-parse --abbrev-ref HEAD" => Ok(Ran::code(0, "main\n")),
+                        PULL | QUIT_CALL => hang(),
+                        ABORT => match abort {
+                            Some(took) => {
+                                clock.set(clock.get() + took);
+                                Ok(Ran::code(1, ""))
+                            }
+                            None => hang(),
+                        },
+                        _ => Ok(Ran::code(0, "")),
+                    }
+                }
+            });
+            let (env, ticking) = (session(), Ticking(clock.clone()));
+            let ctx = Ctx::new(
+                Path::new("."),
+                Path::new("store/epochs/eleemosynary-mnemosyne"),
+                &proc,
+                &env,
+                OsStr::new("cm"),
+                Duration::ZERO,
+            )
+            .clocked(&ticking, BUDGET);
+            let start = clock.get();
+            let report = sync(&ctx, Mode::Always);
+            assert_eq!(report.lines, [FAILED]);
+            assert_eq!(proc.log().contains(&QUIT_CALL.to_owned()), quits);
+            assert_eq!(clock.get() - start, BUDGET + Duration::from_secs(40));
+        }
+    }
+
     #[test]
     fn gitsync_ends_at_most_40_s_past_its_budget_and_the_time_of_its_three_checks() {
         let clock = Rc::new(Cell::new(Instant::now()));
