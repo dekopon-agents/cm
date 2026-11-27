@@ -138,6 +138,31 @@ fn act(root: &Path) -> (Option<i32>, Vec<Value>, String) {
     )
 }
 
+fn cm(root: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_current")
+        .env_remove("CM_CODEX_WEEKLY_PCT")
+        .output()
+        .unwrap();
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).unwrap(),
+    )
+}
+
+fn head(root: &Path) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
 /// The 11-25/26 shape: paused at 23:08Z, the lane's paused handoff at 23:29Z, a later lane
 /// progress entry, `paused = false` committed at 22:16Z the next day.
 fn eleven_26(names: &[&str]) -> Campaign {
@@ -181,14 +206,38 @@ fn a_lane_parked_past_the_unpause_is_one_line_until_it_journals_a_resume() {
         line["command"],
         "send_message session_tooling 'LIMITS.toml is paused = false: resume lane tooling from handoff/lane-tooling-2026-11-25T2335Z.md, then journal `Lane tooling: resumed`'"
     );
-    assert!(
-        text.starts_with("lane-paused tooling: paused at 2026-11-25T23:29Z (`Lane tooling: paused for Claude quota`), no lane entry after the unpause (LIMITS.toml commit "),
-        "{text}"
+    let sha: String = head(&c.root).chars().take(12).collect();
+    let summary = format!(
+        "lane-paused tooling: paused at 2026-11-25T23:29Z (`Lane tooling: paused for Claude quota`), no lane entry after the unpause (LIMITS.toml commit {sha}) since 2026-11-26T22:16:05Z (0 waiting)"
     );
-    assert!(
-        text.contains("since 2026-11-26T22:16:05Z (0 waiting)"),
-        "{text}"
+    assert_eq!(
+        text,
+        format!("{summary} — `{}`\n", line["command"].as_str().unwrap())
     );
+
+    // Plain `cm next` prints it as a numbered item with its command, and exits 0 as ever.
+    let (code, plain) = cm(&c.root, &["next"]);
+    assert_eq!(code, Some(0), "{plain}");
+    assert!(plain.contains(&summary), "{plain}");
+    assert!(plain.contains(line["command"].as_str().unwrap()), "{plain}");
+
+    // A `--target` or `--lane` view names steps, so it leaves the lane out.
+    for args in [
+        &["--json", "next", "--act", "--lane", "claude-cloud"][..],
+        &["--json", "next", "--lane", "claude-cloud"][..],
+    ] {
+        let (_, out) = cm(&c.root, args);
+        assert!(!out.contains("lane-paused"), "{args:?}: {out}");
+    }
+
+    // CARD.md, which sync renders from the units' facts, does not count it.
+    let next = cm::plan::Next {
+        paused: false,
+        launchable: Vec::new(),
+        waiting: Vec::new(),
+    };
+    let card = cm::render::card(&c.root, Fake.now(), "c", &Default::default(), &next);
+    assert!(card.contains("Actionable: 0 (oldest: —)"), "{card}");
 
     // Plain `cm next` lists the same action.
     let next = Command::new(env!("CARGO_BIN_EXE_cm"))
@@ -372,4 +421,35 @@ fn an_uncommitted_or_shallow_unpause_falls_back_to_the_journal() {
     assert_eq!(lines.len(), 1, "{text}");
     assert_eq!(lines[0]["since"], "2026-11-26T22:16:00Z");
     assert!(text.contains("not in this clone (shallow?)"), "{text}");
+}
+
+#[test]
+fn a_title_naming_both_words_is_a_resume() {
+    let c = eleven_26(&["tooling"]);
+    // Before the unpause, so only the word decides: resumed after the paused window.
+    journal(
+        &c.root,
+        "2026-11-26T06:00Z",
+        "Lane tooling: resumed after the paused window",
+        "",
+    );
+    let (code, lines, _) = act(&c.root);
+    assert_eq!((code, lines.len()), (Some(0), 0), "{lines:?}");
+}
+
+#[test]
+fn with_the_journal_fallback_a_lane_entry_in_the_unpause_minute_is_no_resume() {
+    let c = campaign_outside_git(&Fake);
+    lane(&c.root, "tooling", "session_tooling");
+    pause_entry(&c.root, "tooling", "2026-11-25T23:29Z");
+    journal(
+        &c.root,
+        "2026-11-26T22:16Z",
+        "Coordinator: resumed after quota reset",
+        "`paused = false` in LIMITS.toml.",
+    );
+    journal(&c.root, "2026-11-26T22:16Z", "Lane tooling: reading", "");
+    assert_eq!(act(&c.root).1.len(), 1);
+    journal(&c.root, "2026-11-26T22:17Z", "Lane tooling: resumed", "");
+    assert_eq!(act(&c.root).1.len(), 0);
 }

@@ -1937,7 +1937,7 @@ fn lane_handoff(root: &Path, body: &[&str], lane: &str) -> Option<(String, Optio
 
 /// `lane-paused <lane>`: LIMITS.toml says `paused = false`, but a lane's newest journal state is
 /// a pause entry older than the unpause and the lane has journaled nothing since the unpause. A
-/// lane's state entries are its entries whose title holds the word `paused` or `resumed`; any
+/// lane's state entries are its entries whose title holds the word `paused` or `resumed` (`resumed` wins); any
 /// entry the lane writes after the unpause is its resume. Read-only: no file is written.
 fn lane_paused(root: &Path, inputs: &ActionInputs) -> Vec<Action> {
     if inputs.paused {
@@ -1956,10 +1956,11 @@ fn lane_paused(root: &Path, inputs: &ActionInputs) -> Vec<Action> {
         let Some(lane) = entry_lane(entry.title, &lanes) else {
             continue;
         };
-        if has_word(entry.title, "paused") {
-            paused.insert(lane, entry);
-        } else if has_word(entry.title, "resumed") {
+        // `resumed` wins: "resumed after the paused window" is no pause.
+        if has_word(entry.title, "resumed") {
             paused.remove(lane);
+        } else if has_word(entry.title, "paused") {
+            paused.insert(lane, entry);
         }
     }
     if paused.is_empty() {

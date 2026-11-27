@@ -539,7 +539,7 @@ It returns `done`, `successful`, and `turn_status` as JSON, with optional `compl
 recorded at launch, GitHub must report that branch as the PR head. Sync reports unparseable
 LIMITS.toml, invalid command pairs, and reader failures in `turn_reader_warnings`.
 
-`cm next --act` prints only actionable lines, each starting with `<kind> <step>:`. It lists
+`cm next --act` prints only actionable lines, each starting with `<kind> <step>:` (`<kind> <lane>:` for `lane-paused`). It lists
 `turn-ended` first, then `review-owed`, then the other kinds by the number of steps waiting
 behind them; lines of a unit amended with `--priority now` come before all others. JSON carries
 `kind`, `since`, `waiting_count`, `priority` and `command` in the `actionable` list and, where
@@ -573,6 +573,7 @@ its own checklist contradicts (an empty `files:` included) as `weight-contradict
 | `expired-watch` | an unresolved watch is past its deadline | `cm watch <step> resolve <id> --evidence …` (or `withdraw <id> --reason …`) |
 | `merge-ready` | a `pr-open` PR whose observed head is the head CI completed green at (`ci_green` in `.cm/pulls.json`: sync re-reads finished CI in full with each full PR read, at least every 30 minutes, and clears the value on a read that finds checks still running or fails, and when the PR itself goes unread), whose `mergeable_state` is `clean`, and whose merge gate has no gaps there (only a script pin, a rollout named `…/pin` or `…/deploy`, needs no review). Before `cm next` lists it, a fresh read of GitHub must find the PR still open at that head, `mergeable_state` clean and CI green there; a failed read or no GitHub drops the line. A blocked step merges none of its parts. Each action carries its `part`. A red check leaves `mergeable_state` unstable or blocked, so a known-red merge never shows here; it stays with `cm advance … merged`. Quiet while `paused = true`, the owner's stop; the Codex quota hold, which holds dispatch only, does not quiet it | `cm advance <step> merged --pr <url> --sha '<merge-sha>'` after the merge |
 | `stale-block` | a free-text `blocked:` older than 24 h: lint's `block-stale`, without lint's journal-mention silencer. Reviewer waits (`EVIDENCE-BLOCKED`, `REVIEW_BLOCKED`) are `review_waits` timers, not owed blocks | `cm unblock <step> --evidence …` |
+| `lane-paused` | LIMITS.toml says `paused = false` and a campaign lane (a `LANE-<name>.md` brief or a registered driver) is parked: the newest of its journal entries whose title holds `resumed` or `paused` (an entry is the lane's when its title starts `Lane <name>:` or `<name> lane:`, any case; `resumed` wins in one title) is a pause stamped before the unpause, and no entry of the lane is stamped after the unpause's minute. The unpause is the author date of the newest commit that moved LIMITS.toml's `paused` from true to false; when that history is unreadable (no git, an uncommitted `paused = false`, a shallow clone) it is the newest entry no lane wrote that names `paused = false`, and the line says why; with neither, no line. The target is the lane name; `since` is the unpause; JSON adds `handoff`, the first `handoff/*.md` the pause entry names whose `Handoff:` line has `role=lane-<name>`. Quiet while `paused = true`. `--target` and `--lane` views and CARD.md leave it out | `send_message <session> '…resume lane <name> from <handoff>, then journal `Lane <name>: resumed`'`: the session is the registered driver's, else the handoff's `lineage=` |
 
 `pr-open-unreviewed` is the old name of `review-owed`, which now also covers a new head after a
 verdict and a FIX REQUIRED head. Plain `cm next` prints the actions it does not already list as
@@ -581,7 +582,8 @@ a next, unblock or watch item.
 `earlier-coordinator` lists a live attempt claimed by a session other than the one running cm,
 unless a registered lane driver whose units cover the step holds it ([Lane drivers](#lane-drivers));
 `--act` prints no note for those. CARD.md's `Actionable:` count leaves out caller-relative items
-(`earlier-coordinator`), which `cm next --act` still lists.
+(`earlier-coordinator`), which `cm next --act` still lists, and `lane-paused`, which reads the
+journal and git history rather than the units' facts.
 
 ### CARD guarantees
 
@@ -598,7 +600,7 @@ Oldest undeployed tag: <line>@<version> since <stamp>
 Launchable at sync: <count> (oldest: <stamp>)
 ```
 
-`Actionable` counts every `--act` kind. `Deployed in 24 h` counts the deploy steps that reached
+`Actionable` counts every `--act` kind but `earlier-coordinator` and `lane-paused` (see above). `Deployed in 24 h` counts the deploy steps that reached
 `merged` or `deployed` in the last 24 hours by the step's own move (a part's move is not the step's deploy): a rollout, or a `tag:`-gated
 pin (`…/pin`, `…/deploy`) or step whose PR is in a repository no release line ships, the set
 `released-undeployed` reads. Its
