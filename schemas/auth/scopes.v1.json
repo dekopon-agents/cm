@@ -1,0 +1,489 @@
+{
+  "version": 1,
+  "audience": "campaign-trail-api",
+  "matching": "exact-case-sensitive",
+  "scope_implication": "none",
+  "unknown_scopes": "grant-nothing",
+  "scopes": {
+    "cm:campaigns:read": "Read campaign state and consistent views.",
+    "cm:campaigns:write": "Create campaigns and edit unaccepted campaign drafts.",
+    "cm:campaigns:approve": "Approve a campaign plan or scope revision.",
+    "cm:campaigns:close": "Close a campaign after its outstanding obligations are accounted for.",
+    "cm:cards:read": "Read cards, readiness, dependencies and accepted work packets.",
+    "cm:cards:write": "Create cards and edit unaccepted card drafts, dependencies and metadata.",
+    "cm:cards:approve": "Approve a card revision and its acceptance criteria or execution grant.",
+    "cm:cards:advance": "Request a card state transition; applicable evidence and state guards still apply.",
+    "cm:reviews:read": "Read review cards, rounds and stable finding histories.",
+    "cm:reviews:start": "Admit one formal review round within its declared cap.",
+    "cm:reviews:record": "Collect a native review result; supplied labels do not establish reviewer identity.",
+    "cm:reviews:adjudicate": "Resolve a disputed finding or review disagreement with an attributed decision.",
+    "cm:sessions:read": "Read managed session status, declared purpose, limits and native receipts.",
+    "cm:sessions:start": "Admit a managed worker or helper under an accepted card and remaining limits.",
+    "cm:sessions:stop": "Request checkpoint and termination; a request is not confirmation that a session stopped.",
+    "cm:spend:read": "Read usage, API-equivalent cost, actual charges and their coverage separately.",
+    "cm:spend:record": "Collect deduplicated native usage; arbitrary submitted amounts are not authoritative.",
+    "cm:journal:read": "Read linked decisions and their alternatives, evidence and preconditions.",
+    "cm:journal:append": "Append a decision or a superseding correction; never overwrite history.",
+    "cm:escalations:read": "Read escalations without acknowledging, answering or closing them.",
+    "cm:escalations:open": "Open or update a deduplicated escalation linked to its cause.",
+    "cm:escalations:resolve": "Answer and close an escalation with an explicit disposition; closure alone grants nothing else.",
+    "cm:evidence:read": "Read accepted evidence and its source bindings.",
+    "cm:evidence:submit": "Submit an attributed report or artifact; submission does not certify native provenance or acceptance.",
+    "cm:evidence:collect": "Fetch and bind native evidence from a recorded run or task.",
+    "cm:backups:create": "Create a consistent snapshot without changing campaign authority.",
+    "cm:backups:read": "Download a snapshot and its verification manifest.",
+    "cm:recovery:inspect": "Inspect recovery state, missing history and unknown operations.",
+    "cm:recovery:reconcile": "Collect positive recovery evidence and apply safe reconciliation.",
+    "cm:recovery:accept-exposure": "Explicitly accept a named unresolved exposure; never infer acceptance from silence.",
+    "cm:releases:prepare": "Prepare a versioned release operation from applicable reviewed inputs.",
+    "cm:releases:approve": "Approve the exact release inputs under the campaign policy.",
+    "cm:releases:publish": "Publish through the qualified native release path; source and artifact guards still apply.",
+    "cm:deployments:apply": "Ship an accepted immutable artifact to an authorized target.",
+    "cm:deployments:rollback": "Run an accepted rollback to the named compatible artifact/configuration.",
+    "cm:tests:run": "Start a declared integration or smoke test within its task and target bounds.",
+    "cm:experiments:run": "Start a declared experiment with its protocol, limits and cleanup obligations.",
+    "cm:credentials:revoke": "Revoke a credential identifier; cannot mint tokens or read signing/provider secrets.",
+    "cm:drivers:write": "Register, replace or remove a driver within an accepted assignment.",
+    "cm:watches:write": "Create or change a watch; expiry is not successful completion.",
+    "cm:exceptions:approve": "Approve a specifically bounded exception; no blanket bypass of other checks.",
+    "cm:observations:record": "Collect source-bound observations without replacing a judgement.",
+    "cm:campaigns:reconcile": "Request collection/reconciliation of existing campaign operations; never redispatch an unknown effect.",
+    "cm:ideas:write": "Admit or update idea records and outcomes under campaign phase/evidence guards.",
+    "cm:reviews:raise-cap": "Explicitly increase a review card round cap with a linked escalation disposition; never reset round history."
+  },
+  "operations": {
+    "getCampaign": {
+      "public": false,
+      "all_of": [
+        "cm:campaigns:read"
+      ]
+    },
+    "createCampaign": {
+      "public": false,
+      "all_of": [
+        "cm:campaigns:write"
+      ]
+    },
+    "updateCampaignDraft": {
+      "public": false,
+      "all_of": [
+        "cm:campaigns:write"
+      ]
+    },
+    "approveCampaign": {
+      "public": false,
+      "all_of": [
+        "cm:campaigns:approve"
+      ]
+    },
+    "closeCampaign": {
+      "public": false,
+      "all_of": [
+        "cm:campaigns:close"
+      ]
+    },
+    "getCard": {
+      "public": false,
+      "all_of": [
+        "cm:cards:read"
+      ]
+    },
+    "listCards": {
+      "public": false,
+      "all_of": [
+        "cm:cards:read"
+      ]
+    },
+    "getReadiness": {
+      "public": false,
+      "all_of": [
+        "cm:cards:read"
+      ]
+    },
+    "getBrief": {
+      "public": false,
+      "all_of": [
+        "cm:cards:read"
+      ]
+    },
+    "createCard": {
+      "public": false,
+      "all_of": [
+        "cm:cards:write"
+      ]
+    },
+    "updateCardDraft": {
+      "public": false,
+      "all_of": [
+        "cm:cards:write"
+      ]
+    },
+    "approveCard": {
+      "public": false,
+      "all_of": [
+        "cm:cards:approve"
+      ]
+    },
+    "advanceCard": {
+      "public": false,
+      "all_of": [
+        "cm:cards:advance"
+      ]
+    },
+    "getReviewCard": {
+      "public": false,
+      "all_of": [
+        "cm:reviews:read"
+      ]
+    },
+    "getRound": {
+      "public": false,
+      "all_of": [
+        "cm:reviews:read"
+      ]
+    },
+    "startReviewRound": {
+      "public": false,
+      "all_of": [
+        "cm:reviews:start"
+      ]
+    },
+    "recordReviewRound": {
+      "public": false,
+      "all_of": [
+        "cm:reviews:record"
+      ]
+    },
+    "adjudicateFinding": {
+      "public": false,
+      "all_of": [
+        "cm:reviews:adjudicate"
+      ]
+    },
+    "getSession": {
+      "public": false,
+      "all_of": [
+        "cm:sessions:read"
+      ]
+    },
+    "startSession": {
+      "public": false,
+      "all_of": [
+        "cm:sessions:start"
+      ]
+    },
+    "stopSession": {
+      "public": false,
+      "all_of": [
+        "cm:sessions:stop"
+      ]
+    },
+    "getSpend": {
+      "public": false,
+      "all_of": [
+        "cm:spend:read"
+      ]
+    },
+    "recordUsage": {
+      "public": false,
+      "all_of": [
+        "cm:spend:record"
+      ]
+    },
+    "getJournalEntry": {
+      "public": false,
+      "all_of": [
+        "cm:journal:read"
+      ]
+    },
+    "appendJournalEntry": {
+      "public": false,
+      "all_of": [
+        "cm:journal:append"
+      ]
+    },
+    "getEscalation": {
+      "public": false,
+      "all_of": [
+        "cm:escalations:read"
+      ]
+    },
+    "openEscalation": {
+      "public": false,
+      "all_of": [
+        "cm:escalations:open"
+      ]
+    },
+    "updateEscalation": {
+      "public": false,
+      "all_of": [
+        "cm:escalations:open"
+      ]
+    },
+    "resolveEscalation": {
+      "public": false,
+      "all_of": [
+        "cm:escalations:resolve"
+      ]
+    },
+    "getEvidence": {
+      "public": false,
+      "all_of": [
+        "cm:evidence:read"
+      ]
+    },
+    "submitEvidence": {
+      "public": false,
+      "all_of": [
+        "cm:evidence:submit"
+      ]
+    },
+    "collectEvidence": {
+      "public": false,
+      "all_of": [
+        "cm:evidence:collect"
+      ]
+    },
+    "createBackup": {
+      "public": false,
+      "all_of": [
+        "cm:backups:create"
+      ]
+    },
+    "downloadBackup": {
+      "public": false,
+      "all_of": [
+        "cm:backups:read"
+      ]
+    },
+    "inspectRecovery": {
+      "public": false,
+      "all_of": [
+        "cm:recovery:inspect"
+      ]
+    },
+    "reconcileRecovery": {
+      "public": false,
+      "all_of": [
+        "cm:recovery:reconcile"
+      ]
+    },
+    "acceptExposure": {
+      "public": false,
+      "all_of": [
+        "cm:recovery:accept-exposure"
+      ]
+    },
+    "prepareRelease": {
+      "public": false,
+      "all_of": [
+        "cm:releases:prepare"
+      ]
+    },
+    "approveRelease": {
+      "public": false,
+      "all_of": [
+        "cm:releases:approve"
+      ]
+    },
+    "publishRelease": {
+      "public": false,
+      "all_of": [
+        "cm:releases:publish"
+      ]
+    },
+    "applyDeployment": {
+      "public": false,
+      "all_of": [
+        "cm:deployments:apply"
+      ]
+    },
+    "rollbackDeployment": {
+      "public": false,
+      "all_of": [
+        "cm:deployments:rollback"
+      ]
+    },
+    "runTest": {
+      "public": false,
+      "all_of": [
+        "cm:tests:run"
+      ]
+    },
+    "runExperiment": {
+      "public": false,
+      "all_of": [
+        "cm:experiments:run"
+      ]
+    },
+    "revokeCredential": {
+      "public": false,
+      "all_of": [
+        "cm:credentials:revoke"
+      ]
+    },
+    "registerDriver": {
+      "public": false,
+      "all_of": [
+        "cm:drivers:write"
+      ]
+    },
+    "removeDriver": {
+      "public": false,
+      "all_of": [
+        "cm:drivers:write"
+      ]
+    },
+    "updateWatch": {
+      "public": false,
+      "all_of": [
+        "cm:watches:write"
+      ]
+    },
+    "approveException": {
+      "public": false,
+      "all_of": [
+        "cm:exceptions:approve"
+      ]
+    },
+    "recordObservation": {
+      "public": false,
+      "all_of": [
+        "cm:observations:record"
+      ]
+    },
+    "getJwtSchema": {
+      "public": true,
+      "all_of": []
+    },
+    "getScopeCatalog": {
+      "public": true,
+      "all_of": []
+    },
+    "getLineage": {
+      "public": true,
+      "all_of": []
+    },
+    "getAttention": {
+      "public": false,
+      "all_of": [
+        "cm:cards:read"
+      ]
+    },
+    "recordAttention": {
+      "public": false,
+      "all_of": [
+        "cm:observations:record"
+      ]
+    },
+    "requestReconciliation": {
+      "public": false,
+      "all_of": [
+        "cm:campaigns:reconcile"
+      ]
+    },
+    "admitIdea": {
+      "public": false,
+      "all_of": [
+        "cm:ideas:write"
+      ]
+    },
+    "updateIdea": {
+      "public": false,
+      "all_of": [
+        "cm:ideas:write"
+      ]
+    },
+    "recordIdeaOutcome": {
+      "public": false,
+      "all_of": [
+        "cm:ideas:write"
+      ]
+    },
+    "getAttempt": {
+      "public": false,
+      "all_of": [
+        "cm:sessions:read"
+      ]
+    },
+    "recordAttempt": {
+      "public": false,
+      "all_of": [
+        "cm:observations:record"
+      ]
+    },
+    "requestAttemptRepair": {
+      "public": false,
+      "all_of": [
+        "cm:recovery:reconcile"
+      ]
+    },
+    "listDrivers": {
+      "public": false,
+      "all_of": [
+        "cm:cards:read"
+      ]
+    },
+    "getWatch": {
+      "public": false,
+      "all_of": [
+        "cm:cards:read"
+      ]
+    },
+    "getMacTask": {
+      "public": false,
+      "all_of": [
+        "cm:cards:read"
+      ]
+    },
+    "createMacTask": {
+      "public": false,
+      "all_of": [
+        "cm:cards:write"
+      ]
+    },
+    "recordMacTask": {
+      "public": false,
+      "all_of": [
+        "cm:evidence:collect"
+      ]
+    },
+    "appendFeedback": {
+      "public": false,
+      "all_of": [
+        "cm:observations:record"
+      ]
+    },
+    "listFollowups": {
+      "public": false,
+      "all_of": [
+        "cm:reviews:read"
+      ]
+    },
+    "resolveFollowup": {
+      "public": false,
+      "all_of": [
+        "cm:reviews:adjudicate"
+      ]
+    },
+    "lintCampaign": {
+      "public": false,
+      "all_of": [
+        "cm:campaigns:read"
+      ]
+    },
+    "requestUnblock": {
+      "public": false,
+      "all_of": [
+        "cm:cards:advance"
+      ]
+    },
+    "raiseReviewCap": {
+      "public": false,
+      "all_of": [
+        "cm:reviews:raise-cap",
+        "cm:escalations:resolve"
+      ]
+    }
+  }
+}

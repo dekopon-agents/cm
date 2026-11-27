@@ -43,6 +43,10 @@ cargo install --locked --git https://github.com/dekopon-agents/cm
 
 ## Commands
 
+The planned API backend has a public [JWT and action-scope contract](docs/api-authorization.md).
+Its schemas under `schemas/auth/` define capabilities independently of identities;
+this contract does not change Git-backend behavior.
+
 Every command takes `--json` (one JSON object on stdout with `ok` and `violations`, whatever the
 exit) and `-C DIR` (the campaign folder; found by walking up from the current directory
 otherwise). Exit 0 is success. 1 is a refusal or violations (every one listed, never only the

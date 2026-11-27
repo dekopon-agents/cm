@@ -1,0 +1,30 @@
+name: Public auth contract
+
+on:
+  pull_request:
+    paths:
+      - schemas/auth/**
+      - tools/check_auth_contract.py
+      - tools/auth-contract-requirements.txt
+      - .github/workflows/auth-contract.yml
+  push:
+    branches: [main]
+    paths:
+      - schemas/auth/**
+      - tools/check_auth_contract.py
+      - tools/auth-contract-requirements.txt
+      - .github/workflows/auth-contract.yml
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 -m venv "$RUNNER_TEMP/auth-contract"
+      - run: '"$RUNNER_TEMP/auth-contract/bin/pip" install -r tools/auth-contract-requirements.txt'
+      - run: '"$RUNNER_TEMP/auth-contract/bin/python" tools/check_auth_contract.py'
