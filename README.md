@@ -564,6 +564,11 @@ For each registered lane driver, sync also runs the Claude Cloud reader with `{t
 driver's session and `{turn}` empty, and reads only `context_used_tokens` (and, when present,
 `thread_id`, which must name that session) from its answer, into `.cm/lane-context.json` keyed by
 lane name. A failure keeps the earlier value stale, as for attempts; a removed driver's value goes.
+A reader given an empty `{turn}` is asked about the session alone: it exits 0 and prints one JSON
+object with the session's current `context_used_tokens`, and may add `thread_id`. It need not
+report `done`, `successful` or `turn_status`, which cm ignores there. A nonzero exit, output cm cannot
+parse, or a `thread_id` naming another session is a failed read; a missing or
+non-integer `context_used_tokens` records nothing and warns as for attempts.
 
 `cm next --act` lists `context-over` (below) for a live attempt or a registered driver whose
 current session's value exceeds 200000 tokens, stale ones included, which say so:
