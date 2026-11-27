@@ -11,7 +11,7 @@ use crate::evidence::CampaignFile;
 use crate::host::{Host, stamp};
 use crate::journal;
 use crate::outcome::{self, Next, Outcome, Violation};
-use crate::state::{Attempt, AttemptOutcome, Ended, External, Lane, ObservedTurn};
+use crate::state::{Attempt, AttemptOutcome, Ended, External, Lane, ObservedContext, ObservedTurn};
 use crate::store::{self, CM_DIR, Target, is_name, is_subcampaign_name, lock};
 
 #[derive(Debug, Clone)]
@@ -98,6 +98,40 @@ fn turn_actions(attempt: &Attempt, lane: Lane) -> Option<(&External, Option<&Ext
     }
     let thread = actions.find(|action| is_thread(&action.kind));
     Some((turn, thread))
+}
+
+pub(crate) const FRESH_SESSION: &str = "start a fresh session from the step's handoff, open findings, head and the diff since the last reviewed head";
+
+fn over_cap(context: &ObservedContext) -> String {
+    format!(
+        "session {} is at {}k, over the {}k context cap (read {})",
+        context.session,
+        context.kilotokens(),
+        crate::limits::CONTEXT_CAP_TOKENS / 1000,
+        context.read_at
+    )
+}
+
+fn sessions(attempt: &Attempt) -> impl Iterator<Item = &External> {
+    attempt
+        .actions
+        .iter()
+        .rev()
+        .filter(|action| matches!(action.kind.as_str(), "thread" | "session"))
+}
+
+// While a newer session is being created, the one before it is still the one to keep reading,
+// so `record session` naming it again stays refused.
+pub(crate) fn last_recorded_session(attempt: &Attempt) -> Option<&str> {
+    sessions(attempt).find_map(|action| action.id.as_deref())
+}
+
+pub(crate) fn current_context(attempt: &Attempt) -> Option<&ObservedContext> {
+    let session = session_label(sessions(attempt).next()?.id.as_deref()?);
+    attempt
+        .observed_context
+        .as_ref()
+        .filter(|context| session_label(&context.session) == session)
 }
 
 pub(crate) fn turn_began(attempt: &Attempt, lane: Lane) -> Option<&str> {
@@ -251,6 +285,16 @@ pub fn attempt(
     };
     let now = host.now();
     let at = stamp(now);
+    // A stale value is printed by `cm next --act` alone; it never refuses.
+    let capped = (attempt.lane.or(step.and_then(|step| step.lane)) == Some(Lane::ClaudeCloud)
+        && step.is_some_and(|step| crate::plan::active_attempt(step).is_some())
+        && crate::limits::TurnCommands::read(root)
+            .for_lane(Lane::ClaudeCloud)
+            .is_some())
+    .then_some(attempt.observed_context.as_ref())
+    .flatten()
+    .filter(|context| context.fresh() && context.over_cap());
+    let word = crate::commands::shell_word(&full);
     let fenced = |given: &str| {
         Violation::new(
             &full,
@@ -330,6 +374,18 @@ pub fn attempt(
                     plan(&attempt, now).1,
                 ));
             }
+            if kind == "turn"
+                && let Some(context) = capped.filter(|_| current_context(&attempt).is_some())
+            {
+                violations.push(Violation::new(
+                    &full,
+                    "attempt-context-over",
+                    format!(
+                        "{}: never resume it; {FRESH_SESSION}: `cm attempt {word} begin session`, create the session, then `cm attempt {word} record session '<fresh-session>'`",
+                        over_cap(context)
+                    ),
+                ));
+            }
             Some(format!(
                 "{} begins {kind} (generation {})",
                 attempt.id, attempt.generation
@@ -380,6 +436,19 @@ pub fn attempt(
             }
             if id.is_empty() || id.contains(char::is_whitespace) {
                 violations.push(Violation::new(&full, "attempt-record", "an id is one word"));
+            }
+            if matches!(kind.as_str(), "thread" | "session")
+                && let Some(context) =
+                    capped.filter(|context| session_label(&context.session) == session_label(id))
+            {
+                violations.push(Violation::new(
+                    &full,
+                    "attempt-context-over",
+                    format!(
+                        "{}: never resume it; {FRESH_SESSION}, then `cm attempt {word} record {kind} '<fresh-session>'`",
+                        over_cap(context)
+                    ),
+                ));
             }
             Some(format!(
                 "{} {kind} {id} (generation {})",
@@ -464,6 +533,7 @@ pub fn attempt(
             attempt.lane = Some(*lane);
             attempt.actions.clear();
             attempt.observed_turn = None;
+            attempt.observed_context = None;
             attempt.ended = None;
         }
         Act::Claim { coordinator, .. } => {

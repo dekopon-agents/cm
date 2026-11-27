@@ -1206,6 +1206,7 @@ pub fn launch_remote(
             claim: String::new(),
             actions: Vec::new(),
             observed_turn: None,
+            observed_context: None,
             ended: None,
         });
         if let Some(attempt) = step.attempt.as_mut() {
