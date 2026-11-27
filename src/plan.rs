@@ -699,6 +699,7 @@ enum ActionKind {
     MergeReady,
     StaleBlock,
     ReleasedUndeployed,
+    LanePaused,
 }
 
 impl From<ActionKind> for &'static str {
@@ -717,6 +718,7 @@ impl From<ActionKind> for &'static str {
             ActionKind::MergeReady => "merge-ready",
             ActionKind::StaleBlock => "stale-block",
             ActionKind::ReleasedUndeployed => "released-undeployed",
+            ActionKind::LanePaused => "lane-paused",
         }
     }
 }
@@ -736,7 +738,8 @@ impl ActionKind {
             | Self::ExpiredWatch
             | Self::MergeReady
             | Self::StaleBlock
-            | Self::ReleasedUndeployed => 2,
+            | Self::ReleasedUndeployed
+            | Self::LanePaused => 2,
         }
     }
 
@@ -771,6 +774,9 @@ struct Action {
     base: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ci_green: Option<bool>,
+    /// `lane-paused` only: the paused handoff the lane resumes from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    handoff: Option<String>,
     #[serde(skip)]
     description: String,
 }
@@ -797,6 +803,7 @@ impl Action {
             head: None,
             base: None,
             ci_green: None,
+            handoff: None,
             description,
         }
     }
@@ -1862,6 +1869,184 @@ pub(crate) fn card_lines(
     ]
 }
 
+/// The campaign lanes: each `LANE-<name>.md` brief and each registered driver (`cm lane`).
+fn campaign_lanes(root: &Path, drivers: &Drivers) -> BTreeSet<String> {
+    let briefs = fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            let lane = name.strip_prefix("LANE-")?.strip_suffix(".md")?;
+            (!lane.is_empty()).then(|| lane.to_owned())
+        });
+    briefs.chain(drivers.drivers.keys().cloned()).collect()
+}
+
+/// The lane an entry's title says wrote it: `Lane <name>: …` (LANE-tooling.md's convention) or
+/// `<name> lane: …`, the lane name in any case.
+fn entry_lane<'a>(title: &str, lanes: &'a BTreeSet<String>) -> Option<&'a str> {
+    let title = title.to_lowercase();
+    lanes
+        .iter()
+        .find(|lane| {
+            let lane = lane.to_lowercase();
+            title.starts_with(&format!("lane {lane}:"))
+                || title.starts_with(&format!("{lane} lane:"))
+        })
+        .map(String::as_str)
+}
+
+fn has_word(text: &str, word: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric())
+        .any(|token| token.eq_ignore_ascii_case(word))
+}
+
+/// `paused = false` written anywhere in the text, spaces and backticks aside.
+fn names_unpause(text: &str) -> bool {
+    let squeezed: String = text
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '`')
+        .collect::<String>()
+        .to_lowercase();
+    squeezed.contains("paused=false")
+}
+
+/// The first `handoff/<file>.md` an entry's body names whose `Handoff:` line has
+/// `role=lane-<lane>`, with that line's `lineage=` session.
+fn lane_handoff(root: &Path, body: &[&str], lane: &str) -> Option<(String, Option<String>)> {
+    let role = format!("role=lane-{lane}");
+    body.iter()
+        .flat_map(|line| line.split(|c: char| c.is_whitespace() || "`()[],;\"'".contains(c)))
+        .map(|word| word.trim_end_matches(['.', ':']))
+        .filter(|word| {
+            word.starts_with("handoff/") && word.ends_with(".md") && !word.contains("..")
+        })
+        .find_map(|path| {
+            let text = fs::read_to_string(root.join(path)).ok()?;
+            let line = text.lines().find(|line| line.starts_with("Handoff:"))?;
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            fields.contains(&role.as_str()).then(|| {
+                let lineage = fields
+                    .iter()
+                    .find_map(|field| field.strip_prefix("lineage="))
+                    .map(str::to_owned);
+                (path.to_owned(), lineage)
+            })
+        })
+}
+
+/// `lane-paused <lane>`: LIMITS.toml says `paused = false`, but a lane's newest journal state is
+/// a pause entry older than the unpause and the lane has journaled nothing since the unpause. A
+/// lane's state entries are its entries whose title holds the word `paused` or `resumed`; any
+/// entry the lane writes after the unpause is its resume. Read-only: no file is written.
+fn lane_paused(root: &Path, inputs: &ActionInputs) -> Vec<Action> {
+    if inputs.paused {
+        return Vec::new();
+    }
+    let lanes = campaign_lanes(root, &inputs.drivers);
+    if lanes.is_empty() {
+        return Vec::new();
+    }
+    let Ok(text) = fs::read_to_string(root.join(store::JOURNAL)) else {
+        return Vec::new();
+    };
+    let entries = crate::journal::entries(&text);
+    let mut paused: BTreeMap<&str, &crate::journal::Entry<'_>> = BTreeMap::new();
+    for entry in &entries {
+        let Some(lane) = entry_lane(entry.title, &lanes) else {
+            continue;
+        };
+        if has_word(entry.title, "paused") {
+            paused.insert(lane, entry);
+        } else if has_word(entry.title, "resumed") {
+            paused.remove(lane);
+        }
+    }
+    if paused.is_empty() {
+        return Vec::new();
+    }
+    // The unpause from LIMITS.toml's history; failing that, the newest journal entry no lane
+    // wrote that names `paused = false`, said so in the line. Neither: no line, never a guess.
+    let (unpaused, source) = match limits::unpause(root) {
+        Ok(unpause) => (
+            unpause.at,
+            format!(
+                "LIMITS.toml commit {}",
+                unpause.sha.chars().take(12).collect::<String>()
+            ),
+        ),
+        Err(why) => {
+            let Some((at, entry)) = entries
+                .iter()
+                .filter(|entry| entry_lane(entry.title, &lanes).is_none())
+                .filter(|entry| {
+                    names_unpause(entry.title) || entry.body.iter().any(|line| names_unpause(line))
+                })
+                .filter_map(|entry| Some((instant(entry.stamp)?, entry)))
+                .max_by_key(|(at, _)| *at)
+            else {
+                return Vec::new();
+            };
+            (
+                at,
+                format!(
+                    "journal {} `{}`; {why}",
+                    entry.stamp,
+                    entry.title.replace('`', "'")
+                ),
+            )
+        }
+    };
+    let mut out = Vec::new();
+    for (lane, entry) in paused {
+        if instant(entry.stamp).is_none_or(|at| at >= unpaused) {
+            continue;
+        }
+        let resumed = entries.iter().any(|later| {
+            entry_lane(later.title, &lanes) == Some(lane)
+                && instant(later.stamp).is_some_and(|at| at > unpaused)
+        });
+        if resumed {
+            continue;
+        }
+        let handoff = lane_handoff(root, &entry.body, lane);
+        let session = inputs
+            .drivers
+            .drivers
+            .get(lane)
+            .map(|driver| driver.session.clone())
+            .or_else(|| handoff.as_ref().and_then(|(_, lineage)| lineage.clone()));
+        let from = handoff.as_ref().map_or_else(
+            || format!("its journal entry {}", entry.stamp),
+            |(path, _)| path.clone(),
+        );
+        let title = entry.title.split_once(':').map_or("", |(prefix, _)| prefix);
+        let command = format!(
+            "send_message {} {}",
+            session
+                .as_deref()
+                .map_or_else(|| "'<lane-session>'".to_owned(), shell_word),
+            shell_word(&format!(
+                "LIMITS.toml is paused = false: resume lane {lane} from {from}, then journal `{title}: resumed`"
+            ))
+        );
+        let mut action = Action::new(
+            ActionKind::LanePaused,
+            lane,
+            &unpaused.to_string(),
+            command,
+            format!(
+                "paused at {} (`{}`), no lane entry after the unpause ({source})",
+                entry.stamp,
+                entry.title.replace('`', "'")
+            ),
+        );
+        action.handoff = handoff.map(|(path, _)| path);
+        out.push(action);
+    }
+    out
+}
+
 pub(crate) fn next_act(
     root: &Path,
     target: Option<&Target>,
@@ -1880,7 +2065,7 @@ pub(crate) fn next_act(
         };
         let stalled = stalls(&units, &inputs);
         let verdicts = crate::verdict::load(root)?;
-        confirm_merge_ready(
+        let mut actions = confirm_merge_ready(
             action_scope(
                 actionable(root, &units, &inputs, &stalled, &verdicts),
                 &units,
@@ -1888,7 +2073,12 @@ pub(crate) fn next_act(
                 lane,
             ),
             forge,
-        )
+        );
+        // A campaign lane is no step, so a `--target` or `--lane` view leaves the line out.
+        if target.is_none() && lane.is_none() {
+            actions.extend(lane_paused(root, &inputs));
+        }
+        actions
     };
     actions.sort_by_key(|action| (action.priority, action.kind.act_priority()));
     for action in &actions {
@@ -2240,7 +2430,7 @@ pub fn next_with(
     outcome.field("review_waits", review_waits);
     let verdicts = crate::verdict::load(root)?;
     let stalled = stalls(&units, &inputs);
-    let actions = confirm_merge_ready(
+    let mut actions = confirm_merge_ready(
         action_scope(
             actionable(root, &units, &inputs, &stalled, &verdicts),
             &units,
@@ -2249,6 +2439,10 @@ pub fn next_with(
         ),
         forge,
     );
+    // As in `--act`, so both list the same actions; CARD.md, rendered by sync, leaves it out.
+    if target.is_none() && lane.is_none() {
+        actions.extend(lane_paused(root, &inputs));
+    }
     let driven = driver_held(&units, &inputs, target, lane);
     let quota = limits::codex_pause();
     let quota = (!paused).then_some(quota.as_deref()).flatten();

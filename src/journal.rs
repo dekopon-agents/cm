@@ -100,6 +100,32 @@ pub fn check(root: &Path, state: &CampaignState) -> Vec<Violation> {
     out
 }
 
+/// One stamped journal entry: its `## <stamp> — <title>` heading and the lines up to the next one.
+pub(crate) struct Entry<'a> {
+    pub stamp: &'a str,
+    pub title: &'a str,
+    pub body: Vec<&'a str>,
+}
+
+/// The stamped entries of a journal, in file order (the order they were appended).
+pub(crate) fn entries(text: &str) -> Vec<Entry<'_>> {
+    let mut out: Vec<Entry<'_>> = Vec::new();
+    for line in text.lines() {
+        if is_stamped(line)
+            && let Some((stamp, title)) = line[3..].split_once(" — ")
+        {
+            out.push(Entry {
+                stamp,
+                title: title.trim(),
+                body: Vec::new(),
+            });
+        } else if let Some(entry) = out.last_mut() {
+            entry.body.push(line);
+        }
+    }
+    out
+}
+
 pub fn validate(title: &str, body: Option<&str>) -> Result<(), String> {
     if title.trim().is_empty() || title.contains('\n') {
         return Err("a journal title is one non-empty line".into());
@@ -155,6 +181,18 @@ mod tests {
         assert!(!is_stamped("## 2026-10-08T07:0xZ — typed by a model"));
         assert!(!is_stamped("## 2026-10-08: planning"));
         assert!(!is_stamped("## 2026-10-08T07:04Z — "));
+    }
+
+    #[test]
+    fn entries_split_at_stamped_headings() {
+        let text = "# Journal\n\n## 2026-11-25T23:29Z — Lane tooling: paused\n\nState: x.\n## not a stamp\n## 2026-11-26T22:16Z — Coordinator: resumed\n";
+        let entries = entries(text);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].stamp, "2026-11-25T23:29Z");
+        assert_eq!(entries[0].title, "Lane tooling: paused");
+        assert_eq!(entries[0].body, ["", "State: x.", "## not a stamp"]);
+        assert_eq!(entries[1].title, "Coordinator: resumed");
+        assert!(entries[1].body.is_empty());
     }
 
     #[test]
