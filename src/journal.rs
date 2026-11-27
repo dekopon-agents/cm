@@ -101,6 +101,11 @@ pub fn check(root: &Path, state: &CampaignState) -> Vec<Violation> {
     out
 }
 
+pub(crate) fn split_heading(line: &str) -> Option<(&str, &str)> {
+    let (stamp, title) = line.strip_prefix("## ")?.split_once(" — ")?;
+    is_stamped(line).then(|| (stamp, title.trim()))
+}
+
 pub fn validate(title: &str, body: Option<&str>) -> Result<(), String> {
     if title.trim().is_empty() || title.contains('\n') {
         return Err("a journal title is one non-empty line".into());
@@ -156,6 +161,16 @@ mod tests {
         assert!(!is_stamped("## 2026-10-08T07:0xZ — typed by a model"));
         assert!(!is_stamped("## 2026-10-08: planning"));
         assert!(!is_stamped("## 2026-10-08T07:04Z — "));
+    }
+
+    #[test]
+    fn a_stamped_heading_splits_into_stamp_and_title() {
+        assert_eq!(
+            split_heading("## 2026-11-25T23:29Z — Lane tooling: paused "),
+            Some(("2026-11-25T23:29Z", "Lane tooling: paused"))
+        );
+        assert_eq!(split_heading("## not a stamp — Lane tooling: paused"), None);
+        assert_eq!(split_heading("State: handoff/lane-tooling.md."), None);
     }
 
     #[test]

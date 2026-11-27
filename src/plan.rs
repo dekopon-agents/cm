@@ -2,6 +2,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -700,6 +701,7 @@ enum ActionKind {
     MergeReady,
     StaleBlock,
     ReleasedUndeployed,
+    LanePaused,
     ContextOver,
 }
 
@@ -719,6 +721,7 @@ impl From<ActionKind> for &'static str {
             ActionKind::MergeReady => "merge-ready",
             ActionKind::StaleBlock => "stale-block",
             ActionKind::ReleasedUndeployed => "released-undeployed",
+            ActionKind::LanePaused => "lane-paused",
             ActionKind::ContextOver => "context-over",
         }
     }
@@ -740,6 +743,7 @@ impl ActionKind {
             | Self::MergeReady
             | Self::StaleBlock
             | Self::ReleasedUndeployed
+            | Self::LanePaused
             | Self::ContextOver => 2,
         }
     }
@@ -775,6 +779,8 @@ struct Action {
     base: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ci_green: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    handoff: Option<String>,
     #[serde(skip)]
     description: String,
 }
@@ -801,6 +807,7 @@ impl Action {
             head: None,
             base: None,
             ci_green: None,
+            handoff: None,
             description,
         }
     }
@@ -1934,6 +1941,197 @@ pub(crate) fn card_lines(
     ]
 }
 
+fn campaign_lanes(root: &Path, drivers: &Drivers) -> BTreeSet<String> {
+    let briefs = fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            let lane = name.strip_prefix("LANE-")?.strip_suffix(".md")?;
+            (!lane.is_empty()).then(|| lane.to_owned())
+        });
+    briefs.chain(drivers.drivers.keys().cloned()).collect()
+}
+
+fn entry_lane<'a>(title: &str, lanes: &'a BTreeSet<String>) -> Option<&'a str> {
+    let title = title.to_lowercase();
+    lanes
+        .iter()
+        .find(|lane| {
+            let lane = lane.to_lowercase();
+            title.starts_with(&format!("lane {lane}:"))
+                || title.starts_with(&format!("{lane} lane:"))
+        })
+        .map(String::as_str)
+}
+
+fn has_word(text: &str, word: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric())
+        .any(|token| token.eq_ignore_ascii_case(word))
+}
+
+fn handoff_paths(line: &str) -> impl Iterator<Item = &str> {
+    line.split(|c: char| c.is_whitespace() || "`()[],;\"'".contains(c))
+        .map(|word| word.trim_end_matches(['.', ':']))
+        .filter(|word| {
+            word.starts_with("handoff/") && word.ends_with(".md") && !word.contains("..")
+        })
+}
+
+struct Pause {
+    at: Option<Timestamp>,
+    stamp: String,
+    title: String,
+    handoffs: Vec<String>,
+}
+
+#[derive(Default)]
+struct LaneRecord {
+    pause: Option<Pause>,
+    latest: Option<Timestamp>,
+}
+
+// One pass that keeps per lane only its open pause and newest stamp: the journal only grows. Only
+// the lanes' own entry titles are read; no entry's text dates the unpause.
+fn lane_journal(root: &Path, lanes: &BTreeSet<String>) -> Option<BTreeMap<String, LaneRecord>> {
+    let file = fs::File::open(root.join(store::JOURNAL)).ok()?;
+    let mut records = BTreeMap::<String, LaneRecord>::new();
+    let mut reading: Option<String> = None;
+    for line in BufReader::new(file).lines() {
+        let line = line.ok()?;
+        let Some((stamp, title)) = crate::journal::split_heading(&line) else {
+            if let Some(pause) = reading
+                .as_ref()
+                .and_then(|lane| records.get_mut(lane))
+                .and_then(|record| record.pause.as_mut())
+            {
+                pause
+                    .handoffs
+                    .extend(handoff_paths(&line).map(str::to_owned));
+            }
+            continue;
+        };
+        reading = None;
+        let at = instant(stamp);
+        let Some(lane) = entry_lane(title, lanes) else {
+            continue;
+        };
+        let record = records.entry(lane.to_owned()).or_default();
+        record.latest = record.latest.max(at);
+        // `resumed` wins: "resumed after the paused window" is no pause.
+        if has_word(title, "resumed") {
+            record.pause = None;
+        } else if has_word(title, "paused") {
+            record.pause = Some(Pause {
+                at,
+                stamp: stamp.to_owned(),
+                title: title.to_owned(),
+                handoffs: Vec::new(),
+            });
+            reading = Some(lane.to_owned());
+        }
+    }
+    Some(records)
+}
+
+fn lane_handoff(root: &Path, paths: &[String], lane: &str) -> Option<(String, Option<String>)> {
+    let role = format!("role=lane-{lane}");
+    paths.iter().find_map(|path| {
+        let text = fs::read_to_string(root.join(path)).ok()?;
+        let line = text.lines().find(|line| line.starts_with("Handoff:"))?;
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        fields.contains(&role.as_str()).then(|| {
+            let lineage = fields
+                .iter()
+                .find_map(|field| field.strip_prefix("lineage="))
+                .map(str::to_owned);
+            (path.clone(), lineage)
+        })
+    })
+}
+
+fn lane_paused(root: &Path, inputs: &ActionInputs) -> Vec<Action> {
+    if inputs.paused {
+        return Vec::new();
+    }
+    let lanes = campaign_lanes(root, &inputs.drivers);
+    if lanes.is_empty() {
+        return Vec::new();
+    }
+    let Some(lanes) = lane_journal(root, &lanes) else {
+        return Vec::new();
+    };
+    if lanes.values().all(|record| record.pause.is_none()) {
+        return Vec::new();
+    }
+    // The unpause is the commit that set it: with no such commit to date it, a pause cannot be
+    // shown to predate it or a lane entry to follow it, so the pause stands until the lane resumes.
+    let unpause = limits::unpause(root);
+    let mut out = Vec::new();
+    for (lane, record) in &lanes {
+        let Some(pause) = &record.pause else {
+            continue;
+        };
+        let (since, reason) = match &unpause {
+            Ok(unpause) => {
+                if pause.at.is_none_or(|at| at >= unpause.at)
+                    || record.latest.is_some_and(|at| at > unpause.at)
+                {
+                    continue;
+                }
+                (
+                    unpause.at.to_string(),
+                    format!(
+                        "no lane entry after the unpause (LIMITS.toml commit {})",
+                        unpause.sha.chars().take(12).collect::<String>()
+                    ),
+                )
+            }
+            Err(why) => (
+                pause
+                    .at
+                    .map_or_else(|| pause.stamp.clone(), |at| at.to_string()),
+                format!("the unpause cannot be dated ({why}), so the pause stands"),
+            ),
+        };
+        let handoff = lane_handoff(root, &pause.handoffs, lane);
+        let session = inputs
+            .drivers
+            .drivers
+            .get(lane)
+            .map(|driver| driver.session.clone())
+            .or_else(|| handoff.as_ref().and_then(|(_, lineage)| lineage.clone()));
+        let from = handoff.as_ref().map_or_else(
+            || format!("its journal entry {}", pause.stamp),
+            |(path, _)| path.clone(),
+        );
+        let title = pause.title.split_once(':').map_or("", |(prefix, _)| prefix);
+        let command = format!(
+            "send_message {} {}",
+            session
+                .as_deref()
+                .map_or_else(|| "'<lane-session>'".to_owned(), shell_word),
+            shell_word(&format!(
+                "LIMITS.toml is paused = false: resume lane {lane} from {from}, then journal `{title}: resumed`"
+            ))
+        );
+        let mut action = Action::new(
+            ActionKind::LanePaused,
+            lane,
+            &since,
+            command,
+            format!(
+                "paused at {} (`{}`), {reason}",
+                pause.stamp,
+                pause.title.replace('`', "'")
+            ),
+        );
+        action.handoff = handoff.map(|(path, _)| path);
+        out.push(action);
+    }
+    out
+}
+
 pub(crate) fn next_act(
     root: &Path,
     target: Option<&Target>,
@@ -1952,7 +2150,7 @@ pub(crate) fn next_act(
         };
         let stalled = stalls(&units, &inputs);
         let verdicts = crate::verdict::load(root)?;
-        confirm_merge_ready(
+        let mut actions = confirm_merge_ready(
             action_scope(
                 actionable(root, &units, &inputs, &stalled, &verdicts),
                 &units,
@@ -1960,7 +2158,12 @@ pub(crate) fn next_act(
                 lane,
             ),
             forge,
-        )
+        );
+        // A campaign lane is no step, so a `--target` or `--lane` view leaves the line out.
+        if target.is_none() && lane.is_none() {
+            actions.extend(lane_paused(root, &inputs));
+        }
+        actions
     };
     actions.sort_by_key(|action| (action.priority, action.kind.act_priority()));
     for action in &actions {
@@ -2312,7 +2515,7 @@ pub fn next_with(
     outcome.field("review_waits", review_waits);
     let verdicts = crate::verdict::load(root)?;
     let stalled = stalls(&units, &inputs);
-    let actions = confirm_merge_ready(
+    let mut actions = confirm_merge_ready(
         action_scope(
             actionable(root, &units, &inputs, &stalled, &verdicts),
             &units,
@@ -2321,6 +2524,10 @@ pub fn next_with(
         ),
         forge,
     );
+    // As in `--act`, so both list the same actions; CARD.md, rendered by sync, leaves it out.
+    if target.is_none() && lane.is_none() {
+        actions.extend(lane_paused(root, &inputs));
+    }
     let driven = driver_held(&units, &inputs, target, lane);
     let quota = limits::codex_pause();
     let quota = (!paused).then_some(quota.as_deref()).flatten();

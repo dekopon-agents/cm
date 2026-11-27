@@ -1,5 +1,7 @@
 #![allow(deprecated)]
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use toml::{Table, Value};
@@ -251,6 +253,106 @@ impl TurnCommands {
             )
             .chain(self.context_deadline.as_ref().err())
     }
+}
+
+// `at` is the author date, when the coordinator made the change: a later rebase moves only the
+// committer date.
+pub(crate) struct Unpause {
+    pub at: jiff::Timestamp,
+    pub sha: String,
+}
+
+fn git_out(root: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn paused_at(root: &Path, commit: &str) -> Option<bool> {
+    let text = git_out(root, &["show", &format!("{commit}:./LIMITS.toml")])?;
+    text.parse::<Table>().ok()?.get("paused")?.as_bool()
+}
+
+// The first-parent history of LIMITS.toml, merges included and with no line filter: a merge can
+// carry the change, and TOML reads spellings of the key (`"paused"`) a line pattern misses.
+pub(crate) fn unpause(root: &Path) -> Result<Unpause, String> {
+    let unreadable = || "`git log` cannot read LIMITS.toml's history".to_owned();
+    let mut log = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "log",
+            "--first-parent",
+            "--format=%H %aI %P",
+            "--",
+            "LIMITS.toml",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| unreadable())?;
+    let walked = log
+        .stdout
+        .take()
+        .and_then(|stdout| newest_unpause(root, BufReader::new(stdout)));
+    // Stopped early, git need not list the rest; at the end of the list it has exited, and a kill
+    // then could turn its exit status into a signal.
+    if walked.is_some() {
+        let _ = log.kill();
+    }
+    let listed = log.wait().is_ok_and(|status| status.success());
+    walked.unwrap_or_else(|| {
+        Err(if listed {
+            "no commit in LIMITS.toml's history changes `paused` from true to false".to_owned()
+        } else {
+            unreadable()
+        })
+    })
+}
+
+fn newest_unpause(root: &Path, log: impl BufRead) -> Option<Result<Unpause, String>> {
+    for line in log.lines() {
+        let line = line.ok()?;
+        let mut fields = line.split_whitespace();
+        let (Some(sha), Some(date)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let short = &sha[..sha.len().min(12)];
+        match paused_at(root, sha) {
+            Some(false) => {}
+            Some(true) => {
+                return Some(Err(format!(
+                    "the newest LIMITS.toml commit that reads `paused` ({short}) sets it to true; `paused = false` is not committed"
+                )));
+            }
+            None => continue,
+        }
+        let Some(parent) = fields.next() else {
+            return Some(Err(format!(
+                "commit {short} sets `paused = false` but its parent is not in this clone (shallow?)"
+            )));
+        };
+        if paused_at(root, parent) != Some(true) {
+            continue;
+        }
+        return Some(
+            date.parse()
+                .map(|at| Unpause {
+                    at,
+                    sha: sha.to_owned(),
+                })
+                .map_err(|_| format!("commit {short} has an unreadable author date `{date}`")),
+        );
+    }
+    None
 }
 
 pub(crate) fn codex_pause() -> Option<String> {
