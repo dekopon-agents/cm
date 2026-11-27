@@ -557,6 +557,11 @@ fn with_the_journal_fallback_a_later_note_recalling_or_planning_the_unpause_reop
             RESUMED,
             "   ~~~\n    ~~~\npaused = false in LIMITS.toml.\n   ~~~",
         ),
+        (RESUMED, "1. ~~~\n~~~\npaused = false in LIMITS.toml.\n~~~"),
+        (
+            RESUMED,
+            "Quoted:\n- ```\n```\nResumed.\npaused = false in LIMITS.toml.\n```",
+        ),
         (
             RESUMED,
             "Yesterday's record, quoted:\n\n\tResumed.\n\tpaused = false in LIMITS.toml.",
