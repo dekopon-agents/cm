@@ -2117,6 +2117,29 @@ mod gate_git {
     }
 }
 
+// What the scratch repository takes from the checkout: its objects, their format and its shallow
+// boundary. Grafts and replace refs stay off, as in the checkout's own reads.
+struct Borrowed {
+    objects: Vec<u8>,
+    format: String,
+    shallow: Option<Vec<u8>>,
+}
+
+// The umask narrows the mode a file is created with, so it is set again.
+fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .and_then(|()| file.write_all(bytes))
+        .map_err(|error| error.to_string())
+}
+
 // Which files a merge's parents conflict in, and which files a merge changes, are read where only
 // the checkout's objects reach, so that no merge attribute or setting, the checkout's or the
 // caller's, decides them.
@@ -2145,17 +2168,39 @@ impl Isolated {
         }
         let format =
             git_out(repo, &["rev-parse", "--show-object-format"]).ok_or_else(unreadable)?;
-        Isolated::under(scratch_parents(), &objects, &format)
+        let mut shallow = git_bytes(
+            repo,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "shallow",
+            ],
+        )
+        .ok_or_else(unreadable)?;
+        if shallow.pop() != Some(b'\n') {
+            return Err(unreadable());
+        }
+        // The checkout's reads stop at its shallow boundary, so the scratch repository's must too.
+        let shallow = match fs::read(
+            <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(shallow),
+        ) {
+            Ok(boundary) => Some(boundary),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(_) => return Err(unreadable()),
+        };
+        let borrowed = Borrowed {
+            objects,
+            format,
+            shallow,
+        };
+        Isolated::under(scratch_parents(), &borrowed)
     }
 
-    fn under(
-        parents: Vec<PathBuf>,
-        objects: &[u8],
-        format: &str,
-    ) -> Result<Isolated, CleanUpdateError> {
+    fn under(parents: Vec<PathBuf>, borrowed: &Borrowed) -> Result<Isolated, CleanUpdateError> {
         let mut tried = Vec::new();
         for parent in parents {
-            match Isolated::made_in(&parent, objects, format) {
+            match Isolated::made_in(&parent, borrowed) {
                 Ok(isolated) => return Ok(isolated),
                 Err(why) => tried.push((parent, why)),
             }
@@ -2164,7 +2209,7 @@ impl Isolated {
     }
 
     // A step that fails drops what the earlier ones made, so the parent is left as it was.
-    fn made_in(parent: &Path, objects: &[u8], format: &str) -> Result<Isolated, String> {
+    fn made_in(parent: &Path, borrowed: &Borrowed) -> Result<Isolated, String> {
         let isolated = Isolated {
             dir: scratch_dir_under(parent).map_err(|error| error.to_string())?,
         };
@@ -2174,15 +2219,29 @@ impl Isolated {
             "--quiet",
             "--template=",
             "--shared=0700",
-            &format!("--object-format={format}"),
+            &format!("--object-format={}", borrowed.format),
         ])?;
         let alternates = isolated.dir.join("objects").join("info").join("alternates");
-        fs::write(alternates, quoted(objects)).map_err(|error| error.to_string())?;
+        write_private(&alternates, &quoted(&borrowed.objects))?;
+        if let Some(boundary) = &borrowed.shallow {
+            write_private(&isolated.dir.join("shallow"), boundary)?;
+        }
         Ok(isolated)
     }
 
+    // git can print an error and still exit 0, as for an object it could not read; what it printed
+    // then is no account of the merge.
     fn output(&self, args: &[&str]) -> Result<std::process::Output, String> {
-        gate_git::isolated(&self.dir, args).map_err(|error| format!("git: {error}"))
+        let output =
+            gate_git::isolated(&self.dir, args).map_err(|error| format!("git: {error}"))?;
+        let erred = output
+            .stderr
+            .split(|byte| *byte == b'\n')
+            .any(|line| line.starts_with(b"error:") || line.starts_with(b"fatal:"));
+        if erred {
+            return Err(failure(&output));
+        }
+        Ok(output)
     }
 
     fn bytes(&self, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -2205,8 +2264,26 @@ impl Isolated {
 
 impl Drop for Isolated {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
+        remove_tree(&self.dir);
     }
+}
+
+// The umask can leave a directory git made unreadable even to its owner, which `remove_dir_all`
+// cannot list; each one gets its owner's permissions back first. A symlink is removed, not
+// followed.
+fn remove_tree(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                remove_tree(&entry.path());
+            } else {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    let _ = fs::remove_dir(dir);
 }
 
 fn failure(output: &std::process::Output) -> String {
@@ -2976,10 +3053,14 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let missing = parent.path().join("missing");
         let objects = parent.path().as_os_str().as_encoded_bytes();
+        let borrowed = Borrowed {
+            objects: objects.to_vec(),
+            format: "sha1".to_owned(),
+            shallow: None,
+        };
         let isolated = Isolated::under(
             vec![missing.clone(), parent.path().to_path_buf()],
-            objects,
-            "sha1",
+            &borrowed,
         )
         .unwrap();
         assert!(
@@ -2991,13 +3072,9 @@ mod tests {
             fs::metadata(&isolated.dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
-        let refused = Isolated::under(
-            vec![missing.clone(), missing.join("deeper")],
-            objects,
-            "sha1",
-        )
-        .err()
-        .unwrap();
+        let refused = Isolated::under(vec![missing.clone(), missing.join("deeper")], &borrowed)
+            .err()
+            .unwrap();
         assert_eq!(
             refused.to_string(),
             format!(

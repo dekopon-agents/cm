@@ -884,19 +884,23 @@ git's default merge of the two parents: a merge that only looked clean through a
 (`merge=union`, a merge driver), committed or local, or a `merge.*` setting is no clean update.
 The scratch repository holds no submodule's objects either, so a merge whose parents set a
 submodule to two different commits, even when one is the other's ancestor, reads as a conflict
-there and needs its own review. It is made, mode 0700 whatever the umask, under TMPDIR, taken as
+there and needs its own review. It takes the checkout's shallow boundary, so it reads no history
+the checkout cannot; in a shallow checkout a merge whose merge base lies past the boundary has no
+merge there and does not pass. It is made, mode 0700 and its files 0600 whatever the umask, under TMPDIR, taken as
 absolute (an empty TMPDIR names none), else under `/tmp`: a directory where it, its `git init` or
 its alternates file cannot be made is passed over, and with neither the gate refuses, naming both
-and why, and asks for a writable TMPDIR. Once it is made, git failing in it stops the gate with
-the scratch repository's path and git's error. It is removed when the gate is done; a run killed
+and why, and asks for a writable TMPDIR. Once it is made, git failing in it, or printing an
+`error:` or `fatal:` line even when it exits 0, stops the gate with the scratch repository's path
+and git's error. It is removed when the gate is done; a run killed
 mid-gate leaves its `cm-gate-*` directory there, under TMPDIR or `/tmp`, and nothing cleans it up
 later. Every git command the gate runs ignores replace refs, any `info/grafts` file, the
 commit-graph and the multi-pack-index, including those it reads through alternates, and drops
 from its environment every `GIT_TEST_*` variable (some bring those caches back) and `GIT_DIR`,
 `GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_SHALLOW_FILE` and the other variables that would
 move the repository or the history it reads. The gate trusts the checkout itself: an object
-stored under the wrong name is read as it stands, and a merge driver the checkout configures runs
-when the gate re-merges there. When the base tip already contains
+stored under the wrong name is read as it stands, a shallow boundary it records is taken as it
+stands (one at a merge makes it no merge), and a merge driver the checkout configures runs when
+the gate re-merges there. When the base tip already contains
 the head (the PR has merged into it), no merge can be told apart from the PR's own commits, so
 the walk does not run. A merge that resolved conflicts, or
 any other commit, needs its own review. The rule only skips a review nobody did: the walk stops
