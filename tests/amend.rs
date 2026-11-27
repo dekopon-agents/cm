@@ -950,25 +950,22 @@ fn release_metadata_amends_at_pr_open_and_merged_but_stops_at_released() {
 }
 
 #[test]
-fn kickoff_amend_refuses_a_missing_step_folder_with_a_typed_violation() {
+fn kickoff_amend_recreates_a_declared_step_folder_a_checkout_lost() {
     let host = at("2026-10-19T09:00:00Z");
     let c = campaign(&host);
     let step = "01-a/u/S1";
     assert!(declare(&host, &c, step, Lane::Codex, &[]).ok());
     let replacement = kickoff_fixture::file("Updated work.\n");
     fs::remove_dir_all(c.root.join(step)).unwrap();
-    let before = fs::read(c.root.join("JOURNAL.md")).unwrap();
-    let unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_cm"))
         .current_dir(&c.root)
         .args(["--json", "amend", step, "--kickoff-file"])
         .arg(replacement.path())
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    let fields: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(fields["violations"][0]["rule"], "kickoff-file");
-    assert_eq!(store::load_unit(&c.root.join("01-a/u")).unwrap(), unit);
-    assert_eq!(fs::read(c.root.join("JOURNAL.md")).unwrap(), before);
-    assert!(!c.root.join(step).exists());
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(c.root.join(step).join("kickoff.md")).unwrap(),
+        "Updated work.\n"
+    );
 }

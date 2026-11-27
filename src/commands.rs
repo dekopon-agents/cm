@@ -3052,12 +3052,6 @@ pub fn amend(
 
     violations.extend(check_kickoff(&full, amendment.kickoff.as_deref()));
     if amendment.kickoff.is_some() {
-        if !root.join(&full).is_dir() {
-            violations.push(Violation::new(
-                &full, "kickoff-file",
-                "the step folder is missing; repeat its `cm init` declaration to repair it before amending the kickoff",
-            ));
-        }
         changes.push(format!("- kickoff: {full}/kickoff.md"));
     }
     if amendment.ships.given() {
@@ -3213,6 +3207,8 @@ pub fn amend(
         });
     }
     if let Some(kickoff) = &amendment.kickoff {
+        // git keeps no empty folder, so a declared step's folder is absent in a fresh checkout.
+        fs::create_dir_all(root.join(&full))?;
         write_atomic(&root.join(&full).join("kickoff.md"), kickoff.as_bytes())?;
     }
     unit.steps.insert(step_name.to_owned(), next);

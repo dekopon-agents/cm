@@ -942,3 +942,40 @@ fn a_non_utf8_campaign_path_prints_no_move_rather_than_a_substituted_one() {
     );
     assert!(!refused.to_string().contains('\u{fffd}'), "{refused}");
 }
+
+#[test]
+fn the_packet_kickoff_amend_replays_when_a_checkout_lost_the_step_folder() {
+    let c = Scratch::new(&[("01-a/u/run", "claude-cloud")]);
+    fs::remove_dir(c.root.join("01-a/u/run")).unwrap();
+    let refused = c.refused(&[
+        "--json",
+        "launch",
+        "01-a/u/run",
+        "--coordinator",
+        "session_x",
+    ]);
+    let next = rule_next(&refused, "packet-kickoff");
+    assert_eq!(argvs(&next)[0][1], "amend");
+    let kickoff = c.root.join("../kickoff.md");
+    fs::write(&kickoff, "Do it.\n").unwrap();
+    let amended = c.cm(&[
+        "amend",
+        "01-a/u/run",
+        "--kickoff-file",
+        kickoff.to_str().unwrap(),
+    ]);
+    assert!(amended.status.success(), "{amended:?}");
+    assert_eq!(
+        fs::read_to_string(c.root.join("01-a/u/run/kickoff.md")).unwrap(),
+        "Do it.\n"
+    );
+    let undeclared = c.cm(&[
+        "--json",
+        "amend",
+        "01-a/u/nope",
+        "--kickoff-file",
+        kickoff.to_str().unwrap(),
+    ]);
+    assert_eq!(undeclared.status.code(), Some(1), "{undeclared:?}");
+    assert!(!c.root.join("01-a/u/nope").exists());
+}
