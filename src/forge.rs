@@ -823,15 +823,20 @@ pub(crate) struct TurnRead {
     turn_id: Option<String>,
     pub completed_at: Option<String>,
     pub pr_url: Option<String>,
-    // Raw, so a malformed value costs the context record only, never the turn read.
-    #[serde(default)]
-    context_used_tokens: Option<serde_json::Value>,
+    #[serde(skip)]
+    pub context_used_tokens: Option<u64>,
 }
 
-impl TurnRead {
-    pub(crate) fn context_tokens(&self) -> Option<u64> {
-        self.context_used_tokens.as_ref()?.as_u64()
+// A pass of its own over the reader's output, so a value cm cannot read costs the context
+// record alone: the turn read parses as if the field were absent.
+fn context_used_tokens(stdout: &[u8]) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Context {
+        context_used_tokens: Option<u64>,
     }
+    serde_json::from_slice::<Context>(stdout)
+        .ok()?
+        .context_used_tokens
 }
 
 pub(crate) const TURN_READER_TIMEOUT: Duration = Duration::from_secs(15);
@@ -844,8 +849,6 @@ pub(crate) fn read_session_context(
     #[derive(Deserialize)]
     struct SessionRead {
         thread_id: Option<String>,
-        #[serde(default)]
-        context_used_tokens: Option<serde_json::Value>,
     }
     let read = || {
         let (program, args) = argv.split_first().ok_or(ForgeError::Spawn)?;
@@ -859,10 +862,7 @@ pub(crate) fn read_session_context(
         if read.thread_id.as_deref().is_some_and(|id| id != session) {
             return Err(ForgeError::Json);
         }
-        Ok(read
-            .context_used_tokens
-            .as_ref()
-            .and_then(serde_json::Value::as_u64))
+        Ok(context_used_tokens(&output.stdout))
     };
     read().map_err(|error| fmt::from_fn(|f| error.fmt_program("turn reader", f)).to_string())
 }
@@ -880,8 +880,9 @@ pub(crate) fn read_remote_turn(
         if !output.status.success() {
             return Err(ForgeError::Exit(output.status.code()));
         }
-        let status: TurnRead =
+        let mut status: TurnRead =
             serde_json::from_slice(&output.stdout).map_err(|_| ForgeError::Json)?;
+        status.context_used_tokens = context_used_tokens(&output.stdout);
         if status.turn_status.trim().is_empty()
             || (status.successful && !status.done)
             || status.thread_id.as_deref().is_some_and(|id| id != thread)
@@ -1468,6 +1469,55 @@ mod tests {
             .err()
             .expect("held stdout must time out even after valid JSON");
         assert!(error.starts_with("turn reader did not answer"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_context_size_cm_cannot_read_costs_the_context_only() {
+        let deep = format!("{}{}", "[".repeat(130), "]".repeat(130));
+        let digits = "9".repeat(400);
+        let values = [
+            "1e999",
+            digits.as_str(),
+            r#"{"bad":1e400}"#,
+            deep.as_str(),
+            "1,\"context_used_tokens\":2",
+            "\"\\0377\"",
+            "-1",
+            "2.5",
+            "2e5",
+            "\"250000\"",
+            "null",
+            "true",
+            "[250000]",
+            "18446744073709551616",
+        ];
+        for value in values {
+            let turn = format!(
+                r#"printf '{{"done":true,"successful":true,"turn_status":"completed","context_used_tokens":%b}}' '{value}'"#
+            );
+            let argv = ["sh".to_owned(), "-c".to_owned(), turn];
+            let read = read_remote_turn(&argv, "thread", "turn", Duration::from_secs(5))
+                .unwrap_or_else(|error| panic!("{value}: {error}"));
+            assert!(read.done, "{value}");
+            assert_eq!(read.context_used_tokens, None, "{value}");
+            let session =
+                format!(r#"printf '{{"thread_id":"thread","context_used_tokens":%b}}' '{value}'"#);
+            let argv = ["sh".to_owned(), "-c".to_owned(), session];
+            assert_eq!(
+                read_session_context(&argv, "thread", Duration::from_secs(5)),
+                Ok(None),
+                "{value}"
+            );
+        }
+        let argv = [
+            "sh",
+            "-c",
+            r#"printf '{"done":false,"successful":false,"turn_status":"inProgress","context_used_tokens":250000}'"#,
+        ]
+        .map(str::to_owned);
+        let read = read_remote_turn(&argv, "thread", "turn", Duration::from_secs(5)).unwrap();
+        assert_eq!(read.context_used_tokens, Some(250000));
     }
 
     #[test]

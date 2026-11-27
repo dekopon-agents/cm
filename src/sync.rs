@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::attempt::{Drivers, recorded_id, remote_turn, session_label};
+use crate::attempt::{Drivers, last_recorded_session, recorded_id, remote_turn, session_label};
 use crate::commands::{check_release_pr, closed, is_pr_url, write_unit};
 use crate::forge::{
     CheckState, CommitSha, Forge, ForgeError, GithubRepo, MergeableState, Pull, PullState,
@@ -15,12 +15,13 @@ use crate::forge::{
 };
 use crate::host::{Host, stamp};
 use crate::journal;
-use crate::limits::TurnCommands;
+use crate::limits::{TurnCommands, TurnProgram};
 use crate::outcome::{Outcome, Violation};
 use crate::plan::{self, Units};
 use crate::render;
 use crate::state::{
-    Evidence, Lane, Move, ObservedContext, ObservedTurn, Phase, Release, Step, Track, Version, Work,
+    Attempt, Evidence, Lane, Move, ObservedContext, ObservedTurn, Phase, Release, Step, Track,
+    Version, Work,
 };
 use crate::store::{self, lock, parse_target, write_atomic};
 
@@ -42,6 +43,23 @@ pub struct Moved {
 type Read<T> = Result<T, ForgeError>;
 type TurnQuery = (String, String, String, Vec<String>);
 type SessionQuery = (String, String, Vec<String>);
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Subject {
+    Step(String),
+    Lane(String),
+}
+
+enum Sample {
+    Read {
+        session: String,
+        tokens: Option<u64>,
+    },
+    // This sync reads no session for it.
+    Unread,
+    // The lock walk has no read to apply, or a later read overtook this one.
+    Pending,
+}
 
 const PULL_MAX_AGE: jiff::SignedDuration = jiff::SignedDuration::from_mins(30);
 
@@ -96,6 +114,7 @@ struct Reads {
     branch_pulls: BTreeMap<(String, GithubRepo, String), Read<Option<String>>>,
     turns: BTreeMap<TurnQuery, Result<TurnRead, String>>,
     sessions: BTreeMap<SessionQuery, Result<Option<u64>, String>>,
+    context_seen: BTreeMap<Subject, Option<ObservedContext>>,
     pulls: BTreeMap<String, Read<PullRead>>,
     open_checks: BTreeMap<(GithubRepo, CommitSha), Read<OpenChecks>>,
     tags: BTreeMap<(GithubRepo, TagName), Read<bool>>,
@@ -241,6 +260,7 @@ struct Run<'a> {
     turn_commands: TurnCommands,
     turn_warnings: Vec<String>,
     lane_contexts: BTreeMap<String, ObservedContext>,
+    reader_deadline: Instant,
 }
 
 struct Tracked {
@@ -310,6 +330,7 @@ impl<'a> Run<'a> {
             turn_commands,
             turn_warnings,
             lane_contexts: store::read_json(&lane_context_path(root)).unwrap_or_default(),
+            reader_deadline: Instant::now() + TURN_READER_TIMEOUT,
         }
     }
 
@@ -916,62 +937,39 @@ impl<'a> Run<'a> {
             return;
         }
         let lane = Lane::ClaudeCloud;
-        let Some(programs) = self.turn_commands.for_lane(lane) else {
-            return;
-        };
-        let reader = programs.reader.clone();
-        let live: Vec<_> = self
+        let reader = self
+            .turn_commands
+            .for_lane(lane)
+            .map(|programs| programs.reader.clone());
+        let attempts: Vec<_> = self
             .units
             .iter()
             .flat_map(|(unit, state)| {
                 state.steps.iter().filter_map(move |(name, step)| {
-                    let attempt = plan::active_attempt(step)?;
-                    (attempt.lane.or(step.lane) == Some(lane))
-                        .then(|| (format!("{unit}/{name}"), step.clone(), attempt.clone()))
+                    let attempt = step.attempt.as_ref()?;
+                    let live = plan::active_attempt(step).is_some();
+                    (attempt.lane.or(step.lane) == Some(lane)
+                        && (live || attempt.observed_context.is_some()))
+                    .then(|| {
+                        let launched = step.track.state == Phase::Launched;
+                        (format!("{unit}/{name}"), launched, live, attempt.clone())
+                    })
                 })
             })
             .collect();
-        for (target, step, attempt) in live {
-            let Some(turn) = remote_turn(&attempt, lane) else {
-                continue;
-            };
-            let argv = reader.argv(turn.thread, turn.turn);
-            // The key observe_turns reads under, so a launched step's reader runs once a sync.
-            let key = (
-                attempt.id.clone(),
-                turn.thread.to_owned(),
-                turn.turn.to_owned(),
-                argv.clone(),
-            );
-            let (thread, turn_id) = (key.1.clone(), key.2.clone());
-            let tokens = match self.read(
-                "turn",
-                |reads| &mut reads.turns,
-                key,
-                move |_| read_remote_turn(&argv, &thread, &turn_id, TURN_READER_TIMEOUT),
-            ) {
-                Some(Ok(read)) => {
-                    let tokens = read.context_tokens();
-                    if tokens.is_none() {
-                        self.turn_warnings
-                            .push(missing_context(&target, turn.thread));
+        for (target, launched, live, attempt) in attempts {
+            let earlier = attempt.observed_context.as_ref();
+            let observed = match reader.as_ref().filter(|_| live) {
+                Some(reader) => match self.read_worker_context(&target, launched, &attempt, reader)
+                {
+                    Sample::Read { session, tokens } => {
+                        ObservedContext::after_read(earlier, &session, tokens, &self.at)
                     }
-                    tokens
-                }
-                Some(Err(error)) => {
-                    if step.track.state != Phase::Launched {
-                        self.turn_warnings.push(format!("{target}: {error}"));
-                    }
-                    None
-                }
-                None => continue,
+                    Sample::Unread => ObservedContext::unread(earlier, &self.at),
+                    Sample::Pending => continue,
+                },
+                None => ObservedContext::unread(earlier, &self.at),
             };
-            let observed = ObservedContext::after_read(
-                attempt.observed_context.as_ref(),
-                turn.thread,
-                tokens,
-                &self.at,
-            );
             if observed != attempt.observed_context {
                 let (unit, name) = plan::split(&target).expect("step target has a unit and name");
                 let attempt = self
@@ -990,29 +988,125 @@ impl<'a> Run<'a> {
         }
     }
 
+    fn read_worker_context(
+        &mut self,
+        target: &str,
+        launched: bool,
+        attempt: &Attempt,
+        reader: &TurnProgram,
+    ) -> Sample {
+        let deadline = self.reader_deadline;
+        let (session, read, warned) = if let Some(turn) = remote_turn(attempt, Lane::ClaudeCloud) {
+            let argv = reader.argv(turn.thread, turn.turn);
+            // The key observe_turns reads a launched step under, so its reader runs once a sync.
+            let key = (
+                attempt.id.clone(),
+                turn.thread.to_owned(),
+                turn.turn.to_owned(),
+                argv.clone(),
+            );
+            let (thread, turn_id) = (key.1.clone(), key.2.clone());
+            let read = self.read(
+                "turn",
+                |reads| &mut reads.turns,
+                key,
+                move |_| {
+                    within(deadline, |timeout| {
+                        read_remote_turn(&argv, &thread, &turn_id, timeout)
+                    })
+                },
+            );
+            let Some(read) = read else {
+                return Sample::Pending;
+            };
+            let read = read.map(|read| read.context_used_tokens);
+            (turn.thread.to_owned(), read, launched)
+        } else if let Some(session) = last_recorded_session(attempt) {
+            let argv = reader.argv(session, "");
+            let key = (attempt.id.clone(), session.to_owned(), argv.clone());
+            let wanted = session.to_owned();
+            let read = self.read(
+                "session",
+                |reads| &mut reads.sessions,
+                key,
+                move |_| {
+                    within(deadline, |timeout| {
+                        read_session_context(&argv, &wanted, timeout)
+                    })
+                },
+            );
+            let Some(read) = read else {
+                return Sample::Pending;
+            };
+            (session.to_owned(), read, false)
+        } else {
+            return Sample::Unread;
+        };
+        let tokens = match read {
+            Ok(tokens) => {
+                if tokens.is_none() {
+                    self.turn_warnings.push(missing_context(target, &session));
+                }
+                tokens
+            }
+            Err(error) => {
+                if !warned {
+                    self.turn_warnings.push(format!("{target}: {error}"));
+                }
+                None
+            }
+        };
+        if self.overtaken(
+            Subject::Step(target.to_owned()),
+            attempt.observed_context.as_ref(),
+        ) {
+            return Sample::Pending;
+        }
+        Sample::Read { session, tokens }
+    }
+
+    // The read walk notes the value it read against; under the lock, a value that differs was
+    // written by a later read (or a restart) and is kept.
+    fn overtaken(&mut self, subject: Subject, current: Option<&ObservedContext>) -> bool {
+        if matches!(self.access, Access::Read(_)) {
+            self.reads.context_seen.insert(subject, current.cloned());
+            return false;
+        }
+        self.reads.context_seen.get(&subject) != Some(&current.cloned())
+    }
+
     fn observe_drivers(&mut self) {
         if self.planning() {
             return;
         }
         let Some(programs) = self.turn_commands.for_lane(Lane::ClaudeCloud) else {
+            let at = self.at.clone();
+            for observed in self.lane_contexts.values_mut() {
+                *observed = observed.staled(&at);
+            }
             return;
         };
         let Ok(drivers) = Drivers::read(self.root) else {
             return;
         };
         let reader = programs.reader.clone();
+        let deadline = self.reader_deadline;
         self.lane_contexts
             .retain(|lane, _| drivers.drivers.contains_key(lane));
         for (lane, driver) in drivers.drivers {
             let session = session_label(&driver.session);
             let argv = reader.argv(&session, "");
-            let key = (lane.clone(), session.clone(), argv.clone());
+            let key = (format!("lane:{lane}"), session.clone(), argv.clone());
             let wanted = session.clone();
             let tokens = match self.read(
                 "session",
                 |reads| &mut reads.sessions,
                 key,
-                move |_| read_session_context(&argv, &wanted, TURN_READER_TIMEOUT),
+                move |_| {
+                    within(deadline, |timeout| {
+                        read_session_context(&argv, &wanted, timeout)
+                    })
+                },
             ) {
                 Some(Ok(Some(tokens))) => Some(tokens),
                 Some(Ok(None)) => {
@@ -1026,12 +1120,11 @@ impl<'a> Run<'a> {
                 }
                 None => continue,
             };
-            match ObservedContext::after_read(
-                self.lane_contexts.get(&lane),
-                &session,
-                tokens,
-                &self.at,
-            ) {
+            let earlier = self.lane_contexts.get(&lane).cloned();
+            if self.overtaken(Subject::Lane(lane.clone()), earlier.as_ref()) {
+                continue;
+            }
+            match ObservedContext::after_read(earlier.as_ref(), &session, tokens, &self.at) {
                 Some(observed) => self.lane_contexts.insert(lane, observed),
                 None => self.lane_contexts.remove(&lane),
             };
@@ -1631,8 +1724,6 @@ impl<'a> Run<'a> {
     }
 }
 
-// EPOCH.md's `epoch` slug, else a fixed name: a checkout under another folder name renders the
-// same card.
 fn missing_context(subject: &str, session: &str) -> String {
     format!(
         "{subject}: turn reader reported no integer context_used_tokens for {session}; its {}k context cap is unchecked",
@@ -1640,10 +1731,28 @@ fn missing_context(subject: &str, session: &str) -> String {
     )
 }
 
+// Context reads past the launched steps' turn reads share the sync's reader deadline, which those
+// turn reads spend too, so a hung reader never costs a sync two reader timeouts.
+fn within<T>(
+    deadline: Instant,
+    read: impl FnOnce(Duration) -> Result<T, String>,
+) -> Result<T, String> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(format!(
+            "turn reader not run: this sync's reader runs passed their shared {}s deadline",
+            TURN_READER_TIMEOUT.as_secs()
+        ));
+    }
+    read(left)
+}
+
 pub(crate) fn lane_context_path(root: &Path) -> std::path::PathBuf {
     root.join(store::CM_DIR).join(LANE_CONTEXT)
 }
 
+// EPOCH.md's `epoch` slug, else a fixed name: a checkout under another folder name renders the
+// same card.
 fn card_name(root: &Path) -> String {
     let declared = std::fs::read_to_string(root.join(crate::epoch::EPOCH))
         .ok()

@@ -111,19 +111,26 @@ fn over_cap(context: &ObservedContext) -> String {
     )
 }
 
-// The context sync recorded for the session the attempt now addresses, if it read that one.
-pub(crate) fn current_context(attempt: &Attempt) -> Option<&ObservedContext> {
-    let session = attempt
+fn sessions(attempt: &Attempt) -> impl Iterator<Item = &External> {
+    attempt
         .actions
         .iter()
         .rev()
-        .find(|action| matches!(action.kind.as_str(), "thread" | "session"))?
-        .id
-        .as_deref()?;
+        .filter(|action| matches!(action.kind.as_str(), "thread" | "session"))
+}
+
+// While a newer session is being created, the one before it is still the one to keep reading,
+// so `record session` naming it again stays refused.
+pub(crate) fn last_recorded_session(attempt: &Attempt) -> Option<&str> {
+    sessions(attempt).find_map(|action| action.id.as_deref())
+}
+
+pub(crate) fn current_context(attempt: &Attempt) -> Option<&ObservedContext> {
+    let session = session_label(sessions(attempt).next()?.id.as_deref()?);
     attempt
         .observed_context
         .as_ref()
-        .filter(|context| context.session == session)
+        .filter(|context| session_label(&context.session) == session)
 }
 
 pub(crate) fn turn_began(attempt: &Attempt, lane: Lane) -> Option<&str> {
@@ -277,8 +284,9 @@ pub fn attempt(
     };
     let now = host.now();
     let at = stamp(now);
-    // Only a value the last sync read refuses: a stale one is printed by `cm next --act` alone.
+    // A stale value is printed by `cm next --act` alone; it never refuses.
     let capped = (attempt.lane.or(step.and_then(|step| step.lane)) == Some(Lane::ClaudeCloud)
+        && step.is_some_and(|step| crate::plan::active_attempt(step).is_some())
         && crate::limits::TurnCommands::read(root)
             .for_lane(Lane::ClaudeCloud)
             .is_some())
@@ -394,7 +402,8 @@ pub fn attempt(
                 violations.push(Violation::new(&full, "attempt-record", "an id is one word"));
             }
             if matches!(kind.as_str(), "thread" | "session")
-                && let Some(context) = capped.filter(|context| context.session == *id)
+                && let Some(context) =
+                    capped.filter(|context| session_label(&context.session) == session_label(id))
             {
                 violations.push(Violation::new(
                     &full,

@@ -1081,10 +1081,11 @@ pub struct Attempt {
 pub(crate) struct ObservedContext {
     pub session: String,
     pub used_tokens: u64,
-    // A later read of the same value keeps this stamp, so an unchanged session rewrites no state.
+    // The sync that recorded this value. A later read less than CONTEXT_RECORD_STEP_TOKENS from it,
+    // on the same side of the cap, keeps it, so a working session's syncs rewrite no state.
     pub read_at: String,
-    // Set by the first sync whose read of the session failed or carried no value; a value with
-    // it set is stale and never refuses a resume.
+    // Set by the first sync that did not read the session (its read failed, carried no value or
+    // was not made); a value with it set is stale and never refuses a resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unread_since: Option<String>,
 }
@@ -1098,15 +1099,36 @@ impl ObservedContext {
         self.unread_since.is_none()
     }
 
+    fn holds(&self, tokens: u64) -> bool {
+        self.used_tokens.abs_diff(tokens) < crate::limits::CONTEXT_RECORD_STEP_TOKENS
+            && (tokens > crate::limits::CONTEXT_CAP_TOKENS) == self.over_cap()
+    }
+
+    pub(crate) fn staled(&self, at: &str) -> Self {
+        Self {
+            unread_since: self.unread_since.clone().or_else(|| Some(at.to_owned())),
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn unread(earlier: Option<&Self>, at: &str) -> Option<Self> {
+        earlier.map(|earlier| earlier.staled(at))
+    }
+
+    // What a sync records after reading `session`: an earlier session's value is not this
+    // sync's read, so it goes.
     pub(crate) fn after_read(
         earlier: Option<&Self>,
         session: &str,
         tokens: Option<u64>,
         at: &str,
     ) -> Option<Self> {
-        let same = earlier.filter(|earlier| earlier.session == session);
+        let same = earlier.filter(|earlier| {
+            crate::attempt::session_label(&earlier.session)
+                == crate::attempt::session_label(session)
+        });
         match (tokens, same) {
-            (Some(tokens), Some(earlier)) if earlier.used_tokens == tokens && earlier.fresh() => {
+            (Some(tokens), Some(earlier)) if earlier.fresh() && earlier.holds(tokens) => {
                 Some(earlier.clone())
             }
             (Some(tokens), _) => Some(Self {
@@ -1115,11 +1137,7 @@ impl ObservedContext {
                 read_at: at.to_owned(),
                 unread_since: None,
             }),
-            (None, Some(earlier)) => Some(Self {
-                unread_since: earlier.unread_since.clone().or_else(|| Some(at.to_owned())),
-                ..earlier.clone()
-            }),
-            (None, None) => earlier.cloned(),
+            (None, same) => Self::unread(same, at),
         }
     }
 

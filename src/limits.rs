@@ -30,6 +30,10 @@ pub const CODEX_STALL_HOURS: f64 = 2.0;
 
 pub(crate) const CONTEXT_CAP_TOKENS: u64 = 200_000;
 
+// A context value moves on in state only by this much, or across the cap, so the heartbeat's
+// commit of a working session's syncs is not one per beat.
+pub(crate) const CONTEXT_RECORD_STEP_TOKENS: u64 = 10_000;
+
 /// Keys a campaign may leave out; each is checked when present.
 const OPTIONAL: [(&str, Shape); 3] = [
     ("codex_stall_hours", Shape::Number),

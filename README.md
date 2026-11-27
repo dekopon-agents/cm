@@ -378,7 +378,7 @@ Campaign `.cm/state.json`:
 `closed` appears only after `cm close`. Optional `owner_queue_read` records the read stamp and heading identities; only an explicit queue read writes it. Beside it, `.cm/verdicts.json` is the computed-verdict
 ledger (see [Review verdicts](#review-verdicts)), `.cm/lane-drivers.json` the registered lane
 drivers (see [Lane drivers](#lane-drivers)), `.cm/lane-context.json` their sessions' context
-sizes the last `cm sync` read (see [Context caps](#context-caps)) and `.cm/pulls.json` the open PRs the last
+sizes as `cm sync` recorded them (see [Context caps](#context-caps)) and `.cm/pulls.json` the open PRs the last
 `cm sync` saw (optional `base`, `ci_head` and `ci_base` remember its base and last completed CI observation); a campaign without them reads as having none. `written` are files cm wrote, `adopted` are files that existed and linted clean at `cm init`.
 `journal.baseline_lines` is where cm's stamped region starts; an adopted journal keeps its old
 headings.
@@ -550,25 +550,43 @@ reviewed head. cm holds no credential for the sessions API; the operator's
 `claude_cloud_turn_reader` reports the size, and with no reader configured nothing below is read,
 listed or refused.
 
-`cm sync` runs the reader for each live Claude Cloud attempt at `launched` or `pr-open` (one run
-for a launched step's turn read and its context) and records `observed_context` on the attempt:
-the `session` read, its `used_tokens`, the `read_at` of the sync that read that value (a later read
-of the same value leaves it, so a quiet sync rewrites no state) and, once a later read fails or
-carries no value, `unread_since`. A value with `unread_since` is stale until a read delivers one
-again. A missing, negative, fractional or non-integer `context_used_tokens` records nothing,
-leaves the turn read as it was and adds one `turn_reader_warnings` entry per step per sync;
-`completed_at`, `pr_url` and `turn-ended` do not depend on it. A newer `session` (or `thread`)
-recorded on the attempt is a different session: an earlier session's value does not apply to it.
+`cm sync` runs the reader for each live Claude Cloud attempt (at `launched` or `pr-open`, not
+ended) and records `observed_context` on the attempt. When the attempt's newest record is a turn,
+the turn read serves (at `launched`, one run for the turn read and its context); otherwise sync
+reads the last session the attempt recorded as it reads a lane driver's, with `{turn}` empty
+(below), also while a newer `begin session` waits for its id. The record holds the `session`
+read, its `used_tokens`, the `read_at` of the sync that recorded that value and, from the first
+sync that does not read it (the read fails, carries no value or is not run, no reader is
+configured, or the attempt is no longer live), `unread_since`. A value with `unread_since` is
+stale until a read delivers one again. A later read within 10k tokens of the recorded value, on
+the same side of the cap, leaves the record as it is, so a working session's syncs rewrite no
+state; a move of 10k or more, or across the cap, records the new value. A `context_used_tokens`
+cm cannot read as an unsigned integer (missing, `null`, negative, fractional, a string, out of
+range, a duplicated key or any other value) records nothing, leaves the turn read exactly as if
+the field were absent and adds one `turn_reader_warnings` entry per step per sync;
+`completed_at`, `pr_url` and `turn-ended` do not depend on it. An attempt keeps one value, for
+the session sync reads: a read of a newer `session` (or `thread`) replaces the earlier
+session's value, and a failed read of it drops that value.
 
-For each registered lane driver, sync also runs the Claude Cloud reader with `{thread}` the
-driver's session and `{turn}` empty, and reads only `context_used_tokens` (and, when present,
-`thread_id`, which must name that session) from its answer, into `.cm/lane-context.json` keyed by
-lane name. A failure keeps the earlier value stale, as for attempts; a removed driver's value goes.
+For each registered lane driver, and only those, sync also runs the Claude Cloud reader with
+`{thread}` the driver's session (a `cse_` registration read as `session_`) and `{turn}` empty,
+and reads only `context_used_tokens` (and, when present, `thread_id`, which must name that
+session) from its answer, into `.cm/lane-context.json` keyed by lane name. Its values follow the
+attempts' rules: stale from a failed or empty read, or a sync with no reader configured, and kept
+within 10k; a removed driver's value goes, and a campaign with no driver gets no file.
 A reader given an empty `{turn}` is asked about the session alone: it exits 0 and prints one JSON
 object with the session's current `context_used_tokens`, and may add `thread_id`. It need not
 report `done`, `successful` or `turn_status`, which cm ignores there. A nonzero exit, output cm cannot
 parse, or a `thread_id` naming another session is a failed read; a missing or
 non-integer `context_used_tokens` records nothing and warns as for attempts.
+
+These reads run before sync takes the campaign lock, as the turn reads do. Under the lock, sync
+records a value only while the attempt's (or the lane's) value is still the one it saw before
+reading: a value another sync recorded in between, or a restart cleared, is newer and stays.
+The reads this adds (an attempt at `pr-open` or with no turn, and each lane driver) share one
+deadline, 15 s from the start of the sync's reads, which the launched steps' own turn reads also
+spend; a read the deadline leaves no time for is not run, warns `turn reader not run: …` and
+leaves the value stale, so a hung reader costs a sync one 15 s timeout, not one per read.
 
 `cm next --act` lists `context-over` (below) for a live attempt or a registered driver whose
 current session's value exceeds 200000 tokens, stale ones included, which say so:
@@ -581,11 +599,14 @@ context-over lane:tooling: session_driver at 260k > 200k cap (read 2030-01-01T10
 Sizes round up to the next thousand tokens. A driver line's target is `lane:<name>`; CARD.md,
 which reads no lane-driver registry, neither lists nor counts it.
 
-`cm attempt` refuses a resume of a session whose value the last sync read (not a stale one) over
-the cap, as `attempt-context-over`, naming the fresh-session commands: `begin turn` while the
-attempt's current session is that one, and `record session <id>` (or `record thread <id>`) that
-names it again. `begin session` is never refused, and nor is `record turn`: by then the turn was
-sent, and its id is what the attempt must keep.
+`cm attempt` refuses a resume of a live attempt's session whose recorded value is over the cap
+and fresh (a stale one never refuses), as `attempt-context-over`, naming the fresh-session
+commands: `begin turn` while the attempt's current session is that one, and `record session <id>`
+(or `record thread <id>`) that names it again, in its `session_` or `cse_` spelling. `begin
+session` is never refused, and nor is `record turn`: by then the turn was sent, and its id is what
+the attempt must keep. Since an attempt keeps the value of the session sync reads, once a sync has
+read a newer session, `record session` naming the earlier one is not refused until a sync reads
+that one again as the current session.
 
 `cm next --act` prints only actionable lines, each starting with `<kind> <step>:`. It lists
 `turn-ended` first, then `review-owed`, then the other kinds by the number of steps waiting
