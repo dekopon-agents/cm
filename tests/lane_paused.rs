@@ -564,15 +564,15 @@ fn with_the_journal_fallback_a_later_note_recalling_or_planning_the_unpause_reop
         ),
         (
             RESUMED,
-            "- notes\n    ```\n  paused = false in LIMITS.toml.\n    ```",
+            "- notes.\n    ```\n  paused = false in LIMITS.toml.\n    ```",
         ),
         (
             RESUMED,
-            "1. notes\n    ~~~\n   paused = false in LIMITS.toml.\n    ~~~",
+            "1. notes.\n    ~~~\n   paused = false in LIMITS.toml.\n    ~~~",
         ),
         (
             RESUMED,
-            "- notes\n    - ```\n  paused = false in LIMITS.toml.\n    ```",
+            "- notes.\n    - ```\n  paused = false in LIMITS.toml.\n    ```",
         ),
         (
             RESUMED,
@@ -581,6 +581,26 @@ fn with_the_journal_fallback_a_later_note_recalling_or_planning_the_unpause_reop
         (
             RESUMED,
             "1. notes\n   ~~~\n~~~\npaused = false in LIMITS.toml.\n~~~",
+        ),
+        (
+            RESUMED,
+            "-\t~~~\n  ~~~\npaused = false in LIMITS.toml.\n  ~~~",
+        ),
+        (
+            RESUMED,
+            "1.\t~~~\n   ~~~\npaused = false in LIMITS.toml.\n   ~~~",
+        ),
+        (
+            RESUMED,
+            "Quoted:\n```\nResumed.\n```\u{a0}\npaused = false in LIMITS.toml.\n```",
+        ),
+        (
+            RESUMED,
+            "Quoted:\n```\nResumed.\n\u{a0}```\npaused = false in LIMITS.toml.\n```",
+        ),
+        (
+            RESUMED,
+            "Resumed by hand\n    and then\npaused = false in LIMITS.toml.",
         ),
         (
             RESUMED,
@@ -640,9 +660,12 @@ fn with_the_journal_fallback_the_record_states_the_assignment_as_a_clause_of_its
         "Resumed; ran\n```\ncm next --act\n```\npaused = false in LIMITS.toml.",
         "Resumed; ran\n```\ncm next --act\n`````\npaused = false in LIMITS.toml.",
         "Resumed from the handoff:\n1. `paused = false` in LIMITS.toml\n2) heartbeat re-armed",
-        "Resumed:\n1. ran\n   ```\n   cm next --act\n   ```\n\npaused = false in LIMITS.toml.",
-        "Ran:\n10. ```\n    cm next --act\n    ```\n\npaused = false in LIMITS.toml.",
-        "Ran:\n- ```\n  cm next --act\n\n  cm lint\n  ```\n\npaused = false in LIMITS.toml.",
+        "```a`b\n\npaused = false in LIMITS.toml.",
+        "  ```\ncm next --act\n```\n\npaused = false in LIMITS.toml.",
+        "  ~~~\ncm next --act\n  ~~~\npaused = false in LIMITS.toml.",
+        "Ran:\n\n    ```\n\npaused = false in LIMITS.toml.",
+        "- ran cm next\n```\n  cm next --act\n```\n\npaused = false in LIMITS.toml.",
+        "> note\n  ```\n  cm next --act\n  ```\n\npaused = false in LIMITS.toml.",
     ] {
         let c = unpaused_in_the_journal(body);
         let (code, lines, text) = act(&c.root);
@@ -670,6 +693,23 @@ fn with_the_journal_fallback_a_record_shaped_plan_or_restatement_is_taken_as_the
         let (code, lines, text) = act(&c.root);
         assert_eq!((code, lines.len()), (Some(1), 1), "{body}: {text}");
         assert_eq!(lines[0]["since"], "2026-11-27T01:10:00Z", "{body}");
+    }
+}
+
+#[test]
+fn with_the_journal_fallback_a_fence_inside_a_list_item_or_quote_makes_no_record() {
+    for body in [
+        "Resumed:\n1. ran\n   ```\n   cm next --act\n   ```\n\npaused = false in LIMITS.toml.",
+        "Ran:\n10. ```\n    cm next --act\n    ```\n\npaused = false in LIMITS.toml.",
+        "Ran:\n- ```\n  cm next --act\n\n  cm lint\n  ```\n\npaused = false in LIMITS.toml.",
+        "- a\n  - ```\n    cm next --act\n    ```\n\npaused = false in LIMITS.toml.",
+        "> ```\n> cm next --act\n> ```\n\npaused = false in LIMITS.toml.",
+        "-\tran cm next\n\npaused = false in LIMITS.toml.",
+        "-     cm next --act\n\npaused = false in LIMITS.toml.",
+    ] {
+        let c = unpaused_in_the_journal(body);
+        let (code, lines, text) = act(&c.root);
+        assert_eq!((code, lines.len()), (Some(0), 0), "{body}: {text}");
     }
 }
 

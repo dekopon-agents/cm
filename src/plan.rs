@@ -1989,73 +1989,88 @@ fn list_item(line: &str) -> Option<&str> {
     rest.starts_with([' ', '\t']).then(|| rest.trim_start())
 }
 
-fn fence_run(line: &str) -> Option<(char, usize)> {
-    let mark = line.chars().next().filter(|c| matches!(c, '`' | '~'))?;
-    let len = line.len() - line.trim_start_matches(mark).len();
-    (len >= 3).then_some((mark, len))
+fn opens_fence(text: &str) -> bool {
+    text.starts_with("```") || text.starts_with("~~~")
 }
 
-fn indent(line: &str) -> usize {
-    line.chars()
-        .map_while(|c| match c {
-            ' ' => Some(1),
-            '\t' => Some(4),
-            _ => None,
-        })
-        .sum()
+// A line's text after its quote and list markers, and whether it has markers and the first is a
+// list item's; None when a marker is followed by a tab, or a list marker by five spaces, which move
+// the content column in ways this reading does not follow.
+fn after_markers(line: &str) -> Option<(&str, Option<bool>)> {
+    let mut rest = line;
+    let mut first = None;
+    loop {
+        let (after, item) = if let Some(after) = rest.strip_prefix('>') {
+            (after, false)
+        } else {
+            let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            let after = match digits {
+                0 => rest.strip_prefix(['-', '*', '+']),
+                1..=9 => rest[digits..].strip_prefix(['.', ')']),
+                _ => None,
+            };
+            match after {
+                Some(after) if after.is_empty() || after.starts_with([' ', '\t']) => (after, true),
+                _ => break,
+            }
+        };
+        first.get_or_insert(item);
+        let padding = after.len() - after.trim_start_matches([' ', '\t']).len();
+        if after[..padding].contains('\t') || (item && padding >= 5) {
+            return None;
+        }
+        rest = &after[padding..];
+    }
+    Some((rest, first))
 }
 
-// A fence closes only on a run of its own character at least as long as the opener, with nothing
-// after it and indented at most three columns past its container (a list item's content column
-// when the opener is on the item's line, else the margin): anything else is fenced content. Two
-// lines end what this reading can follow, so from either on nothing in the body is read: a
-// non-blank line inside an open fence indented less than the item's content column or, for an
-// opener not on an item's line, less than the opener (in a list item it ends the item and can open
-// another fence), and a fence run on a line indented four columns, which in a list item can open
-// one. Where this differs from CommonMark it skips more, never less.
+// Only fences outside list items and quotes are followed, by the rules cm's other Markdown checks
+// use (`markdown::Fences`). A fence inside a list item or quote (on the item's line, or indented
+// after a list item), or a marker followed by a tab or a list marker by five spaces, would need
+// container columns this reading does not model, so such a body states nothing. A line indented
+// four columns, or by a tab, is code or list text; it is not read and closes no clause.
 fn states_unpause(body: &str) -> bool {
-    let mut fence: Option<(char, usize, usize, usize)> = None;
-    let mut hidden = false;
-    let text = body
-        .lines()
-        .map(|raw| {
-            let depth = indent(raw);
-            let line = raw.trim();
-            if hidden {
-                return ";".to_owned();
+    let mut fences = crate::markdown::Fences::default();
+    let mut in_list = false;
+    let mut text = String::new();
+    for raw in body.lines() {
+        let opening = !fences.is_open();
+        if fences.contains(raw) {
+            if opening && in_list && raw.starts_with(' ') {
+                return false;
             }
-            if let Some((mark, open, at, floor)) = fence {
-                if !line.is_empty() && depth < floor {
-                    hidden = true;
-                } else if (at..=at + 3).contains(&depth)
-                    && line.len() >= open
-                    && line.chars().all(|c| c == mark)
-                {
-                    fence = None;
-                }
-                return ";".to_owned();
+            text.push_str(" ;");
+            continue;
+        }
+        let lead = raw.len() - raw.trim_start_matches([' ', '\t']).len();
+        let line = raw[lead..].trim_end_matches([' ', '\t']);
+        let indented = lead >= 4 || raw[..lead].contains('\t');
+        if indented && !in_list {
+            continue;
+        }
+        let Some((content, marker)) = after_markers(line) else {
+            return false;
+        };
+        if (indented || marker.is_some()) && opens_fence(content) {
+            return false;
+        }
+        if indented {
+            continue;
+        }
+        in_list |= marker == Some(true);
+        match list_item(line) {
+            Some(item) => {
+                text.push_str(" ; ");
+                text.push_str(item);
             }
-            if depth >= 4 {
-                hidden = fence_run(list_item(line).unwrap_or(line)).is_some();
-                return ";".to_owned();
+            None if line.is_empty() => text.push_str(" ;"),
+            None => {
+                text.push(' ');
+                text.push_str(line);
             }
-            let item = list_item(line);
-            if let Some((mark, open)) = fence_run(item.unwrap_or(line)) {
-                let column = item.map_or(0, |rest| depth + line.len() - rest.len());
-                fence = Some((mark, open, column, column.max(depth)));
-                return ";".to_owned();
-            }
-            match item {
-                Some(item) => format!("; {item}"),
-                None if line.is_empty() => ";".to_owned(),
-                None => line.to_owned(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace('`', "")
-        .replace('=', " = ")
-        .to_lowercase();
+        }
+    }
+    let text = text.replace('`', "").replace('=', " = ").to_lowercase();
     let mut clause = Vec::new();
     for word in text.split_whitespace() {
         let bare = word.trim_end_matches(['.', ';', '!', '?']);
