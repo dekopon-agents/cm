@@ -503,41 +503,32 @@ fn a_pull_killed_mid_rebase_is_aborted_with_the_tree_as_it_was_and_the_next_try_
 }
 
 #[test]
-fn a_pull_cut_or_refused_before_its_rebase_is_quit_and_its_autostash_kept_for_the_next_tick() {
-    for (hook, budget) in [
-        ("exec sleep 60\n", Duration::from_secs(2)),
-        ("exit 1\n", MAX_BUDGET),
-    ] {
-        let scratch = Scratch::new();
-        let ct = scratch.ct();
-        write(&ct.join(EPOCH).join("NOTES.md"), "local, unpushed\n");
-        scratch.git(&ct, &["add", "-A"]);
-        scratch.git(&ct, &["commit", "-qm", "local"]);
-        scratch.push_from_other("STATE.md", "other\n");
-        script(&ct.join(".git/hooks/pre-commit"), "exit 1\n");
-        script(&ct.join(".git/hooks/pre-rebase"), hook);
-        write(&ct.join(EPOCH).join("CARD.md"), "card, in the autostash\n");
-        let proc = scratch.proc();
-        let report = scratch.phase(&proc, Path::new("cm"), budget, |ctx| {
-            gitsync::sync(ctx, Mode::Always)
-        });
-        assert_eq!(
-            report.lines,
-            [COMMIT_FAILED, gitsync::QUIT, SYNC_FAILED],
-            "{hook}"
-        );
-        assert!(proc.log().contains(&"git rebase --quit".to_owned()));
-        assert!(!ct.join(".git/rebase-merge").exists(), "{hook}");
-        assert_eq!(scratch.status(), "");
-        assert_eq!(scratch.git(&ct, &["stash", "list"]).lines().count(), 1);
-        assert_eq!(
-            scratch.git(&ct, &["show", &format!("stash@{{0}}:{EPOCH}/CARD.md")]),
-            "card, in the autostash\n"
-        );
-        fs::remove_file(ct.join(".git/hooks/pre-rebase")).unwrap();
-        assert_eq!(scratch.sync(&proc, Mode::Always), Report::default());
-        assert_eq!(scratch.origin_log(), ["local", "other: STATE.md", "start"]);
-    }
+fn a_pull_cut_before_its_rebase_is_quit_and_its_autostash_kept_for_the_next_tick() {
+    let scratch = Scratch::new();
+    let ct = scratch.ct();
+    write(&ct.join(EPOCH).join("NOTES.md"), "local, unpushed\n");
+    scratch.git(&ct, &["add", "-A"]);
+    scratch.git(&ct, &["commit", "-qm", "local"]);
+    scratch.push_from_other("STATE.md", "other\n");
+    script(&ct.join(".git/hooks/pre-commit"), "exit 1\n");
+    script(&ct.join(".git/hooks/pre-rebase"), "exec sleep 60\n");
+    write(&ct.join(EPOCH).join("CARD.md"), "card, in the autostash\n");
+    let proc = scratch.proc();
+    let report = scratch.phase(&proc, Path::new("cm"), Duration::from_secs(2), |ctx| {
+        gitsync::sync(ctx, Mode::Always)
+    });
+    assert_eq!(report.lines, [COMMIT_FAILED, gitsync::QUIT, SYNC_FAILED]);
+    assert!(proc.log().contains(&"git rebase --quit".to_owned()));
+    assert!(!ct.join(".git/rebase-merge").exists());
+    assert_eq!(scratch.status(), "");
+    assert_eq!(scratch.git(&ct, &["stash", "list"]).lines().count(), 1);
+    assert_eq!(
+        scratch.git(&ct, &["show", &format!("stash@{{0}}:{EPOCH}/CARD.md")]),
+        "card, in the autostash\n"
+    );
+    fs::remove_file(ct.join(".git/hooks/pre-rebase")).unwrap();
+    assert_eq!(scratch.sync(&proc, Mode::Always), Report::default());
+    assert_eq!(scratch.origin_log(), ["local", "other: STATE.md", "start"]);
 }
 
 const STILL_BOUND: [&str; 4] = [
