@@ -422,8 +422,6 @@ fn with_no_limits_history_the_journal_names_the_unpause_or_no_line_is_given() {
     );
     assert_eq!(act(&c.root).1.len(), 0);
 
-    // Nor is a note other than the coordinator's resume record, or a resume entry that does not
-    // state the assignment in LIMITS.toml.
     journal(
         &c.root,
         "2026-11-26T21:00Z",
@@ -453,8 +451,6 @@ fn with_no_limits_history_the_journal_names_the_unpause_or_no_line_is_given() {
         "{text}"
     );
 
-    // A later note recalling the unpause, or a later resume entry stating no assignment, leaves
-    // `since` at the record.
     journal(
         &c.root,
         "2026-11-27T01:06Z",
@@ -472,34 +468,72 @@ fn with_no_limits_history_the_journal_names_the_unpause_or_no_line_is_given() {
     assert_eq!(lines[0]["since"], "2026-11-26T22:16:00Z");
 }
 
-#[test]
-fn with_the_journal_fallback_a_later_note_recalling_the_unpause_reopens_no_lane() {
+const RESUMED: &str = "Coordinator: resumed after quota reset";
+
+fn unpaused_in_the_journal(body: &str) -> Campaign {
     let c = outside_git();
     lane(&c.root, "tooling", "session_tooling");
     pause_entry(&c.root, "tooling", "2026-11-25T23:29Z");
-    journal(
-        &c.root,
-        "2026-11-26T22:16Z",
-        "Coordinator: resumed after quota reset",
-        "paused = false in LIMITS.toml.",
-    );
-    journal(
-        &c.root,
-        "2026-11-26T23:59Z",
-        "Lane tooling: a fix round sent",
-        "",
-    );
-    let (code, lines, text) = act(&c.root);
-    assert_eq!((code, lines.len()), (Some(0), 0), "{text}");
+    journal(&c.root, "2026-11-26T22:16Z", RESUMED, body);
+    c
+}
 
-    journal(
-        &c.root,
-        "2026-11-27T01:06Z",
-        "Owner: a paused lane must not outlive the pause",
-        "The coordinator resumed at 22:16Z (`paused = false` in LIMITS.toml) and the lane waited.",
-    );
-    let (code, lines, text) = act(&c.root);
-    assert_eq!((code, lines.len()), (Some(0), 0), "{text}");
+#[test]
+fn with_the_journal_fallback_a_later_note_recalling_or_planning_the_unpause_reopens_no_lane() {
+    for (title, body) in [
+        (
+            "Owner: a paused lane must not outlive the pause",
+            "The coordinator resumed at 22:16Z (`paused = false` in LIMITS.toml) and the lane waited.",
+        ),
+        (
+            "Coordinator: resumed from handoff after compaction",
+            "The previous coordinator set paused = false in LIMITS.toml at 22:16Z yesterday; LIMITS.toml is unchanged this turn.",
+        ),
+        (
+            "Coordinator: resumed the prep thread",
+            "Do not set paused = false in LIMITS.toml until the next reset.",
+        ),
+        (
+            RESUMED,
+            "The previous coordinator set paused = false in LIMITS.toml at 22:16Z yesterday.",
+        ),
+        (
+            RESUMED,
+            "Do not set `paused = false` in LIMITS.toml until the next reset.",
+        ),
+        (
+            RESUMED,
+            "The previous coordinator set\n`paused = false` in LIMITS.toml.",
+        ),
+    ] {
+        let c = unpaused_in_the_journal("paused = false in LIMITS.toml.");
+        journal(
+            &c.root,
+            "2026-11-26T23:59Z",
+            "Lane tooling: a fix round sent",
+            "",
+        );
+        let (code, lines, text) = act(&c.root);
+        assert_eq!((code, lines.len()), (Some(0), 0), "{text}");
+
+        journal(&c.root, "2026-11-27T01:10Z", title, body);
+        let (code, lines, text) = act(&c.root);
+        assert_eq!((code, lines.len()), (Some(0), 0), "{title}: {body}: {text}");
+    }
+}
+
+#[test]
+fn with_the_journal_fallback_the_record_states_the_assignment_as_a_clause_of_its_own() {
+    for body in [
+        "Owner woke the coordinator by hand. paused = false in LIMITS.toml; hourly backstop re-enabled.",
+        "Resumed from the handoff:\n\n- `paused=false` in LIMITS.toml\n- heartbeat re-armed",
+    ] {
+        let c = unpaused_in_the_journal(body);
+        let (code, lines, text) = act(&c.root);
+        assert_eq!(code, Some(1), "{body}: {text}");
+        assert_eq!(lines.len(), 1, "{body}: {text}");
+        assert_eq!(lines[0]["since"], "2026-11-26T22:16:00Z");
+    }
 }
 
 #[test]

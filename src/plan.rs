@@ -1898,27 +1898,43 @@ fn has_word(text: &str, word: &str) -> bool {
         .any(|token| token.eq_ignore_ascii_case(word))
 }
 
-// The resume record the owner's resume directive prescribes: a `Coordinator: resumed …` entry whose
-// body states `paused = false` in LIMITS.toml. A note recalling or planning the unpause is none.
-fn resume_heading(title: &str) -> bool {
-    title.split_once(':').is_some_and(|(who, what)| {
-        who.trim().eq_ignore_ascii_case("coordinator")
-            && what
-                .split(|c: char| !c.is_alphanumeric())
-                .find(|word| !word.is_empty())
-                .is_some_and(|word| word.eq_ignore_ascii_case("resumed"))
-    })
-}
+// The resume record the owner's resume directive (2026-11-25T23:36Z) prescribes: an entry with this
+// exact title whose body states the assignment as a clause of its own. Any other coordinator
+// restart, and a sentence that recalls or plans the unpause, is none; a line break inside a
+// paragraph ends no clause, so a wrapped recollection stays one sentence.
+const RESUME_TITLE: &str = "Coordinator: resumed after quota reset";
+const ASSIGNMENT: [&str; 5] = ["paused", "=", "false", "in", "limits.toml"];
 
-fn states_unpause(line: &str) -> bool {
-    let line = line.replace('`', "").replace('=', " = ").to_lowercase();
-    let words: Vec<&str> = line
-        .split_whitespace()
-        .map(|word| word.trim_matches(|c: char| "()[],.;:".contains(c)))
-        .collect();
-    words
-        .windows(5)
-        .any(|words| words == ["paused", "=", "false", "in", "limits.toml"])
+fn states_unpause(body: &str) -> bool {
+    let text = body
+        .lines()
+        .map(|line| {
+            let line = line.trim();
+            match line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+                Some(item) => format!("; {item}"),
+                None if line.is_empty() => ";".to_owned(),
+                None => line.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('`', "")
+        .replace('=', " = ")
+        .to_lowercase();
+    let mut clause = Vec::new();
+    for word in text.split_whitespace() {
+        let bare = word.trim_end_matches(['.', ';', '!', '?']);
+        if !bare.is_empty() {
+            clause.push(bare);
+        }
+        if bare.len() < word.len() {
+            if clause == ASSIGNMENT {
+                return true;
+            }
+            clause.clear();
+        }
+    }
+    clause == ASSIGNMENT
 }
 
 fn handoff_paths(line: &str) -> impl Iterator<Item = &str> {
@@ -1945,13 +1961,12 @@ struct LaneRecord {
 struct ResumeRecord {
     at: Timestamp,
     stamp: String,
-    title: String,
 }
 
 enum Reading {
     Other,
     Pause(String),
-    Resume(ResumeRecord, bool),
+    Resume(ResumeRecord, String),
 }
 
 #[derive(Default)]
@@ -1981,7 +1996,10 @@ impl LaneJournal {
                                 .extend(handoff_paths(&line).map(str::to_owned));
                         }
                     }
-                    Reading::Resume(_, stated) => *stated |= states_unpause(&line),
+                    Reading::Resume(_, body) => {
+                        body.push_str(&line);
+                        body.push('\n');
+                    }
                     Reading::Other => {}
                 }
                 continue;
@@ -2003,15 +2021,14 @@ impl LaneJournal {
                     });
                     reading = Reading::Pause(lane.to_owned());
                 }
-            } else if resume_heading(title)
+            } else if title == RESUME_TITLE
                 && let Some(at) = at
             {
                 let record = ResumeRecord {
                     at,
                     stamp: stamp.to_owned(),
-                    title: title.to_owned(),
                 };
-                reading = Reading::Resume(record, false);
+                reading = Reading::Resume(record, String::new());
             }
         }
         journal.close(reading);
@@ -2019,7 +2036,8 @@ impl LaneJournal {
     }
 
     fn close(&mut self, reading: Reading) {
-        if let Reading::Resume(record, true) = reading
+        if let Reading::Resume(record, body) = reading
+            && states_unpause(&body)
             && self
                 .resume
                 .as_ref()
@@ -2074,11 +2092,7 @@ fn lane_paused(root: &Path, inputs: &ActionInputs) -> Vec<Action> {
             };
             (
                 resume.at,
-                format!(
-                    "journal {} `{}`; {why}",
-                    resume.stamp,
-                    resume.title.replace('`', "'")
-                ),
+                format!("journal {} `{RESUME_TITLE}`; {why}", resume.stamp),
             )
         }
     };
