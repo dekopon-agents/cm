@@ -965,6 +965,7 @@ fn rising_counts_request_a_fresh_reader_until_one_is_recorded() {
         assert!(next.ok(), "{:?}", next.violations);
         assert_eq!(next.fields["fresh_readers"][0]["command"], command);
         assert_eq!(next.fields["fresh_readers"][0]["review"], "R2");
+        assert_eq!(next.fields["fresh_readers"][0].get("kind"), None);
         assert!(next.lines.iter().any(|line| line
             == &format!("1. fresh reader {STEP}: independent Opus, high effort — `{command}`")));
     }
@@ -6992,11 +6993,8 @@ fn a_clean_update_that_a_replace_ref_or_graft_disguised_is_waived() {
 }
 
 fn logging_git(s: &Scratch) -> PathBuf {
-    let quote = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', r"'\''"));
-    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
-        .map(|dir| dir.join("git"))
-        .find(|git| git.is_file())
-        .unwrap();
+    let quote = |path: &Path| shell_quoted(path);
+    let git = real_git();
     let log = s.home.join("git.log");
     let bin = s.home.join("bin");
     fs::create_dir_all(&bin).unwrap();
@@ -7113,7 +7111,7 @@ fn every_gate_git_command_ignores_rewritten_history_and_merge_listings_run_isola
         );
     }
     for site in [
-        "init --bare --quiet --template= --object-format=sha1".to_owned(),
+        "init --bare --quiet --template= --shared=0700 --object-format=sha1".to_owned(),
         "merge-tree --write-tree ".to_owned(),
         format!("{listing} --no-show-signature --name-only -z {merge}"),
         format!("{listing} {clean}"),
@@ -7810,19 +7808,27 @@ fn a_fresh_reader_is_due_only_when_a_round_rises_against_rounds_of_its_kind() {
 #[test]
 fn the_fresh_reader_cm_next_asks_for_takes_the_round_that_clears_it() {
     let host = at("2026-11-25T06:00:00Z");
-    let s = Scratch::with(&host, Lane::Codex, true);
-    s.on_main("shared.txt", "main\n");
-    let merge = s.merge_main(Some("feature and main\n"));
-    let one = "F1 | contract | introduced | shared.txt:1 | the resolution drops main's line";
-    let two = "F2 | contract | introduced | shared.txt:1 | the resolution keeps a marker";
-    for (name, findings) in [
-        ("claude-first", &[one][..]),
-        ("claude-second", &[one, two][..]),
-    ] {
-        let report = round_report(&s, name, &merge, findings, "FIX REQUIRED");
-        let recorded = offline_cm(
-            &s,
-            &[
+    for (worktree, gone) in [(true, false), (false, false), (true, true)] {
+        let s = Scratch::with(&host, Lane::Codex, worktree);
+        if gone {
+            let unit = s.c.root.join("01-a/u");
+            let mut state = store::load_unit(&unit).unwrap();
+            state.steps.get_mut("S1").unwrap().worktree =
+                s.home.join("gone").to_str().unwrap().to_owned();
+            commands::write_unit(&unit, &state).unwrap();
+        }
+        let worktree = worktree && !gone;
+        s.on_main("shared.txt", "main\n");
+        let merge = s.merge_main(Some("feature and main\n"));
+        let repo = s.c.repo.to_str().unwrap().to_owned();
+        let one = "F1 | contract | introduced | shared.txt:1 | the resolution drops main's line";
+        let two = "F2 | contract | introduced | shared.txt:1 | the resolution keeps a marker";
+        for (name, findings) in [
+            ("claude-first", &[one][..]),
+            ("claude-second", &[one, two][..]),
+        ] {
+            let report = round_report(&s, name, &merge, findings, "FIX REQUIRED");
+            let mut args = vec![
                 "review",
                 "record",
                 STEP,
@@ -7831,41 +7837,53 @@ fn the_fresh_reader_cm_next_asks_for_takes_the_round_that_clears_it() {
                 "claude",
                 "--kind",
                 "resolution",
-            ],
-        );
-        assert!(recorded.status.success(), "{name}: {recorded:?}");
-    }
-    let next = offline_cm(&s, &["next"]);
-    let out = String::from_utf8_lossy(&next.stdout).into_owned();
-    let line = out
-        .lines()
-        .find(|line| line.contains("fresh reader"))
-        .unwrap_or_else(|| panic!("{out}"));
-    assert!(
-        line.contains(&format!("on the conflict resolution of {merge}")),
-        "{line}"
-    );
-    let command = line.rsplit_once(" — `").unwrap().1.trim_end_matches('`');
-    let report = round_report(&s, "fresh-resolution", &merge, &[], "ACCEPT");
-    let args: Vec<String> = command
-        .split_whitespace()
-        .skip(1)
-        .map(|word| {
-            if word == "'<fresh-review-report>'" {
-                report.clone()
-            } else {
-                word.to_owned()
+            ];
+            if !worktree {
+                args.extend(["--repo", &repo]);
             }
-        })
-        .collect();
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let followed = offline_cm(&s, &args);
-    assert!(followed.status.success(), "{command}: {followed:?}");
-    let next = offline_cm(&s, &["next"]);
-    assert!(
-        !String::from_utf8_lossy(&next.stdout).contains("fresh reader"),
-        "{next:?}"
-    );
+            let recorded = offline_cm(&s, &args);
+            assert!(recorded.status.success(), "{name}: {recorded:?}");
+        }
+        let next = offline_cm(&s, &["next"]);
+        let out = String::from_utf8_lossy(&next.stdout).into_owned();
+        let line = out
+            .lines()
+            .find(|line| line.contains("fresh reader"))
+            .unwrap_or_else(|| panic!("{out}"));
+        assert!(
+            line.contains(&format!("on the conflict resolution of {merge}")),
+            "{line}"
+        );
+        let command = line.rsplit_once(" — `").unwrap().1.trim_end_matches('`');
+        assert_eq!(
+            command.contains(" --repo '<checkout>'"),
+            !worktree,
+            "{command}"
+        );
+        let item = &plan::next_at(&s.c.root, None, None, host.now)
+            .unwrap()
+            .fields["fresh_readers"][0];
+        assert_eq!(item["kind"], "resolution", "{item}");
+        assert_eq!(item["command"], command, "{item}");
+        let report = round_report(&s, "fresh-resolution", &merge, &[], "ACCEPT");
+        let args: Vec<String> = command
+            .split_whitespace()
+            .skip(1)
+            .map(|word| match word {
+                "'<fresh-review-report>'" => report.clone(),
+                "'<checkout>'" => repo.clone(),
+                word => word.to_owned(),
+            })
+            .collect();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let followed = offline_cm(&s, &args);
+        assert!(followed.status.success(), "{command}: {followed:?}");
+        let next = offline_cm(&s, &["next"]);
+        assert!(
+            !String::from_utf8_lossy(&next.stdout).contains("fresh reader"),
+            "{next:?}"
+        );
+    }
 }
 
 #[test]
@@ -8124,10 +8142,24 @@ fn no_git_test_variable_brings_back_a_cache_the_gate_turns_off() {
     }
 }
 
+// Where each scratch repository cm made was initialised, in order.
+fn scratch_inits(log: &Path) -> Vec<PathBuf> {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.splitn(5, '\t').collect();
+            (fields.len() == 5 && fields[4].contains(" init --bare "))
+                .then(|| PathBuf::from(fields[2]))
+        })
+        .collect()
+}
+
 #[test]
 fn the_scratch_repository_finds_a_writable_absolute_home() {
     let host = at("2026-11-25T06:00:00Z");
     let s = Scratch::new(&host);
+    let log = logging_git(&s);
     s.on_main("shared.txt", "main\n");
     let merge = s.merge_main(Some("feature and main\n"));
     fs::create_dir_all(s.home.join("relative-tmp")).unwrap();
@@ -8148,14 +8180,34 @@ fn the_scratch_repository_finds_a_writable_absolute_home() {
     }
     let merged = offline_merge_env(&s, Some(&s.home), &relative, &merge, s.c.repo.as_os_str());
     assert!(merged.status.success(), "relative TMPDIR: {merged:?}");
+    let inits = scratch_inits(&log);
+    assert_eq!(inits.len(), 3, "{inits:?}");
+    for dir in &inits {
+        assert!(dir.starts_with(s.home.join("relative-tmp")), "{inits:?}");
+    }
 
-    let s = Scratch::new(&host);
-    s.on_main("other.txt", "main\n");
-    let clean = s.merge_main(None);
-    let missing = s.home.join("missing");
-    let missing = [("TMPDIR", missing.to_str().unwrap())];
-    let waived = offline_merge_env(&s, None, &missing, &clean, s.c.repo.as_os_str());
-    assert!(waived.status.success(), "missing TMPDIR: {waived:?}");
+    for temp in ["writable", "missing", ""] {
+        let s = Scratch::new(&host);
+        let log = logging_git(&s);
+        s.on_main("other.txt", "main\n");
+        let clean = s.merge_main(None);
+        let (dir, under) = match temp {
+            "writable" => (s.home.join(temp), s.home.join(temp)),
+            "missing" => (s.home.join(temp), PathBuf::from("/tmp")),
+            _ => (PathBuf::new(), PathBuf::from("/tmp")),
+        };
+        if temp == "writable" {
+            fs::create_dir_all(&dir).unwrap();
+        }
+        let env = [("TMPDIR", dir.to_str().unwrap())];
+        let waived = offline_merge_env(&s, Some(&s.home), &env, &clean, s.c.repo.as_os_str());
+        assert!(waived.status.success(), "TMPDIR {temp:?}: {waived:?}");
+        let inits = scratch_inits(&log);
+        assert!(
+            inits.len() == 1 && inits[0].starts_with(&under),
+            "TMPDIR {temp:?}: {inits:?}"
+        );
+    }
 }
 
 fn submodule_history(host: &Fake) -> (Scratch, [String; 3]) {
@@ -8413,6 +8465,435 @@ fn a_gitlink_conflict_stands_on_its_stages_unless_both_parents_set_different_com
             )
         },
     );
+}
+
+fn real_git() -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("git"))
+        .find(|git| git.is_file())
+        .unwrap()
+}
+
+fn shell_quoted(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Fault {
+    TempIsAFile,
+    TempInit,
+    TempAlternates,
+    EveryInit,
+    MergeTree,
+    Listing,
+}
+
+// A `git` first on cm's PATH that fails one step of the scratch repository's setup or use; the
+// scratch repository's commands reach it through PATH and are told apart by their GIT_DIR.
+fn faulty_git(s: &Scratch, temp: &Path, fault: Fault) {
+    let git = shell_quoted(&real_git());
+    let under_temp = format!("{}/cm-gate-*", shell_quoted(temp));
+    let fail = |step: &str| format!("echo 'fatal: injected {step}' >&2; exit 128");
+    let (pattern, action) = match fault {
+        Fault::TempIsAFile => return,
+        Fault::TempInit => (format!("{under_temp}'|init'"), fail("init")),
+        Fault::TempAlternates => (
+            format!("{under_temp}'|init'"),
+            format!("{git} \"$@\" && mkdir \"$GIT_DIR/objects/info/alternates\"; exit $?"),
+        ),
+        Fault::EveryInit => ("*/cm-gate-*'|init'".to_owned(), fail("init")),
+        Fault::MergeTree => ("*/cm-gate-*'|merge-tree'".to_owned(), fail("merge-tree")),
+        Fault::Listing => ("*/cm-gate-*'|show'".to_owned(), fail("show")),
+    };
+    let bin = s.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    support::write_executable(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\ncase \"${{GIT_DIR-}}|$5\" in\n{pattern}) {action} ;;\nesac\nexec {git} \"$@\"\n"
+        ),
+    );
+}
+
+#[test]
+fn each_step_of_the_scratch_repository_fails_its_parent_or_names_the_scratch_repository() {
+    use Fault::*;
+    let host = at("2026-11-25T06:00:00Z");
+    let gate = |fault: Fault| {
+        let s = Scratch::new(&host);
+        let temp = if fault == TempIsAFile {
+            let file = s.home.join("temp-file");
+            fs::write(&file, "not a directory\n").unwrap();
+            file
+        } else {
+            let dir = s.home.join("temp");
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        faulty_git(&s, &temp, fault);
+        (s, temp)
+    };
+    for fault in [
+        TempIsAFile,
+        TempInit,
+        TempAlternates,
+        EveryInit,
+        MergeTree,
+        Listing,
+    ] {
+        let (s, temp) = gate(fault);
+        let env = [("TMPDIR", temp.to_str().unwrap())];
+        let no_scratch = format!(
+            "no scratch repository for reading the merges can be made in {} (fatal: injected init) or /tmp (fatal: injected init); set TMPDIR to a writable directory",
+            temp.display()
+        );
+        let in_scratch = |step: &str, merge: &str| {
+            vec![
+                format!(
+                    "reading {}'s merge in the scratch repository {}/cm-gate-",
+                    &merge[..12],
+                    temp.display()
+                ),
+                format!("failed: fatal: injected {step}"),
+            ]
+        };
+        let refused_with = |out: &std::process::Output, why: &[String]| {
+            assert_eq!(out.status.code(), Some(1), "{fault:?}: {out:?}");
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(!text.contains("cannot read"), "{fault:?}: {text}");
+            for part in why {
+                assert!(text.contains(part.as_str()), "{fault:?}: {part} in {text}");
+            }
+        };
+
+        s.on_main("shared.txt", "main\n");
+        let merge = s.merge_main(Some("feature and main\n"));
+        let at_record_and_walk = match fault {
+            TempIsAFile | TempInit | TempAlternates => None,
+            EveryInit => Some(vec![no_scratch.clone()]),
+            MergeTree => Some(in_scratch("merge-tree", &merge)),
+            Listing => Some(in_scratch("show", &merge)),
+        };
+        match &at_record_and_walk {
+            None => {
+                for reviewer in ["claude", "astra"] {
+                    let recorded =
+                        record_env(&s, None, &env, s.c.repo.as_os_str(), reviewer, &merge);
+                    assert!(
+                        recorded.status.success(),
+                        "{fault:?} {reviewer}: {recorded:?}"
+                    );
+                }
+                let merged = offline_merge_env(&s, None, &env, &merge, s.c.repo.as_os_str());
+                assert!(merged.status.success(), "{fault:?}: {merged:?}");
+            }
+            Some(why) => {
+                let recorded = record_env(&s, None, &env, s.c.repo.as_os_str(), "claude", &merge);
+                refused_with(&recorded, why);
+                hand_written_resolutions(&s, &merge);
+                let walked = offline_merge_env(&s, None, &env, &merge, s.c.repo.as_os_str());
+                refused_with(&walked, why);
+            }
+        }
+
+        let (s, other) = gate(fault);
+        let env = [("TMPDIR", other.to_str().unwrap())];
+        let no_scratch = no_scratch.replace(temp.to_str().unwrap(), other.to_str().unwrap());
+        let in_scratch = |step: &str, merge: &str| {
+            in_scratch(step, merge)
+                .into_iter()
+                .map(|part| part.replace(temp.to_str().unwrap(), other.to_str().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        s.on_main("other.txt", "main\n");
+        let clean = s.merge_main(None);
+        let waived = offline_merge_env(&s, None, &env, &clean, s.c.repo.as_os_str());
+        match fault {
+            TempIsAFile | TempInit | TempAlternates | MergeTree => {
+                assert!(waived.status.success(), "{fault:?}: {waived:?}");
+            }
+            EveryInit => refused_with(&waived, std::slice::from_ref(&no_scratch)),
+            Listing => refused_with(&waived, &in_scratch("show", &clean)),
+        }
+    }
+}
+
+const REDIRECTING: [&str; 9] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_SHALLOW_FILE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_INDEX_FILE",
+    "GIT_TEST_ANYTHING",
+];
+
+// A `git` first on cm's PATH that logs each command with the redirecting variables it was given.
+fn redirect_logging_git(s: &Scratch) -> PathBuf {
+    let log = s.home.join("redirects.log");
+    let bin = s.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    support::write_executable(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\n{{ printf '%s' \"$*\"; for name in {}; do eval \"[ -n \\\"\\${{$name+x}}\\\" ]\" && printf '\\t%s' \"$name\"; done; printf '\\n'; }} >> {}\nexec {} \"$@\"\n",
+            REDIRECTING.join(" "),
+            shell_quoted(&log),
+            shell_quoted(&real_git())
+        ),
+    );
+    log
+}
+
+fn mirror_of(s: &Scratch, name: &str) -> PathBuf {
+    let mirror = s.home.join(name);
+    let cloned = scratch_git(
+        &s.home,
+        &s.home,
+        &[
+            "clone",
+            "-q",
+            "--mirror",
+            s.c.repo.to_str().unwrap(),
+            mirror.to_str().unwrap(),
+        ],
+    );
+    assert!(cloned.status.success(), "{cloned:?}");
+    mirror
+}
+
+#[test]
+fn no_redirecting_variable_reaches_a_checkout_read_of_the_gate() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let log = redirect_logging_git(&s);
+    let mirror = mirror_of(&s, "mirror.git");
+    let objects = mirror.join("objects");
+    let shallow = s.home.join("shallow");
+    fs::write(&shallow, "").unwrap();
+    let index = s.home.join("index");
+    let values = [
+        mirror.to_str().unwrap(),
+        s.c.repo.to_str().unwrap(),
+        mirror.to_str().unwrap(),
+        objects.to_str().unwrap(),
+        objects.to_str().unwrap(),
+        shallow.to_str().unwrap(),
+        "refs/elsewhere/",
+        index.to_str().unwrap(),
+        "1",
+    ];
+    let env: Vec<(&str, &str)> = REDIRECTING.into_iter().zip(values).collect();
+    for reviewer in ["claude", "astra"] {
+        let recorded = record_env(&s, None, &env, s.c.repo.as_os_str(), reviewer, &merge);
+        assert!(recorded.status.success(), "{reviewer}: {recorded:?}");
+    }
+    let merged = offline_merge_env(&s, None, &env, &merge, s.c.repo.as_os_str());
+    assert!(merged.status.success(), "{merged:?}");
+    let reads: Vec<String> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("core.commitGraph=false") && line.contains(" -C "))
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        reads
+            .iter()
+            .any(|read| read.contains("merge-base --is-ancestor")),
+        "{reads:#?}"
+    );
+    for read in &reads {
+        assert!(
+            !read.contains('\t'),
+            "a redirecting variable reached {read}"
+        );
+    }
+}
+
+#[test]
+fn a_shallow_file_common_dir_or_object_directory_in_the_environment_moves_no_read_of_the_gate() {
+    let host = at("2026-11-25T06:00:00Z");
+
+    let s = Scratch::new(&host);
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    let shallow = s.home.join("shallow");
+    fs::write(&shallow, format!("{clean}\n")).unwrap();
+    let env = [("GIT_SHALLOW_FILE", shallow.to_str().unwrap())];
+    let waived = offline_merge_env(&s, None, &env, &clean, s.c.repo.as_os_str());
+    assert!(waived.status.success(), "GIT_SHALLOW_FILE: {waived:?}");
+
+    // Both take objects from the empty repository, so a read that kept either would miss the merge.
+    for name in ["GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"] {
+        let s = Scratch::new(&host);
+        s.on_main("shared.txt", "main\n");
+        let merge = s.merge_main(Some("feature and main\n"));
+        let empty = s.home.join("empty.git");
+        let made = scratch_git(
+            &s.home,
+            &s.home,
+            &["init", "-q", "--bare", empty.to_str().unwrap()],
+        );
+        assert!(made.status.success(), "{made:?}");
+        let value = if name == "GIT_COMMON_DIR" {
+            empty
+        } else {
+            empty.join("objects")
+        };
+        let env = [(name, value.to_str().unwrap())];
+        let recorded = record_env(&s, None, &env, s.c.repo.as_os_str(), "claude", &merge);
+        assert!(recorded.status.success(), "{name}: {recorded:?}");
+    }
+}
+
+#[test]
+fn the_scratch_repository_is_private_and_gone_whatever_the_umask() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    let temp = s.home.join("temp");
+    fs::create_dir_all(&temp).unwrap();
+    let modes = s.home.join("modes");
+    let bin = s.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    support::write_executable(
+        &bin.join("gh"),
+        "#!/bin/sh\necho 'gh: offline' >&2\nexit 1\n",
+    );
+    support::write_executable(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\n[ \"$5\" = init ] && (umask 022; stat -c %a \"$GIT_DIR\" >> {})\nexec {} \"$@\"\n",
+            shell_quoted(&modes),
+            shell_quoted(&real_git())
+        ),
+    );
+    let ci = s.c.write("ci-green.md", "CI green at the head.\n");
+    let merged = Command::new("sh")
+        .arg("-c")
+        .arg("umask 0777; exec \"$0\" \"$@\"")
+        .arg(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&s.c.root)
+        .args(["advance", STEP, "merged", "--sha", &clean, "--repo"])
+        .arg(&s.c.repo)
+        .args(["--head", &clean, "--ci-verified"])
+        .arg(&ci)
+        .env("HOME", &s.home)
+        .env("TMPDIR", &temp)
+        .env("GIT_CONFIG_GLOBAL", s.home.join("gitconfig"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output()
+        .unwrap();
+    let modes = fs::read_to_string(&modes).unwrap();
+    assert!(
+        !modes.is_empty() && modes.lines().all(|mode| mode == "700"),
+        "{modes}"
+    );
+    assert_eq!(fs::read_dir(&temp).unwrap().count(), 0, "{merged:?}");
+    let root = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
+    if root.trim() == "0" {
+        assert!(merged.status.success(), "{merged:?}");
+    } else {
+        assert_eq!(merged.status.code(), Some(1), "{merged:?}");
+        assert!(
+            String::from_utf8_lossy(&merged.stdout).contains(&format!(
+                "no scratch repository for reading the merges can be made in {} (",
+                temp.display()
+            )),
+            "{merged:?}"
+        );
+    }
+}
+
+#[test]
+fn a_killed_gate_leaves_its_scratch_repository_in_tmpdir_and_no_later_gate_removes_it() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    let temp = s.home.join("temp");
+    fs::create_dir_all(&temp).unwrap();
+    let env = [("TMPDIR", temp.to_str().unwrap())];
+    let bin = s.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let git = bin.join("git");
+    support::write_executable(
+        &git,
+        &format!(
+            "#!/bin/sh\ncase \"${{GIT_DIR-}}|$5\" in\n*/cm-gate-*'|show') kill -9 \"$PPID\"; exit 1 ;;\nesac\nexec {} \"$@\"\n",
+            shell_quoted(&real_git())
+        ),
+    );
+    let killed = offline_merge_env(&s, None, &env, &clean, s.c.repo.as_os_str());
+    assert_eq!(killed.status.code(), None, "{killed:?}");
+    let left = || -> Vec<String> {
+        fs::read_dir(&temp)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect()
+    };
+    let leftover = left();
+    assert!(
+        leftover.len() == 1 && leftover[0].starts_with("cm-gate-"),
+        "{leftover:?}"
+    );
+    fs::remove_file(&git).unwrap();
+    let merged = offline_merge_env(&s, None, &env, &clean, s.c.repo.as_os_str());
+    assert!(merged.status.success(), "{merged:?}");
+    assert_eq!(left(), leftover);
+}
+
+#[test]
+fn the_gate_trusts_the_checkout_it_reads() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let ran = s.home.join("driver-ran");
+    fs::write(
+        s.c.repo.join(".git/info/attributes"),
+        "shared.txt merge=marker\n",
+    )
+    .unwrap();
+    s.git(&[
+        "config",
+        "merge.marker.driver",
+        &format!("touch {}; exit 1", shell_quoted(&ran)),
+    ]);
+    let recorded = record_claude_resolution(&s, &merge);
+    assert!(recorded.status.success(), "{recorded:?}");
+    assert!(ran.exists(), "the checkout's merge driver ran");
+
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let honest = s.merge_main(Some("feature and main\n"));
+    let honest_tree = s.git(&["rev-parse", &format!("{honest}^{{tree}}")]);
+    fs::write(s.c.repo.join("evil.txt"), "beyond\n").unwrap();
+    s.git(&["add", "evil.txt"]);
+    s.git(&["commit", "-q", "--amend", "--no-edit"]);
+    let merge = s.head();
+    let refused = record_claude_resolution(&s, &merge);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let tree = s.git(&["rev-parse", &format!("{merge}^{{tree}}")]);
+    let loose = |id: &str| s.c.repo.join(".git/objects").join(&id[..2]).join(&id[2..]);
+    fs::remove_file(loose(&tree)).unwrap();
+    fs::copy(loose(&honest_tree), loose(&tree)).unwrap();
+    let admitted = record_claude_resolution(&s, &merge);
+    assert!(admitted.status.success(), "{admitted:?}");
 }
 
 #[derive(Clone, Copy, Debug)]

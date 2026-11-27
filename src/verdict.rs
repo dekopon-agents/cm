@@ -824,15 +824,7 @@ fn resolution_parent(
             repo.display()
         ));
     }
-    let unreadable = || {
-        CleanUpdateError::Unreadable {
-            commit: merge.clone(),
-            repo: repo.clone(),
-        }
-        .to_string()
-    };
-    let isolated =
-        Isolated::over(&repo).map_err(|why| why.map_or_else(unreadable, |why| why.to_string()))?;
+    let isolated = Isolated::over(&repo, &merge).map_err(|why| why.to_string())?;
     let merged = merge_from_base(&repo, &isolated, &merge, base).map_err(|why| why.to_string())?;
     if merged.clean {
         return Err(format!(
@@ -840,7 +832,9 @@ fn resolution_parent(
             short(&merge)
         ));
     }
-    if let Some(gap) = beyond_resolution(&repo, &isolated, &merge, &merged) {
+    if let Some(gap) =
+        beyond_resolution(&isolated, &merge, &merged).map_err(|why| why.to_string())?
+    {
         return Err(format!(
             "{} is no conflict resolution a resolution review can cover: {gap}; it needs a review of its own",
             short(&merge)
@@ -2108,7 +2102,7 @@ mod gate_git {
         git(false).arg("-C").arg(repo).args(args).output().ok()
     }
 
-    pub(super) fn isolated(dir: &Path, args: &[&str]) -> Option<Output> {
+    pub(super) fn isolated(dir: &Path, args: &[&str]) -> std::io::Result<Output> {
         let home = dir.join("home");
         git(true)
             .env("GIT_DIR", dir)
@@ -2120,7 +2114,6 @@ mod gate_git {
             .current_dir(dir)
             .args(args)
             .output()
-            .ok()
     }
 }
 
@@ -2132,7 +2125,11 @@ struct Isolated {
 }
 
 impl Isolated {
-    fn over(repo: &Path) -> Result<Isolated, Option<CleanUpdateError>> {
+    fn over(repo: &Path, commit: &str) -> Result<Isolated, CleanUpdateError> {
+        let unreadable = || CleanUpdateError::Unreadable {
+            commit: commit.to_owned(),
+            repo: repo.to_path_buf(),
+        };
         let mut objects = git_bytes(
             repo,
             &[
@@ -2142,36 +2139,67 @@ impl Isolated {
                 "objects",
             ],
         )
-        .ok_or(None)?;
+        .ok_or_else(unreadable)?;
         if objects.pop() != Some(b'\n') {
-            return Err(None);
+            return Err(unreadable());
         }
-        let format = git_out(repo, &["rev-parse", "--show-object-format"]).ok_or(None)?;
+        let format =
+            git_out(repo, &["rev-parse", "--show-object-format"]).ok_or_else(unreadable)?;
+        Isolated::under(scratch_parents(), &objects, &format)
+    }
+
+    fn under(
+        parents: Vec<PathBuf>,
+        objects: &[u8],
+        format: &str,
+    ) -> Result<Isolated, CleanUpdateError> {
+        let mut tried = Vec::new();
+        for parent in parents {
+            match Isolated::made_in(&parent, objects, format) {
+                Ok(isolated) => return Ok(isolated),
+                Err(why) => tried.push((parent, why)),
+            }
+        }
+        Err(CleanUpdateError::NoScratch { tried })
+    }
+
+    // A step that fails drops what the earlier ones made, so the parent is left as it was.
+    fn made_in(parent: &Path, objects: &[u8], format: &str) -> Result<Isolated, String> {
         let isolated = Isolated {
-            dir: scratch_dir().map_err(Some)?,
+            dir: scratch_dir_under(parent).map_err(|error| error.to_string())?,
         };
-        let made = isolated
-            .output(&[
-                "init",
-                "--bare",
-                "--quiet",
-                "--template=",
-                &format!("--object-format={format}"),
-            ])
-            .ok_or(None)?;
+        isolated.bytes(&[
+            "init",
+            "--bare",
+            "--quiet",
+            "--template=",
+            "--shared=0700",
+            &format!("--object-format={format}"),
+        ])?;
         let alternates = isolated.dir.join("objects").join("info").join("alternates");
-        (made.status.success() && fs::write(alternates, quoted(&objects)).is_ok())
-            .then_some(isolated)
-            .ok_or(None)
+        fs::write(alternates, quoted(objects)).map_err(|error| error.to_string())?;
+        Ok(isolated)
     }
 
-    fn output(&self, args: &[&str]) -> Option<std::process::Output> {
-        gate_git::isolated(&self.dir, args)
+    fn output(&self, args: &[&str]) -> Result<std::process::Output, String> {
+        gate_git::isolated(&self.dir, args).map_err(|error| format!("git: {error}"))
     }
 
-    fn bytes(&self, args: &[&str]) -> Option<Vec<u8>> {
+    fn bytes(&self, args: &[&str]) -> Result<Vec<u8>, String> {
         let output = self.output(args)?;
-        output.status.success().then_some(output.stdout)
+        if output.status.success() {
+            Ok(output.stdout)
+        } else {
+            Err(failure(&output))
+        }
+    }
+
+    fn failed(&self, commit: &str, why: String) -> CleanUpdateError {
+        CleanUpdateError::Scratch {
+            commit: commit.to_owned(),
+            dir: self.dir.clone(),
+            why,
+        }
     }
 }
 
@@ -2181,45 +2209,67 @@ impl Drop for Isolated {
     }
 }
 
-// git gets the scratch repository's path as GIT_DIR from inside it, so the path must be absolute.
-fn scratch_dir() -> Result<PathBuf, CleanUpdateError> {
-    let temp = std::env::temp_dir();
-    let temp = if temp.is_absolute() {
-        Some(temp)
+fn failure(output: &std::process::Output) -> String {
+    let said: Vec<&str> = std::str::from_utf8(&output.stderr)
+        .unwrap_or("")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if said.is_empty() {
+        format!("git {}", output.status)
     } else {
-        std::env::current_dir().ok().map(|cwd| cwd.join(temp))
-    };
-    scratch_dir_in(temp.into_iter().chain([PathBuf::from("/tmp")]).collect())
+        said.join("; ")
+    }
 }
 
-fn scratch_dir_in(mut parents: Vec<PathBuf>) -> Result<PathBuf, CleanUpdateError> {
+// git gets the scratch repository's path as GIT_DIR from inside it, so the path must be absolute.
+// An empty TMPDIR names no directory.
+fn scratch_parents() -> Vec<PathBuf> {
+    let temp = std::env::var_os("TMPDIR")
+        .filter(|temp| !temp.is_empty())
+        .map(PathBuf::from)
+        .and_then(|temp| {
+            if temp.is_absolute() {
+                Some(temp)
+            } else {
+                std::env::current_dir().ok().map(|cwd| cwd.join(temp))
+            }
+        });
+    let mut parents: Vec<PathBuf> = temp.into_iter().chain([PathBuf::from("/tmp")]).collect();
     parents.dedup();
     parents
-        .iter()
-        .find_map(|parent| scratch_dir_under(parent))
-        .ok_or(CleanUpdateError::NoScratch { tried: parents })
 }
 
-fn scratch_dir_under(temp: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::DirBuilderExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
+static SCRATCH_NAMES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn scratch_dir_under(temp: &Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     for _ in 0..100 {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.subsec_nanos());
         let dir = temp.join(format!(
-            "cm-gate-{}-{}-{stamp}",
+            "cm-gate-{}-{}",
             std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
+            SCRATCH_NAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         match fs::DirBuilder::new().mode(0o700).create(&dir) {
-            Ok(()) => return Some(dir),
+            // The umask narrows the mode create asks for, so it is set again.
+            Ok(()) => {
+                return match fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)) {
+                    Ok(()) => Ok(dir),
+                    Err(error) => {
+                        let _ = fs::remove_dir(&dir);
+                        Err(error)
+                    }
+                };
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(_) => return None,
+            Err(error) => return Err(error),
         }
     }
-    None
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "a hundred names were taken",
+    ))
 }
 
 // git reads a quoted alternates line C-style, so a path holding a newline or a quote survives.
@@ -2240,15 +2290,6 @@ fn quoted(path: &[u8]) -> Vec<u8> {
 enum Reader<'a> {
     Checkout(&'a Path),
     Isolated(&'a Isolated),
-}
-
-impl Reader<'_> {
-    fn bytes(self, args: &[&str]) -> Option<Vec<u8>> {
-        match self {
-            Reader::Checkout(repo) => git_bytes(repo, args),
-            Reader::Isolated(isolated) => isolated.bytes(args),
-        }
-    }
 }
 
 // Only for commands that print object names, which are ASCII hex; paths go through git_bytes.
@@ -2304,8 +2345,15 @@ pub enum CleanUpdateError {
         commit: String,
         gaps: Vec<String>,
     },
+    /// No parent directory took a scratch repository; each with why.
     NoScratch {
-        tried: Vec<PathBuf>,
+        tried: Vec<(PathBuf, String)>,
+    },
+    /// git failed in the scratch repository it was reading `commit` in.
+    Scratch {
+        commit: String,
+        dir: PathBuf,
+        why: String,
     },
 }
 
@@ -2354,9 +2402,15 @@ impl fmt::Display for CleanUpdateError {
                 "no scratch repository for reading the merges can be made in {}; set TMPDIR to a writable directory",
                 tried
                     .iter()
-                    .map(|dir| dir.display().to_string())
+                    .map(|(dir, why)| format!("{} ({why})", dir.display()))
                     .collect::<Vec<_>>()
                     .join(" or ")
+            ),
+            CleanUpdateError::Scratch { commit, dir, why } => write!(
+                f,
+                "reading {}'s merge in the scratch repository {} failed: {why}",
+                short(commit),
+                dir.display()
             ),
         }
     }
@@ -2365,12 +2419,7 @@ impl fmt::Display for CleanUpdateError {
 /// `commit`'s first parent when it is a clean update from the base branch: a merge whose second
 /// parent is on `base` and whose `git show --remerge-diff` is empty (no conflict resolved).
 pub fn clean_update(repo: &Path, commit: &str, base: &str) -> Result<String, CleanUpdateError> {
-    let isolated = Isolated::over(repo).map_err(|why| {
-        why.unwrap_or_else(|| CleanUpdateError::Unreadable {
-            commit: commit.to_owned(),
-            repo: repo.to_path_buf(),
-        })
-    })?;
+    let isolated = Isolated::over(repo, commit)?;
     let merge = merge_from_base(repo, &isolated, commit, base)?;
     if merge.clean {
         Ok(merge.first)
@@ -2416,11 +2465,7 @@ fn merge_from_base(
         remerge_diff(reader, commit, Listing::Waiver).map(|diff| diff.trim_ascii().is_empty())
     };
     // Empty in the checkout, as the waiver always asked, and where no local merge setting reaches.
-    let clean = match empty(Reader::Checkout(repo)) {
-        Some(true) => empty(Reader::Isolated(isolated)).ok_or_else(unreadable)?,
-        Some(false) => false,
-        None => return Err(unreadable()),
-    };
+    let clean = empty(Reader::Checkout(repo))? && empty(Reader::Isolated(isolated))?;
     Ok(Merge {
         first: first.to_owned(),
         second: second.to_owned(),
@@ -2440,7 +2485,11 @@ enum Listing {
 // leave out a signature check's output: in the waiver's patch it still makes a signed merge no
 // clean update under `log.showSignature`, as it always has, because leaving it out there would
 // let the waiver accept more.
-fn remerge_diff(reader: Reader<'_>, commit: &str, listing: Listing) -> Option<Vec<u8>> {
+fn remerge_diff(
+    reader: Reader<'_>,
+    commit: &str,
+    listing: Listing,
+) -> Result<Vec<u8>, CleanUpdateError> {
     let mut args = vec![
         "show",
         "--remerge-diff",
@@ -2456,7 +2505,17 @@ fn remerge_diff(reader: Reader<'_>, commit: &str, listing: Listing) -> Option<Ve
         args.extend(["--no-show-signature", "--name-only", "-z"]);
     }
     args.push(commit);
-    reader.bytes(&args)
+    match reader {
+        Reader::Checkout(repo) => {
+            git_bytes(repo, &args).ok_or_else(|| CleanUpdateError::Unreadable {
+                commit: commit.to_owned(),
+                repo: repo.to_path_buf(),
+            })
+        }
+        Reader::Isolated(isolated) => isolated
+            .bytes(&args)
+            .map_err(|why| isolated.failed(commit, why)),
+    }
 }
 
 // A hex name must be a prefix of the commit it resolves to, so that no ref named like it stands in;
@@ -2544,63 +2603,58 @@ fn beyond<'a, K: Ord + From<&'a [u8]>>(
 }
 
 fn beyond_resolution(
-    repo: &Path,
     isolated: &Isolated,
     commit: &str,
     merge: &Merge,
-) -> Option<String> {
-    let unreadable = || {
-        CleanUpdateError::Unreadable {
-            commit: commit.to_owned(),
-            repo: repo.to_path_buf(),
-        }
-        .to_string()
-    };
-    let merged = isolated.output(&[
-        "merge-tree",
-        "--write-tree",
-        "--no-messages",
-        "-z",
-        &merge.first,
-        &merge.second,
-    ]);
-    let listed = match merged {
-        Some(output) if output.status.code() == Some(1) => output.stdout,
-        Some(output) if output.status.code() == Some(0) => {
-            return Some(
+) -> Result<Option<String>, CleanUpdateError> {
+    let merged = isolated
+        .output(&[
+            "merge-tree",
+            "--write-tree",
+            "--no-messages",
+            "-z",
+            &merge.first,
+            &merge.second,
+        ])
+        .map_err(|why| isolated.failed(commit, why))?;
+    let listed = match merged.status.code() {
+        Some(1) => merged.stdout,
+        Some(0) => {
+            return Ok(Some(
                 "its parents merge without a conflict, so its remerge diff resolves none"
                     .to_owned(),
-            );
+            ));
         }
-        _ => return Some(unreadable()),
+        _ => return Err(isolated.failed(commit, failure(&merged))),
     };
-    let Some(conflicts) = conflicts::<&[u8]>(&listed) else {
-        return Some(unreadable());
-    };
+    let conflicts = conflicts::<&[u8]>(&listed).ok_or_else(|| {
+        isolated.failed(
+            commit,
+            "git merge-tree listed an entry cm cannot read".to_owned(),
+        )
+    })?;
     let submodules: Vec<String> = conflicts
         .iter()
         .filter(|(_, stages)| needs_submodule_history(stages))
         .map(|(path, _)| format!("\"{}\"", path.escape_ascii()))
         .collect();
     if !submodules.is_empty() {
-        return Some(format!(
+        return Ok(Some(format!(
             "its parents set the submodule {} to different commits, which only the submodule's history can merge",
             submodules.join(", ")
-        ));
+        )));
     }
-    let Some(changed) = remerge_diff(Reader::Isolated(isolated), commit, Listing::Paths) else {
-        return Some(unreadable());
-    };
+    let changed = remerge_diff(Reader::Isolated(isolated), commit, Listing::Paths)?;
     let beyond: Vec<String> = beyond(&conflicts, &changed)
         .into_iter()
         .map(|path| format!("\"{}\"", path.escape_ascii()))
         .collect();
-    (!beyond.is_empty()).then(|| {
+    Ok((!beyond.is_empty()).then(|| {
         format!(
             "it changes {} beyond the files its parents conflict in",
             beyond.join(", ")
         )
-    })
+    }))
 }
 
 /// The gate's (a) and (b) for a codex step about to merge at `head`.
@@ -2753,13 +2807,10 @@ fn gate(
         };
         None
     } else {
-        match Isolated::over(repo) {
+        match Isolated::over(repo, &at) {
             Ok(isolated) => Some(isolated),
             Err(no) => {
-                why = no.unwrap_or_else(|| CleanUpdateError::Unreadable {
-                    commit: at.clone(),
-                    repo: repo.to_path_buf(),
-                });
+                why = no;
                 None
             }
         }
@@ -2769,9 +2820,13 @@ fn gate(
             match merge_from_base(repo, &isolated, &at, base) {
                 Ok(merge) if merge.clean => at = merge.first,
                 Ok(merge) if resolution_at(&at) => {
-                    let open = match beyond_resolution(repo, &isolated, &at, &merge) {
-                        Some(gap) => vec![gap],
-                        None => resolution_gaps(&at),
+                    let open = match beyond_resolution(&isolated, &at, &merge) {
+                        Err(reason) => {
+                            why = reason;
+                            break;
+                        }
+                        Ok(Some(gap)) => vec![gap],
+                        Ok(None) => resolution_gaps(&at),
                     };
                     if !open.is_empty() {
                         why = CleanUpdateError::ResolutionGaps {
@@ -2854,21 +2909,55 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let parent = tempfile::tempdir().unwrap();
         let missing = parent.path().join("missing");
-        let dir = scratch_dir_in(vec![missing.clone(), parent.path().to_path_buf()]).unwrap();
-        assert!(dir.starts_with(parent.path()), "{dir:?}");
+        let objects = parent.path().as_os_str().as_encoded_bytes();
+        let isolated = Isolated::under(
+            vec![missing.clone(), parent.path().to_path_buf()],
+            objects,
+            "sha1",
+        )
+        .unwrap();
+        assert!(
+            isolated.dir.starts_with(parent.path()),
+            "{:?}",
+            isolated.dir
+        );
         assert_eq!(
-            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&isolated.dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
-        let refused = scratch_dir_in(vec![missing.clone(), missing.join("deeper")]).unwrap_err();
+        let refused = Isolated::under(
+            vec![missing.clone(), missing.join("deeper")],
+            objects,
+            "sha1",
+        )
+        .err()
+        .unwrap();
         assert_eq!(
             refused.to_string(),
             format!(
-                "no scratch repository for reading the merges can be made in {} or {}; set TMPDIR to a writable directory",
+                "no scratch repository for reading the merges can be made in {} (No such file or directory (os error 2)) or {} (No such file or directory (os error 2)); set TMPDIR to a writable directory",
                 missing.display(),
                 missing.join("deeper").display()
             )
         );
+    }
+
+    #[test]
+    fn a_scratch_directory_name_already_taken_is_passed_over() {
+        let parent = tempfile::tempdir().unwrap();
+        let next = SCRATCH_NAMES.load(std::sync::atomic::Ordering::Relaxed);
+        let taken: Vec<PathBuf> = (next..next + 50)
+            .map(|n| {
+                let dir = parent
+                    .path()
+                    .join(format!("cm-gate-{}-{n}", std::process::id()));
+                fs::create_dir(&dir).unwrap();
+                dir
+            })
+            .collect();
+        let dir = scratch_dir_under(parent.path()).unwrap();
+        assert!(!taken.contains(&dir), "{dir:?}");
+        assert!(dir.starts_with(parent.path()), "{dir:?}");
     }
 
     #[test]

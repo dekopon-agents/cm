@@ -2291,10 +2291,16 @@ pub fn next_with(
                 .map(|part| format!(" --part={}", shell_word(part)))
                 .unwrap_or_default();
             let resolution = review.kind == crate::verdict::ReviewKind::Resolution;
+            // Without a worktree the step records, review record reads the merge only in --repo.
+            let checkout = resolution
+                && step(&units, &review.step).is_none_or(|step| {
+                    step.worktree.is_empty() || !Path::new(&step.worktree).exists()
+                });
             let command = format!(
-                "cm review record {} '<fresh-review-report>' --reviewer fresh-opus{part}{}",
+                "cm review record {} '<fresh-review-report>' --reviewer fresh-opus{part}{}{}",
                 shell_word(&review.step),
-                if resolution { " --kind resolution" } else { "" }
+                if resolution { " --kind resolution" } else { "" },
+                if checkout { " --repo '<checkout>'" } else { "" }
             );
             outcome.line(next_item(
                 &mut number,
