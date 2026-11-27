@@ -650,6 +650,17 @@ enum ReviewAct {
         #[arg(long, value_name = "NAME")]
         part: Option<String>,
     },
+    #[command(
+        about = "Raise this step's 10-pass review cap by 1 to 3 passes, on an owner ruling committed in the campaign"
+    )]
+    CapRaise {
+        #[arg(value_parser = step_target, help = "<NN-name>/<unit>/<step>")]
+        target: Target,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=3), value_name = "N")]
+        by: u32,
+        #[arg(long, value_name = "FILE")]
+        ruling: PathBuf,
+    },
     /// Record what resolved a blocking finding: a commit, or a ruling file in the campaign.
     Resolve {
         /// <NN-name>/<unit>/<step>
@@ -1313,6 +1324,10 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             reviewer.as_deref(),
             part.as_deref(),
         ),
+        Commands::Review {
+            act: Some(ReviewAct::CapRaise { target, by, ruling }),
+            ..
+        } => crate::verdict::cap_raise(host, &root()?, target, *by, &under_root(cli, ruling)),
         Commands::Review {
             act:
                 Some(ReviewAct::Resolve {
