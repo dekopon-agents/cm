@@ -1902,7 +1902,9 @@ fn has_word(text: &str, word: &str) -> bool {
 // exact title whose body states the assignment as a clause of its own. Any other coordinator
 // restart, and a sentence that recalls or plans the unpause, is none; a line break inside a
 // paragraph ends no clause, so a wrapped recollection stays one sentence. A question states nothing
-// and fenced code quotes, so neither is the record.
+// and code quotes (a fence, or a line indented four columns), so neither is the record. The record
+// is read by its form: a clause of that form that plans or restates the unpause still counts, since
+// without history cm cannot tell it from the transition.
 const RESUME_TITLE: &str = "Coordinator: resumed after quota reset";
 const ASSIGNMENT: [&str; 5] = ["paused", "=", "false", "in", "limits.toml"];
 
@@ -1922,23 +1924,38 @@ fn fence_run(line: &str) -> Option<(char, usize)> {
     (len >= 3).then_some((mark, len))
 }
 
+fn indent(line: &str) -> usize {
+    line.chars()
+        .map_while(|c| match c {
+            ' ' => Some(1),
+            '\t' => Some(4),
+            _ => None,
+        })
+        .sum()
+}
+
 // A fence closes only on a run of its own character at least as long as the opener, with nothing
-// after it: a shorter run or one followed by text is fenced content, as CommonMark reads it.
+// after it and indented less than four columns past the opener's line: anything else is fenced
+// content, as CommonMark reads it.
 fn states_unpause(body: &str) -> bool {
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence: Option<(char, usize, usize)> = None;
     let text = body
         .lines()
-        .map(|line| {
-            let line = line.trim();
-            let item = list_item(line);
-            if let Some((mark, open)) = fence {
-                if line.len() >= open && line.chars().all(|c| c == mark) {
+        .map(|raw| {
+            let depth = indent(raw);
+            let line = raw.trim();
+            if let Some((mark, open, at)) = fence {
+                if depth < at + 4 && line.len() >= open && line.chars().all(|c| c == mark) {
                     fence = None;
                 }
                 return ";".to_owned();
             }
-            if let Some(run) = fence_run(item.unwrap_or(line)) {
-                fence = Some(run);
+            if depth >= 4 {
+                return ";".to_owned();
+            }
+            let item = list_item(line);
+            if let Some((mark, open)) = fence_run(item.unwrap_or(line)) {
+                fence = Some((mark, open, depth));
                 return ";".to_owned();
             }
             match item {

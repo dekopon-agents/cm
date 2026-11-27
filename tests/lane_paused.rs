@@ -539,6 +539,22 @@ fn with_the_journal_fallback_a_later_note_recalling_or_planning_the_unpause_reop
         ),
         (
             RESUMED,
+            "~~~~\n~~~\npaused = false in LIMITS.toml.\n~~~\n~~~~",
+        ),
+        (
+            RESUMED,
+            "Yesterday's record, quoted:\n```\n    ```\nResumed.\npaused = false in LIMITS.toml.\n```",
+        ),
+        (
+            RESUMED,
+            "Yesterday's record, quoted:\n\n    Resumed.\n    paused = false in LIMITS.toml.",
+        ),
+        (
+            RESUMED,
+            "Yesterday's record, quoted:\n\n\tResumed.\n\tpaused = false in LIMITS.toml.",
+        ),
+        (
+            RESUMED,
             "Quoted from yesterday:\n+ ```\n  Resumed.\n  paused = false in LIMITS.toml.\n  ```",
         ),
         (
@@ -579,12 +595,33 @@ fn with_the_journal_fallback_the_record_states_the_assignment_as_a_clause_of_its
         "Resumed; ran\n```\ncm next --act\n```\npaused = false in LIMITS.toml.",
         "Resumed; ran\n```\ncm next --act\n`````\npaused = false in LIMITS.toml.",
         "Resumed from the handoff:\n1. `paused = false` in LIMITS.toml\n2) heartbeat re-armed",
+        "Resumed:\n1. ran\n   ```\n   cm next --act\n   ```\n\npaused = false in LIMITS.toml.",
     ] {
         let c = unpaused_in_the_journal(body);
         let (code, lines, text) = act(&c.root);
         assert_eq!(code, Some(1), "{body}: {text}");
         assert_eq!(lines.len(), 1, "{body}: {text}");
         assert_eq!(lines[0]["since"], "2026-11-26T22:16:00Z");
+    }
+}
+
+#[test]
+fn with_the_journal_fallback_a_record_shaped_plan_or_restatement_is_taken_as_the_unpause() {
+    for body in [
+        "Next:\n- paused = false in LIMITS.toml",
+        "Yesterday's record, restated. paused = false in LIMITS.toml.",
+    ] {
+        let c = unpaused_in_the_journal("paused = false in LIMITS.toml.");
+        journal(
+            &c.root,
+            "2026-11-26T23:59Z",
+            "Lane tooling: a fix round sent",
+            "",
+        );
+        journal(&c.root, "2026-11-27T01:10Z", RESUMED, body);
+        let (code, lines, text) = act(&c.root);
+        assert_eq!((code, lines.len()), (Some(1), 1), "{body}: {text}");
+        assert_eq!(lines[0]["since"], "2026-11-27T01:10:00Z", "{body}");
     }
 }
 
