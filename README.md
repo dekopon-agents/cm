@@ -889,10 +889,21 @@ the checkout cannot; in a shallow checkout a merge whose merge base lies past th
 merge there and does not pass. It is made, mode 0700 and its files 0600 whatever the umask, under TMPDIR, taken as
 absolute (an empty TMPDIR names none), else under `/tmp`: a directory where it, its `git init` or
 its alternates file cannot be made is passed over, and with neither the gate refuses, naming both
-and why, and asks for a writable TMPDIR. Once it is made, git failing in it, or printing an
-`error:` or `fatal:` line even when it exits 0, stops the gate with the scratch repository's path
-and git's error. It is removed when the gate is done; a run killed
-mid-gate leaves its `cm-gate-*` directory there, under TMPDIR or `/tmp`, and nothing cleans it up
+and why, and asks for a writable TMPDIR. Every git command in it runs under umask 077 whatever the
+caller's, so nothing git makes there, a remerge diff's temporary object directory included, takes
+the caller's umask. Once it is made, git failing in it, or printing a line that begins `error:` or
+`fatal:` even when it exits 0, stops the gate with the scratch repository's path and git's error;
+git runs there with no locale set, so those prefixes are untranslated, and any other line, such as
+a `warning:` or a `hint:`, stops nothing. In the checkout the remerge diff runs under the caller's
+umask, as it always has, and only its exit status counts. For a non-root user a umask that takes
+the owner's write or search bit (0277, 0377, 0577, 0777) leaves git no temporary object directory
+there: git 2.43 then fails and the gate refuses the merge as unreadable, while git 2.56 prints an
+error and no diff and exits 0, so only the scratch repository's read keeps a resolved conflict from
+passing as a clean update. Under one that takes only the owner's read bit (0477) git leaves its
+`tmp_objdir-remerge-diff-*` directory in the checkout's objects directory, and on a merge that
+resolved a conflict it fails and the gate refuses. The scratch repository is removed when the gate
+is done; a run killed mid-gate leaves its `cm-gate-*` directory under TMPDIR or `/tmp`, and nothing
+cleans it up
 later. Every git command the gate runs ignores replace refs, any `info/grafts` file, the
 commit-graph and the multi-pack-index, including those it reads through alternates, and drops
 from its environment every `GIT_TEST_*` variable (some bring those caches back) and `GIT_DIR`,

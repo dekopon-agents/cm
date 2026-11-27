@@ -2067,10 +2067,15 @@ mod gate_git {
         "GIT_INDEX_FILE",
     ];
 
+    // git makes a remerge diff's temporary object directory with the umask's mode, not the
+    // repository's, so the scratch repository's git runs under 077 whatever the caller's umask.
+    // The script is fixed; git's arguments reach it only as "$@".
+    const UNDER_UMASK_077: &str = "umask 077 && exec git \"$@\"";
+
     fn git(cleared: bool) -> Command {
-        let mut command = Command::new("git");
+        let mut command = Command::new(if cleared { "/bin/sh" } else { "git" });
         if cleared {
-            command.env_clear();
+            command.args(["-c", UNDER_UMASK_077, "git"]).env_clear();
             if let Some(path) = std::env::var_os("PATH") {
                 command.env("PATH", path);
             }
@@ -2268,9 +2273,8 @@ impl Drop for Isolated {
     }
 }
 
-// The umask can leave a directory git made unreadable even to its owner, which `remove_dir_all`
-// cannot list; each one gets its owner's permissions back first. A symlink is removed, not
-// followed.
+// A git first on PATH that sets its own umask can still leave a directory its owner cannot list;
+// each one gets its owner's permissions back first. A symlink is removed, not followed.
 fn remove_tree(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
@@ -3101,6 +3105,26 @@ mod tests {
         let dir = scratch_dir_under(parent.path()).unwrap();
         assert!(!taken.contains(&dir), "{dir:?}");
         assert!(dir.starts_with(parent.path()), "{dir:?}");
+    }
+
+    #[test]
+    fn a_scratch_tree_goes_past_directories_its_owner_cannot_list_and_follows_no_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let outside = parent.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("kept"), "kept\n").unwrap();
+        let tree = parent.path().join("tree");
+        let shut = tree.join("objects").join("shut");
+        fs::create_dir_all(shut.join("deeper")).unwrap();
+        fs::write(shut.join("deeper").join("object"), "object\n").unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("link")).unwrap();
+        for (dir, mode) in [(shut.join("deeper"), 0o300), (shut.clone(), 0o000)] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        remove_tree(&tree);
+        assert!(!tree.exists(), "{tree:?}");
+        assert!(outside.join("kept").is_file());
     }
 
     #[test]

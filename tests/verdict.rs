@@ -6467,6 +6467,17 @@ fn offline_cm_env<A: AsRef<std::ffi::OsStr>>(
     env: &[(&str, &str)],
     args: &[A],
 ) -> std::process::Output {
+    offline_cm_under(s, cwd, env, None, args)
+}
+
+// A umask is set for cm alone, through sh: setting the test process's would reach every test.
+fn offline_cm_under<A: AsRef<std::ffi::OsStr>>(
+    s: &Scratch,
+    cwd: Option<&Path>,
+    env: &[(&str, &str)],
+    umask: Option<&str>,
+    args: &[A],
+) -> std::process::Output {
     let bin = s.home.join("bin");
     let gh = bin.join("gh");
     if !gh.exists() {
@@ -6478,7 +6489,17 @@ fn offline_cm_env<A: AsRef<std::ffi::OsStr>>(
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let mut command = Command::new(env!("CARGO_BIN_EXE_cm"));
+    let mut command = match umask {
+        Some(umask) => {
+            let mut command = Command::new("sh");
+            command
+                .arg("-c")
+                .arg(format!("umask {umask} && exec \"$0\" \"$@\""))
+                .arg(env!("CARGO_BIN_EXE_cm"));
+            command
+        }
+        None => Command::new(env!("CARGO_BIN_EXE_cm")),
+    };
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -6516,13 +6537,25 @@ fn offline_merge_env(
     head: &str,
     repo: &std::ffi::OsStr,
 ) -> std::process::Output {
+    offline_merge_under(s, cwd, env, None, head, repo)
+}
+
+fn offline_merge_under(
+    s: &Scratch,
+    cwd: Option<&Path>,
+    env: &[(&str, &str)],
+    umask: Option<&str>,
+    head: &str,
+    repo: &std::ffi::OsStr,
+) -> std::process::Output {
     use std::ffi::OsStr;
     let ci = s.c.write("ci-green.md", "CI green at the head.\n");
     let sha = s.head();
-    offline_cm_env(
+    offline_cm_under(
         s,
         cwd,
         env,
+        umask,
         &[
             OsStr::new("advance"),
             OsStr::new(STEP),
@@ -8878,6 +8911,7 @@ enum Fault {
     WaiverRead,
     QuietTreeDiff,
     QuietWaiverRead,
+    WarnedWaiverRead,
 }
 
 // A `git` first on cm's PATH that fails one step of the scratch repository's setup or use; the
@@ -8905,6 +8939,12 @@ fn faulty_git(s: &Scratch, temp: &Path, fault: Fault) {
             quiet("fatal", "diff-tree"),
         ),
         Fault::QuietWaiverRead => ("*/cm-gate-*'|show'".to_owned(), quiet("error", "show")),
+        Fault::WarnedWaiverRead => (
+            "*/cm-gate-*'|show'".to_owned(),
+            format!(
+                "echo 'warning: injected show' >&2; echo 'hint: an error: past the start' >&2; exec {git} \"$@\""
+            ),
+        ),
     };
     let bin = s.home.join("bin");
     fs::create_dir_all(&bin).unwrap();
@@ -8946,6 +8986,7 @@ fn each_step_of_the_scratch_repository_fails_its_parent_or_names_the_scratch_rep
         WaiverRead,
         QuietTreeDiff,
         QuietWaiverRead,
+        WarnedWaiverRead,
     ] {
         let (s, temp) = gate(fault);
         let env = [("TMPDIR", temp.to_str().unwrap())];
@@ -8975,7 +9016,8 @@ fn each_step_of_the_scratch_repository_fails_its_parent_or_names_the_scratch_rep
         s.on_main("shared.txt", "main\n");
         let merge = s.merge_main(Some("feature and main\n"));
         let at_record_and_walk = match fault {
-            TempIsAFile | TempInit | TempAlternates | WaiverRead | QuietWaiverRead => None,
+            TempIsAFile | TempInit | TempAlternates | WaiverRead | QuietWaiverRead
+            | WarnedWaiverRead => None,
             EveryInit => Some(vec![no_scratch.clone()]),
             MergeTree => Some(in_scratch("merge-tree", &merge)),
             TreeDiff | QuietTreeDiff => Some(in_scratch("diff-tree", &merge)),
@@ -9018,7 +9060,7 @@ fn each_step_of_the_scratch_repository_fails_its_parent_or_names_the_scratch_rep
         let waived = offline_merge_env(&s, None, &env, &clean, s.c.repo.as_os_str());
         match fault {
             TempIsAFile | TempInit | TempAlternates | MergeTree | TreeDiff | Bases | Trees
-            | QuietTreeDiff => {
+            | QuietTreeDiff | WarnedWaiverRead => {
                 assert!(waived.status.success(), "{fault:?}: {waived:?}");
             }
             EveryInit => refused_with(&waived, std::slice::from_ref(&no_scratch)),
@@ -9164,79 +9206,123 @@ fn a_shallow_file_common_dir_or_object_directory_in_the_environment_moves_no_rea
     }
 }
 
+// A `git` first on cm's PATH that logs the umask each scratch repository command runs under, the
+// scratch repository's mode at its init and its alternates file's mode at each later command. The
+// checkout's reads run under 077, so that the umask under test reaches only cm and the scratch
+// repository.
+fn umask_logging_git(s: &Scratch) -> [PathBuf; 3] {
+    let logs = ["umasks", "modes", "alternates"].map(|log| s.home.join(log));
+    let bin = s.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let [umasks, modes, alternates] = logs.each_ref().map(|log| shell_quoted(log));
+    support::write_executable(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\ncase \"${{GIT_DIR-}}\" in\n*/cm-gate-*)\n  umask >> {umasks}\n  if [ \"$5\" = init ]; then (umask 022; stat -c %a \"$GIT_DIR\" >> {modes})\n  else (umask 022; stat -c %a \"$GIT_DIR/objects/info/alternates\" >> {alternates}); fi ;;\n*) umask 077 ;;\nesac\nexec {} \"$@\"\n",
+            shell_quoted(&real_git())
+        ),
+    );
+    logs
+}
+
 #[test]
 fn the_scratch_repository_and_its_files_are_private_and_gone_whatever_the_umask() {
     let host = at("2026-11-25T06:00:00Z");
-    for umask in ["0777", "0477"] {
-        let s = Scratch::new(&host);
-        s.on_main("other.txt", "main\n");
-        let clean = s.merge_main(None);
-        let temp = s.home.join("temp");
-        fs::create_dir_all(&temp).unwrap();
-        let modes = s.home.join("modes");
-        let bin = s.home.join("bin");
-        fs::create_dir_all(&bin).unwrap();
-        support::write_executable(
-            &bin.join("gh"),
-            "#!/bin/sh\necho 'gh: offline' >&2\nexit 1\n",
-        );
-        support::write_executable(
-            &bin.join("git"),
-            &format!(
-                "#!/bin/sh\n[ \"$5\" = init ] && (umask 022; stat -c %a \"$GIT_DIR\" >> {})\n[ \"$5\" = show ] && (umask 022; stat -c %a \"$GIT_DIR/objects/info/alternates\" >> {})\nexec {} \"$@\"\n",
-                shell_quoted(&modes),
-                shell_quoted(&s.home.join("alternates")),
-                shell_quoted(&real_git())
-            ),
-        );
-        let ci = s.c.write("ci-green.md", "CI green at the head.\n");
-        let merged = Command::new("sh")
-            .arg("-c")
-            .arg(format!("umask {umask}; exec \"$0\" \"$@\""))
-            .arg(env!("CARGO_BIN_EXE_cm"))
-            .arg("-C")
-            .arg(&s.c.root)
-            .args(["advance", STEP, "merged", "--sha", &clean, "--repo"])
-            .arg(&s.c.repo)
-            .args(["--head", &clean, "--ci-verified"])
-            .arg(&ci)
-            .env("HOME", &s.home)
-            .env("TMPDIR", &temp)
-            .env("GIT_CONFIG_GLOBAL", s.home.join("gitconfig"))
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    bin.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
-            .output()
-            .unwrap();
-        let modes = fs::read_to_string(&modes).unwrap();
-        assert!(
-            !modes.is_empty() && modes.lines().all(|mode| mode == "700"),
-            "{modes}"
-        );
-        assert_eq!(fs::read_dir(&temp).unwrap().count(), 0, "{merged:?}");
-        let root =
-            String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
-        if root.trim() == "0" || umask == "0477" {
-            assert!(merged.status.success(), "{umask}: {merged:?}");
-            let alternates = fs::read_to_string(s.home.join("alternates")).unwrap();
-            assert_eq!(alternates.trim(), "600", "{umask}");
-        } else {
-            assert_eq!(merged.status.code(), Some(1), "{merged:?}");
-            assert!(
-                String::from_utf8_lossy(&merged.stdout).contains(&format!(
-                    "no scratch repository for reading the merges can be made in {} (",
-                    temp.display()
-                )),
-                "{merged:?}"
+    for umask in [
+        "0000", "0022", "0077", "0277", "0377", "0477", "0577", "0777",
+    ] {
+        for history in ["clean", "reviewed resolution", "unreviewed resolution"] {
+            let s = Scratch::new(&host);
+            let temp = s.home.join("temp");
+            fs::create_dir_all(&temp).unwrap();
+            let env = [("TMPDIR", temp.to_str().unwrap())];
+            let logs = umask_logging_git(&s);
+            let repo = s.c.repo.as_os_str();
+            let under = Some(umask);
+            let merged = if history == "clean" {
+                s.on_main("other.txt", "main\n");
+                let clean = s.merge_main(None);
+                offline_merge_under(&s, None, &env, under, &clean, repo)
+            } else {
+                s.on_main("shared.txt", "main\n");
+                let merge = s.merge_main(Some("feature and main\n"));
+                if history == "reviewed resolution" {
+                    for reviewer in ["claude", "astra"] {
+                        let recorded = record_env(&s, None, &env, repo, reviewer, &merge);
+                        assert!(
+                            recorded.status.success(),
+                            "{umask} {reviewer}: {recorded:?}"
+                        );
+                    }
+                }
+                offline_merge_under(&s, None, &env, under, &merge, repo)
+            };
+            if history == "unreviewed resolution" {
+                assert_eq!(merged.status.code(), Some(1), "{umask}: {merged:?}");
+                assert!(
+                    String::from_utf8_lossy(&merged.stdout)
+                        .contains("resolved merge conflicts; it needs its own review"),
+                    "{umask}: {merged:?}"
+                );
+            } else {
+                assert!(merged.status.success(), "{umask} {history}: {merged:?}");
+            }
+            let [umasks, modes, alternates] =
+                logs.map(|log| fs::read_to_string(log).unwrap_or_default());
+            // An unreviewed resolution is refused on the checkout's remerge diff, after the init.
+            let read_after_init = history != "unreviewed resolution";
+            for (log, want, ran) in [
+                (&umasks, "0077", true),
+                (&modes, "700", true),
+                (&alternates, "600", read_after_init),
+            ] {
+                assert!(
+                    log.is_empty() != ran && log.lines().all(|line| line == want),
+                    "{umask} {history}: {want} in {log}"
+                );
+            }
+            assert_eq!(
+                fs::read_dir(&temp).unwrap().count(),
+                0,
+                "{umask} {history}: {merged:?}"
             );
         }
     }
+}
+
+// git 2.56, given a umask that leaves it no temporary object directory, prints an error, no remerge
+// diff, and exits 0; a `git` first on cm's PATH does that in the checkout.
+#[test]
+fn a_resolution_whose_checkout_remerge_diff_is_an_error_and_exit_0_is_still_read_in_the_scratch_repository()
+ {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let bin = s.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    support::write_executable(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\ncase \"${{GIT_DIR-}}| $* \" in\n'|'*' --remerge-diff '*) echo 'error: unable to create temporary object directory' >&2; exit 0 ;;\nesac\nexec {} \"$@\"\n",
+            shell_quoted(&real_git())
+        ),
+    );
+    let waived = offline_merge(&s, &merge, &s.c.repo);
+    assert_eq!(waived.status.code(), Some(1), "{waived:?}");
+    assert!(
+        String::from_utf8_lossy(&waived.stdout).contains(&format!(
+            "{} resolved merge conflicts; it needs its own review",
+            &merge[..12]
+        )),
+        "{waived:?}"
+    );
+    for reviewer in ["claude", "astra"] {
+        let recorded = record_env(&s, None, &[], s.c.repo.as_os_str(), reviewer, &merge);
+        assert!(recorded.status.success(), "{reviewer}: {recorded:?}");
+    }
+    let merged = offline_merge(&s, &merge, &s.c.repo);
+    assert!(merged.status.success(), "{merged:?}");
 }
 
 #[test]
