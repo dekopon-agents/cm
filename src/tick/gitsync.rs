@@ -65,7 +65,7 @@ fn push(ctx: &Ctx, report: &mut Report) {
             &["pull", "-q", "--rebase", "--autostash", "origin", "main"],
         ) {
             // A successor's handoff that arrived with this pull retires this session: heartbeat.sh
-            // pushed nothing and said nothing, and the frame's re-check then stops the tick.
+            // pushed nothing and said nothing.
             if !ctx.still_bound() {
                 return;
             }
@@ -158,7 +158,6 @@ mod tests {
         pick: "ok store/epochs/eleemosynary-mnemosyne/handoff/coordinator-1.md\n",
     };
 
-    // The bound check's children, from its branch read to its diff, as the one entry BOUND.
     fn checked(proc: &FakeProc) -> Vec<String> {
         let mut log = Vec::new();
         for call in proc.log() {
@@ -393,8 +392,6 @@ mod tests {
         assert_eq!(proc.pauses(), [Duration::from_secs(2)]);
     }
 
-    // heartbeat.sh's `is_bound || exit 0` after the pull: no push, no abort, no later try and no
-    // line, whatever the tree held.
     #[test]
     fn a_pull_that_retires_the_session_pushes_nothing_and_says_nothing() {
         for pick in [

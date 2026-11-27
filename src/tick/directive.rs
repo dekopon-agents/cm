@@ -15,9 +15,9 @@ const PICKED_UP: &[u8] = "— Directive picked up: ".as_bytes();
 
 const MODULUS: u64 = (1 << 61) - 1;
 
-const BLOCKS: usize = 64;
+const BLOCK: usize = 1 << 12;
 
-const MIN_BLOCK: usize = 1 << 12;
+const PROBES_PER_BYTE: usize = 64;
 
 pub fn run(ctx: &Ctx) -> Report {
     let epoch = ctx.epoch_dir();
@@ -169,19 +169,22 @@ fn stamp_fields(line: &[u8]) -> impl Iterator<Item = &[u8]> {
 
 // A pickup anywhere in the journal counts, as heartbeat.sh's `grep -cF` over the whole file did.
 fn unpicked(journal: impl BufRead, stamp: &[u8]) -> std::io::Result<Option<Vec<String>>> {
-    unpicked_by(journal, stamp, random_base())
+    unpicked_by(journal, stamp, random_base(), PROBES_PER_BYTE)
 }
 
 fn unpicked_by(
     journal: impl BufRead,
     stamp: &[u8],
     base: u64,
+    probes_per_byte: usize,
 ) -> std::io::Result<Option<Vec<String>>> {
     let heading = [b"## ", stamp, b" "].concat();
     let mut below = false;
     let mut directives = Vec::new();
     let mut pickups = Vec::new();
+    let mut read = 0usize;
     each_line(journal, |line| {
+        read = read.saturating_add(line.len() + 1);
         if !below {
             examined(heading.len().min(line.len()));
             below = line.starts_with(&heading);
@@ -195,7 +198,7 @@ fn unpicked_by(
     if !below {
         return Ok(None);
     }
-    let mut index = Pickups::of(&directives, base);
+    let mut index = Pickups::of(&directives, base, read.saturating_mul(probes_per_byte));
     for line in &pickups {
         index.scan(line);
     }
@@ -212,13 +215,17 @@ fn unpicked_by(
 // its length; the text after each pickup is hashed, for each length a heading has, in O(1) from
 // rolling hashes of its line's prefixes, and a heading's bytes are compared only when its hash
 // matches and only until it is picked up. No pickup is walked for as long as it agrees with a
-// heading, so the work is the bytes read plus the pickups times the distinct heading lengths.
+// heading. Pickups times distinct heading lengths can still grow faster than the journal, so
+// the probes stop at PROBES_PER_BYTE per byte read and the headings not found by then are
+// listed: a directive is listed again rather than missed, as heartbeat.sh listed a heading its
+// grep could not take.
 struct Pickups<'a> {
     base: u64,
     ids: HashMap<&'a [u8], usize>,
     headings: Vec<&'a [u8]>,
     picked: Vec<bool>,
     lengths: Vec<Length>,
+    probes: usize,
 }
 
 struct Length {
@@ -228,7 +235,7 @@ struct Length {
 }
 
 impl<'a> Pickups<'a> {
-    fn of(directives: &'a [Vec<u8>], base: u64) -> Self {
+    fn of(directives: &'a [Vec<u8>], base: u64, probes: usize) -> Self {
         let mut ids = HashMap::new();
         let mut headings = Vec::new();
         for directive in directives {
@@ -261,6 +268,7 @@ impl<'a> Pickups<'a> {
             picked: vec![false; headings.len()],
             headings,
             lengths,
+            probes,
         }
     }
 
@@ -269,29 +277,29 @@ impl<'a> Pickups<'a> {
         self.ids.get(directive).is_some_and(|&id| self.picked[id])
     }
 
-    // A line's prefix hashes are made a block at a time, at most 1/64 of the line, and each
-    // pickup whose text would end in the block is checked against each length then, so a line
-    // costs an eighth of its size in hashes rather than eight times it.
+    // A line's prefix hashes are made BLOCK positions at a time, and each pickup whose text would
+    // end in the block is checked against each length then, so a line of any size holds 32 KiB
+    // of hashes, not eight bytes for each of its own.
     fn scan(&mut self, line: &[u8]) {
         let Pickups {
             base,
             headings,
             picked,
             lengths,
+            probes,
             ..
         } = self;
         let starts: Vec<usize> = after_each(line, PICKED_UP)
             .map(|rest| line.len() - rest.len())
             .collect();
         let fits = &lengths[..lengths.partition_point(|length| length.len <= line.len())];
-        let block = (line.len() / BLOCKS).max(MIN_BLOCK);
         let mut next = vec![0; fits.len()];
         let mut at_start = Vec::with_capacity(starts.len());
-        let mut prefix = Vec::with_capacity(block);
+        let mut prefix = Vec::with_capacity(BLOCK);
         let mut hash = 0;
         let mut first = 0;
         while first <= line.len() {
-            let end = (first + block).min(line.len() + 1);
+            let end = (first + BLOCK).min(line.len() + 1);
             prefix.clear();
             for &byte in &line[first..end.min(line.len())] {
                 prefix.push(hash);
@@ -306,9 +314,17 @@ impl<'a> Pickups<'a> {
             }
             for (length, next) in fits.iter().zip(&mut next) {
                 examined(1);
+                let Some(left) = probes.checked_sub(1) else {
+                    return;
+                };
+                *probes = left;
                 while let Some(&start) =
                     starts.get(*next).filter(|&&start| start + length.len < end)
                 {
+                    let Some(left) = probes.checked_sub(1) else {
+                        return;
+                    };
+                    *probes = left;
                     let text = minus(
                         prefix[start + length.len - first],
                         times(at_start[*next], length.power),
@@ -418,8 +434,6 @@ pub(crate) fn examining(body: impl FnOnce()) -> usize {
     EXAMINED.with(std::cell::Cell::get)
 }
 
-// Each input at most `per_byte` times its size, and twice the input never more than 2.25 times
-// the work.
 #[cfg(test)]
 pub(crate) fn grows_with_its_input(shape: &str, sizes: &[usize], work: &[usize], per_byte: usize) {
     for (size, work) in sizes.iter().zip(work) {
@@ -589,6 +603,10 @@ mod tests {
 
     const SIZES: [usize; 3] = [1 << 14, 1 << 15, 1 << 16];
 
+    // The shapes whose probes outgrow their bytes reach PROBES_PER_BYTE only past 10 MB, so the
+    // table holds every shape to one probe per byte, which the others stay under.
+    const SHAPE_PROBES: usize = 1;
+
     fn repeated(unit: &str, size: usize) -> String {
         unit.repeat(size / unit.len() + 1)
     }
@@ -607,7 +625,25 @@ mod tests {
 
     type Shape = (&'static str, fn(usize) -> Vec<u8>);
 
-    const JOURNALS: [Shape; 12] = [
+    fn of_many_lengths(size: usize, under: &str) -> Vec<u8> {
+        let lengths = (size as f64).sqrt() as usize;
+        below_stamp(
+            numbered(lengths, |n| {
+                format!("## 1 — Owner directive: {}\n", "y".repeat(n))
+            }) + &repeated(under, size / 2)
+                + "\n",
+        )
+    }
+
+    const JOURNALS: [Shape; 14] = [
+        (
+            "headings of as many lengths as the journal's square root, over a line of bare markers",
+            |size| of_many_lengths(size, MARKER),
+        ),
+        (
+            "headings of as many lengths, under pickups that each begin like one",
+            |size| of_many_lengths(size, "— Directive picked up: 1 — Owner directive: z "),
+        ),
         (
             "a heading that is its whole line, picked up again and again inside itself",
             |size| {
@@ -721,14 +757,14 @@ mod tests {
                 .iter()
                 .map(|text| {
                     examining(|| {
-                        unpicked_by(text.as_slice(), STAMP.as_bytes(), BASE).unwrap();
+                        unpicked_by(text.as_slice(), STAMP.as_bytes(), BASE, SHAPE_PROBES).unwrap();
                     })
                 })
                 .collect();
             let sizes: Vec<usize> = texts.iter().map(Vec::len).collect();
             grows_with_its_input(shape, &sizes, &work, 16);
             assert_eq!(
-                unpicked_by(texts[0].as_slice(), STAMP.as_bytes(), BASE).unwrap(),
+                unpicked_by(texts[0].as_slice(), STAMP.as_bytes(), BASE, SHAPE_PROBES).unwrap(),
                 grep_f_per_directive(&texts[0], STAMP.as_bytes()),
                 "{shape}"
             );
@@ -766,8 +802,6 @@ mod tests {
         }),
     ];
 
-    // Reading is linear; ordering the distinct stamps, as `sort -u` did, takes up to about
-    // log2 of their number comparisons each, each comparing at most the shorter stamp.
     #[test]
     fn every_handoff_shape_is_read_in_proportion_to_its_bytes_and_sorted_as_sort_u_sorts() {
         for (shape, handoff) in HANDOFFS {
@@ -825,6 +859,27 @@ mod tests {
     }
 
     #[test]
+    fn past_its_probe_budget_the_scan_lists_the_directives_it_has_not_found() {
+        let text = below_stamp(format!(
+            "## 1 — Owner directive: a\n## 1 — Owner directive: b\n{MARKER}1 — Owner directive: a\n"
+        ));
+        let listed = |probes_per_byte| {
+            unpicked_by(text.as_slice(), STAMP.as_bytes(), BASE, probes_per_byte).unwrap()
+        };
+        assert_eq!(
+            listed(PROBES_PER_BYTE),
+            Some(vec!["owner-directive: 1 — Owner directive: b".to_owned()])
+        );
+        assert_eq!(
+            listed(0),
+            Some(vec![
+                "owner-directive: 1 — Owner directive: a".to_owned(),
+                "owner-directive: 1 — Owner directive: b".to_owned()
+            ])
+        );
+    }
+
+    #[test]
     fn a_hash_match_counts_only_when_the_bytes_agree_and_every_heading_with_that_hash_is_tried() {
         let one = "1 — Owner directive: ";
         for (base, first, second) in [(1, "ab", "ba"), (0, "xa", "ya")] {
@@ -832,7 +887,7 @@ mod tests {
                 "## {one}{first}\n## {one}{second}\n{MARKER}{one}{second}\n"
             ));
             assert_eq!(
-                unpicked_by(text.as_slice(), STAMP.as_bytes(), base).unwrap(),
+                unpicked_by(text.as_slice(), STAMP.as_bytes(), base, PROBES_PER_BYTE).unwrap(),
                 Some(vec![format!("owner-directive: {one}{first}")]),
                 "base {base}"
             );
@@ -843,9 +898,8 @@ mod tests {
     fn a_pickup_is_matched_whether_its_text_ends_inside_a_block_on_its_edge_or_at_its_line_s_end() {
         let heading = "1 — Owner directive: h";
         let reach = MARKER.len() + heading.len();
-        for line in [3 * MIN_BLOCK, BLOCKS * MIN_BLOCK + 7 * BLOCKS] {
-            let block = (line / BLOCKS).max(MIN_BLOCK);
-            let edges = [block, 2 * block, line];
+        for line in [3 * BLOCK, 64 * BLOCK + 7] {
+            let edges = [BLOCK, 2 * BLOCK, line];
             for end in edges.into_iter().flat_map(|edge| edge - 5..=edge + 2) {
                 if end > line {
                     continue;
@@ -857,9 +911,9 @@ mod tests {
                     &heading[..heading.len() - 1]
                 ));
                 assert_eq!(
-                    unpicked_by(text.as_slice(), STAMP.as_bytes(), BASE).unwrap(),
+                    unpicked_by(text.as_slice(), STAMP.as_bytes(), BASE, PROBES_PER_BYTE).unwrap(),
                     Some(vec![format!("owner-directive: {heading}z")]),
-                    "a pickup ending at {end} of a {line}-byte line, in blocks of {block}"
+                    "a pickup ending at {end} of a {line}-byte line"
                 );
             }
         }
@@ -942,7 +996,7 @@ mod tests {
             }
             let base = base();
             assert_eq!(
-                unpicked_by(text.as_bytes(), b"1", base).unwrap(),
+                unpicked_by(text.as_bytes(), b"1", base, PROBES_PER_BYTE).unwrap(),
                 grep_f_per_directive(text.as_bytes(), b"1"),
                 "base {base}: {text:?}"
             );

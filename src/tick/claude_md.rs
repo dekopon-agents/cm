@@ -48,7 +48,6 @@ fn boot_time(path: &Path) -> bool {
     File::open(path).is_ok_and(begins_with_boot_time)
 }
 
-// Only a first line's worth is read, however large the file.
 fn begins_with_boot_time(file: impl Read) -> bool {
     let mut first = Vec::new();
     let limit = BOOT_TIME.len() as u64 + 2;

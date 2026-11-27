@@ -503,7 +503,6 @@ fn a_pull_killed_mid_rebase_is_aborted_with_the_tree_as_it_was_and_the_next_try_
     );
 }
 
-// `Ctx::still_bound`'s check, which gitsync runs after each pull that succeeds.
 const STILL_BOUND: [&str; 4] = [
     "git rev-parse --abbrev-ref HEAD",
     "sh tools/cloud-env/handoff-pick.sh store/epochs/eleemosynary-mnemosyne coordinator --lineage session_01abc --max-age-hours 24",
@@ -558,6 +557,91 @@ fn a_pull_that_lands_a_successor_s_handoff_pushes_nothing_and_says_nothing_where
         );
         assert_eq!(scratch.status(), "");
     }
+}
+
+// A handoff-pick.sh that answers each call in turn from `$TICK_FIXTURE/answers`, `ok` past
+// its end, and counts its calls in `$TICK_FIXTURE/picks`; a cm that logs its calls.
+fn picking(answers: &str) -> Scratch {
+    let scratch = Scratch::new();
+    let ct = scratch.ct();
+    write(&scratch.path().join("answers"), answers);
+    write(&scratch.path().join("picks"), "0\n");
+    script(
+        &ct.join("tools/cloud-env/handoff-pick.sh"),
+        &format!(
+            "n=$(($(cat \"$TICK_FIXTURE/picks\") + 1))\necho \"$n\" > \"$TICK_FIXTURE/picks\"\nif [ \"$(sed -n \"${{n}}p\" \"$TICK_FIXTURE/answers\")\" = missing ]; then echo missing; exit 3; fi\necho \"ok $1/handoff/{OURS}\"\n"
+        ),
+    );
+    script(
+        &scratch.path().join("bin/cm"),
+        "echo \"cm $*\" >> \"$TICK_FIXTURE/cm.log\"\necho '{\"actionable\": []}'\n",
+    );
+    write(&ct.join(EPOCH).join("handoff").join(OURS), &handoff(STAMP));
+    let journal = ct.join(EPOCH).join("JOURNAL.md");
+    fs::write(
+        &journal,
+        fs::read_to_string(&journal).unwrap() + "\n" + OPEN,
+    )
+    .unwrap();
+    scratch
+}
+
+impl Scratch {
+    fn tick_with_logging_cm(&self) -> Vec<String> {
+        let cm = self.path().join("bin/cm");
+        let output = self.tick(
+            None,
+            &[
+                OsStr::new("--cm"),
+                cm.as_os_str(),
+                OsStr::new("--checkout"),
+                self.ct().as_os_str(),
+            ],
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        printed(&output.stdout).0
+    }
+
+    fn picks(&self) -> String {
+        fs::read_to_string(self.path().join("picks")).unwrap()
+    }
+}
+
+// The check runs afresh each time, so it can answer unbound after gitsync's pull and bound at
+// the frame's re-check: heartbeat.sh exited at the first answer, the tick goes on with this
+// turn's commit unpushed, and the next turn pushes it.
+#[test]
+fn a_check_that_answers_unbound_after_the_pull_and_bound_at_the_re_check_leaves_the_commit_for_the_next_tick()
+ {
+    let scratch = picking("ok\nmissing\nok\n");
+    assert_eq!(scratch.tick_with_logging_cm(), [LISTED]);
+    assert_eq!(scratch.picks(), "3\n");
+    assert_eq!(scratch.origin_log(), ["start"]);
+    assert_eq!(
+        scratch.git(&scratch.ct(), &["log", "--format=%s", "-1"]),
+        "chore(mnemosyne): heartbeat sync\n"
+    );
+    assert_eq!(
+        fs::read_to_string(scratch.path().join("cm.log")).unwrap(),
+        format!("cm --json next -C {EPOCH} --act\n")
+    );
+    assert_eq!(scratch.tick_with_logging_cm(), [LISTED]);
+    assert_eq!(scratch.picks(), "6\n");
+    assert_eq!(
+        scratch.origin_log(),
+        ["chore(mnemosyne): heartbeat sync", "start"]
+    );
+}
+
+// heartbeat.sh checked twice, before its sync and after the pull, and exited; the tick checks a
+// third time at the frame's re-check before it stops.
+#[test]
+fn a_pull_that_retires_the_session_costs_three_handoff_picks_and_the_tick_says_nothing() {
+    let scratch = picking("ok\nmissing\nmissing\n");
+    assert_eq!(scratch.tick_with_logging_cm(), Vec::<String>::new());
+    assert_eq!(scratch.picks(), "3\n");
+    assert_eq!(scratch.origin_log(), ["start"]);
+    assert!(!scratch.path().join("cm.log").exists());
 }
 
 const RELEASED: &str = "cp \"$TICK_FIXTURE/release.tar.gz\" \"$3\"";
