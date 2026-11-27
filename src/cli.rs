@@ -650,10 +650,11 @@ enum ReviewAct {
         #[arg(long, value_name = "NAME")]
         part: Option<String>,
     },
-    /// Raise this step's 10-pass review cap by 1 to 3 passes, on an owner ruling committed in the campaign.
+    #[command(
+        about = "Raise this step's 10-pass review cap by 1 to 3 passes, on an owner ruling committed in the campaign"
+    )]
     CapRaise {
-        /// <NN-name>/<unit>/<step>
-        #[arg(value_parser = step_target)]
+        #[arg(value_parser = step_target, help = "<NN-name>/<unit>/<step>")]
         target: Target,
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=3), value_name = "N")]
         by: u32,
