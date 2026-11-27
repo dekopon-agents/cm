@@ -1161,26 +1161,20 @@ pub(crate) fn block_refusal(
     Violation::refuse_printed(path, "block-condition", cause, choice(moves))
 }
 
-// A block on a gate clears only once that gate's step or release is declared and is not the
-// blocked step itself, which cannot move while it waits.
-fn blocks_on_a_declared_other(root: &Path, target: &Target, reason: &str) -> bool {
-    let Some(condition) = reason.strip_prefix("until:") else {
-        return true;
-    };
-    let Ok(gate) = plan::block_condition(condition, &target.unit) else {
-        return false;
-    };
-    let Ok(after) = After::parse(&gate, &target.unit) else {
-        return true;
-    };
-    let named = after.target();
-    named != whole(target)
-        && plan::load_units(root).is_ok_and(|units| plan::step(&units, &named).is_some())
+// A block on the blocked step itself never clears: the step cannot move while it waits. A block
+// on a step or release no unit declares is the coordinator's wait idiom and stays accepted.
+fn blocks_on_itself(target: &Target, reason: &str) -> bool {
+    reason
+        .strip_prefix("until:")
+        .and_then(|condition| plan::block_condition(condition, &target.unit).ok())
+        .and_then(|gate| After::parse(&gate, &target.unit).ok())
+        .is_some_and(|after| after.target() == whole(target))
 }
 
 pub struct Asked<'a> {
     pub part: Option<&'a str>,
-    pub evidence: bool,
+    // The evidence flags the caller gave, kept by a suggested move as given.
+    pub given: &'a [Flag],
     pub by: bool,
 }
 
@@ -1211,7 +1205,7 @@ pub fn advance_state(
     text: &str,
 ) -> std::result::Result<Phase, Violation> {
     let message = match text.parse::<Phase>() {
-        Ok(Phase::Blocked(reason)) if !blocks_on_a_declared_other(root, target, &reason) => {
+        Ok(Phase::Blocked(reason)) if blocks_on_itself(target, &reason) => {
             return Err(block_refusal(host, root, target, asked.part, &reason));
         }
         Ok(phase) => return Ok(phase),
@@ -1300,17 +1294,42 @@ pub fn advance_state(
         ));
     }
     let resuming = matches!(track.state, Phase::Blocked(_)) && *track.resting() == to;
-    let needs_file =
-        !resuming && !asked.evidence && evidence_for(&to, finish).0.contains(&Flag::File);
+    let required = match resuming {
+        true => &[][..],
+        false => evidence_for(&to, finish).0,
+    };
     let moves = again(host, Slot::Positional("state"), &to.to_string())
-        .map(|again| match needs_file {
-            true => again.set("--evidence", Input::EvidenceFile),
-            false => again,
+        .map(|again| {
+            required
+                .iter()
+                .filter(|flag| !asked.given.contains(flag))
+                .fold(again, |again, flag| {
+                    again.set(flag.name(), evidence_value(*flag, &to, track))
+                })
         })
         .map(|again| (format!("to move {path} to {to}"), again))
         .into_iter()
         .collect();
     Err(refuse_moves(path, "advance-refused", cause, moves))
+}
+
+// What a suggested state's required evidence flag takes: the value cm recorded where it is the
+// one the move needs, else an input only the caller has.
+fn evidence_value(flag: Flag, to: &Phase, track: &Track) -> outcome::Arg {
+    let recorded = match (flag, to) {
+        (Flag::Pr, _) => track.evidence.pr.as_deref(),
+        // A rollout deploys the merge it recorded; the merge itself is a new revision.
+        (Flag::Sha, Phase::Deployed) => track.evidence.sha.as_deref(),
+        _ => None,
+    };
+    match (recorded, flag) {
+        (Some(value), _) => value.into(),
+        (None, Flag::Sha) => Input::Revision.into(),
+        (None, Flag::Pr) => Input::Pr.into(),
+        (None, Flag::Tag) => Input::Tag.into(),
+        (None, Flag::Digest) => Input::Digest.into(),
+        (None, Flag::File) => Input::EvidenceFile.into(),
+    }
 }
 
 pub(crate) struct Gate<'a> {

@@ -15,7 +15,7 @@ use crate::host::{Host, Invoked};
 use crate::idea::{self, Maturity, Word};
 use crate::lint;
 use crate::outcome::{Arg, Input, Move, Next, Outcome, Violation};
-use crate::state::{Evidence, LANES, Lane, Phase, Work};
+use crate::state::{Evidence, Flag, LANES, Lane, Phase, Work};
 use crate::store::{self, Target, parse_target};
 use crate::tick::proc::FileSizeLimit;
 
@@ -1205,9 +1205,19 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
         } => {
             let root = root()?;
             let target = any_target(host, &root, target)?;
+            let given: Vec<Flag> = [
+                (Flag::Sha, sha.is_some()),
+                (Flag::Pr, pr.is_some()),
+                (Flag::Tag, tag.is_some()),
+                (Flag::Digest, digest.is_some()),
+                (Flag::File, file.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(flag, given)| given.then_some(flag))
+            .collect();
             let asked = commands::Asked {
                 part: part.as_deref(),
-                evidence: file.is_some(),
+                given: &given,
                 by: !by.is_empty(),
             };
             let state =
@@ -1670,7 +1680,7 @@ fn roles(argv: &[String]) -> Vec<Role> {
     command.build();
     let mut roles = vec![Role::Program];
     let (mut slot, mut found, mut ended) = (0, false, false);
-    let mut words = argv.iter().skip(1);
+    let mut words = argv.iter().skip(1).peekable();
     while let Some(word) = words.next() {
         let option = |test: &dyn Fn(&clap::Arg) -> bool| {
             command
@@ -1733,8 +1743,11 @@ fn roles(argv: &[String]) -> Vec<Role> {
             _ => None,
         };
         roles.push(role);
+        // As clap reads it: a word that begins with `-`, other than `-` alone, is never a value.
         if let Some(id) = value
-            && words.next().is_some()
+            && words
+                .next_if(|next| !next.starts_with('-') || *next == "-")
+                .is_some()
         {
             roles.push(Role::Value(id));
         }
@@ -1768,13 +1781,24 @@ pub(crate) enum Slot<'a> {
     Option(&'a str, usize),
 }
 
-fn option_at(roles: &[Role], id: &str, nth: usize) -> Option<(usize, bool)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    Inline,
+    Next,
+    Missing,
+}
+
+// Where the nth occurrence of an option is and how it holds its value.
+fn option_at(roles: &[Role], id: &str, nth: usize) -> Option<(usize, Held)> {
     roles
         .iter()
         .enumerate()
         .filter_map(|(at, role)| match role {
-            Role::Flag(flag) if flag == id => Some((at, false)),
-            Role::Inline(flag) if flag == id => Some((at, true)),
+            Role::Flag(flag) if flag == id => Some(match roles.get(at + 1) {
+                Some(Role::Value(value)) if value == id => (at, Held::Next),
+                _ => (at, Held::Missing),
+            }),
+            Role::Inline(flag) if flag == id => Some((at, Held::Inline)),
             _ => None,
         })
         .nth(nth)
@@ -1796,15 +1820,20 @@ pub(crate) fn replaced(argv: &[String], slot: Slot, to: &str) -> Option<Vec<Stri
             argv[at] = to.to_owned();
         }
         Slot::Option(id, nth) => {
-            let (at, inline) = option_at(&roles, id, nth)?;
-            if inline {
-                let (flag, _) = argv[at].split_once('=')?;
-                argv[at] = format!("{flag}={to}");
-            } else if to.starts_with('-') {
-                argv[at] = format!("{}={to}", argv[at]);
-                argv.remove(at + 1);
-            } else {
-                *argv.get_mut(at + 1)? = to.to_owned();
+            let (at, held) = option_at(&roles, id, nth)?;
+            match held {
+                Held::Inline => {
+                    let (flag, _) = argv[at].split_once('=')?;
+                    argv[at] = format!("{flag}={to}");
+                }
+                _ if to.starts_with('-') => {
+                    argv[at] = format!("{}={to}", argv[at]);
+                    if held == Held::Next {
+                        argv.remove(at + 1);
+                    }
+                }
+                Held::Next => argv[at + 1] = to.to_owned(),
+                Held::Missing => argv.insert(at + 1, to.to_owned()),
             }
         }
     }
@@ -1812,9 +1841,9 @@ pub(crate) fn replaced(argv: &[String], slot: Slot, to: &str) -> Option<Vec<Stri
 }
 
 pub(crate) fn dropped(argv: &[String], id: &str, nth: usize) -> Option<Vec<String>> {
-    let (at, inline) = option_at(&roles(argv), id, nth)?;
+    let (at, held) = option_at(&roles(argv), id, nth)?;
     let mut argv = argv.to_vec();
-    argv.drain(at..if inline { at + 1 } else { at + 2 });
+    argv.drain(at..if held == Held::Next { at + 2 } else { at + 1 });
     Some(argv)
 }
 
@@ -2203,6 +2232,71 @@ mod tests {
             replaced(&words, Slot::Positional("target"), "01-a/u/t").unwrap(),
             argv(&["cm", "amend", "01-a/u/t", "--after", "g", "--after=g"])
         );
+    }
+
+    fn paths(
+        command: &clap::Command,
+        at: Vec<String>,
+        all: &mut Vec<(Vec<String>, clap::Command)>,
+    ) {
+        all.push((at.clone(), command.clone()));
+        for sub in command.get_subcommands() {
+            let mut next = at.clone();
+            next.push(sub.get_name().to_owned());
+            paths(sub, next, all);
+        }
+    }
+
+    #[test]
+    fn a_value_option_followed_by_a_flag_holds_no_value_at_every_option_of_every_verb() {
+        let mut command = Cli::command();
+        command.build();
+        let mut all = Vec::new();
+        paths(&command, Vec::new(), &mut all);
+        let mut checked = 0;
+        for (path, at) in all {
+            for arg in at.get_arguments() {
+                if arg.is_positional() || !arg.get_action().takes_values() {
+                    continue;
+                }
+                let flag = match (arg.get_long(), arg.get_short()) {
+                    (Some(long), _) => format!("--{long}"),
+                    (None, Some(short)) => format!("-{short}"),
+                    (None, None) => continue,
+                };
+                let id = arg.get_id().to_string();
+                let mut words = vec!["cm".to_owned()];
+                words.extend(path.iter().cloned());
+                words.extend([flag.clone(), "--json".to_owned()]);
+                let read = roles(&words);
+                assert!(
+                    read.contains(&Role::Switch("json".to_owned())),
+                    "{words:?}: {read:?}"
+                );
+                assert!(!read.contains(&Role::Value(id.clone())), "{words:?}");
+                let lossy: Vec<OsString> = words.iter().map(OsString::from).collect();
+                assert_eq!(verbs(&lossy), path, "{words:?}");
+                assert_eq!(
+                    replaced(&words, Slot::Option(&id, 0), "v").unwrap(),
+                    [
+                        &words[..words.len() - 1],
+                        &["v".to_owned(), "--json".to_owned()]
+                    ]
+                    .concat(),
+                    "{words:?}"
+                );
+                assert_eq!(
+                    dropped(&words, &id, 0).unwrap(),
+                    [&words[..words.len() - 2], &["--json".to_owned()]].concat(),
+                    "{words:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 50, "{checked}");
+        let lone = argv(&["cm", "journal", "t", "--body-file", "-", "--json"]);
+        assert!(roles(&lone).contains(&Role::Value("body_file".to_owned())));
+        assert!(roles(&lone).contains(&Role::Switch("json".to_owned())));
     }
 
     #[test]

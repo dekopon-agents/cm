@@ -861,7 +861,9 @@ fn a_bad_state_word_names_the_legal_next_state_as_a_full_command() {
             STEP,
             "pr-open",
             "--pr",
-            "https://github.com/o/r/pull/1"
+            "https://github.com/o/r/pull/1",
+            "--sha",
+            "<revision>"
         ])]
     );
 
@@ -1141,7 +1143,16 @@ fn a_repair_edits_the_argument_it_names_whatever_text_the_other_arguments_hold()
     let advance = json(&cm(root, &["--json", "advance", STEP, "advance"]));
     assert_eq!(
         argvs(&advance),
-        [serde_json::json!(["cm", "advance", STEP, "pr-open"])]
+        [serde_json::json!([
+            "cm",
+            "advance",
+            STEP,
+            "pr-open",
+            "--pr",
+            "<pr>",
+            "--sha",
+            "<revision>"
+        ])]
     );
     let lane = json(&cm(root, &["--json", "next", "--lane", "next"]));
     assert_eq!(
@@ -1610,48 +1621,70 @@ fn no_repair_offers_a_step_a_gate_or_block_on_itself_nor_reads_another_condition
 }
 
 #[test]
-fn a_block_on_a_step_that_is_not_declared_is_refused_with_the_nearest_and_the_owner_moves() {
+fn a_block_on_an_undeclared_step_or_release_is_written_as_at_base_and_only_a_self_block_is_refused()
+{
+    // Base 60be060 exits 0 on each of these and writes the state on the right; the live epoch
+    // writes the descriptive form to wait.
+    let unit = "09-daemon/chart-termination";
+    for (state, written) in [
+        ("blocked:until:prbe", format!("blocked:until:{unit}/prbe")),
+        (
+            "blocked:until:pr-open:prbe",
+            format!("blocked:until:pr-open:{unit}/prbe"),
+        ),
+        (
+            "blocked:until:owner-queue",
+            format!("blocked:until:{unit}/owner-queue"),
+        ),
+        (
+            "blocked:until:09-daemon/chart-termination/astra-r2-collect-at-abc1234",
+            format!("blocked:until:{unit}/astra-r2-collect-at-abc1234"),
+        ),
+        (
+            "blocked:until:10-state/durable-deploy/mac-lane-39-done",
+            "blocked:until:10-state/durable-deploy/mac-lane-39-done".to_owned(),
+        ),
+        (
+            "blocked:until:tag:dekopon@0.100.0",
+            "blocked:until:tag:dekopon@0.100.0".to_owned(),
+        ),
+        (
+            "blocked:until:deployed:dekopon@0.100.0",
+            "blocked:until:deployed:dekopon@0.100.0".to_owned(),
+        ),
+    ] {
+        let temp = chart_campaign();
+        let root = temp.path();
+        let out = cm(root, &["--json", "advance", STEP, state]);
+        assert_eq!(out.status.code(), Some(0), "{state}: {out:?}");
+        let state_now = cm::store::load_unit(&root.join(unit)).unwrap().steps["build"]
+            .track
+            .state
+            .to_string();
+        assert_eq!(state_now, written, "{state}");
+    }
     let temp = chart_campaign();
     let root = temp.path();
     let before = files(root);
-    let probe = "09-daemon/chart-termination/probe";
     for state in [
-        "blocked:until:prbe",
-        "blocked:until:pr-open:prbe",
-        "blocked:until:owner-queue",
+        "blocked:until:build",
+        "blocked:until:pr-open:build",
+        "blocked:until:09-daemon/chart-termination/build",
     ] {
         let refused = cm(root, &["--json", "advance", STEP, state]);
         assert_eq!(refused.status.code(), Some(1), "{state}: {refused:?}");
         let report = json(&refused);
-        assert_eq!(
-            report["violations"][0]["rule"], "block-condition",
-            "{state}"
-        );
+        assert_eq!(report["violations"][0]["rule"], "block-condition");
         assert!(
             report["violations"][0]["message"]
                 .as_str()
                 .unwrap()
-                .ends_with("which is not declared"),
+                .ends_with("cannot move on while it waits on itself"),
             "{report}"
         );
         assert_eq!(argvs(&report).last().unwrap(), &add_block(), "{state}");
     }
-    let near = json(&cm(
-        root,
-        &["--json", "advance", STEP, "blocked:until:pr-open:prbe"],
-    ));
-    assert_eq!(
-        argvs(&near)[0],
-        serde_json::json!([
-            "cm",
-            "advance",
-            STEP,
-            format!("blocked:until:pr-open:{probe}")
-        ])
-    );
     assert_eq!(files(root), before);
-    let blocked = cm(root, &["advance", STEP, &format!("blocked:until:{probe}")]);
-    assert!(blocked.status.success(), "{blocked:?}");
 }
 
 #[test]
@@ -1693,4 +1726,180 @@ fn amend_and_unblock_name_the_nearest_declared_step_and_keep_the_refused_path() 
         &["--json", "advance", typo, "pr-open", "--part", "api"],
     ));
     assert_eq!(part["violations"][0]["path"], format!("{typo}#api"));
+}
+
+#[test]
+fn a_value_option_right_before_json_prints_one_usage_object() {
+    let temp = chart_campaign();
+    let root = temp.path();
+    for argv in [
+        vec!["advance", STEP, "pr-open", "--part", "--json"],
+        vec!["advance", STEP, "pr-open", "--sha", "--json"],
+        vec!["advance", STEP, "merged", "--evidence", "--json"],
+        vec!["owner-queue", "strike", "3", "--reason", "--json"],
+        vec!["journal", "t", "--body-file", "--json"],
+        vec!["init", "09-daemon/chart-termination/x", "--lane", "--json"],
+        vec!["-C", "--json", "next"],
+    ] {
+        let out = cm(root, &argv);
+        assert_eq!(out.status.code(), Some(2), "{argv:?}: {out:?}");
+        let text = String::from_utf8(out.stdout.clone()).unwrap();
+        assert_eq!(text.trim().lines().count(), 1, "{argv:?}: {text}");
+        let report = json(&out);
+        assert_eq!(report["violations"][0]["rule"], "usage", "{argv:?}");
+        let verb = argv.iter().find(|word| !word.starts_with('-')).unwrap();
+        let path = report["violations"][0]["path"].as_str().unwrap();
+        assert!(
+            argv[0] == "-C" || path.starts_with(&format!("cm {verb}")),
+            "{argv:?}: {path}"
+        );
+    }
+}
+
+#[test]
+fn each_suggested_state_names_the_evidence_its_advance_requires() {
+    use cm::state::Phase;
+    let temp = chart_campaign();
+    let root = temp.path();
+    let rollout = "09-daemon/chart-termination/roll";
+    let declared = cm(
+        root,
+        &["init", rollout, "--lane", "codex", "--kind", "rollout"],
+    );
+    assert!(declared.status.success(), "{declared:?}");
+    fs::write(root.join("ev.md"), "Synced.\n").unwrap();
+    let pr = "https://github.com/dekopon-agents/cm/pull/1";
+    let samples = [
+        ("<pr>", pr),
+        ("<revision>", "abcdef1234567"),
+        ("<tag>", "v1.0.0"),
+        (
+            "<digest>",
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        ),
+        ("<evidence-file>", "ev.md"),
+    ];
+    let at = |step: &str, phase: Phase, sha: Option<&str>| {
+        set_state(root, step, |each| {
+            each.track.state = phase;
+            each.track.evidence.pr = sha.map(|_| pr.to_owned());
+            each.track.evidence.sha = sha.map(str::to_owned);
+        })
+    };
+    type Case<'a> = (
+        &'a str,
+        Phase,
+        Option<&'a str>,
+        &'a [&'a str],
+        &'a [&'a str],
+        &'a [&'a str],
+    );
+    let cases: [Case; 7] = [
+        (
+            STEP,
+            Phase::Launched,
+            None,
+            &["pr-opn"],
+            &["pr-open", "--pr", "<pr>", "--sha", "<revision>"],
+            &["pr", "revision"],
+        ),
+        (
+            STEP,
+            Phase::Launched,
+            None,
+            &["mergd"],
+            &["pr-open", "--pr", "<pr>", "--sha", "<revision>"],
+            &["pr", "revision"],
+        ),
+        (
+            STEP,
+            Phase::Launched,
+            None,
+            &["pr-opn", "--pr", pr],
+            &["pr-open", "--pr", pr, "--sha", "<revision>"],
+            &["revision"],
+        ),
+        (
+            STEP,
+            Phase::PrOpen,
+            Some("abcdef1234567"),
+            &["mergd"],
+            &["merged", "--sha", "<revision>"],
+            &["revision"],
+        ),
+        (
+            STEP,
+            Phase::Merged,
+            Some("abcdef1234567"),
+            &["relased"],
+            &["released", "--tag", "<tag>"],
+            &["tag"],
+        ),
+        (
+            STEP,
+            Phase::Released,
+            Some("abcdef1234567"),
+            &["deplyed"],
+            &["deployed", "--digest", "<digest>"],
+            &["digest"],
+        ),
+        (
+            "roll",
+            Phase::Merged,
+            Some("abcdef1234567"),
+            &["deplyed"],
+            &[
+                "deployed",
+                "--sha",
+                "abcdef1234567",
+                "--evidence",
+                "<evidence-file>",
+            ],
+            &["evidence-file"],
+        ),
+    ];
+    for (name, phase, sha, typed, suggested, inputs) in cases {
+        let step = if name == STEP {
+            STEP.to_owned()
+        } else {
+            format!("09-daemon/chart-termination/{name}")
+        };
+        at(if name == STEP { "build" } else { name }, phase, sha);
+        let mut argv = vec!["--json", "advance", &step];
+        argv.extend(typed);
+        let report = json(&cm(root, &argv));
+        assert_eq!(
+            report["violations"][0]["rule"], "advance-refused",
+            "{typed:?}: {report}"
+        );
+        let mut wanted = vec!["cm", "advance", &step];
+        wanted.extend(suggested);
+        assert_eq!(
+            argvs(&report),
+            [serde_json::json!(wanted)],
+            "{typed:?}: {report}"
+        );
+        assert_eq!(
+            report["violations"][0]["next"][0]["inputs"],
+            serde_json::json!(inputs),
+            "{typed:?}"
+        );
+        let filled: Vec<Value> = wanted
+            .iter()
+            .map(|word| {
+                let sample = samples.iter().find(|(input, _)| input == word);
+                Value::from(sample.map_or(*word, |(_, value)| *value))
+            })
+            .collect();
+        let mut run = vec![Value::from("cm"), Value::from("--json")];
+        run.extend(filled[1..].iter().cloned());
+        let ran = run_argv(root, &Value::Array(run));
+        let ran = json(&ran);
+        assert!(
+            ran["violations"]
+                .as_array()
+                .is_none_or(|all| all.iter().all(|each| each["rule"] != "evidence-missing")),
+            "{typed:?}: {ran}"
+        );
+    }
 }

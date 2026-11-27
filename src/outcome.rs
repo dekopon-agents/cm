@@ -41,8 +41,9 @@ pub enum Arg {
     Input(Input),
 }
 
-// No variant may name a value cm can read itself (a step, unit, item number, claim, head, PR,
-// tag or path): those are written in as `Arg::Lit`.
+// No variant may name a value cm can read itself (a step, unit, item number, claim, head, path,
+// or a PR or tag it recorded): those are written in as `Arg::Lit`. `Pr`, `Tag` and `Digest` are
+// the evidence a caller brings to a state cm has not seen yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Input {
     Title,
@@ -60,9 +61,12 @@ pub enum Input {
     Signal,
     Deadline,
     Revision,
+    Pr,
+    Tag,
+    Digest,
 }
 
-pub const INPUTS: [Input; 15] = [
+pub const INPUTS: [Input; 18] = [
     Input::Title,
     Input::Reason,
     Input::Context,
@@ -78,6 +82,9 @@ pub const INPUTS: [Input; 15] = [
     Input::Signal,
     Input::Deadline,
     Input::Revision,
+    Input::Pr,
+    Input::Tag,
+    Input::Digest,
 ];
 
 impl Input {
@@ -98,6 +105,9 @@ impl Input {
             Input::Signal => "signal",
             Input::Deadline => "deadline",
             Input::Revision => "revision",
+            Input::Pr => "pr",
+            Input::Tag => "tag",
+            Input::Digest => "digest",
         }
     }
 
@@ -123,6 +133,11 @@ impl Input {
             Input::Signal => "a signal",
             Input::Deadline => "2026-01-01T00:00Z",
             Input::Revision => "0000000",
+            Input::Pr => "https://github.com/owner/repo/pull/1",
+            Input::Tag => "v0.0.0",
+            Input::Digest => {
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            }
         }
     }
 }
@@ -193,7 +208,8 @@ impl Move {
         Move::new(argv.into_iter().map(Arg::Lit).collect())
     }
 
-    pub fn set(mut self, flag: &str, input: Input) -> Self {
+    pub fn set(mut self, flag: &str, value: impl Into<Arg>) -> Self {
+        let value = value.into();
         let inline = format!("{flag}=");
         let end = self
             .argv
@@ -207,17 +223,17 @@ impl Move {
         match at {
             Some(at) if matches!(&self.argv[at], Arg::Lit(text) if text == flag) => {
                 if at + 1 < end {
-                    self.argv[at + 1] = Arg::Input(input);
+                    self.argv[at + 1] = value;
                 } else {
-                    self.argv.insert(at + 1, Arg::Input(input));
+                    self.argv.insert(at + 1, value.clone());
                 }
             }
             Some(at) => {
                 self.argv[at] = Arg::Lit(flag.to_owned());
-                self.argv.insert(at + 1, Arg::Input(input));
+                self.argv.insert(at + 1, value.clone());
             }
             None => {
-                self.argv.insert(end, Arg::Input(input));
+                self.argv.insert(end, value);
                 self.argv.insert(end, Arg::Lit(flag.to_owned()));
             }
         }
