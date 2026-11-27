@@ -2024,7 +2024,6 @@ pub struct MergeGate<'a> {
 }
 
 impl MergeGate<'_> {
-    /// The gate flags given, by name and clap id.
     pub fn flags(&self) -> Vec<(&'static str, &'static str)> {
         [
             (self.head.is_some(), "--head", "head"),
@@ -2059,7 +2058,6 @@ fn resumes(to: &Phase, track: &Track) -> bool {
     matches!(track.state, Phase::Blocked(_)) && track.resting() == to
 }
 
-/// Whether a move to `to` runs the merge gate, the only move that takes the gate flags.
 fn gate_applies(
     to: &Phase,
     track: &Track,

@@ -341,7 +341,7 @@ impl Next {
     }
 }
 
-const UNPRINTABLE: &str = "; no next move is printed: the campaign path is not UTF-8";
+const UNPRINTABLE: &str = "; no next move is printed: a path it would name is not UTF-8";
 
 fn feedback_recipe(campaign: &[String], what: &str) -> Vec<String> {
     let rest = [
