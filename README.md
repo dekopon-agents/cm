@@ -888,11 +888,8 @@ made under TMPDIR, taken as absolute, else under `/tmp`; with neither writable t
 and asks for a writable TMPDIR. Every git command the gate runs ignores replace refs, any
 `info/grafts` file, the commit-graph and the multi-pack-index, including those it reads through
 alternates, and drops from its environment every `GIT_TEST_*` variable (some bring those caches
-back) and `GIT_DIR` and the other variables that would move the repository it reads. All this
-only refuses more than before, but in three cases, which now pass: a clean merge that a replace
-ref or a graft made look conflicted, or like no merge; one whose base a local tag or branch named
-`origin/HEAD` moved off it; and one a `GIT_DIR` in the caller's environment had read in another
-repository. When the base tip already contains
+back) and `GIT_DIR` and the other variables that would move the repository it reads. When the
+base tip already contains
 the head (the PR has merged into it), no merge can be told apart from the PR's own commits, so
 the walk does not run. A merge that resolved conflicts, or
 any other commit, needs its own review. The rule only skips a review nobody did: the walk stops
@@ -919,8 +916,9 @@ repository above, so git's default merge of the commits decides them and no merg
 driver or `merge.*` setting, committed or local, does: a `-merge` or `binary` attribute makes no
 file conflicted, a merge whose parents merge there without a conflict, or that changes other files,
 does not pass this way, and a signature check's output is no such file. Nor does a merge whose
-parents conflict there in a submodule: without the submodule's objects a fast-forward cannot be
-told from a conflict. A resolution review is never an ACCEPT of the head, and its receipt never meets (a) at
+parents set a submodule to two different commits: without the submodule's objects their merge
+cannot be read. Any other conflict on a submodule, one parent deleting it or putting a file or
+directory in its place, is read like a file's. A resolution review is never an ACCEPT of the head, and its receipt never meets (a) at
 the head: without a checkout, (a) and (b) must hold at the merge itself, and a review of the head
 recorded at the merge governs it. Any commit after the merge needs its own review, and so does
 the merge once it is amended. The journal entry of the `merged` move names each merge the walk

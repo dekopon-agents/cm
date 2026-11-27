@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -2132,7 +2132,6 @@ struct Isolated {
 }
 
 impl Isolated {
-    // Err(None) when the checkout cannot be read.
     fn over(repo: &Path) -> Result<Isolated, Option<CleanUpdateError>> {
         let mut objects = git_bytes(
             repo,
@@ -2502,6 +2501,48 @@ fn nul_paths(listed: &[u8]) -> Vec<&[u8]> {
         .collect()
 }
 
+const GITLINK: &[u8] = b"160000";
+
+// The mode and object merge-tree lists for one conflicted path at each stage: the merge base, the
+// first parent, the second parent; none where that side has no such path.
+type Stages<'a> = [Option<(&'a [u8], &'a [u8])>; 3];
+
+// After the tree id, one `<mode> <object> <stage>\t<path>` entry per stage of each conflict. The
+// key is generic so that a test can count the comparisons.
+fn conflicts<'a, K: Ord + From<&'a [u8]>>(listed: &'a [u8]) -> Option<BTreeMap<K, Stages<'a>>> {
+    let mut conflicts: BTreeMap<K, Stages<'a>> = BTreeMap::new();
+    for entry in nul_paths(listed).into_iter().skip(1) {
+        let tab = entry.iter().position(|byte| *byte == b'\t')?;
+        let mut fields = entry[..tab].split(|byte| *byte == b' ');
+        let (mode, object) = (fields.next()?, fields.next()?);
+        let stage = match fields.next()? {
+            b"1" => 0,
+            b"2" => 1,
+            b"3" => 2,
+            _ => return None,
+        };
+        conflicts.entry(K::from(&entry[tab + 1..])).or_default()[stage] = Some((mode, object));
+    }
+    Some(conflicts)
+}
+
+// The scratch repository holds no submodule's objects. A gitlink conflict with one side absent,
+// or against a file or directory, is decided by its stages; two different gitlinks need the
+// submodule's history to merge.
+fn needs_submodule_history(stages: &Stages<'_>) -> bool {
+    matches!(stages, [_, Some((GITLINK, ours)), Some((GITLINK, theirs))] if ours != theirs)
+}
+
+fn beyond<'a, K: Ord + From<&'a [u8]>>(
+    conflicts: &BTreeMap<K, Stages<'_>>,
+    changed: &'a [u8],
+) -> Vec<&'a [u8]> {
+    nul_paths(changed)
+        .into_iter()
+        .filter(|path| !conflicts.contains_key(&K::from(path)))
+        .collect()
+}
+
 fn beyond_resolution(
     repo: &Path,
     isolated: &Isolated,
@@ -2533,36 +2574,25 @@ fn beyond_resolution(
         }
         _ => return Some(unreadable()),
     };
-    // After the tree id, one `<mode> <object> <stage>\t<path>` entry per stage of each conflict.
-    let mut conflicted: Vec<&[u8]> = Vec::new();
-    let mut submodules: Vec<String> = Vec::new();
-    for entry in nul_paths(&listed).into_iter().skip(1) {
-        let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
-            return Some(unreadable());
-        };
-        let path = &entry[tab + 1..];
-        let shown = format!("\"{}\"", path.escape_ascii());
-        if entry.starts_with(b"160000 ") && !submodules.contains(&shown) {
-            submodules.push(shown);
-        }
-        if !conflicted.contains(&path) {
-            conflicted.push(path);
-        }
-    }
-    // The scratch repository holds no submodule's objects, so it cannot tell a submodule's
-    // fast-forward from a conflict; no resolution review covers either.
+    let Some(conflicts) = conflicts::<&[u8]>(&listed) else {
+        return Some(unreadable());
+    };
+    let submodules: Vec<String> = conflicts
+        .iter()
+        .filter(|(_, stages)| needs_submodule_history(stages))
+        .map(|(path, _)| format!("\"{}\"", path.escape_ascii()))
+        .collect();
     if !submodules.is_empty() {
         return Some(format!(
-            "its parents conflict in the submodule {}",
+            "its parents set the submodule {} to different commits, which only the submodule's history can merge",
             submodules.join(", ")
         ));
     }
     let Some(changed) = remerge_diff(Reader::Isolated(isolated), commit, Listing::Paths) else {
         return Some(unreadable());
     };
-    let beyond: Vec<String> = nul_paths(&changed)
+    let beyond: Vec<String> = beyond(&conflicts, &changed)
         .into_iter()
-        .filter(|path| !conflicted.contains(path))
         .map(|path| format!("\"{}\"", path.escape_ascii()))
         .collect();
     (!beyond.is_empty()).then(|| {
@@ -3024,5 +3054,104 @@ mod tests {
         HASHES.with(|hashes| hashes.set(0));
         assert!(astra_gap(root, &target, &verdicts, None, SHA, None, ReviewKind::Head).is_empty());
         assert_eq!(HASHES.with(Cell::get), 2);
+    }
+
+    #[test]
+    fn only_two_different_gitlinks_on_the_parents_stages_need_submodule_history() {
+        let (a, b) = ("1".repeat(40), "2".repeat(40));
+        let classified = |entries: &[(&str, &str, u8)]| {
+            let mut listed = format!("{SHA}\0");
+            for (mode, object, stage) in entries {
+                listed.push_str(&format!("{mode} {object} {stage}\tsub\0"));
+            }
+            conflicts::<&[u8]>(listed.as_bytes()).map(|conflicts| {
+                conflicts
+                    .values()
+                    .map(needs_submodule_history)
+                    .collect::<Vec<_>>()
+            })
+        };
+        let gitlink = "160000";
+        assert_eq!(
+            classified(&[(gitlink, &a, 1), (gitlink, &a, 2), (gitlink, &b, 3)]),
+            Some(vec![true])
+        );
+        assert_eq!(
+            classified(&[(gitlink, &b, 2), (gitlink, &a, 3)]),
+            Some(vec![true])
+        );
+        assert_eq!(
+            classified(&[(gitlink, &a, 1), (gitlink, &b, 2), (gitlink, &b, 3)]),
+            Some(vec![false])
+        );
+        assert_eq!(
+            classified(&[(gitlink, &a, 1), (gitlink, &b, 2)]),
+            Some(vec![false])
+        );
+        assert_eq!(
+            classified(&[(gitlink, &a, 1), (gitlink, &b, 3)]),
+            Some(vec![false])
+        );
+        assert_eq!(
+            classified(&[(gitlink, &a, 1), ("100644", &a, 2), (gitlink, &b, 3)]),
+            Some(vec![false])
+        );
+        assert_eq!(classified(&[(gitlink, &a, 4)]), None);
+        assert_eq!(
+            conflicts::<&[u8]>(format!("{SHA}\0160000 {a} 2 sub\0").as_bytes()),
+            None
+        );
+    }
+
+    #[test]
+    fn conflicted_paths_are_classified_and_checked_against_the_changed_ones_in_n_log_n_comparisons()
+    {
+        thread_local! {
+            static COMPARED: Cell<usize> = const { Cell::new(0) };
+        }
+        struct Counted<'a>(&'a [u8]);
+        impl PartialEq for Counted<'_> {
+            fn eq(&self, other: &Self) -> bool {
+                COMPARED.with(|compared| compared.set(compared.get() + 1));
+                self.0 == other.0
+            }
+        }
+        impl Eq for Counted<'_> {}
+        impl PartialOrd for Counted<'_> {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Counted<'_> {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                COMPARED.with(|compared| compared.set(compared.get() + 1));
+                self.0.cmp(other.0)
+            }
+        }
+        impl<'a> From<&'a [u8]> for Counted<'a> {
+            fn from(path: &'a [u8]) -> Self {
+                Counted(path)
+            }
+        }
+
+        let paths = 4096;
+        let mut listed = format!("{SHA}\0").into_bytes();
+        for path in 0..paths {
+            for stage in 1..=3 {
+                listed.extend(format!("100644 {SHA} {stage}\tdir/{path:05}.txt\0").bytes());
+            }
+        }
+        let changed: Vec<u8> = (0..paths)
+            .flat_map(|path| format!("dir/{:05}.txt\0", 2 * path).into_bytes())
+            .collect();
+        let conflicts = conflicts::<Counted>(&listed).unwrap();
+        assert_eq!(conflicts.len(), paths);
+        assert_eq!(beyond(&conflicts, &changed).len(), paths / 2);
+        let lookups = 3 * paths + paths;
+        let compared = COMPARED.with(Cell::get);
+        assert!(
+            compared <= 4 * lookups * paths.ilog2() as usize,
+            "{compared}"
+        );
     }
 }
