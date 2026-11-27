@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -774,7 +775,6 @@ struct Action {
     base: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ci_green: Option<bool>,
-    /// `lane-paused` only: the paused handoff the lane resumes from.
     #[serde(skip_serializing_if = "Option::is_none")]
     handoff: Option<String>,
     #[serde(skip)]
@@ -1869,7 +1869,6 @@ pub(crate) fn card_lines(
     ]
 }
 
-/// The campaign lanes: each `LANE-<name>.md` brief and each registered driver (`cm lane`).
 fn campaign_lanes(root: &Path, drivers: &Drivers) -> BTreeSet<String> {
     let briefs = fs::read_dir(root)
         .into_iter()
@@ -1882,8 +1881,6 @@ fn campaign_lanes(root: &Path, drivers: &Drivers) -> BTreeSet<String> {
     briefs.chain(drivers.drivers.keys().cloned()).collect()
 }
 
-/// The lane an entry's title says wrote it: `Lane <name>: …` (LANE-tooling.md's convention) or
-/// `<name> lane: …`, the lane name in any case.
 fn entry_lane<'a>(title: &str, lanes: &'a BTreeSet<String>) -> Option<&'a str> {
     let title = title.to_lowercase();
     lanes
@@ -1901,44 +1898,154 @@ fn has_word(text: &str, word: &str) -> bool {
         .any(|token| token.eq_ignore_ascii_case(word))
 }
 
-/// `paused = false` written anywhere in the text, spaces and backticks aside.
-fn names_unpause(text: &str) -> bool {
-    let squeezed: String = text
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '`')
-        .collect::<String>()
-        .to_lowercase();
-    squeezed.contains("paused=false")
+// The resume record the owner's resume directive prescribes: a `Coordinator: resumed …` entry whose
+// body states `paused = false` in LIMITS.toml. A note recalling or planning the unpause is none.
+fn resume_heading(title: &str) -> bool {
+    title.split_once(':').is_some_and(|(who, what)| {
+        who.trim().eq_ignore_ascii_case("coordinator")
+            && what
+                .split(|c: char| !c.is_alphanumeric())
+                .find(|word| !word.is_empty())
+                .is_some_and(|word| word.eq_ignore_ascii_case("resumed"))
+    })
 }
 
-/// The first `handoff/<file>.md` an entry's body names whose `Handoff:` line has
-/// `role=lane-<lane>`, with that line's `lineage=` session.
-fn lane_handoff(root: &Path, body: &[&str], lane: &str) -> Option<(String, Option<String>)> {
-    let role = format!("role=lane-{lane}");
-    body.iter()
-        .flat_map(|line| line.split(|c: char| c.is_whitespace() || "`()[],;\"'".contains(c)))
+fn states_unpause(line: &str) -> bool {
+    let line = line.replace('`', "").replace('=', " = ").to_lowercase();
+    let words: Vec<&str> = line
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| "()[],.;:".contains(c)))
+        .collect();
+    words
+        .windows(5)
+        .any(|words| words == ["paused", "=", "false", "in", "limits.toml"])
+}
+
+fn handoff_paths(line: &str) -> impl Iterator<Item = &str> {
+    line.split(|c: char| c.is_whitespace() || "`()[],;\"'".contains(c))
         .map(|word| word.trim_end_matches(['.', ':']))
         .filter(|word| {
             word.starts_with("handoff/") && word.ends_with(".md") && !word.contains("..")
         })
-        .find_map(|path| {
-            let text = fs::read_to_string(root.join(path)).ok()?;
-            let line = text.lines().find(|line| line.starts_with("Handoff:"))?;
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            fields.contains(&role.as_str()).then(|| {
-                let lineage = fields
-                    .iter()
-                    .find_map(|field| field.strip_prefix("lineage="))
-                    .map(str::to_owned);
-                (path.to_owned(), lineage)
-            })
-        })
 }
 
-/// `lane-paused <lane>`: LIMITS.toml says `paused = false`, but a lane's newest journal state is
-/// a pause entry older than the unpause and the lane has journaled nothing since the unpause. A
-/// lane's state entries are its entries whose title holds the word `paused` or `resumed` (`resumed` wins); any
-/// entry the lane writes after the unpause is its resume. Read-only: no file is written.
+struct Pause {
+    at: Option<Timestamp>,
+    stamp: String,
+    title: String,
+    handoffs: Vec<String>,
+}
+
+#[derive(Default)]
+struct LaneRecord {
+    pause: Option<Pause>,
+    latest: Option<Timestamp>,
+}
+
+struct ResumeRecord {
+    at: Timestamp,
+    stamp: String,
+    title: String,
+}
+
+enum Reading {
+    Other,
+    Pause(String),
+    Resume(ResumeRecord, bool),
+}
+
+#[derive(Default)]
+struct LaneJournal {
+    lanes: BTreeMap<String, LaneRecord>,
+    resume: Option<ResumeRecord>,
+}
+
+impl LaneJournal {
+    // One pass that keeps per lane only its open pause and newest stamp: the journal only grows.
+    fn read(root: &Path, lanes: &BTreeSet<String>) -> Option<Self> {
+        let file = fs::File::open(root.join(store::JOURNAL)).ok()?;
+        let mut journal = Self::default();
+        let mut reading = Reading::Other;
+        for line in BufReader::new(file).lines() {
+            let line = line.ok()?;
+            let Some((stamp, title)) = crate::journal::split_heading(&line) else {
+                match &mut reading {
+                    Reading::Pause(lane) => {
+                        if let Some(pause) = journal
+                            .lanes
+                            .get_mut(lane)
+                            .and_then(|record| record.pause.as_mut())
+                        {
+                            pause
+                                .handoffs
+                                .extend(handoff_paths(&line).map(str::to_owned));
+                        }
+                    }
+                    Reading::Resume(_, stated) => *stated |= states_unpause(&line),
+                    Reading::Other => {}
+                }
+                continue;
+            };
+            journal.close(std::mem::replace(&mut reading, Reading::Other));
+            let at = instant(stamp);
+            if let Some(lane) = entry_lane(title, lanes) {
+                let record = journal.lanes.entry(lane.to_owned()).or_default();
+                record.latest = record.latest.max(at);
+                // `resumed` wins: "resumed after the paused window" is no pause.
+                if has_word(title, "resumed") {
+                    record.pause = None;
+                } else if has_word(title, "paused") {
+                    record.pause = Some(Pause {
+                        at,
+                        stamp: stamp.to_owned(),
+                        title: title.to_owned(),
+                        handoffs: Vec::new(),
+                    });
+                    reading = Reading::Pause(lane.to_owned());
+                }
+            } else if resume_heading(title)
+                && let Some(at) = at
+            {
+                let record = ResumeRecord {
+                    at,
+                    stamp: stamp.to_owned(),
+                    title: title.to_owned(),
+                };
+                reading = Reading::Resume(record, false);
+            }
+        }
+        journal.close(reading);
+        Some(journal)
+    }
+
+    fn close(&mut self, reading: Reading) {
+        if let Reading::Resume(record, true) = reading
+            && self
+                .resume
+                .as_ref()
+                .is_none_or(|newest| record.at >= newest.at)
+        {
+            self.resume = Some(record);
+        }
+    }
+}
+
+fn lane_handoff(root: &Path, paths: &[String], lane: &str) -> Option<(String, Option<String>)> {
+    let role = format!("role=lane-{lane}");
+    paths.iter().find_map(|path| {
+        let text = fs::read_to_string(root.join(path)).ok()?;
+        let line = text.lines().find(|line| line.starts_with("Handoff:"))?;
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        fields.contains(&role.as_str()).then(|| {
+            let lineage = fields
+                .iter()
+                .find_map(|field| field.strip_prefix("lineage="))
+                .map(str::to_owned);
+            (path.clone(), lineage)
+        })
+    })
+}
+
 fn lane_paused(root: &Path, inputs: &ActionInputs) -> Vec<Action> {
     if inputs.paused {
         return Vec::new();
@@ -1947,27 +2054,12 @@ fn lane_paused(root: &Path, inputs: &ActionInputs) -> Vec<Action> {
     if lanes.is_empty() {
         return Vec::new();
     }
-    let Ok(text) = fs::read_to_string(root.join(store::JOURNAL)) else {
+    let Some(LaneJournal { lanes, resume }) = LaneJournal::read(root, &lanes) else {
         return Vec::new();
     };
-    let entries = crate::journal::entries(&text);
-    let mut paused: BTreeMap<&str, &crate::journal::Entry<'_>> = BTreeMap::new();
-    for entry in &entries {
-        let Some(lane) = entry_lane(entry.title, &lanes) else {
-            continue;
-        };
-        // `resumed` wins: "resumed after the paused window" is no pause.
-        if has_word(entry.title, "resumed") {
-            paused.remove(lane);
-        } else if has_word(entry.title, "paused") {
-            paused.insert(lane, entry);
-        }
-    }
-    if paused.is_empty() {
+    if lanes.values().all(|record| record.pause.is_none()) {
         return Vec::new();
     }
-    // The unpause from LIMITS.toml's history; failing that, the newest journal entry no lane
-    // wrote that names `paused = false`, said so in the line. Neither: no line, never a guess.
     let (unpaused, source) = match limits::unpause(root) {
         Ok(unpause) => (
             unpause.at,
@@ -1977,40 +2069,29 @@ fn lane_paused(root: &Path, inputs: &ActionInputs) -> Vec<Action> {
             ),
         ),
         Err(why) => {
-            let Some((at, entry)) = entries
-                .iter()
-                .filter(|entry| entry_lane(entry.title, &lanes).is_none())
-                .filter(|entry| {
-                    names_unpause(entry.title) || entry.body.iter().any(|line| names_unpause(line))
-                })
-                .filter_map(|entry| Some((instant(entry.stamp)?, entry)))
-                .max_by_key(|(at, _)| *at)
-            else {
+            let Some(resume) = resume else {
                 return Vec::new();
             };
             (
-                at,
+                resume.at,
                 format!(
                     "journal {} `{}`; {why}",
-                    entry.stamp,
-                    entry.title.replace('`', "'")
+                    resume.stamp,
+                    resume.title.replace('`', "'")
                 ),
             )
         }
     };
     let mut out = Vec::new();
-    for (lane, entry) in paused {
-        if instant(entry.stamp).is_none_or(|at| at >= unpaused) {
+    for (lane, record) in &lanes {
+        let Some(pause) = &record.pause else {
+            continue;
+        };
+        if pause.at.is_none_or(|at| at >= unpaused) || record.latest.is_some_and(|at| at > unpaused)
+        {
             continue;
         }
-        let resumed = entries.iter().any(|later| {
-            entry_lane(later.title, &lanes) == Some(lane)
-                && instant(later.stamp).is_some_and(|at| at > unpaused)
-        });
-        if resumed {
-            continue;
-        }
-        let handoff = lane_handoff(root, &entry.body, lane);
+        let handoff = lane_handoff(root, &pause.handoffs, lane);
         let session = inputs
             .drivers
             .drivers
@@ -2018,10 +2099,10 @@ fn lane_paused(root: &Path, inputs: &ActionInputs) -> Vec<Action> {
             .map(|driver| driver.session.clone())
             .or_else(|| handoff.as_ref().and_then(|(_, lineage)| lineage.clone()));
         let from = handoff.as_ref().map_or_else(
-            || format!("its journal entry {}", entry.stamp),
+            || format!("its journal entry {}", pause.stamp),
             |(path, _)| path.clone(),
         );
-        let title = entry.title.split_once(':').map_or("", |(prefix, _)| prefix);
+        let title = pause.title.split_once(':').map_or("", |(prefix, _)| prefix);
         let command = format!(
             "send_message {} {}",
             session
@@ -2038,8 +2119,8 @@ fn lane_paused(root: &Path, inputs: &ActionInputs) -> Vec<Action> {
             command,
             format!(
                 "paused at {} (`{}`), no lane entry after the unpause ({source})",
-                entry.stamp,
-                entry.title.replace('`', "'")
+                pause.stamp,
+                pause.title.replace('`', "'")
             ),
         );
         action.handoff = handoff.map(|(path, _)| path);

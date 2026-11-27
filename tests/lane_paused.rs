@@ -1,6 +1,3 @@
-//! `lane-paused <lane>` in `cm next --act`: a lane parked on its paused handoff after LIMITS.toml's
-//! `paused = false`.
-
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -12,7 +9,7 @@ use serde_json::Value;
 
 #[path = "support/campaign.rs"]
 mod campaign_fixture;
-use campaign_fixture::{Campaign, campaign, campaign_outside_git};
+use campaign_fixture::Campaign;
 
 struct Fake;
 
@@ -30,8 +27,46 @@ impl Host for Fake {
     }
 }
 
+// Each process a test starts gets the fixture's own HOME, global git config and TMPDIR, and none
+// of the runner's GIT_DIR, GIT_WORK_TREE or GIT_INDEX_FILE. A campaign root here is a folder of
+// its fixture's temporary directory, which holds them.
+fn sealed<'a>(command: &'a mut Command, root: &Path) -> &'a mut Command {
+    let fixture = root.parent().unwrap();
+    command
+        .env("HOME", fixture.join("home"))
+        .env("GIT_CONFIG_GLOBAL", fixture.join("gitconfig"))
+        .env("TMPDIR", fixture.join("tmp"))
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+}
+
+fn outside_git() -> Campaign {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    fs::create_dir(temp.path().join("tmp")).unwrap();
+    fs::write(temp.path().join("gitconfig"), "").unwrap();
+    let root = temp.path().join("campaign");
+    let init = sealed(
+        Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("init")
+            .arg(&root),
+        &root,
+    )
+    .output()
+    .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    Campaign { _temp: temp, root }
+}
+
+fn in_git() -> Campaign {
+    let c = outside_git();
+    git(&c.root, "2026-11-20T00:00:00Z", &["init", "-q"]);
+    c
+}
+
 fn git(root: &Path, date: &str, args: &[&str]) {
-    let output = Command::new("git")
+    let output = sealed(&mut Command::new("git"), root)
         .arg("-C")
         .arg(root)
         .args(["-c", "user.name=cm", "-c", "user.email=cm@example.com"])
@@ -43,14 +78,20 @@ fn git(root: &Path, date: &str, args: &[&str]) {
     assert!(output.status.success(), "git {args:?}: {output:?}");
 }
 
-fn set_paused(root: &Path, paused: bool) {
+fn write_paused(root: &Path, assignment: &str) {
     let path = root.join("LIMITS.toml");
     let text = fs::read_to_string(&path).unwrap();
     let text = text
         .lines()
         .map(|line| {
-            if line.starts_with("paused =") {
-                format!("paused = {paused}")
+            let key = line
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"');
+            if line.contains('=') && key == "paused" {
+                assignment.to_owned()
             } else {
                 line.to_owned()
             }
@@ -60,15 +101,18 @@ fn set_paused(root: &Path, paused: bool) {
     fs::write(path, text + "\n").unwrap();
 }
 
-/// Sets `paused` and commits the whole tree, authored at `date`.
+fn set_paused(root: &Path, paused: bool) {
+    write_paused(root, &format!("paused = {paused}"));
+}
+
+fn commit_all(root: &Path, date: &str, message: &str) {
+    git(root, date, &["add", "-A"]);
+    git(root, date, &["commit", "-q", "-m", message]);
+}
+
 fn commit_paused(root: &Path, paused: bool, date: &str) {
     set_paused(root, paused);
-    git(root, date, &["add", "-A"]);
-    git(
-        root,
-        date,
-        &["commit", "-q", "-m", &format!("paused = {paused}")],
-    );
+    commit_all(root, date, &format!("paused = {paused}"));
 }
 
 fn journal(root: &Path, stamp: &str, title: &str, body: &str) {
@@ -107,6 +151,7 @@ fn pause_entry(root: &Path, name: &str, stamp: &str) {
 fn act(root: &Path) -> (Option<i32>, Vec<Value>, String) {
     let run = |json: bool| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cm"));
+        sealed(&mut command, root);
         if json {
             command.arg("--json");
         }
@@ -139,7 +184,7 @@ fn act(root: &Path) -> (Option<i32>, Vec<Value>, String) {
 }
 
 fn cm(root: &Path, args: &[&str]) -> (Option<i32>, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_cm"))
+    let output = sealed(&mut Command::new(env!("CARGO_BIN_EXE_cm")), root)
         .arg("-C")
         .arg(root)
         .args(args)
@@ -154,7 +199,7 @@ fn cm(root: &Path, args: &[&str]) -> (Option<i32>, String) {
 }
 
 fn head(root: &Path) -> String {
-    let output = Command::new("git")
+    let output = sealed(&mut Command::new("git"), root)
         .arg("-C")
         .arg(root)
         .args(["rev-parse", "HEAD"])
@@ -163,10 +208,8 @@ fn head(root: &Path) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
-/// The 11-25/26 shape: paused at 23:08Z, the lane's paused handoff at 23:29Z, a later lane
-/// progress entry, `paused = false` committed at 22:16Z the next day.
 fn eleven_26(names: &[&str]) -> Campaign {
-    let c = campaign(&Fake);
+    let c = in_git();
     commit_paused(&c.root, false, "2026-11-20T00:00:00Z");
     for name in names {
         lane(&c.root, name, &format!("session_{name}"));
@@ -240,7 +283,7 @@ fn a_lane_parked_past_the_unpause_is_one_line_until_it_journals_a_resume() {
     assert!(card.contains("Actionable: 0 (oldest: —)"), "{card}");
 
     // Plain `cm next` lists the same action.
-    let next = Command::new(env!("CARGO_BIN_EXE_cm"))
+    let next = sealed(&mut Command::new(env!("CARGO_BIN_EXE_cm")), &c.root)
         .arg("--json")
         .arg("-C")
         .arg(&c.root)
@@ -363,7 +406,7 @@ fn a_registered_driver_is_a_lane_and_its_session_is_the_one_woken() {
 
 #[test]
 fn with_no_limits_history_the_journal_names_the_unpause_or_no_line_is_given() {
-    let c = campaign_outside_git(&Fake);
+    let c = outside_git();
     lane(&c.root, "tooling", "session_tooling");
     pause_entry(&c.root, "tooling", "2026-11-25T23:29Z");
     // No commit and no journal entry names the unpause: never a guessed time.
@@ -376,6 +419,22 @@ fn with_no_limits_history_the_journal_names_the_unpause_or_no_line_is_given() {
         "2026-11-26T00:05Z",
         "Lane tooling: noted",
         "waiting until `paused = false`",
+    );
+    assert_eq!(act(&c.root).1.len(), 0);
+
+    // Nor is a note other than the coordinator's resume record, or a resume entry that does not
+    // state the assignment in LIMITS.toml.
+    journal(
+        &c.root,
+        "2026-11-26T21:00Z",
+        "Owner: the resume plan",
+        "At the reset the coordinator sets `paused = false` in LIMITS.toml.",
+    );
+    journal(
+        &c.root,
+        "2026-11-26T21:30Z",
+        "Coordinator: resumed from its handoff after compaction",
+        "`paused = false` waits for the reset.",
     );
     assert_eq!(act(&c.root).1.len(), 0);
 
@@ -393,6 +452,132 @@ fn with_no_limits_history_the_journal_names_the_unpause_or_no_line_is_given() {
         text.contains("(journal 2026-11-26T22:16Z `Coordinator: resumed after quota reset`; `git log` cannot read LIMITS.toml's history)"),
         "{text}"
     );
+
+    // A later note recalling the unpause, or a later resume entry stating no assignment, leaves
+    // `since` at the record.
+    journal(
+        &c.root,
+        "2026-11-27T01:06Z",
+        "Owner: notes on the 11-26 resume",
+        "The coordinator set `paused = false` in LIMITS.toml at 22:16Z.",
+    );
+    journal(
+        &c.root,
+        "2026-11-27T01:10Z",
+        "Coordinator: resumed the prep thread",
+        "LIMITS.toml unchanged.",
+    );
+    let (_, lines, text) = act(&c.root);
+    assert_eq!(lines.len(), 1, "{text}");
+    assert_eq!(lines[0]["since"], "2026-11-26T22:16:00Z");
+}
+
+#[test]
+fn with_the_journal_fallback_a_later_note_recalling_the_unpause_reopens_no_lane() {
+    let c = outside_git();
+    lane(&c.root, "tooling", "session_tooling");
+    pause_entry(&c.root, "tooling", "2026-11-25T23:29Z");
+    journal(
+        &c.root,
+        "2026-11-26T22:16Z",
+        "Coordinator: resumed after quota reset",
+        "paused = false in LIMITS.toml.",
+    );
+    journal(
+        &c.root,
+        "2026-11-26T23:59Z",
+        "Lane tooling: a fix round sent",
+        "",
+    );
+    let (code, lines, text) = act(&c.root);
+    assert_eq!((code, lines.len()), (Some(0), 0), "{text}");
+
+    journal(
+        &c.root,
+        "2026-11-27T01:06Z",
+        "Owner: a paused lane must not outlive the pause",
+        "The coordinator resumed at 22:16Z (`paused = false` in LIMITS.toml) and the lane waited.",
+    );
+    let (code, lines, text) = act(&c.root);
+    assert_eq!((code, lines.len()), (Some(0), 0), "{text}");
+}
+
+#[test]
+fn an_unpause_with_a_quoted_key_is_read_from_history() {
+    let c = in_git();
+    commit_paused(&c.root, false, "2026-11-20T00:00:00Z");
+    lane(&c.root, "tooling", "session_tooling");
+    write_paused(&c.root, "\"paused\" = true");
+    commit_all(&c.root, "2026-11-25T23:08:00Z", "pause");
+    pause_entry(&c.root, "tooling", "2026-11-25T23:29Z");
+    write_paused(&c.root, "\"paused\" = false");
+    commit_all(&c.root, "2026-11-26T22:16:05Z", "unpause");
+    // No journal entry names the unpause, so the line can only come from the commit.
+    let (code, lines, text) = act(&c.root);
+    assert_eq!(code, Some(1), "{text}");
+    assert_eq!(lines.len(), 1, "{text}");
+    assert_eq!(lines[0]["since"], "2026-11-26T22:16:05Z");
+    let sha: String = head(&c.root).chars().take(12).collect();
+    assert!(
+        text.contains(&format!("(LIMITS.toml commit {sha})")),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_unpause_a_merge_commit_makes_is_read_from_first_parent_history() {
+    let c = in_git();
+    commit_paused(&c.root, false, "2026-11-20T00:00:00Z");
+    lane(&c.root, "tooling", "session_tooling");
+    commit_paused(&c.root, true, "2026-11-25T23:08:00Z");
+    pause_entry(&c.root, "tooling", "2026-11-25T23:29Z");
+    commit_all(&c.root, "2026-11-25T23:30:00Z", "journal");
+    let merge = |date: &str, branch: &str| {
+        git(&c.root, date, &["checkout", "-q", "-"]);
+        git(
+            &c.root,
+            date,
+            &["merge", "-q", "--no-ff", "--no-commit", branch],
+        );
+    };
+
+    // Both parents have `paused = true`; the merge itself writes `paused = false`.
+    git(
+        &c.root,
+        "2026-11-26T10:00:00Z",
+        &["checkout", "-q", "-b", "side"],
+    );
+    fs::write(c.root.join("side.md"), "side\n").unwrap();
+    commit_all(&c.root, "2026-11-26T10:00:00Z", "side");
+    merge("2026-11-26T22:16:05Z", "side");
+    commit_paused(&c.root, false, "2026-11-26T22:16:05Z");
+    let (code, lines, text) = act(&c.root);
+    assert_eq!(code, Some(1), "{text}");
+    assert_eq!(lines.len(), 1, "{text}");
+    assert_eq!(lines[0]["since"], "2026-11-26T22:16:05Z");
+    let sha: String = head(&c.root).chars().take(12).collect();
+    assert!(
+        text.contains(&format!("(LIMITS.toml commit {sha})")),
+        "{text}"
+    );
+
+    // A branch that sets `paused = false`, merged later: the unpause is the merge, where the
+    // first-parent history changes.
+    commit_paused(&c.root, true, "2026-11-27T00:00:00Z");
+    pause_entry(&c.root, "tooling", "2026-11-27T00:30Z");
+    commit_all(&c.root, "2026-11-27T00:30:00Z", "journal");
+    git(
+        &c.root,
+        "2026-11-27T01:00:00Z",
+        &["checkout", "-q", "-b", "unpause"],
+    );
+    commit_paused(&c.root, false, "2026-11-27T01:00:00Z");
+    merge("2026-11-27T02:00:00Z", "unpause");
+    commit_all(&c.root, "2026-11-27T02:00:00Z", "merge unpause");
+    let (code, lines, text) = act(&c.root);
+    assert_eq!(code, Some(1), "{text}");
+    assert_eq!(lines.len(), 1, "{text}");
+    assert_eq!(lines[0]["since"], "2026-11-27T02:00:00Z");
 }
 
 #[test]
@@ -410,7 +595,7 @@ fn an_uncommitted_or_shallow_unpause_falls_back_to_the_journal() {
     let c = eleven_26(&["tooling"]);
     let clone = c.root.parent().unwrap().join("shallow");
     let url = format!("file://{}", c.root.display());
-    let output = Command::new("git")
+    let output = sealed(&mut Command::new("git"), &c.root)
         .args(["clone", "-q", "--depth", "1", &url])
         .arg(&clone)
         .output()
@@ -439,7 +624,7 @@ fn a_title_naming_both_words_is_a_resume() {
 
 #[test]
 fn with_the_journal_fallback_a_lane_entry_in_the_unpause_minute_is_no_resume() {
-    let c = campaign_outside_git(&Fake);
+    let c = outside_git();
     lane(&c.root, "tooling", "session_tooling");
     pause_entry(&c.root, "tooling", "2026-11-25T23:29Z");
     journal(

@@ -1,4 +1,6 @@
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use toml::{Table, Value};
 
@@ -202,15 +204,15 @@ impl TurnCommands {
     }
 }
 
-/// The commit that last set `paused = false` in LIMITS.toml: its author date (when the
-/// coordinator made the change; a later rebase moves only the committer date) and its SHA.
+// `at` is the author date, when the coordinator made the change: a later rebase moves only the
+// committer date.
 pub(crate) struct Unpause {
     pub at: jiff::Timestamp,
     pub sha: String,
 }
 
 fn git_out(root: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = Command::new("git")
         .arg("-C")
         .arg(root)
         .args(args)
@@ -222,29 +224,52 @@ fn git_out(root: &Path, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// `paused` as LIMITS.toml held it at `commit`; `None` when the file or the key is absent there.
 fn paused_at(root: &Path, commit: &str) -> Option<bool> {
     let text = git_out(root, &["show", &format!("{commit}:./LIMITS.toml")])?;
     text.parse::<Table>().ok()?.get("paused")?.as_bool()
 }
 
-/// Reads the unpause from the repository's own record: the newest commit that changed the
-/// `paused` line from `true` to `false`. Never guesses: an uncommitted unpause, a history the
-/// clone does not hold (shallow) or no such change is an error naming why.
+// The first-parent history of LIMITS.toml, merges included and with no line filter: a merge can
+// carry the change, and TOML reads spellings of the key (`"paused"`) a line pattern misses.
 pub(crate) fn unpause(root: &Path) -> Result<Unpause, String> {
-    let log = git_out(
-        root,
-        &[
+    let unreadable = || "`git log` cannot read LIMITS.toml's history".to_owned();
+    let mut log = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
             "log",
+            "--first-parent",
             "--format=%H %aI %P",
-            "-G",
-            "^[[:space:]]*paused[[:space:]]*=",
             "--",
             "LIMITS.toml",
-        ],
-    )
-    .ok_or("`git log` cannot read LIMITS.toml's history")?;
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| unreadable())?;
+    let walked = log
+        .stdout
+        .take()
+        .and_then(|stdout| newest_unpause(root, BufReader::new(stdout)));
+    // Stopped early, git need not list the rest; at the end of the list it has exited, and a kill
+    // then could turn its exit status into a signal.
+    if walked.is_some() {
+        let _ = log.kill();
+    }
+    let listed = log.wait().is_ok_and(|status| status.success());
+    walked.unwrap_or_else(|| {
+        Err(if listed {
+            "no commit in LIMITS.toml's history changes `paused` from true to false".to_owned()
+        } else {
+            unreadable()
+        })
+    })
+}
+
+fn newest_unpause(root: &Path, log: impl BufRead) -> Option<Result<Unpause, String>> {
     for line in log.lines() {
+        let line = line.ok()?;
         let mut fields = line.split_whitespace();
         let (Some(sha), Some(date)) = (fields.next(), fields.next()) else {
             continue;
@@ -253,29 +278,30 @@ pub(crate) fn unpause(root: &Path) -> Result<Unpause, String> {
         match paused_at(root, sha) {
             Some(false) => {}
             Some(true) => {
-                return Err(format!(
-                    "the newest commit changing `paused` ({short}) sets it to true; `paused = false` is not committed"
-                ));
+                return Some(Err(format!(
+                    "the newest LIMITS.toml commit that reads `paused` ({short}) sets it to true; `paused = false` is not committed"
+                )));
             }
             None => continue,
         }
         let Some(parent) = fields.next() else {
-            return Err(format!(
+            return Some(Err(format!(
                 "commit {short} sets `paused = false` but its parent is not in this clone (shallow?)"
-            ));
+            )));
         };
         if paused_at(root, parent) != Some(true) {
             continue;
         }
-        let at = date
-            .parse()
-            .map_err(|_| format!("commit {short} has an unreadable author date `{date}`"))?;
-        return Ok(Unpause {
-            at,
-            sha: sha.to_owned(),
-        });
+        return Some(
+            date.parse()
+                .map(|at| Unpause {
+                    at,
+                    sha: sha.to_owned(),
+                })
+                .map_err(|_| format!("commit {short} has an unreadable author date `{date}`")),
+        );
     }
-    Err("no commit in LIMITS.toml's history changes `paused` from true to false".to_owned())
+    None
 }
 
 pub(crate) fn codex_pause() -> Option<String> {
