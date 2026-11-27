@@ -2290,25 +2290,36 @@ pub fn next_with(
                 .as_ref()
                 .map(|part| format!(" --part={}", shell_word(part)))
                 .unwrap_or_default();
+            let resolution = review.kind == crate::verdict::ReviewKind::Resolution;
             let command = format!(
-                "cm review record {} '<fresh-review-report>' --reviewer fresh-opus{part}",
-                shell_word(&review.step)
+                "cm review record {} '<fresh-review-report>' --reviewer fresh-opus{part}{}",
+                shell_word(&review.step),
+                if resolution { " --kind resolution" } else { "" }
             );
             outcome.line(next_item(
                 &mut number,
                 &format!(
-                    "fresh reader {}{}: independent Opus, high effort",
+                    "fresh reader {}{}{}: independent Opus, high effort",
                     review.step,
                     review
                         .part
                         .as_ref()
                         .map(|part| format!(" part {part}"))
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
+                    if resolution {
+                        format!(", on the conflict resolution of {}", review.head)
+                    } else {
+                        String::new()
+                    }
                 ),
                 &command,
             ));
-            json!({"target": review.step, "part": review.part, "pr": review.pr,
-                "review": review.id(), "converging": false, "command": command})
+            let mut item = json!({"target": review.step, "part": review.part, "pr": review.pr,
+                "review": review.id(), "converging": false, "command": command});
+            if resolution {
+                item["kind"] = json!("resolution");
+            }
+            item
         })
         .collect();
     let has_fresh_reader = !fresh_readers.is_empty();

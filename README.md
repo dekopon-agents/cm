@@ -814,12 +814,15 @@ A non-converging round prints `converging: false` and journals the owner's rulin
 > Fix passes: when a review round closes fewer blocking findings than it opens, or a finding marked fixed returns, one fresh independent reader (Opus, high effort) reviews the head; the PR or design escalates to the owner only if that round also fails to converge. A third FIX REQUIRED by count alone escalates nothing. The session cap of 10 passes stands.
 
 `cm next` lists a `fresh reader` item with
-`cm review record <step> '<fresh-review-report>' --reviewer fresh-opus [--part=NAME]`.
+`cm review record <step> '<fresh-review-report>' --reviewer fresh-opus [--part=NAME]`, and
+`--kind resolution` added when the rising round reviewed a merge's conflict resolution, which the
+item names. Rounds are compared like with like: a resolution round only with resolution rounds of
+the same merge, a head round only with head rounds.
 Have an independent Opus reader at high effort review the head, then record its report with that
 command. The item appears before the step is merged, including when no PR is recorded, and
 remains until a `fresh-opus` report is recorded for that PR and part. The fresh round's baseline
 is the trigger head, or the latest previously reviewed head for the same step, PR and part when
-no request is pending. Its blocking count is the maximum across all reports at that head, so
+no request is pending. Its blocking count is the maximum across the reports of its kind at that head, so
 recording order does not affect the fresh round's convergence. Without either baseline, `converging` is
 null and no convergence verdict is printed. A failing fresh round writes an owner-queue item
 and blocks the step `blocked:non-convergence` when it can change phase. An unrelated block and
@@ -879,10 +882,17 @@ clean update either. It is read again in a scratch repository that borrows the c
 and has no refs, configuration or attributes, its own or the caller's environment's, so it is
 git's default merge of the two parents: a merge that only looked clean through a merge attribute
 (`merge=union`, a merge driver), committed or local, or a `merge.*` setting is no clean update.
-Every git command the gate runs ignores replace refs, any `info/grafts` file, the commit-graph and
-the multi-pack-index, including those it reads through alternates. All this only refuses more
-than before, but in one case: a clean merge that a replace ref or a graft made look conflicted, or
-like no merge, now passes. When the base tip already contains
+The scratch repository holds no submodule's objects either, so a clean update that fast-forwards a
+submodule the base branch also moved reads as a conflict there and needs its own review. It is
+made under TMPDIR, taken as absolute, else under `/tmp`; with neither writable the gate refuses
+and asks for a writable TMPDIR. Every git command the gate runs ignores replace refs, any
+`info/grafts` file, the commit-graph and the multi-pack-index, including those it reads through
+alternates, and drops from its environment every `GIT_TEST_*` variable (some bring those caches
+back) and `GIT_DIR` and the other variables that would move the repository it reads. All this
+only refuses more than before, but in three cases, which now pass: a clean merge that a replace
+ref or a graft made look conflicted, or like no merge; one whose base a local tag or branch named
+`origin/HEAD` moved off it; and one a `GIT_DIR` in the caller's environment had read in another
+repository. When the base tip already contains
 the head (the PR has merged into it), no merge can be told apart from the PR's own commits, so
 the walk does not run. A merge that resolved conflicts, or
 any other commit, needs its own review. The rule only skips a review nobody did: the walk stops
@@ -908,7 +918,9 @@ files the parents conflict in, and which files the merge changes, are both read 
 repository above, so git's default merge of the commits decides them and no merge attribute,
 driver or `merge.*` setting, committed or local, does: a `-merge` or `binary` attribute makes no
 file conflicted, a merge whose parents merge there without a conflict, or that changes other files,
-does not pass this way, and a signature check's output is no such file. A resolution review is never an ACCEPT of the head, and its receipt never meets (a) at
+does not pass this way, and a signature check's output is no such file. Nor does a merge whose
+parents conflict there in a submodule: without the submodule's objects a fast-forward cannot be
+told from a conflict. A resolution review is never an ACCEPT of the head, and its receipt never meets (a) at
 the head: without a checkout, (a) and (b) must hold at the merge itself, and a review of the head
 recorded at the merge governs it. Any commit after the merge needs its own review, and so does
 the merge once it is amended. The journal entry of the `merged` move names each merge the walk

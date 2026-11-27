@@ -658,8 +658,6 @@ fn previous_review<'a>(
     })
 }
 
-// A resolution round is measured only against resolution rounds of the same merge, and a head
-// round only against head rounds.
 fn same_round(review: &Recorded, kind: ReviewKind, head: &str) -> bool {
     review.kind == kind && (kind.is_head() || review.binds(head))
 }
@@ -833,7 +831,8 @@ fn resolution_parent(
         }
         .to_string()
     };
-    let isolated = Isolated::over(&repo).ok_or_else(unreadable)?;
+    let isolated =
+        Isolated::over(&repo).map_err(|why| why.map_or_else(unreadable, |why| why.to_string()))?;
     let merged = merge_from_base(&repo, &isolated, &merge, base).map_err(|why| why.to_string())?;
     if merged.clean {
         return Err(format!(
@@ -2061,12 +2060,36 @@ mod gate_git {
     // /dev/null is no directory, so no graft file can exist at this path.
     const NO_GRAFTS: &str = "/dev/null/grafts";
 
+    // Variables that move the repository a checkout read reads from; the GIT_TEST_ ones go too,
+    // since some bring back the caches the flags below turn off.
+    const REDIRECTS: [&str; 8] = [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_SHALLOW_FILE",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_INDEX_FILE",
+    ];
+
     fn git(cleared: bool) -> Command {
         let mut command = Command::new("git");
         if cleared {
             command.env_clear();
             if let Some(path) = std::env::var_os("PATH") {
                 command.env("PATH", path);
+            }
+        } else {
+            for (name, _) in std::env::vars_os() {
+                let bytes = name.as_encoded_bytes();
+                if bytes.starts_with(b"GIT_TEST_")
+                    || REDIRECTS
+                        .iter()
+                        .any(|redirect| bytes == redirect.as_bytes())
+                {
+                    command.env_remove(&name);
+                }
             }
         }
         command
@@ -2109,7 +2132,8 @@ struct Isolated {
 }
 
 impl Isolated {
-    fn over(repo: &Path) -> Option<Isolated> {
+    // Err(None) when the checkout cannot be read.
+    fn over(repo: &Path) -> Result<Isolated, Option<CleanUpdateError>> {
         let mut objects = git_bytes(
             repo,
             &[
@@ -2118,24 +2142,28 @@ impl Isolated {
                 "--git-path",
                 "objects",
             ],
-        )?;
+        )
+        .ok_or(None)?;
         if objects.pop() != Some(b'\n') {
-            return None;
+            return Err(None);
         }
-        let format = git_out(repo, &["rev-parse", "--show-object-format"])?;
+        let format = git_out(repo, &["rev-parse", "--show-object-format"]).ok_or(None)?;
         let isolated = Isolated {
-            dir: scratch_dir()?,
+            dir: scratch_dir().map_err(Some)?,
         };
-        let made = isolated.output(&[
-            "init",
-            "--bare",
-            "--quiet",
-            "--template=",
-            &format!("--object-format={format}"),
-        ])?;
+        let made = isolated
+            .output(&[
+                "init",
+                "--bare",
+                "--quiet",
+                "--template=",
+                &format!("--object-format={format}"),
+            ])
+            .ok_or(None)?;
         let alternates = isolated.dir.join("objects").join("info").join("alternates");
         (made.status.success() && fs::write(alternates, quoted(&objects)).is_ok())
             .then_some(isolated)
+            .ok_or(None)
     }
 
     fn output(&self, args: &[&str]) -> Option<std::process::Output> {
@@ -2154,11 +2182,29 @@ impl Drop for Isolated {
     }
 }
 
-fn scratch_dir() -> Option<PathBuf> {
+// git gets the scratch repository's path as GIT_DIR from inside it, so the path must be absolute.
+fn scratch_dir() -> Result<PathBuf, CleanUpdateError> {
+    let temp = std::env::temp_dir();
+    let temp = if temp.is_absolute() {
+        Some(temp)
+    } else {
+        std::env::current_dir().ok().map(|cwd| cwd.join(temp))
+    };
+    scratch_dir_in(temp.into_iter().chain([PathBuf::from("/tmp")]).collect())
+}
+
+fn scratch_dir_in(mut parents: Vec<PathBuf>) -> Result<PathBuf, CleanUpdateError> {
+    parents.dedup();
+    parents
+        .iter()
+        .find_map(|parent| scratch_dir_under(parent))
+        .ok_or(CleanUpdateError::NoScratch { tried: parents })
+}
+
+fn scratch_dir_under(temp: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let temp = std::env::temp_dir();
     for _ in 0..100 {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2259,6 +2305,9 @@ pub enum CleanUpdateError {
         commit: String,
         gaps: Vec<String>,
     },
+    NoScratch {
+        tried: Vec<PathBuf>,
+    },
 }
 
 fn short(sha: &str) -> &str {
@@ -2301,6 +2350,15 @@ impl fmt::Display for CleanUpdateError {
                 short(commit),
                 gaps.join("; ")
             ),
+            CleanUpdateError::NoScratch { tried } => write!(
+                f,
+                "no scratch repository for reading the merges can be made in {}; set TMPDIR to a writable directory",
+                tried
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            ),
         }
     }
 }
@@ -2308,9 +2366,11 @@ impl fmt::Display for CleanUpdateError {
 /// `commit`'s first parent when it is a clean update from the base branch: a merge whose second
 /// parent is on `base` and whose `git show --remerge-diff` is empty (no conflict resolved).
 pub fn clean_update(repo: &Path, commit: &str, base: &str) -> Result<String, CleanUpdateError> {
-    let isolated = Isolated::over(repo).ok_or_else(|| CleanUpdateError::Unreadable {
-        commit: commit.to_owned(),
-        repo: repo.to_path_buf(),
+    let isolated = Isolated::over(repo).map_err(|why| {
+        why.unwrap_or_else(|| CleanUpdateError::Unreadable {
+            commit: commit.to_owned(),
+            repo: repo.to_path_buf(),
+        })
     })?;
     let merge = merge_from_base(repo, &isolated, commit, base)?;
     if merge.clean {
@@ -2458,7 +2518,6 @@ fn beyond_resolution(
     let merged = isolated.output(&[
         "merge-tree",
         "--write-tree",
-        "--name-only",
         "--no-messages",
         "-z",
         &merge.first,
@@ -2474,7 +2533,30 @@ fn beyond_resolution(
         }
         _ => return Some(unreadable()),
     };
-    let conflicted: Vec<&[u8]> = nul_paths(&listed).into_iter().skip(1).collect();
+    // After the tree id, one `<mode> <object> <stage>\t<path>` entry per stage of each conflict.
+    let mut conflicted: Vec<&[u8]> = Vec::new();
+    let mut submodules: Vec<String> = Vec::new();
+    for entry in nul_paths(&listed).into_iter().skip(1) {
+        let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+            return Some(unreadable());
+        };
+        let path = &entry[tab + 1..];
+        let shown = format!("\"{}\"", path.escape_ascii());
+        if entry.starts_with(b"160000 ") && !submodules.contains(&shown) {
+            submodules.push(shown);
+        }
+        if !conflicted.contains(&path) {
+            conflicted.push(path);
+        }
+    }
+    // The scratch repository holds no submodule's objects, so it cannot tell a submodule's
+    // fast-forward from a conflict; no resolution review covers either.
+    if !submodules.is_empty() {
+        return Some(format!(
+            "its parents conflict in the submodule {}",
+            submodules.join(", ")
+        ));
+    }
     let Some(changed) = remerge_diff(Reader::Isolated(isolated), commit, Listing::Paths) else {
         return Some(unreadable());
     };
@@ -2634,12 +2716,25 @@ fn gate(
     let mut gaps = gaps;
     let mut resolved = Vec::new();
     let mut why = CleanUpdateError::TooLong { limit: MAX_UPDATES };
-    if is_ancestor(repo, &at, base).unwrap_or(false) {
+    let isolated = if is_ancestor(repo, &at, base).unwrap_or(false) {
         why = CleanUpdateError::BaseContainsHead {
             head: at.clone(),
             base: shown(base).to_owned(),
         };
-    } else if let Some(isolated) = Isolated::over(repo) {
+        None
+    } else {
+        match Isolated::over(repo) {
+            Ok(isolated) => Some(isolated),
+            Err(no) => {
+                why = no.unwrap_or_else(|| CleanUpdateError::Unreadable {
+                    commit: at.clone(),
+                    repo: repo.to_path_buf(),
+                });
+                None
+            }
+        }
+    };
+    if let Some(isolated) = isolated {
         for _ in 0..MAX_UPDATES {
             match merge_from_base(repo, &isolated, &at, base) {
                 Ok(merge) if merge.clean => at = merge.first,
@@ -2689,11 +2784,6 @@ fn gate(
                 });
             }
         }
-    } else {
-        why = CleanUpdateError::Unreadable {
-            commit: at.clone(),
-            repo: repo.to_path_buf(),
-        };
     }
     let earlier = verdicts
         .reviews
@@ -2727,6 +2817,28 @@ mod tests {
 
     fn report(block: &str, tail: &str) -> String {
         format!("# Review\n\nFindings follow.\n\n```{BLOCK}\n{block}```\n{tail}")
+    }
+
+    #[test]
+    fn a_scratch_repository_is_private_and_without_a_writable_parent_names_tmpdir() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("missing");
+        let dir = scratch_dir_in(vec![missing.clone(), parent.path().to_path_buf()]).unwrap();
+        assert!(dir.starts_with(parent.path()), "{dir:?}");
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let refused = scratch_dir_in(vec![missing.clone(), missing.join("deeper")]).unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "no scratch repository for reading the merges can be made in {} or {}; set TMPDIR to a writable directory",
+                missing.display(),
+                missing.join("deeper").display()
+            )
+        );
     }
 
     #[test]
