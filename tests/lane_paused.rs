@@ -560,6 +560,22 @@ fn with_the_journal_fallback_a_later_note_recalling_or_planning_the_unpause_reop
         (RESUMED, "1. ~~~\n~~~\npaused = false in LIMITS.toml.\n~~~"),
         (
             RESUMED,
+            "Quoted from yesterday:\n* ```\n  Resumed.\n  paused = false in LIMITS.toml.\n  ```",
+        ),
+        (
+            RESUMED,
+            "- notes\n    ```\n  paused = false in LIMITS.toml.\n    ```",
+        ),
+        (
+            RESUMED,
+            "1. notes\n    ~~~\n   paused = false in LIMITS.toml.\n    ~~~",
+        ),
+        (
+            RESUMED,
+            "- notes\n    - ```\n  paused = false in LIMITS.toml.\n    ```",
+        ),
+        (
+            RESUMED,
             "1. ~~~\n~~~~\n   ~~~\npaused = false in LIMITS.toml.\n~~~~",
         ),
         (
@@ -647,6 +663,26 @@ fn with_the_journal_fallback_a_record_shaped_plan_or_restatement_is_taken_as_the
         assert_eq!((code, lines.len()), (Some(1), 1), "{body}: {text}");
         assert_eq!(lines[0]["since"], "2026-11-27T01:10:00Z", "{body}");
     }
+}
+
+#[test]
+fn with_the_journal_fallback_an_html_block_is_read_as_text() {
+    let c = unpaused_in_the_journal("paused = false in LIMITS.toml.");
+    journal(
+        &c.root,
+        "2026-11-26T23:59Z",
+        "Lane tooling: a fix round sent",
+        "",
+    );
+    journal(
+        &c.root,
+        "2026-11-27T01:10Z",
+        RESUMED,
+        "<pre>\nResumed.\npaused = false in LIMITS.toml.\n</pre>",
+    );
+    let (code, lines, text) = act(&c.root);
+    assert_eq!((code, lines.len()), (Some(1), 1), "{text}");
+    assert_eq!(lines[0]["since"], "2026-11-27T01:10:00Z");
 }
 
 #[test]

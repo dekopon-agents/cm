@@ -2007,10 +2007,11 @@ fn indent(line: &str) -> usize {
 
 // A fence closes only on a run of its own character at least as long as the opener, with nothing
 // after it and indented at most three columns past its container (a list item's content column
-// when the opener is on the item's line, else the margin): anything else is fenced content, as
-// CommonMark reads it. A non-blank line dedented out of the item ends the item and can open another
-// fence that later lines would have to be matched against, so from that line on nothing in the body
-// is read: an unclosed fence in a list item hides the rest of the body.
+// when the opener is on the item's line, else the margin): anything else is fenced content. Two
+// lines end what this reading can follow, so from either on nothing in the body is read: a
+// non-blank line dedented out of an open list-item fence, which ends the item and can open another
+// fence, and a fence run on a line indented four columns, which in a list item can open one. Where
+// this differs from CommonMark it skips more, never less.
 fn states_unpause(body: &str) -> bool {
     let mut fence: Option<(char, usize, usize)> = None;
     let mut hidden = false;
@@ -2034,6 +2035,7 @@ fn states_unpause(body: &str) -> bool {
                 return ";".to_owned();
             }
             if depth >= 4 {
+                hidden = fence_run(list_item(line).unwrap_or(line)).is_some();
                 return ";".to_owned();
             }
             let item = list_item(line);
