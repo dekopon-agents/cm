@@ -1935,8 +1935,9 @@ fn indent(line: &str) -> usize {
 }
 
 // A fence closes only on a run of its own character at least as long as the opener, with nothing
-// after it and indented less than four columns past the opener's line: anything else is fenced
-// content, as CommonMark reads it.
+// after it and indented at most three columns past its container (a list item's content column
+// when the opener is on the item's line, else the margin): anything else is fenced content, as
+// CommonMark reads it.
 fn states_unpause(body: &str) -> bool {
     let mut fence: Option<(char, usize, usize)> = None;
     let text = body
@@ -1945,7 +1946,7 @@ fn states_unpause(body: &str) -> bool {
             let depth = indent(raw);
             let line = raw.trim();
             if let Some((mark, open, at)) = fence {
-                if depth < at + 4 && line.len() >= open && line.chars().all(|c| c == mark) {
+                if depth <= at + 3 && line.len() >= open && line.chars().all(|c| c == mark) {
                     fence = None;
                 }
                 return ";".to_owned();
@@ -1955,7 +1956,8 @@ fn states_unpause(body: &str) -> bool {
             }
             let item = list_item(line);
             if let Some((mark, open)) = fence_run(item.unwrap_or(line)) {
-                fence = Some((mark, open, depth));
+                let column = item.map_or(0, |rest| depth + line.len() - rest.len());
+                fence = Some((mark, open, column));
                 return ";".to_owned();
             }
             match item {

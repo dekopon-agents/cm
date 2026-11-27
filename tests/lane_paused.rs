@@ -555,6 +555,10 @@ fn with_the_journal_fallback_a_later_note_recalling_or_planning_the_unpause_reop
         ),
         (
             RESUMED,
+            "   ~~~\n    ~~~\npaused = false in LIMITS.toml.\n   ~~~",
+        ),
+        (
+            RESUMED,
             "Yesterday's record, quoted:\n\n\tResumed.\n\tpaused = false in LIMITS.toml.",
         ),
         (
@@ -600,6 +604,7 @@ fn with_the_journal_fallback_the_record_states_the_assignment_as_a_clause_of_its
         "Resumed; ran\n```\ncm next --act\n`````\npaused = false in LIMITS.toml.",
         "Resumed from the handoff:\n1. `paused = false` in LIMITS.toml\n2) heartbeat re-armed",
         "Resumed:\n1. ran\n   ```\n   cm next --act\n   ```\n\npaused = false in LIMITS.toml.",
+        "Ran:\n10. ```\n    cm next --act\n    ```\n\npaused = false in LIMITS.toml.",
     ] {
         let c = unpaused_in_the_journal(body);
         let (code, lines, text) = act(&c.root);
