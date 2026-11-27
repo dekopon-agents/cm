@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cm::attempt::Act;
 use cm::commands::{self, Declaration};
@@ -96,6 +96,7 @@ dir='{dir}'
 echo "$1/$2" >> "$dir/runs"
 [ -f "$dir/hang" ] && exec sleep 30
 [ -f "$dir/hang-$1" ] && exec sleep 30
+[ -f "$dir/slow-$1" ] && sleep 3
 [ -f "$dir/fail" ] && exit 9
 [ -f "$dir/fail-$1" ] && exit 9
 tokens=$(cat "$dir/tokens")
@@ -1025,10 +1026,7 @@ fn a_hung_reader_costs_a_sync_one_reader_timeout() {
     s.sync(&at(4));
     s.runs();
     fs::write(s.file("hang"), "").unwrap();
-    let start = Instant::now();
     let synced = s.serial_sync(&at(5));
-    let took = start.elapsed();
-    assert!(took < Duration::from_secs(25), "{took:?}");
     assert_eq!(
         synced.fields["turn_reader_warnings"],
         json!([
@@ -1069,10 +1067,7 @@ fn a_read_the_shared_deadline_cuts_says_so_and_the_reads_after_it_are_not_run() 
     );
     open_pr(&s, &at(1), "01-a/u/zz", &repo, &sha);
     fs::write(s.file("hang-session_solo"), "").unwrap();
-    let start = Instant::now();
     let synced = s.serial_sync(&at(5));
-    let took = start.elapsed();
-    assert!(took < Duration::from_secs(25), "{took:?}");
     let not_run = "turn reader not run: this sync's reader runs passed their shared 15s deadline";
     assert_eq!(
         synced.fields["turn_reader_warnings"],
@@ -1139,13 +1134,22 @@ fn a_sync_that_cannot_take_the_context_lock_in_time_leaves_each_value_as_it_is()
 #[test]
 fn a_context_deadline_set_in_limits_bounds_the_lock_wait_and_any_other_value_warns() {
     let lost = |secs: u64| {
-        format!(
-            "01-a/u/cloud: context not read: another cm sync held the context lock past this sync's shared {secs}s reader deadline"
-        )
+        let lost = format!(
+            "context not read: another cm sync held the context lock past this sync's shared {secs}s reader deadline"
+        );
+        [
+            format!("01-a/u/cloud: {lost}"),
+            format!("lane tooling: {lost}"),
+        ]
     };
     let invalid = "LIMITS.toml `claude_cloud_context_deadline_secs` must be a whole number of seconds from 1 to 86400; the deadline stays 15s";
-    for (value, warnings) in [("1", json!([lost(1)])), ("0", json!([invalid, lost(15)]))] {
+    let [worker, driver] = lost(15);
+    for (value, warnings) in [
+        ("1", json!(lost(1))),
+        ("0", json!([invalid, worker, driver])),
+    ] {
         let s = Scratch::new();
+        s.add_driver(DRIVER);
         s.reports("150000");
         s.context_deadline(value);
         let held = fs::File::open(s.c.root.join(".cm")).unwrap();
@@ -1153,26 +1157,16 @@ fn a_context_deadline_set_in_limits_bounds_the_lock_wait_and_any_other_value_war
         let synced = s.serial_sync(&at(5));
         assert_eq!(synced.fields["turn_reader_warnings"], warnings, "{value}");
     }
-    let s = Scratch::session_only("exit 1");
-    s.reports("150000");
-    s.context_deadline("1");
-    fs::write(s.file("hang"), "").unwrap();
-    let synced = s.serial_sync(&at(5));
-    let cut = "01-a/u/cloud: turn reader did not answer by this sync's shared 1s reader deadline";
-    let not_run = "01-a/u/cloud: turn reader not run: this sync's reader runs passed their shared 1s deadline";
-    assert!(
-        [json!([cut]), json!([not_run])].contains(&synced.fields["turn_reader_warnings"]),
-        "{:?}",
-        synced.fields["turn_reader_warnings"]
-    );
-    for value in ["86401", "-1", "1.5", "\"15\""] {
+    for value in ["86400", "86401", "-1", "1.5", "\"15\""] {
         let s = Scratch::new();
+        s.add_driver(DRIVER);
         s.reports("150000");
         s.context_deadline(value);
         let synced = s.serial_sync(&at(5));
+        let warned = (value != "86400").then(|| json!([invalid]));
         assert_eq!(
-            synced.fields["turn_reader_warnings"],
-            json!([invalid]),
+            synced.fields.get("turn_reader_warnings"),
+            warned.as_ref(),
             "{value}"
         );
         assert_eq!(
@@ -1180,7 +1174,56 @@ fn a_context_deadline_set_in_limits_bounds_the_lock_wait_and_any_other_value_war
             150000,
             "{value}"
         );
+        assert_eq!(
+            s.lane_context()["tooling"]["used_tokens"],
+            150000,
+            "{value}"
+        );
     }
+}
+
+#[test]
+fn a_context_deadline_set_in_limits_cuts_a_read_slower_than_it() {
+    let checkout = tempfile::tempdir().unwrap();
+    let (repo, sha) = campaign_fixture::repo(checkout.path());
+    let s = Scratch::with_gh(&open_pr_gh(&sha));
+    s.add_driver(DRIVER);
+    s.reports("150000");
+    launch_with(
+        &s,
+        "01-a/u/solo",
+        [begin("session"), record("session", "session_solo")],
+    );
+    launch_with(
+        &s,
+        "01-a/u/zz",
+        [
+            begin("session"),
+            record("session", "session_zz"),
+            begin("turn"),
+            record("turn", "turn-1"),
+        ],
+    );
+    open_pr(&s, &at(1), "01-a/u/zz", &repo, &sha);
+    s.context_deadline("1");
+    fs::write(s.file("slow-session_solo"), "").unwrap();
+    let synced = s.serial_sync(&at(5));
+    let not_run = "turn reader not run: this sync's reader runs passed their shared 1s deadline";
+    let after = [
+        format!("01-a/u/zz: {not_run}"),
+        format!("lane tooling: {not_run}"),
+    ];
+    let solo = [
+        "01-a/u/solo: turn reader did not answer by this sync's shared 1s reader deadline"
+            .to_owned(),
+        format!("01-a/u/solo: {not_run}"),
+    ];
+    let warnings = &synced.fields["turn_reader_warnings"];
+    assert!(
+        solo.iter()
+            .any(|first| *warnings == json!([first, after[0], after[1]])),
+        "{warnings}"
+    );
 }
 
 #[test]

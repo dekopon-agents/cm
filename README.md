@@ -636,7 +636,9 @@ as one launched step's turn read and a lane driver's, a reader slower than 7.5 s
 the second too little time on every sync, and its value stays stale. Set
 `claude_cloud_context_deadline_secs` in LIMITS.toml, a whole number of seconds from 1 to 86400,
 to give the deadline another length, which its warnings then name; any other value warns in
-`turn_reader_warnings` and the deadline stays 15 s.
+`turn_reader_warnings` and the deadline stays 15 s. A longer deadline also lets a hung context
+reader hold its sync, and the context lock, that long, while every other `cm sync` waits up to
+its own deadline for the lock.
 
 `cm next --act` lists `context-over` (below) for a live attempt or a registered driver whose
 current session's value exceeds 200000 tokens, stale ones included, which say so:
