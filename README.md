@@ -80,7 +80,7 @@ error. `review wait` additionally uses 3 for its deadline and 4 for unreadable c
 | `cm evidence <NN-name>/<unit>/<step> --name NAME --body-file F [--candidate STEP[@SHA] [--harness STEP[@SHA]]]` | Writes `<step>/evidence/<NAME>.md` once from a non-empty body and journals the path. `cm advance <step> done` without `--evidence` takes the step's one evidence file when it has exactly one. `--candidate` and `--harness` pin the file to the commits it was produced against (see [Pinned evidence](#pinned-evidence)). |
 | `cm review <step> --pr URL --head SHA --model ID --effort E --verdict accept\|fix-required --findings C/F --cost USD --wall MIN [--delta FROM_SHA]`, `cm review --import` | Appends one row to the review ledger `.cm/reviews.json` and renders `REVIEW-OFF.md` from it, rows in PR order with a delta review under its PR, and journals the row. The rows a hand-written `REVIEW-OFF.md` already holds are imported once, kept cell for cell, and the text before and after the table (per-PR adjudications, rules) is kept byte for byte (`--import`, or the first `cm review`). The step must be declared (`step-unknown`); an imported delta row is the one whose `#` cell carries `Δ`. After that a hand edit is `review-hand-edit`, as for `STATE.md`. |
 | `cm review wait <step> --head SHA --reviewer KIND --deadline RFC3339 [--part NAME]` | Blocks until `.cm/verdicts.json` records the named round: step, current PR, part, reviewer and head (either verdict). Re-reads the step’s current PR and review ledger once per second without holding the campaign lock; missing ledger means empty. Exit 0 / `wait_status: recorded`, 3 / `deadline`, 4 / `unreadable`; Invalid head/reviewer arguments and unknown step/part scopes exit 2 (`refused` for scope refusals); This command alone uses strict campaign discovery: read/decode errors and invalid campaign state exit 4, including a malformed inner campaign without falling through to an outer campaign; a genuinely absent campaign exits 2. Unreadable or malformed declared unit state or review ledger also exits 4. Writes nothing. Run it as a background command to await a review instead of polling. |
-| `cm review record <step> <report-file> [--reviewer KIND] [--part NAME]` | Parses the `cm-review` block that ends the report (see [Review verdicts](#review-verdicts)), computes the verdict, copies the report to `<step>/evidence/reviews/R<n>[-KIND].md` and records the review in `.cm/verdicts.json` as `R<n>`, its findings as `R<n>.<id>`. Refuses a report with no block or a malformed one (`review-block`, one per problem, with its line), an undeclared step and a report already recorded for the step (`review-duplicate`). A report whose own verdict line disagrees with the computed one is recorded with the computed verdict and the disagreement printed and journaled. `--part` selects a declared part and its PR; it is required on multipart steps. Distinct FIX REQUIRED heads on the current PR count toward the ten-pass step cap; rising blocking counts request an independent reader and only a non-converging `fresh-opus` round blocks the step (see [Rounds](#rounds)). |
+| `cm review record <step> <report-file> [--reviewer KIND] [--part NAME] [--kind resolution [--repo PATH]]` | Parses the `cm-review` block that ends the report (see [Review verdicts](#review-verdicts)), computes the verdict, copies the report to `<step>/evidence/reviews/R<n>[-KIND].md` and records the review in `.cm/verdicts.json` as `R<n>`, its findings as `R<n>.<id>`. Refuses a report with no block or a malformed one (`review-block`, one per problem, with its line), an undeclared step and a report already recorded for the step (`review-duplicate`). A report whose own verdict line disagrees with the computed one is recorded with the computed verdict and the disagreement printed and journaled. `--part` selects a declared part and its PR; it is required on multipart steps. Distinct FIX REQUIRED heads on the current PR count toward the ten-pass step cap; rising blocking counts request an independent reader and only a non-converging `fresh-opus` round blocks the step (see [Rounds](#rounds)). `--kind resolution` records a review of only the conflict resolutions of the merge at the report's head, as `"kind": "resolution"` with the merge's full SHA (see [Merge gate](#merge-gate)). It is refused (`review-resolution`) unless `--reviewer` names a reviewer of either family and, in `--repo` (a checkout, its `.git` directory or a bare repository; else the step's worktree), `refs/remotes/origin/HEAD` reads as the base branch's tip and the head is a two-parent merge whose second parent is on it, whose parents have a merge base in a scratch repository over the checkout's objects and conflict there, which differs from git's own merge of them (one `git merge-tree --write-tree` in that scratch repository) only where that merge's conflicts allow, and whose first parent both families' ACCEPTs clear, on any lane. The first one stamps the campaign's `.cm/state.json` with schema 8, which a cm older than this one refuses (`upgrade cm`). |
 | `cm review resolve <step> <finding> --by <commit\|ruling-file>` | Records what resolved a blocking finding: `R<n>.<id>`, or `<id>` in the step's latest review holding it; an id whose `R<n>` is not a review number names no finding (`finding-unknown`). `--by` is a ruling file in the campaign when that path exists, else a commit SHA. A follow-up is `resolve-not-blocking`; a second resolution is `resolve-done`. |
 | `cm ruling <step> "<text>"` | Appends `- YYYY-MM-DD: <text>` to `<step>/evidence/coordinator-scope.md`, creating it with `# Scope and coordinator rulings: <step>` when it is missing, and journals the line. |
 | `cm brief <step>` | Prints the step's `kickoff.md`, then `## Coordinator scope and rulings` and the step's `evidence/coordinator-scope.md` (or a line saying none is recorded): the brief for `astra-review.sh start` and review packets. `--json` puts it in `brief`. Refuses a step with no `kickoff.md`. |
@@ -664,8 +664,8 @@ remains required. Superseding meets no gate; amend consumers to name the replace
 
 cm 0.13 raises SCHEMA from 6 to 7 for additive PR base/CI observations and an optional owner-queue read acknowledgement.
 New fields default to absent and are omitted when absent; old state remains readable.
-Sync stamps campaign state with schema 7 before writing observations so an older reader
-cannot erase them. A first nonempty, fully completed check read records head/base;
+Sync stamps campaign state with at least schema 7 before writing observations so an older reader
+cannot erase them, and never lowers it: a campaign holding a resolution review stays at schema 8. A first nonempty, fully completed check read records head/base;
 pending or unreadable checks do not. The baseline changes with a new tested head,
 not a same-head rerun. A changed base is a warning and never a lifecycle gate.
 Upgrade every reader before writing shared state with cm 0.13.
@@ -856,12 +856,15 @@ A non-converging round prints `converging: false` and journals the owner's rulin
 > Fix passes: when a review round closes fewer blocking findings than it opens, or a finding marked fixed returns, one fresh independent reader (Opus, high effort) reviews the head; the PR or design escalates to the owner only if that round also fails to converge. A third FIX REQUIRED by count alone escalates nothing. The session cap of 10 passes stands.
 
 `cm next` lists a `fresh reader` item with
-`cm review record <step> '<fresh-review-report>' --reviewer fresh-opus [--part=NAME]`.
+`cm review record <step> '<fresh-review-report>' --reviewer fresh-opus [--part=NAME]`, and
+`--kind resolution` added when the rising round reviewed a merge's conflict resolution, which the
+item names. Rounds are compared like with like: a resolution round only with resolution rounds of
+the same merge, a head round only with head rounds.
 Have an independent Opus reader at high effort review the head, then record its report with that
 command. The item appears before the step is merged, including when no PR is recorded, and
 remains until a `fresh-opus` report is recorded for that PR and part. The fresh round's baseline
 is the trigger head, or the latest previously reviewed head for the same step, PR and part when
-no request is pending. Its blocking count is the maximum across all reports at that head, so
+no request is pending. Its blocking count is the maximum across the reports of its kind at that head, so
 recording order does not affect the fresh round's convergence. Without either baseline, `converging` is
 null and no convergence verdict is printed. A failing fresh round writes an owner-queue item
 and blocks the step `blocked:non-convergence` when it can change phase. An unrelated block and
@@ -911,14 +914,115 @@ one `merge-gate` violation per gap, unless at the PR's head (GitHub's, via `gh a
 A clean update from the base branch needs no new review, only green CI on the new head: (a) and
 (b) may hold instead at an earlier reviewed head H1 when every commit on the first-parent chain
 from H1 to the head is a merge whose second parent is on the base branch (GitHub's base tip, else
-`origin/HEAD`) and whose `git show --remerge-diff` is empty. When the base tip already contains
+the checkout's `refs/remotes/origin/HEAD`, for which no local tag or branch named `origin/HEAD`
+stands in) and whose `git show --remerge-diff` is empty, read twice. In the checkout it is read
+with every submodule shown, no textconv or external diff driver and not relative to the checkout's
+subdirectory, so a merge that also moves a submodule `.gitmodules` or config marks ignored, or
+whose change a textconv or `diff.relative` setting would hide, is no clean update; a signature
+check that `log.showSignature` asks for prints into it, so under that setting a signed merge is no
+clean update either. It is read again in a scratch repository that borrows the checkout's objects
+and has no refs, configuration or attributes, its own or the caller's environment's, so it is
+git's default merge of the two parents: a merge that only looked clean through a merge attribute
+(`merge=union`, a merge driver), committed or local, or a `merge.*` setting is no clean update.
+The scratch repository holds no submodule's objects either, so a merge whose parents set a
+submodule to two different commits, even when one is the other's ancestor, reads as a conflict
+there and needs its own review. Of the commits the checkout's `shallow` file lists, it stops only
+at those with a parent missing from the checkout's objects, where git could read no further; past
+any other, whose parents are all there (forged, or left listed by a later, deeper fetch), it reads
+on. A merge whose parents have no merge base there (`git merge-base --all` finds none), because it
+lies past the boundary or the two histories are unrelated, is still a clean update when both
+remerge diffs are empty, but no conflict resolution: `cm review record --kind resolution` and the
+walk refuse it, naming the merge. Nor is a merge whose parents reach a boundary entry that stays
+above the merge bases git found, since a nearer merge base may lie past it (a shallow clone of
+the feature branch three commits deep and of the base branch two deep, or one that cuts a
+criss-cross merge): both refuse it, naming the merge and the entry, and ask for its own review or
+a checkout that holds the history back to the merge base. A shallow file the gate cannot
+read, or with a line that is not a full object id, stops the gate as unreadable, though git reads
+a shallow file it cannot read as no boundary, and a line that starts with an object id as that id.
+It is made, mode 0700 and its files 0600 whatever the umask, under TMPDIR, taken as
+absolute (an empty TMPDIR names none), else under `/tmp`: a directory where it, its `git init` or
+its alternates file or its copy of the shallow boundary cannot be made is passed over, and with neither the gate refuses, naming both
+and why, and asks for a writable TMPDIR. Every git command in it runs under umask 077 whatever the
+caller's, so nothing git makes there, a remerge diff's temporary object directory included, takes
+the caller's umask. Once it is made, git failing in it, or printing a line that begins `error:` or
+`fatal:` even when it exits 0, stops the gate with the scratch repository's path and git's error;
+git runs there with no locale set, so those prefixes are untranslated, and any other line, such as
+a `warning:` or a `hint:`, stops nothing. The scratch repository reads the checkout's objects
+through its alternates, so an error git prints about them stops the gate there too, even for a
+clean update the checkout's own reads pass: a checkout whose `objects/info/alternates` names a
+directory that is gone, or whose pack directory holds a pack index git cannot read, is refused.
+In the checkout the remerge diff runs under the caller's
+umask, as it always has, and only its exit status counts. For a non-root user a umask that takes
+the owner's write or search bit (0277, 0377, 0577, 0777) leaves git no temporary object directory
+there: git 2.43 then fails and the gate refuses the merge as unreadable, while git 2.56 prints an
+error and no diff and exits 0, so only the scratch repository's read keeps a resolved conflict from
+passing as a clean update. Under one that takes only the owner's read bit (0477) git leaves its
+`tmp_objdir-remerge-diff-*` directory in the checkout's objects directory, and on a merge that
+resolved a conflict it fails and the gate refuses. The scratch repository is removed when the gate
+is done; a run killed mid-gate leaves its `cm-gate-*` directory under TMPDIR or `/tmp`, and nothing
+cleans it up
+later. Every git command the gate runs ignores replace refs, any `info/grafts` file, the
+commit-graph and the multi-pack-index, including those it reads through alternates, and drops
+from its environment every `GIT_TEST_*` variable (some bring those caches back) and `GIT_DIR`,
+`GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_SHALLOW_FILE` and the other variables that would
+move the repository or the history it reads. The gate trusts the checkout itself: an object
+stored under the wrong name is read as it stands, and a merge driver the checkout configures runs
+when the gate re-merges there. Its shallow file is trusted only as far as its objects bear it out:
+the checkout's own reads honour every entry (one at a merge makes it no merge; one below it can
+move the merge base of the checkout's own remerge diff, but not of the scratch repository's, which
+must be empty too), while the scratch repository stops only at an entry with a missing parent. When the base tip already contains
 the head (the PR has merged into it), no merge can be told apart from the PR's own commits, so
 the walk does not run. A merge that resolved conflicts, or
 any other commit, needs its own review. The rule only skips a review nobody did: the walk stops
 at the first commit, from the head back, that has a recorded review or a finished receipt, and
-that commit must clear (a) and (b) itself; an earlier ACCEPT never outweighs it. The walk runs in `--repo` or the step's worktree (for
+that commit must clear (a) and (b) itself; an earlier ACCEPT never outweighs it. The walk runs in `--repo` (a checkout, its `.git` directory or a bare repository) or the step's worktree (for
 `cm sync`, the worktree only), which must hold those commits and the base tip; without one, (a)
-and (b) must hold at the head itself.
+and (b) must hold at the head itself. The walk starts at the commit `--head` names in that
+checkout: a hex prefix must be a prefix of that commit, and any other name must name the same
+commit as every ref of that name (under `refs/`, a tag, a branch or a remote-tracking ref), or
+the walk does not run. A step that holds a resolution review also matches receipts and reviews
+to that commit; any other step matches them to `--head` as given.
+
+A merge from the base branch whose parents conflict, and which differs from git's own merge of
+them only where that merge's conflicts allow (below), may instead stand on resolution reviews recorded at it with `cm review
+record … --kind resolution` (owner, 2026-11-25). Those reviews, and the receipts of their
+reports, do not stop the walk as a review of the merge would. The walk passes such a merge when
+Astra and a Claude reviewer have each recorded an explicit resolution ACCEPT there, none of its
+resolution reviews has an unresolved blocking finding (a resolved FIX REQUIRED is no ACCEPT), and
+every finished Astra receipt at the merge is the receipt of an Astra resolution report recorded
+there. It then goes on to the merge's first parent, which must clear with both families' ACCEPTs
+on any lane, so a later merge from the base branch walks back through an earlier one. Git's own
+merge is made in the scratch repository above: one `git merge-tree --write-tree` run gives its
+tree, the paths it lists as conflicted and a typed record of each conflict, and the merge is
+compared with that tree path by path, with renames not folded. So git's default merge of the
+commits decides all three, and no merge attribute, driver or `merge.*` setting, committed or
+local, does: a `-merge` or `binary` attribute makes no file conflicted, and a merge whose parents
+merge there without a conflict, or that differs from git's merge at any path its conflicts do not
+allow, does not pass this way. The merge may differ at a conflicted path. Symlinks and
+submodules git moves aside are not read: a merge whose parents put a symlink or a submodule
+against a directory, or entries of two different types (a file, a symlink, a submodule) at one
+path, is refused whatever it keeps, naming the path and the two kinds, as a conflict shape cm does
+not read, and needs its own review. Where git suggests
+moving a file one parent put in a directory the other parent renamed
+(`CONFLICT (file location)`), it lists the file's path in the renamed directory as conflicted,
+and the merge may keep the file there or put it back at the path its parent gave it. Where git
+moves a file aside for a directory (`CONFLICT (file/directory)`), the record names the path it
+made up for the file, `<path>~` and the commit of the parent it came from, and that path must not
+remain: a merge that keeps both entries, under that name or a new one, does not pass. The merge
+may keep the directory, or put the file back at its own path and delete the directory's files;
+no other change beneath that path passes. A file/directory record whose made-up path holds no
+conflicted entry, as when a parent renames the file it names while the other parent puts a
+directory in its place, allows nothing. Git's other records, `Auto-merging` and content, binary,
+modify/delete, rename/delete and rename/rename conflicts, a rename involved in a collision, a
+file in the way of a directory rename, a directory rename collision and a directory rename git
+could not split, allow nothing more than the paths git lists as conflicted, and a record of any
+other type stops the merge passing this way. Nor does a merge whose parents set a submodule to
+two different commits: without the submodule's objects their merge cannot be read. A submodule
+one parent deletes is read like a file. A resolution review is never an ACCEPT of the head, and its receipt never meets (a) at
+the head: without a checkout, (a) and (b) must hold at the merge itself, and a review of the head
+recorded at the merge governs it. Any commit after the merge needs its own review, and so does
+the merge once it is amended. The journal entry of the `merged` move names each merge the walk
+passed this way.
 
 When cm cannot read the PR or its checks from GitHub, (c) refuses unless `--ci-verified <path>`
 names a campaign file showing green CI; the head is then `--head`, else the SHA recorded at

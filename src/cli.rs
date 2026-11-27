@@ -649,6 +649,19 @@ enum ReviewAct {
         /// The declared part reviewed by this report.
         #[arg(long, value_name = "NAME")]
         part: Option<String>,
+        #[arg(
+            long,
+            value_parser = ["resolution"],
+            help = "The report reviewed only the conflict resolutions of the merge from the base branch at its head; with both families' ACCEPT the merge gate's walk passes that merge"
+        )]
+        kind: Option<String>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            requires = "kind",
+            help = "The checkout --kind resolution reads the merge in, with origin/HEAD as the base branch's tip; defaults to the step's worktree"
+        )]
+        repo: Option<PathBuf>,
     },
     /// Record what resolved a blocking finding: a commit, or a ruling file in the campaign.
     Resolve {
@@ -1303,16 +1316,29 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                     report,
                     reviewer,
                     part,
+                    kind,
+                    repo,
                 }),
             ..
-        } => crate::verdict::record(
-            host,
-            &root()?,
-            target,
-            &under_root(cli, report),
-            reviewer.as_deref(),
-            part.as_deref(),
-        ),
+        } => match kind {
+            Some(_) => crate::verdict::record_resolution(
+                host,
+                &root()?,
+                target,
+                &under_root(cli, report),
+                reviewer.as_deref(),
+                part.as_deref(),
+                repo.as_deref(),
+            ),
+            None => crate::verdict::record(
+                host,
+                &root()?,
+                target,
+                &under_root(cli, report),
+                reviewer.as_deref(),
+                part.as_deref(),
+            ),
+        },
         Commands::Review {
             act:
                 Some(ReviewAct::Resolve {

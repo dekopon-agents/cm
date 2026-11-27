@@ -8,6 +8,7 @@ use crate::evidence::CampaignFile;
 use crate::forge::{GithubRepo, TagName};
 
 pub const SCHEMA: u32 = 7;
+pub const RESOLUTION_SCHEMA: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]

@@ -1,0 +1,91 @@
+{
+  "reviews": [
+    {
+      "number": 1,
+      "at": "2026-11-25T18:13Z",
+      "step": "01-a/u/S1",
+      "reviewer": "astra",
+      "head": "122ed358bca895bc3b07bab4cc9603b52a651918",
+      "verdict": "accept",
+      "stated": "accept",
+      "report": "01-a/u/S1/evidence/reviews/R1-astra.md",
+      "findings": []
+    },
+    {
+      "number": 2,
+      "at": "2026-11-25T18:13Z",
+      "step": "01-a/u/S1",
+      "reviewer": "claude",
+      "pr": "https://github.com/o/r/pull/7",
+      "head": "122ed358bca895bc3b07bab4cc9603b52a651918",
+      "verdict": "fix-required",
+      "stated": "fix-required",
+      "report": "01-a/u/S1/evidence/reviews/R2-claude.md",
+      "findings": [
+        {
+          "id": "F1",
+          "type": "contract",
+          "origin": "introduced",
+          "at": "src/lib.rs:1",
+          "summary": "broken",
+          "blocking": true,
+          "resolution": {
+            "at": "2026-11-25T18:13Z",
+            "by": {
+              "commit": "5b1b852ba93a6763dcce3482d95a6444126b962d"
+            }
+          }
+        },
+        {
+          "id": "F2",
+          "type": "contract",
+          "origin": "exposed",
+          "at": "src/lib.rs:2-4",
+          "summary": "main exposed it",
+          "blocking": true,
+          "resolution": {
+            "at": "2026-11-25T18:13Z",
+            "by": {
+              "ruling": "ruling.md"
+            }
+          }
+        },
+        {
+          "id": "F3",
+          "type": "guideline",
+          "origin": "introduced",
+          "at": "-",
+          "summary": "name it better",
+          "blocking": false,
+          "closed": {
+            "at": "2026-11-25T18:13Z",
+            "by": "kept as is"
+          }
+        }
+      ]
+    },
+    {
+      "number": 3,
+      "at": "2026-11-25T18:13Z",
+      "step": "01-a/u/S1",
+      "pr": "https://github.com/o/r/pull/7",
+      "head": "5b1b852ba93a6763dcce3482d95a6444126b962d",
+      "verdict": "accept",
+      "report": "01-a/u/S1/evidence/reviews/R3.md",
+      "findings": []
+    },
+    {
+      "number": 4,
+      "at": "2026-11-25T18:13Z",
+      "step": "01-a/u/S2",
+      "reviewer": "astra",
+      "pr": "https://github.com/o/r/pull/9",
+      "part": "one",
+      "head": "5b1b852ba93a6763dcce3482d95a6444126b962d",
+      "verdict": "accept",
+      "stated": "accept",
+      "report": "01-a/u/S2/evidence/reviews/R4-astra.md",
+      "findings": []
+    }
+  ]
+}

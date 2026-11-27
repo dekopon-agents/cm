@@ -1,9 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -499,6 +498,27 @@ pub struct Verdicts {
     pub reviews: Vec<Recorded>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewKind {
+    #[default]
+    Head,
+    Resolution,
+}
+
+impl ReviewKind {
+    fn is_head(&self) -> bool {
+        *self == ReviewKind::Head
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            ReviewKind::Head => "head",
+            ReviewKind::Resolution => "resolution",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recorded {
     pub number: u32,
@@ -511,6 +531,8 @@ pub struct Recorded {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part: Option<String>,
     pub head: String,
+    #[serde(default, skip_serializing_if = "ReviewKind::is_head")]
+    pub kind: ReviewKind,
     pub verdict: Verdict,
     /// The verdict line the report ends with, when it has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -576,6 +598,13 @@ impl Recorded {
     pub fn at_head(&self, head: &str) -> bool {
         same_commit(&self.head, head)
     }
+
+    fn binds(&self, at: &str) -> bool {
+        match self.kind {
+            ReviewKind::Head => self.at_head(at),
+            ReviewKind::Resolution => self.head.eq_ignore_ascii_case(at),
+        }
+    }
 }
 
 fn verdicts_path(root: &Path) -> PathBuf {
@@ -618,13 +647,19 @@ fn previous_review<'a>(
     pr: Option<&str>,
     part: Option<&str>,
     reviewer: Option<&str>,
+    round: impl Fn(&Recorded) -> bool,
 ) -> Option<&'a Recorded> {
     previous.iter().rev().find(|before| {
         before.step == step
             && before.pr.as_deref() == pr
             && before.part.as_deref() == part
             && before.reviewer.as_deref() == reviewer
+            && round(before)
     })
+}
+
+fn same_round(review: &Recorded, kind: ReviewKind, head: &str) -> bool {
+    review.kind == kind && (kind.is_head() || review.binds(head))
 }
 
 pub(crate) fn fresh_readers(verdicts: &Verdicts) -> Vec<&Recorded> {
@@ -635,9 +670,10 @@ pub(crate) fn fresh_readers(verdicts: &Verdicts) -> Vec<&Recorded> {
             review.step.as_str(),
             review.pr.as_deref(),
             review.part.as_deref(),
+            (!review.kind.is_head()).then(|| review.head.to_ascii_lowercase()),
         );
         let count = blocking_count(review);
-        let before = previous.insert((scope, review.reviewer.as_deref()), count);
+        let before = previous.insert((scope.clone(), review.reviewer.as_deref()), count);
         if review.reviewer.as_deref() == Some("fresh-opus") {
             pending.remove(&scope);
         } else if before.is_some_and(|before| count > before) {
@@ -696,6 +732,142 @@ pub fn record(
     report: &Path,
     reviewer: Option<&str>,
     part: Option<&str>,
+) -> Result<Outcome> {
+    record_as(host, root, target, report, reviewer, part, None)
+}
+
+pub fn record_resolution(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    report: &Path,
+    reviewer: Option<&str>,
+    part: Option<&str>,
+    repo: Option<&Path>,
+) -> Result<Outcome> {
+    record_as(
+        host,
+        root,
+        target,
+        report,
+        reviewer,
+        part,
+        Some(Resolving { repo }),
+    )
+}
+
+struct Resolving<'a> {
+    repo: Option<&'a Path>,
+}
+
+fn step_worktree(root: &Path, target: &Target) -> Option<PathBuf> {
+    let unit = store::load_unit(&root.join(&target.unit)).ok()?;
+    let step = unit.steps.get(target.step.as_deref()?)?;
+    let worktree = PathBuf::from(&step.worktree);
+    (!step.worktree.is_empty() && worktree.exists()).then_some(worktree)
+}
+
+fn resolution_parent(
+    root: &Path,
+    target: &Target,
+    part: Option<&str>,
+    pr: Option<&str>,
+    merge: &str,
+    reviewer: Option<&str>,
+    repo: Option<&Path>,
+) -> Result<(String, String), String> {
+    if Family::reviewer(reviewer).is_none() {
+        return Err(
+            "a resolution review counts only for its reviewer's family: name a Codex reviewer (astra, sol, terra, gpt-…) or a Claude one (claude, opus, fresh-opus, fable, sonnet, haiku) with --reviewer"
+                .to_owned(),
+        );
+    }
+    let Some(repo) = repo
+        .map(Path::to_path_buf)
+        .or_else(|| step_worktree(root, target))
+    else {
+        return Err(
+            "a resolution review is checked against the merge in a checkout; pass --repo <a checkout of the repo>"
+                .to_owned(),
+        );
+    };
+    let base = ORIGIN_HEAD;
+    if git_out(
+        &repo,
+        &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+    )
+    .is_none()
+    {
+        return Err(format!(
+            "cannot read {}, the base branch's tip, in {}; fetch the base branch there",
+            shown(base),
+            repo.display()
+        ));
+    }
+    let named = merge;
+    let Some(merge) = git_out(
+        &repo,
+        &["rev-parse", "--verify", &format!("{named}^{{commit}}")],
+    ) else {
+        return Err(CleanUpdateError::Unreadable {
+            commit: named.to_owned(),
+            repo,
+        }
+        .to_string());
+    };
+    if !merge
+        .to_ascii_lowercase()
+        .starts_with(&named.to_ascii_lowercase())
+    {
+        return Err(format!(
+            "{named} resolves to {merge} in {}, a commit it does not name: a ref of that name shadows it",
+            repo.display()
+        ));
+    }
+    let isolated = Isolated::over(&repo, &merge).map_err(|why| why.to_string())?;
+    let merged = merge_from_base(&repo, &isolated, &merge, base).map_err(|why| why.to_string())?;
+    if merged.clean {
+        return Err(format!(
+            "{} is a clean update from the base branch: its remerge diff is empty, so it needs no review",
+            short(&merge)
+        ));
+    }
+    resolvable(&isolated, &merge, &merged).map_err(|why| why.to_string())?;
+    if let Some(gap) =
+        beyond_resolution(&isolated, &merge, &merged).map_err(|why| why.to_string())?
+    {
+        return Err(format!(
+            "{} is no conflict resolution a resolution review can cover: {gap}; it needs a review of its own",
+            short(&merge)
+        ));
+    }
+    let first = merged.first;
+    let lineage = Lineage {
+        repo: &repo,
+        base: Some(base),
+    };
+    let cleared = gate(root, target, part, pr, &first, Some(&lineage), true)
+        .map_err(|error| format!("{error:#}"))?;
+    if cleared.gaps.is_empty() {
+        Ok((merge, first))
+    } else {
+        Err(format!(
+            "{}'s first parent {} does not clear the gate, so no resolution review can stand on it: {}",
+            short(&merge),
+            short(&first),
+            cleared.gaps.join("; ")
+        ))
+    }
+}
+
+fn record_as(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    report: &Path,
+    reviewer: Option<&str>,
+    part: Option<&str>,
+    resolving: Option<Resolving>,
 ) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
     let full = full_name(target);
@@ -756,6 +928,27 @@ pub fn record(
     };
     let mut verdicts = load(root)?;
     let pr = step_pr(root, target, part)?;
+    let mut first_parent = None;
+    let mut canonical = None;
+    if let Some(resolving) = &resolving
+        && let Some((block, _)) = &block
+    {
+        match resolution_parent(
+            root,
+            target,
+            part,
+            pr.as_deref(),
+            &block.head,
+            reviewer,
+            resolving.repo,
+        ) {
+            Ok((merge, parent)) => {
+                canonical = Some(merge);
+                first_parent = Some(parent);
+            }
+            Err(why) => violations.push(Violation::new(&full, "review-resolution", why)),
+        }
+    }
     let heads = fix_heads(
         verdicts
             .reviews
@@ -764,7 +957,9 @@ pub fn record(
     );
     let new_pass = block.as_ref().is_some_and(|(block, _)| {
         block.verdict() == Verdict::FixRequired
-            && !heads.iter().any(|head| same_commit(head, &block.head))
+            && !heads
+                .iter()
+                .any(|head| same_commit(head, canonical.as_deref().unwrap_or(&block.head)))
     });
     let passes = heads.len() + usize::from(new_pass);
     if new_pass && passes > 10 {
@@ -823,6 +1018,13 @@ pub fn record(
     let Some((block, text)) = block.filter(|_| violations.is_empty()) else {
         return Ok(Outcome::refused(violations));
     };
+    let head = canonical.unwrap_or_else(|| block.head.clone());
+    let kind = if resolving.is_some() {
+        ReviewKind::Resolution
+    } else {
+        ReviewKind::Head
+    };
+    let round = |review: &Recorded| same_round(review, kind, &head);
     let verdict = block.verdict();
     let at = stamp(host.now());
     let part_heads =
@@ -831,8 +1033,7 @@ pub fn record(
         }));
     let rounds = part_heads.len()
         + usize::from(
-            verdict == Verdict::FixRequired
-                && !part_heads.iter().any(|head| same_commit(head, &block.head)),
+            verdict == Verdict::FixRequired && !part_heads.iter().any(|at| same_commit(at, &head)),
         );
     let findings: Vec<Logged> = block
         .findings
@@ -847,10 +1048,18 @@ pub fn record(
     let previous = if reviewer == Some("fresh-opus") {
         fresh_readers(&verdicts)
             .into_iter()
-            .find(|review| review.step == full && review.pr == pr && review.part.as_deref() == part)
+            .find(|review| {
+                review.step == full
+                    && review.pr == pr
+                    && review.part.as_deref() == part
+                    && round(review)
+            })
             .or_else(|| {
                 verdicts.reviews.iter().rev().find(|review| {
-                    review.step == full && review.pr == pr && review.part.as_deref() == part
+                    review.step == full
+                        && review.pr == pr
+                        && review.part.as_deref() == part
+                        && round(review)
                 })
             })
             .map(|baseline| {
@@ -862,12 +1071,20 @@ pub fn record(
                             && review.pr == pr
                             && review.part.as_deref() == part
                             && review.at_head(&baseline.head)
+                            && round(review)
                     })
                     .max_by_key(|review| blocking_count(review))
                     .unwrap_or(baseline)
             })
     } else {
-        previous_review(&verdicts.reviews, &full, pr.as_deref(), part, reviewer)
+        previous_review(
+            &verdicts.reviews,
+            &full,
+            pr.as_deref(),
+            part,
+            reviewer,
+            round,
+        )
     };
     let converging = match previous {
         Some(before) => Some(
@@ -915,7 +1132,8 @@ pub fn record(
         reviewer: reviewer.map(str::to_owned),
         pr: pr.clone(),
         part: part.map(str::to_owned),
-        head: block.head.clone(),
+        head: head.clone(),
+        kind,
         verdict,
         stated: block.stated,
         report: report_file.clone(),
@@ -934,11 +1152,22 @@ pub fn record(
         .filter(|logged| !logged.blocking)
         .map(|logged| format!("{id}.{}", logged.finding.id))
         .collect();
+    // The campaign is stamped before the ledger holds a resolution review, so a cm that would read
+    // one as an ACCEPT of the head refuses the campaign instead.
+    let mut stamped = false;
+    if recorded.kind == ReviewKind::Resolution {
+        let mut campaign = store::load_campaign(root)?;
+        if campaign.schema < crate::state::RESOLUTION_SCHEMA {
+            campaign.schema = crate::state::RESOLUTION_SCHEMA;
+            write_json(&store::state_path(root), &campaign)?;
+            stamped = true;
+        }
+    }
     verdicts.reviews.push(recorded);
     save(root, &verdicts)?;
     let mut body = format!(
         "- report: `{copy_rel}` @{}{}\n",
-        block.head,
+        head,
         reviewer
             .map(|kind| format!(" by {kind}"))
             .unwrap_or_default()
@@ -957,6 +1186,17 @@ pub fn record(
     }
     if let Some(part) = part {
         body.push_str(&format!("- part: {part}\n"));
+    }
+    if let Some(parent) = &first_parent {
+        body.push_str(&format!(
+            "- resolution: the conflict resolutions of a merge from the base branch; its first parent {parent} clears\n"
+        ));
+    }
+    if stamped {
+        body.push_str(&format!(
+            "- schema: the campaign is at schema {} now; an older cm refuses it\n",
+            crate::state::RESOLUTION_SCHEMA
+        ));
     }
     if converging == Some(false) {
         body.push_str(&format!("- converging: false; ruling: “{RULING}”\n"));
@@ -978,13 +1218,26 @@ pub fn record(
     let mut outcome = Outcome::default();
     outcome.line(format!(
         "{id} {full} @{}: {verdict} ({} blocking, {} follow-up(s)); report {copy_rel}",
-        block.head,
+        head,
         blocking.len(),
         followups.len()
     ));
     if let Some(stated) = mismatch {
         outcome.line(format!(
             "the report says {stated}; cm computes {verdict}: only an introduced or exposed contract finding blocks"
+        ));
+    }
+    if let Some(parent) = &first_parent {
+        outcome.line(format!(
+            "resolution review of the merge; its first parent {parent} clears"
+        ));
+        outcome.field("kind", "resolution");
+        outcome.field("first_parent", parent.clone());
+    }
+    if stamped {
+        outcome.line(format!(
+            "the campaign is at schema {} now; an older cm refuses it",
+            crate::state::RESOLUTION_SCHEMA
         ));
     }
     if let Some(converging) = converging {
@@ -1005,7 +1258,7 @@ pub fn record(
     }
     outcome.field("id", id);
     outcome.field("verdict", verdict.to_string());
-    outcome.field("head", block.head);
+    outcome.field("head", head);
     outcome.field("report", copy_rel);
     outcome.field("blocking", blocking);
     outcome.field("followups", followups);
@@ -1427,10 +1680,11 @@ fn report_sha256(root: &Path, review: &Recorded) -> Option<String> {
     )
 }
 
-/// The step's evidence holds a receipt for a review of `head` that happened, whatever its model.
-fn finished_receipt_at(root: &Path, target: &Target, head: &str) -> bool {
+fn finished_receipt_at(root: &Path, target: &Target, verdicts: &Verdicts, head: &str) -> bool {
     let mut found = Vec::new();
     receipts(&evidence_dir(root, target), &mut found);
+    let step = full_name(target);
+    let mut resolutions: Option<Vec<String>> = None;
     found.iter().any(|path| {
         fs::read_to_string(path)
             .ok()
@@ -1441,6 +1695,26 @@ fn finished_receipt_at(root: &Path, target: &Target, head: &str) -> bool {
                     .and_then(Value::as_str)
                     .is_some_and(|at| same_commit(at, head))
                     && unfinished(&receipt).is_none()
+                    && !receipt
+                        .pointer("/report_sha256")
+                        .and_then(Value::as_str)
+                        .is_some_and(|want| {
+                            resolutions
+                                .get_or_insert_with(|| {
+                                    verdicts
+                                        .reviews
+                                        .iter()
+                                        .filter(|review| {
+                                            review.step == step
+                                                && review.binds(head)
+                                                && review.kind == ReviewKind::Resolution
+                                        })
+                                        .filter_map(|review| report_sha256(root, review))
+                                        .collect()
+                                })
+                                .iter()
+                                .any(|sha256| sha256.eq_ignore_ascii_case(want))
+                        })
             })
     })
 }
@@ -1456,11 +1730,19 @@ fn astra_gap(
     pr: Option<&str>,
     head: &str,
     part: Option<&str>,
+    kind: ReviewKind,
 ) -> Vec<String> {
     let scope = part;
-    let part = part
-        .map(|part| format!(" --part={}", crate::commands::shell_word(part)))
-        .unwrap_or_default();
+    let part = format!(
+        "{}{}",
+        part.map(|part| format!(" --part={}", crate::commands::shell_word(part)))
+            .unwrap_or_default(),
+        if kind == ReviewKind::Resolution {
+            " --kind resolution"
+        } else {
+            ""
+        }
+    );
     let mut found = Vec::new();
     receipts(&evidence_dir(root, target), &mut found);
     let repo = pr.and_then(GithubRepo::of_pr).map(|repo| repo.to_string());
@@ -1499,8 +1781,8 @@ fn astra_gap(
             && same_pr;
         match (matches, unfinished(&receipt)) {
             (true, None) => {
-                finished += 1;
                 let Some(want) = text_at("/report_sha256").map(str::to_lowercase) else {
+                    finished += 1;
                     unbound.push(format!(
                         "{rel} names no report_sha256, so no recorded report is bound to it"
                     ));
@@ -1513,7 +1795,7 @@ fn astra_gap(
                         // Bound to this PR and part, as every review the gate reads.
                         .filter(|review| {
                             review.step == step
-                                && review.at_head(head)
+                                && review.binds(head)
                                 && review.reviewer.as_deref() == Some(ASTRA_REVIEWER)
                                 && review.part.as_deref() == scope
                                 && review
@@ -1524,12 +1806,28 @@ fn astra_gap(
                         .map(|review| (review, report_sha256(root, review)))
                         .collect()
                 });
-                if astra
+                match astra
                     .iter()
-                    .any(|(_, sha256)| sha256.as_deref() == Some(want.as_str()))
+                    .find(|(_, sha256)| sha256.as_deref() == Some(want.as_str()))
                 {
-                    continue;
+                    Some((review, _)) if review.kind != kind => {
+                        seen.push(format!(
+                            "{rel} (the receipt of {}, a {} review)",
+                            review.id(),
+                            review.kind.name()
+                        ));
+                        continue;
+                    }
+                    Some(_) => {
+                        finished += 1;
+                        continue;
+                    }
+                    None => finished += 1,
                 }
+                let astra: Vec<&(&Recorded, Option<String>)> = astra
+                    .iter()
+                    .filter(|(review, _)| review.kind == kind)
+                    .collect();
                 let report = relative(root, &path.with_file_name("report.md"));
                 unbound.push(if astra.is_empty() {
                     format!(
@@ -1614,13 +1912,15 @@ fn reviews_at<'a>(
     head: &str,
     pr: Option<&str>,
     part: Option<&str>,
+    kind: ReviewKind,
 ) -> Vec<&'a Recorded> {
     verdicts
         .reviews
         .iter()
         .filter(|review| {
             review.step == step
-                && review.at_head(head)
+                && review.binds(head)
+                && review.kind == kind
                 && review.part.as_deref() == part
                 && review
                     .pr
@@ -1660,7 +1960,7 @@ pub fn missing_reviews(
     part: Option<&str>,
     model: bool,
 ) -> Vec<&'static str> {
-    let at_head = reviews_at(verdicts, step, head, pr, part);
+    let at_head = reviews_at(verdicts, step, head, pr, part, ReviewKind::Head);
     if model {
         missing_accepts(&at_head)
     } else if at_head.is_empty() {
@@ -1678,10 +1978,21 @@ fn review_gap(
     part: Option<&str>,
     model: bool,
 ) -> Option<String> {
-    let at_head = reviews_at(verdicts, step, head, pr, part);
+    let at_head = reviews_at(verdicts, step, head, pr, part, ReviewKind::Head);
+    let resolutions = reviews_at(verdicts, step, head, pr, part, ReviewKind::Resolution);
     let part = part
         .map(|part| format!(" --part={}", crate::commands::shell_word(part)))
         .unwrap_or_default();
+    if at_head.is_empty() && !resolutions.is_empty() {
+        return Some(format!(
+            "only resolution reviews of {head} are recorded ({}); they count only on the walk from a checkout (`--repo` or the step's worktree) to a first parent that clears; `cm review record {step} <report>{part}`",
+            resolutions
+                .iter()
+                .map(|review| review.id())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     if at_head.is_empty() {
         return Some(format!(
             "no review of {head} is recorded; `cm review record {step} <report>{part}`"
@@ -1727,26 +2038,427 @@ pub struct Lineage<'a> {
 
 const MAX_UPDATES: usize = 100;
 
+// Named in full: a local tag or branch called origin/HEAD would stand in for the short name.
+const ORIGIN_HEAD: &str = "refs/remotes/origin/HEAD";
+
+fn shown(base: &str) -> &str {
+    base.strip_prefix("refs/remotes/").unwrap_or(base)
+}
+
+// Every git command the gate runs must be built here: replace refs, an info/grafts file, a
+// commit-graph and a multi-pack-index can each change what git reads for a commit id, and the gate
+// reads the history as committed.
+mod gate_git {
+    use std::path::Path;
+    use std::process::{Command, Output};
+
+    // /dev/null is no directory, so no graft file can exist at this path.
+    const NO_GRAFTS: &str = "/dev/null/grafts";
+
+    // Variables that move the repository a checkout read reads from; the GIT_TEST_ ones go too,
+    // since some bring back the caches the flags below turn off.
+    const REDIRECTS: [&str; 8] = [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_SHALLOW_FILE",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_INDEX_FILE",
+    ];
+
+    // git makes a remerge diff's temporary object directory with the umask's mode, not the
+    // repository's, so the scratch repository's git runs under 077 whatever the caller's umask.
+    // The script is fixed; git's arguments reach it only as "$@".
+    const UNDER_UMASK_077: &str = "umask 077 && exec git \"$@\"";
+
+    fn git(cleared: bool) -> Command {
+        let mut command = Command::new(if cleared { "/bin/sh" } else { "git" });
+        if cleared {
+            command.args(["-c", UNDER_UMASK_077, "git"]).env_clear();
+            if let Some(path) = std::env::var_os("PATH") {
+                command.env("PATH", path);
+            }
+        } else {
+            for (name, _) in std::env::vars_os() {
+                let bytes = name.as_encoded_bytes();
+                if bytes.starts_with(b"GIT_TEST_")
+                    || REDIRECTS
+                        .iter()
+                        .any(|redirect| bytes == redirect.as_bytes())
+                {
+                    command.env_remove(&name);
+                }
+            }
+        }
+        command
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("GIT_GRAFT_FILE", NO_GRAFTS)
+            .args([
+                "-c",
+                "core.commitGraph=false",
+                "-c",
+                "core.multiPackIndex=false",
+            ]);
+        command
+    }
+
+    pub(super) fn output(repo: &Path, args: &[&str]) -> Option<Output> {
+        git(false).arg("-C").arg(repo).args(args).output().ok()
+    }
+
+    pub(super) fn isolated(dir: &Path, args: &[&str]) -> std::io::Result<Output> {
+        let home = dir.join("home");
+        git(true)
+            .env("GIT_DIR", dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_ATTR_NOSYSTEM", "1")
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &home)
+            .current_dir(dir)
+            .args(args)
+            .output()
+    }
+}
+
+// What the scratch repository takes from the checkout: its objects and their format. Grafts and
+// replace refs stay off, as in the checkout's own reads.
+struct Borrowed {
+    objects: Vec<u8>,
+    format: String,
+}
+
+// The umask narrows the mode a file is created with, so it is set again.
+fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .and_then(|()| file.write_all(bytes))
+        .map_err(|error| error.to_string())
+}
+
+// Which files a merge's parents conflict in, and which files a merge changes, are read where only
+// the checkout's objects reach, so that no merge attribute or setting, the checkout's or the
+// caller's, decides them.
+struct Isolated {
+    dir: PathBuf,
+    boundary: Vec<String>,
+}
+
+impl Isolated {
+    fn over(repo: &Path, commit: &str) -> Result<Isolated, CleanUpdateError> {
+        let unreadable = || CleanUpdateError::Unreadable {
+            commit: commit.to_owned(),
+            repo: repo.to_path_buf(),
+        };
+        let mut objects = git_bytes(
+            repo,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects",
+            ],
+        )
+        .ok_or_else(unreadable)?;
+        if objects.pop() != Some(b'\n') {
+            return Err(unreadable());
+        }
+        let format =
+            git_out(repo, &["rev-parse", "--show-object-format"]).ok_or_else(unreadable)?;
+        let mut shallow = git_bytes(
+            repo,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "shallow",
+            ],
+        )
+        .ok_or_else(unreadable)?;
+        if shallow.pop() != Some(b'\n') {
+            return Err(unreadable());
+        }
+        // git reads a shallow file it cannot open as no boundary; the gate does not guess.
+        let listed = match fs::read(
+            <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(shallow),
+        ) {
+            Ok(listed) => listed,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(_) => return Err(unreadable()),
+        };
+        // Each entry reaches git as an argument, so only a full object id may.
+        let width = if format == "sha256" { 64 } else { 40 };
+        let entries = std::str::from_utf8(&listed)
+            .ok()
+            .and_then(|listed| {
+                listed
+                    .lines()
+                    .map(|entry| {
+                        (entry.len() == width && entry.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                            .then_some(entry)
+                    })
+                    .collect::<Option<Vec<&str>>>()
+            })
+            .ok_or_else(unreadable)?;
+        Isolated::under(
+            scratch_parents(),
+            &Borrowed { objects, format },
+            &entries,
+            commit,
+        )
+    }
+
+    // A listed commit with a parent missing from the objects is where git can read no further.
+    // Past one whose parents are all there, forged or left by a later fetch, the scratch repository
+    // reads on. A boundary that stays can still cut one parent's only path to a merge base the
+    // objects hold, which `resolvable` refuses.
+    fn boundary(&self, entries: &[&str]) -> Result<Vec<String>, String> {
+        let listed = self.commits(&["--parents"], entries)?;
+        let parents: BTreeSet<&str> = listed
+            .iter()
+            .flat_map(|commit| commit.split(' ').skip(1))
+            .collect();
+        let parents: Vec<&str> = parents.into_iter().collect();
+        let present = self.commits(&[], &parents)?;
+        let present: BTreeSet<&str> = present.iter().map(String::as_str).collect();
+        Ok(listed
+            .iter()
+            .filter_map(|commit| {
+                let mut ids = commit.split(' ');
+                let id = ids.next()?;
+                ids.any(|parent| !present.contains(parent))
+                    .then(|| id.to_owned())
+            })
+            .collect())
+    }
+
+    fn commits(&self, flags: &[&str], names: &[&str]) -> Result<Vec<String>, String> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args = vec!["rev-list", "--no-walk", "--ignore-missing"];
+        args.extend(flags);
+        args.extend(names);
+        args.push("--");
+        let listed = String::from_utf8(self.bytes(&args)?)
+            .map_err(|_| "git rev-list listed a commit cm cannot read".to_owned())?;
+        Ok(listed.lines().map(str::to_owned).collect())
+    }
+
+    fn under(
+        parents: Vec<PathBuf>,
+        borrowed: &Borrowed,
+        entries: &[&str],
+        commit: &str,
+    ) -> Result<Isolated, CleanUpdateError> {
+        let mut tried = Vec::new();
+        let mut boundary: Option<Vec<String>> = None;
+        for parent in parents {
+            let mut isolated = match Isolated::made_in(&parent, borrowed) {
+                Ok(isolated) => isolated,
+                Err(why) => {
+                    tried.push((parent, why));
+                    continue;
+                }
+            };
+            let listed = match &boundary {
+                Some(listed) => listed.clone(),
+                None => isolated
+                    .boundary(entries)
+                    .map_err(|why| isolated.failed(commit, why))?,
+            };
+            if !listed.is_empty() {
+                let shallow: String = listed.iter().map(|id| format!("{id}\n")).collect();
+                if let Err(why) = write_private(&isolated.dir.join("shallow"), shallow.as_bytes()) {
+                    tried.push((parent, why));
+                    boundary = Some(listed);
+                    continue;
+                }
+            }
+            isolated.boundary = listed;
+            return Ok(isolated);
+        }
+        Err(CleanUpdateError::NoScratch { tried })
+    }
+
+    // A step that fails drops what the earlier ones made, so the parent is left as it was.
+    fn made_in(parent: &Path, borrowed: &Borrowed) -> Result<Isolated, String> {
+        let isolated = Isolated {
+            dir: scratch_dir_under(parent).map_err(|error| error.to_string())?,
+            boundary: Vec::new(),
+        };
+        isolated.bytes(&[
+            "init",
+            "--bare",
+            "--quiet",
+            "--template=",
+            "--shared=0700",
+            &format!("--object-format={}", borrowed.format),
+        ])?;
+        let alternates = isolated.dir.join("objects").join("info").join("alternates");
+        write_private(&alternates, &quoted(&borrowed.objects))?;
+        Ok(isolated)
+    }
+
+    // git can print an error and still exit 0, as for an object it could not read; what it printed
+    // then is no account of the merge.
+    fn output(&self, args: &[&str]) -> Result<std::process::Output, String> {
+        let output =
+            gate_git::isolated(&self.dir, args).map_err(|error| format!("git: {error}"))?;
+        let erred = output
+            .stderr
+            .split(|byte| *byte == b'\n')
+            .any(|line| line.starts_with(b"error:") || line.starts_with(b"fatal:"));
+        if erred {
+            return Err(failure(&output));
+        }
+        Ok(output)
+    }
+
+    fn bytes(&self, args: &[&str]) -> Result<Vec<u8>, String> {
+        let output = self.output(args)?;
+        if output.status.success() {
+            Ok(output.stdout)
+        } else {
+            Err(failure(&output))
+        }
+    }
+
+    fn failed(&self, commit: &str, why: String) -> CleanUpdateError {
+        CleanUpdateError::Scratch {
+            commit: commit.to_owned(),
+            dir: self.dir.clone(),
+            why,
+        }
+    }
+}
+
+impl Drop for Isolated {
+    fn drop(&mut self) {
+        remove_tree(&self.dir);
+    }
+}
+
+// A git first on PATH that sets its own umask can still leave a directory its owner cannot list;
+// each one gets its owner's permissions back first. A symlink is removed, not followed.
+fn remove_tree(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                remove_tree(&entry.path());
+            } else {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    let _ = fs::remove_dir(dir);
+}
+
+fn failure(output: &std::process::Output) -> String {
+    let said: Vec<&str> = std::str::from_utf8(&output.stderr)
+        .unwrap_or("")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if said.is_empty() {
+        format!("git {}", output.status)
+    } else {
+        said.join("; ")
+    }
+}
+
+// git gets the scratch repository's path as GIT_DIR from inside it, so the path must be absolute.
+// An empty TMPDIR names no directory.
+fn scratch_parents() -> Vec<PathBuf> {
+    let temp = std::env::var_os("TMPDIR")
+        .filter(|temp| !temp.is_empty())
+        .map(PathBuf::from)
+        .and_then(|temp| {
+            if temp.is_absolute() {
+                Some(temp)
+            } else {
+                std::env::current_dir().ok().map(|cwd| cwd.join(temp))
+            }
+        });
+    let mut parents: Vec<PathBuf> = temp.into_iter().chain([PathBuf::from("/tmp")]).collect();
+    parents.dedup();
+    parents
+}
+
+static SCRATCH_NAMES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn scratch_dir_under(temp: &Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    for _ in 0..100 {
+        let dir = temp.join(format!(
+            "cm-gate-{}-{}",
+            std::process::id(),
+            SCRATCH_NAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        match fs::DirBuilder::new().mode(0o700).create(&dir) {
+            // The umask narrows the mode create asks for, so it is set again.
+            Ok(()) => {
+                return match fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)) {
+                    Ok(()) => Ok(dir),
+                    Err(error) => {
+                        let _ = fs::remove_dir(&dir);
+                        Err(error)
+                    }
+                };
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "a hundred names were taken",
+    ))
+}
+
+// git reads a quoted alternates line C-style, so a path holding a newline or a quote survives.
+fn quoted(path: &[u8]) -> Vec<u8> {
+    let mut line = vec![b'"'];
+    for &byte in path {
+        match byte {
+            b'"' | b'\\' => line.extend([b'\\', byte]),
+            byte if byte < b' ' || byte == 0x7f => line.extend(format!("\\{byte:03o}").bytes()),
+            byte => line.push(byte),
+        }
+    }
+    line.extend(b"\"\n");
+    line
+}
+
+#[derive(Clone, Copy)]
+enum Reader<'a> {
+    Checkout(&'a Path),
+    Isolated(&'a Isolated),
+}
+
+// Only for commands that print object names, which are ASCII hex; paths go through git_bytes.
 fn git_out(repo: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .ok()?;
+    let output = gate_git::output(repo, args)?;
     output
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-pub(crate) fn is_ancestor(repo: &Path, ancestor: &str, of: &str) -> Option<bool> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["merge-base", "--is-ancestor", ancestor, of])
-        .output()
-        .ok()?;
+fn is_ancestor(repo: &Path, ancestor: &str, of: &str) -> Option<bool> {
+    let output = gate_git::output(repo, &["merge-base", "--is-ancestor", ancestor, of])?;
     match output.status.code() {
         Some(0) => Some(true),
         Some(1) => Some(false),
@@ -1775,6 +2487,13 @@ pub enum CleanUpdateError {
     Conflicts {
         commit: String,
     },
+    NoMergeBase {
+        commit: String,
+    },
+    ShallowBase {
+        commit: String,
+        shallow: String,
+    },
     /// The walk passed this many clean updates without reaching a reviewed commit.
     TooLong {
         limit: usize,
@@ -1784,6 +2503,18 @@ pub enum CleanUpdateError {
     BaseContainsHead {
         head: String,
         base: String,
+    },
+    ResolutionGaps {
+        commit: String,
+        gaps: Vec<String>,
+    },
+    NoScratch {
+        tried: Vec<(PathBuf, String)>,
+    },
+    Scratch {
+        commit: String,
+        dir: PathBuf,
+        why: String,
     },
 }
 
@@ -1815,11 +2546,43 @@ impl fmt::Display for CleanUpdateError {
                 "{} resolved merge conflicts; it needs its own review",
                 short(commit)
             ),
+            CleanUpdateError::NoMergeBase { commit } => write!(
+                f,
+                "{}'s parents have no merge base in the history the checkout holds, so it is no conflict resolution a resolution review can cover; it needs its own review, or a checkout deep enough to hold their merge base",
+                short(commit)
+            ),
+            CleanUpdateError::ShallowBase { commit, shallow } => write!(
+                f,
+                "{}'s parents reach the checkout's shallow boundary at {} above their merge base, so a nearer merge base may lie past it and git's merge of them cannot be read; it needs its own review, or a checkout that holds their history back to their merge base",
+                short(commit),
+                short(shallow)
+            ),
             CleanUpdateError::TooLong { limit } => write!(f, "more than {limit} updates"),
             CleanUpdateError::BaseContainsHead { head, base } => write!(
                 f,
                 "the base {base} already contains {}, so no merge can be told apart from the PR's own commits",
                 short(head)
+            ),
+            CleanUpdateError::ResolutionGaps { commit, gaps } => write!(
+                f,
+                "{}'s resolution reviews do not clear it: {}",
+                short(commit),
+                gaps.join("; ")
+            ),
+            CleanUpdateError::NoScratch { tried } => write!(
+                f,
+                "no scratch repository for reading the merges can be made in {}; set TMPDIR to a writable directory",
+                tried
+                    .iter()
+                    .map(|(dir, why)| format!("{} ({why})", dir.display()))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            ),
+            CleanUpdateError::Scratch { commit, dir, why } => write!(
+                f,
+                "reading {}'s merge in the scratch repository {} failed: {why}",
+                short(commit),
+                dir.display()
             ),
         }
     }
@@ -1828,6 +2591,29 @@ impl fmt::Display for CleanUpdateError {
 /// `commit`'s first parent when it is a clean update from the base branch: a merge whose second
 /// parent is on `base` and whose `git show --remerge-diff` is empty (no conflict resolved).
 pub fn clean_update(repo: &Path, commit: &str, base: &str) -> Result<String, CleanUpdateError> {
+    let isolated = Isolated::over(repo, commit)?;
+    let merge = merge_from_base(repo, &isolated, commit, base)?;
+    if merge.clean {
+        Ok(merge.first)
+    } else {
+        Err(CleanUpdateError::Conflicts {
+            commit: commit.to_owned(),
+        })
+    }
+}
+
+struct Merge {
+    first: String,
+    second: String,
+    clean: bool,
+}
+
+fn merge_from_base(
+    repo: &Path,
+    isolated: &Isolated,
+    commit: &str,
+    base: &str,
+) -> Result<Merge, CleanUpdateError> {
     let unreadable = || CleanUpdateError::Unreadable {
         commit: commit.to_owned(),
         repo: repo.to_path_buf(),
@@ -1844,32 +2630,478 @@ pub fn clean_update(repo: &Path, commit: &str, base: &str) -> Result<String, Cle
         return Err(CleanUpdateError::OffBase {
             commit: commit.to_owned(),
             parent: second.to_owned(),
-            base: base.to_owned(),
+            base: shown(base).to_owned(),
         });
     }
-    match git_out(repo, &["show", "--remerge-diff", "--format=", commit]) {
-        Some(diff) if diff.is_empty() => Ok(first.to_owned()),
-        Some(_) => Err(CleanUpdateError::Conflicts {
-            commit: commit.to_owned(),
-        }),
-        None => Err(unreadable()),
+    let empty = |reader| remerge_diff(reader, commit).map(|diff| diff.trim_ascii().is_empty());
+    // Empty in the checkout, as the waiver always asked, and where no local merge setting reaches.
+    let clean = empty(Reader::Checkout(repo))? && empty(Reader::Isolated(isolated))?;
+    Ok(Merge {
+        first: first.to_owned(),
+        second: second.to_owned(),
+        clean,
+    })
+}
+
+// Git's merge of the parents is what a resolution is read against. Without a merge base git
+// merges them as if from an empty tree; with a shallow boundary above the merge bases it found, a
+// nearer one may lie past the boundary on a parent's only path to it. Either way git's merge does
+// not say what the resolution resolved.
+fn resolvable(isolated: &Isolated, commit: &str, merge: &Merge) -> Result<(), CleanUpdateError> {
+    let failed = |why| isolated.failed(commit, why);
+    let bases = isolated
+        .output(&["merge-base", "--all", &merge.first, &merge.second])
+        .map_err(failed)?;
+    match bases.status.code() {
+        Some(0) => {}
+        Some(1) if bases.stdout.is_empty() => {
+            return Err(CleanUpdateError::NoMergeBase {
+                commit: commit.to_owned(),
+            });
+        }
+        _ => return Err(failed(failure(&bases))),
     }
+    if isolated.boundary.is_empty() {
+        return Ok(());
+    }
+    let bases = String::from_utf8(bases.stdout)
+        .map_err(|_| failed("git merge-base listed a commit cm cannot read".to_owned()))?;
+    let mut args = vec![
+        "rev-list",
+        merge.first.as_str(),
+        merge.second.as_str(),
+        "--not",
+    ];
+    args.extend(bases.lines());
+    args.push("--");
+    let above = String::from_utf8(isolated.bytes(&args).map_err(failed)?)
+        .map_err(|_| failed("git rev-list listed a commit cm cannot read".to_owned()))?;
+    let boundary: BTreeSet<&str> = isolated.boundary.iter().map(String::as_str).collect();
+    match above.lines().find(|listed| boundary.contains(listed)) {
+        Some(shallow) => Err(CleanUpdateError::ShallowBase {
+            commit: commit.to_owned(),
+            shallow: shallow.to_owned(),
+        }),
+        None => Ok(()),
+    }
+}
+
+// The waiver's account of a merge, with each flag that would let configuration or attributes leave
+// a change out: a relative or submodule-blind diff, a textconv or external driver, colour, renames
+// folding two paths into one. A signature check's output stays in: it makes a signed merge no
+// clean update under `log.showSignature`, as it always has, since leaving it out would let the
+// waiver accept more.
+fn remerge_diff(reader: Reader<'_>, commit: &str) -> Result<Vec<u8>, CleanUpdateError> {
+    let args = [
+        "show",
+        "--remerge-diff",
+        "--format=",
+        "--no-renames",
+        "--ignore-submodules=none",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-relative",
+        "--no-color",
+        commit,
+    ];
+    match reader {
+        Reader::Checkout(repo) => {
+            git_bytes(repo, &args).ok_or_else(|| CleanUpdateError::Unreadable {
+                commit: commit.to_owned(),
+                repo: repo.to_path_buf(),
+            })
+        }
+        Reader::Isolated(isolated) => isolated
+            .bytes(&args)
+            .map_err(|why| isolated.failed(commit, why)),
+    }
+}
+
+// A hex name must be a prefix of the commit it resolves to, so that no ref named like it stands in;
+// any other name must mean one commit wherever git would look for it.
+fn named_commit(repo: &Path, named: &str) -> Option<String> {
+    let commit = |name: &str| {
+        git_out(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{name}^{{commit}}"),
+            ],
+        )
+    };
+    let full = commit(named)?;
+    if named.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return full
+            .to_ascii_lowercase()
+            .starts_with(&named.to_ascii_lowercase())
+            .then_some(full);
+    }
+    ["refs/", "refs/tags/", "refs/heads/", "refs/remotes/"]
+        .into_iter()
+        .map(|space| format!("{space}{named}"))
+        .chain([format!("refs/remotes/{named}/HEAD")])
+        .filter_map(|name| commit(&name))
+        .all(|other| other == full)
+        .then_some(full)
+}
+
+fn git_bytes(repo: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let output = gate_git::output(repo, args)?;
+    output.status.success().then_some(output.stdout)
+}
+
+fn nul_paths(listed: &[u8]) -> Vec<&[u8]> {
+    listed
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .collect()
+}
+
+const GITLINK: &[u8] = b"160000";
+const SYMLINK: &[u8] = b"120000";
+
+// The mode and object merge-tree lists for one conflicted path at each stage: the merge base, the
+// first parent, the second parent; none where that side has no such path.
+type Stages<'a> = [Option<(&'a [u8], &'a [u8])>; 3];
+
+struct Record<'a> {
+    paths: Vec<&'a [u8]>,
+    kind: &'a [u8],
+}
+
+// The records are none when what follows the stage entries is not a whole list of them, as when
+// git appends its advice on a submodule it cannot merge.
+struct Listing<'a, K> {
+    tree: &'a str,
+    conflicts: BTreeMap<K, Stages<'a>>,
+    records: Option<Vec<Record<'a>>>,
+}
+
+// `git merge-tree --write-tree -z`: the tree id, one `<mode> <object> <stage>\t<path>` entry per
+// stage of each conflict, an empty entry, then for each message the number of paths it names,
+// those paths, its type and its text. The key is generic so that a test can count the comparisons.
+fn listing<'a, K: Ord + From<&'a [u8]>>(listed: &'a [u8]) -> Option<Listing<'a, K>> {
+    let mut fields = listed.split(|byte| *byte == 0);
+    let tree = fields
+        .next()
+        .and_then(|tree| std::str::from_utf8(tree).ok())
+        .filter(|tree| tree.bytes().all(|byte| byte.is_ascii_hexdigit()))?;
+    let mut conflicts: BTreeMap<K, Stages<'a>> = BTreeMap::new();
+    for entry in fields.by_ref().take_while(|entry| !entry.is_empty()) {
+        let tab = entry.iter().position(|byte| *byte == b'\t')?;
+        let mut parts = entry[..tab].split(|byte| *byte == b' ');
+        let (mode, object) = (parts.next()?, parts.next()?);
+        let stage = match parts.next()? {
+            b"1" => 0,
+            b"2" => 1,
+            b"3" => 2,
+            _ => return None,
+        };
+        conflicts.entry(K::from(&entry[tab + 1..])).or_default()[stage] = Some((mode, object));
+    }
+    Some(Listing {
+        tree,
+        conflicts,
+        records: records(&mut fields),
+    })
+}
+
+fn records<'a>(fields: &mut impl Iterator<Item = &'a [u8]>) -> Option<Vec<Record<'a>>> {
+    let mut records = Vec::new();
+    loop {
+        let count = fields.next()?;
+        if count.is_empty() {
+            return fields.next().is_none().then_some(records);
+        }
+        let count: usize = std::str::from_utf8(count).ok()?.parse().ok()?;
+        let paths: Vec<&[u8]> = fields.by_ref().take(count).collect();
+        let kind = fields.next()?;
+        fields.next()?;
+        records.push(Record { paths, kind });
+    }
+}
+
+// The scratch repository holds no submodule's objects. A gitlink conflict with one side absent,
+// or against a file or directory, is decided by its stages; two different gitlinks need the
+// submodule's history to merge.
+fn needs_submodule_history(stages: &Stages<'_>) -> bool {
+    matches!(stages, [_, Some((GITLINK, ours)), Some((GITLINK, theirs))] if ours != theirs)
+}
+
+// Beneath a displaced path a resolution may only delete, once the entry is back at that path; a
+// made-up name, kept with the path its entry came from, must not remain.
+struct Bounds<'a, K> {
+    paths: BTreeSet<K>,
+    displaced: BTreeSet<K>,
+    made_up: Vec<(&'a [u8], &'a [u8])>,
+}
+
+enum Unbounded<'a> {
+    Unreadable,
+    Unknown(&'a [u8]),
+    Unsupported(String),
+}
+
+// git names an entry it moves aside `<path>~<the side's name>`, with a suffix when that is taken.
+fn moved_aside(made_up: &[u8], from: &[u8]) -> bool {
+    made_up
+        .strip_prefix(from)
+        .is_some_and(|rest| rest.first() == Some(&b'~'))
+}
+
+fn entry_kind(mode: &[u8]) -> &'static str {
+    match mode {
+        GITLINK => "a submodule",
+        SYMLINK => "a symlink",
+        _ => "a file",
+    }
+}
+
+// The record types of git 2.43 to 2.56. A file/directory record names the made-up path first, a
+// distinct-types one the original path first. A file/directory record bounds a path only where
+// git left a stage entry at the made-up one; one whose entry is a symlink or submodule, and every
+// distinct-types conflict, which always involves one, is a shape cm does not read.
+fn bounds<'a, K: Ord + From<&'a [u8]>>(
+    listing: Listing<'a, K>,
+) -> Result<Bounds<'a, K>, Unbounded<'a>> {
+    let records = listing.records.ok_or(Unbounded::Unreadable)?;
+    let conflicts = listing.conflicts;
+    let mut bounds = Bounds {
+        paths: BTreeSet::new(),
+        displaced: BTreeSet::new(),
+        made_up: Vec::new(),
+    };
+    for Record { paths, kind } in records {
+        match (kind, &paths[..]) {
+            (
+                b"Auto-merging"
+                | b"CONFLICT (contents)"
+                | b"CONFLICT (binary)"
+                | b"CONFLICT (modify/delete)"
+                | b"CONFLICT (rename/delete)"
+                | b"CONFLICT (rename/rename)"
+                | b"CONFLICT (rename involved in collision)"
+                | b"CONFLICT (file in way of directory rename)"
+                | b"CONFLICT(directory rename collision)"
+                | b"CONFLICT(directory rename unclear split)",
+                _,
+            ) => {}
+            (b"CONFLICT (directory rename suggested)", named) => {
+                bounds.paths.extend(named.iter().map(|path| K::from(*path)));
+            }
+            (b"CONFLICT (file/directory)", [made_up, from]) if moved_aside(made_up, from) => {
+                let Some(stages) = conflicts.get(&K::from(*made_up)) else {
+                    continue;
+                };
+                if let Some((mode, _)) = stages[1..]
+                    .iter()
+                    .flatten()
+                    .find(|(mode, _)| *mode == GITLINK || *mode == SYMLINK)
+                {
+                    return Err(Unbounded::Unsupported(format!(
+                        "its parents put {} at {} against a directory",
+                        entry_kind(mode),
+                        quoted_paths([from])
+                    )));
+                }
+                bounds.paths.insert(K::from(*from));
+                bounds.displaced.insert(K::from(*from));
+                bounds.made_up.push((*made_up, *from));
+            }
+            (b"CONFLICT (distinct modes)", [from, made_up @ ..])
+                if !made_up.is_empty() && made_up.iter().all(|path| moved_aside(path, from)) =>
+            {
+                let side = |stage: usize| {
+                    paths.iter().find_map(|path| {
+                        conflicts
+                            .get(&K::from(*path))
+                            .and_then(|stages| stages[stage])
+                    })
+                };
+                let entries = match (side(1), side(2)) {
+                    (Some((first, _)), Some((second, _))) => {
+                        format!("{} and {}", entry_kind(first), entry_kind(second))
+                    }
+                    _ => "entries of different types".to_owned(),
+                };
+                return Err(Unbounded::Unsupported(format!(
+                    "its parents put {entries} at {}",
+                    quoted_paths([from])
+                )));
+            }
+            (b"CONFLICT (file/directory)" | b"CONFLICT (distinct modes)", _) => {
+                return Err(Unbounded::Unreadable);
+            }
+            (kind, _) => return Err(Unbounded::Unknown(kind)),
+        }
+    }
+    bounds.paths.extend(conflicts.into_keys());
+    Ok(bounds)
+}
+
+// `git diff-tree --name-status -z`: a status and a path for each path where two trees differ.
+fn changes(listed: &[u8]) -> Option<Vec<(&[u8], &[u8])>> {
+    let fields = nul_paths(listed);
+    fields.len().is_multiple_of(2).then(|| {
+        fields
+            .chunks(2)
+            .map(|change| (change[0], change[1]))
+            .collect()
+    })
+}
+
+fn beyond<'a, K: Ord + From<&'a [u8]>>(
+    bounds: &Bounds<'_, K>,
+    changed: &[(&[u8], &'a [u8])],
+) -> Vec<&'a [u8]> {
+    let restored: BTreeSet<K> = changed
+        .iter()
+        .map(|(_, path)| K::from(path))
+        .filter(|path| bounds.displaced.contains(path))
+        .collect();
+    let beneath_restored = |path: &'a [u8]| {
+        path.iter()
+            .enumerate()
+            .any(|(at, byte)| *byte == b'/' && restored.contains(&K::from(&path[..at])))
+    };
+    changed
+        .iter()
+        .filter(|(status, path)| {
+            !bounds.paths.contains(&K::from(path)) && !(*status == b"D" && beneath_restored(path))
+        })
+        .map(|(_, path)| *path)
+        .collect()
+}
+
+fn quoted_paths(paths: impl IntoIterator<Item = impl AsRef<[u8]>>) -> String {
+    paths
+        .into_iter()
+        .map(|path| format!("\"{}\"", path.as_ref().escape_ascii()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// The merge stands on resolution reviews when it differs from git's own merge of its parents only
+// where that merge's conflicts bound a resolution. Both come from one merge-tree run: its tree,
+// its stage entries and its typed records.
+fn beyond_resolution(
+    isolated: &Isolated,
+    commit: &str,
+    merge: &Merge,
+) -> Result<Option<String>, CleanUpdateError> {
+    let failed = |why: &str| isolated.failed(commit, why.to_owned());
+    let merged = isolated
+        .output(&[
+            "merge-tree",
+            "--write-tree",
+            "-z",
+            &merge.first,
+            &merge.second,
+        ])
+        .map_err(|why| isolated.failed(commit, why))?;
+    let listed = match merged.status.code() {
+        Some(1) => merged.stdout,
+        Some(0) => {
+            return Ok(Some(
+                "its parents merge without a conflict, so its remerge diff resolves none"
+                    .to_owned(),
+            ));
+        }
+        _ => return Err(isolated.failed(commit, failure(&merged))),
+    };
+    let unlisted = || failed("git merge-tree listed an entry cm cannot read");
+    let listing = listing::<&[u8]>(&listed).ok_or_else(unlisted)?;
+    let submodules: Vec<&[u8]> = listing
+        .conflicts
+        .iter()
+        .filter(|(_, stages)| needs_submodule_history(stages))
+        .map(|(path, _)| *path)
+        .collect();
+    if !submodules.is_empty() {
+        return Ok(Some(format!(
+            "its parents set the submodule {} to different commits, which only the submodule's history can merge",
+            quoted_paths(submodules)
+        )));
+    }
+    let tree = listing.tree;
+    let bounds = match bounds(listing) {
+        Ok(bounds) => bounds,
+        Err(Unbounded::Unreadable) => return Err(unlisted()),
+        Err(Unbounded::Unknown(kind)) => {
+            return Ok(Some(format!(
+                "git's merge of its parents reports a message of a type cm does not read, {}",
+                quoted_paths([kind])
+            )));
+        }
+        Err(Unbounded::Unsupported(shape)) => {
+            return Ok(Some(format!("{shape}, a conflict shape cm does not read")));
+        }
+    };
+    let listed = isolated
+        .bytes(&[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--no-renames",
+            "--ignore-submodules=none",
+            "--no-relative",
+            "--name-status",
+            tree,
+            commit,
+        ])
+        .map_err(|why| isolated.failed(commit, why))?;
+    let changed =
+        changes(&listed).ok_or_else(|| failed("git diff-tree listed an entry cm cannot read"))?;
+    let beyond = beyond(&bounds, &changed);
+    if !beyond.is_empty() {
+        return Ok(Some(format!(
+            "it changes {} beyond the files its parents conflict in",
+            quoted_paths(beyond)
+        )));
+    }
+    let deleted: BTreeSet<&[u8]> = changed
+        .iter()
+        .filter(|(status, _)| *status == b"D")
+        .map(|(_, path)| *path)
+        .collect();
+    let kept: Vec<String> = bounds
+        .made_up
+        .into_iter()
+        .filter(|(made_up, _)| !deleted.contains(made_up))
+        .map(|(made_up, from)| {
+            format!(
+                "it keeps {}, where git moved {} aside for a conflict",
+                quoted_paths([made_up]),
+                quoted_paths([from])
+            )
+        })
+        .collect();
+    Ok((!kept.is_empty()).then(|| kept.join("; ")))
 }
 
 /// The gate's (a) and (b) for a codex step about to merge at `head`.
 pub struct Cleared {
     /// Each unmet condition; empty when the gate's review half holds.
     pub gaps: Vec<String>,
-    /// The reviewed head the gate took, when it is an earlier commit than `head` and every
-    /// commit since is a clean update from the base branch.
     pub reviewed: Option<String>,
     /// Why the walk back from the head stopped short of a reviewed commit, when it did.
     pub stop: Option<CleanUpdateError>,
+    pub resolved: Vec<String>,
 }
 
-/// The gate's (a) and (b) at `head`, or, with `lineage`, at the nearest earlier head on its
-/// first-parent chain where both hold and every first-parent commit after it is a clean update
-/// from the base branch: a clean update needs no review beyond green CI on the new head.
+fn walked_updates(resolved: &[String]) -> String {
+    if resolved.is_empty() {
+        "clean updates".to_owned()
+    } else {
+        format!(
+            "clean updates and merges whose conflict resolutions both families accepted ({})",
+            resolved.join(", ")
+        )
+    }
+}
+
 pub fn merge_gaps(
     root: &Path,
     target: &Target,
@@ -1878,112 +3110,207 @@ pub fn merge_gaps(
     head: &str,
     lineage: Option<&Lineage>,
 ) -> Result<Cleared> {
+    gate(root, target, part, pr, head, lineage, false)
+}
+
+// A resolution review stands on both families' ACCEPTs on every lane: admitting one, and landing
+// past a merge it covers, read the first parent as a model lane's head.
+fn gate(
+    root: &Path,
+    target: &Target,
+    part: Option<&str>,
+    pr: Option<&str>,
+    head: &str,
+    lineage: Option<&Lineage>,
+    both_families: bool,
+) -> Result<Cleared> {
     let verdicts = load(root)?;
-    let model = model_lane(
-        store::load_unit(&root.join(&target.unit))
-            .ok()
-            .and_then(|unit| unit.steps.get(target.step.as_deref()?)?.lane),
-    );
+    let model = both_families
+        || model_lane(
+            store::load_unit(&root.join(&target.unit))
+                .ok()
+                .and_then(|unit| unit.steps.get(target.step.as_deref()?)?.lane),
+        );
+    let step = full_name(target);
     // (a)'s Astra receipt binds model lanes only; any other lane needs any one cleared review.
-    let gaps_at = |at: &str| -> Vec<String> {
+    let gaps_at = |at: &str, model: bool| -> Vec<String> {
         let astra = if model {
-            astra_gap(root, target, &verdicts, pr, at, part)
+            astra_gap(root, target, &verdicts, pr, at, part, ReviewKind::Head)
         } else {
             Vec::new()
         };
         astra
             .into_iter()
-            .chain(review_gap(
-                &verdicts,
-                &full_name(target),
-                at,
-                pr,
-                part,
-                model,
-            ))
+            .chain(review_gap(&verdicts, &step, at, pr, part, model))
             .collect()
     };
-    let gaps = gaps_at(head);
+    // A step without a resolution review matches reviews to the head as given, as before
+    // resolution reviews existed.
+    let resolving = verdicts
+        .reviews
+        .iter()
+        .any(|review| review.step == step && review.kind == ReviewKind::Resolution);
+    let resolved = lineage
+        .filter(|_| resolving)
+        .and_then(|lineage| named_commit(lineage.repo, head));
+    let head_at = resolved.as_deref().unwrap_or(head);
+    let gaps = gaps_at(head_at, model);
     // The clean-update rule only skips a review nobody did: a review recorded at a commit, or a
-    // finished receipt for it, binds there and is never outweighed by an earlier ACCEPT.
+    // finished receipt for it, binds there and is never outweighed by an earlier ACCEPT. A
+    // resolution review and its receipt bind only as the cover for their merge on the walk.
     let reviewed_at = |at: &str| {
-        let step = full_name(target);
-        verdicts
-            .reviews
-            .iter()
-            .any(|review| review.step == step && review.at_head(at))
-            || finished_receipt_at(root, target, at)
+        verdicts.reviews.iter().any(|review| {
+            review.step == step && review.at_head(at) && review.kind == ReviewKind::Head
+        }) || finished_receipt_at(root, target, &verdicts, at)
     };
-    let Some(lineage) = lineage.filter(|_| !gaps.is_empty() && !reviewed_at(head)) else {
+    let resolution_at = |at: &str| {
+        verdicts.reviews.iter().any(|review| {
+            review.step == step && review.binds(at) && review.kind == ReviewKind::Resolution
+        })
+    };
+    let resolution_gaps = |at: &str| -> Vec<String> {
+        let reviews = reviews_at(&verdicts, &step, at, pr, part, ReviewKind::Resolution);
+        let open: Vec<String> = reviews
+            .iter()
+            .flat_map(|review| {
+                review
+                    .unresolved()
+                    .into_iter()
+                    .map(move |logged| format!("{}.{}", review.id(), logged.finding.id))
+            })
+            .collect();
+        let missing = missing_accepts(&reviews);
+        let mut gaps = Vec::new();
+        if !open.is_empty() {
+            gaps.push(format!("{} unresolved", open.join(", ")));
+        }
+        if !missing.is_empty() {
+            gaps.push(format!("no {} resolution ACCEPT", missing.join(" or ")));
+        }
+        gaps.extend(astra_gap(
+            root,
+            target,
+            &verdicts,
+            pr,
+            at,
+            part,
+            ReviewKind::Resolution,
+        ));
+        gaps
+    };
+    let Some(lineage) = lineage.filter(|_| !gaps.is_empty() && !reviewed_at(head_at)) else {
         return Ok(Cleared {
             gaps,
             reviewed: None,
             stop: None,
+            resolved: Vec::new(),
         });
     };
     let repo = lineage.repo;
-    let base = lineage.base.unwrap_or("origin/HEAD");
-    let Some(mut at) = git_out(
-        repo,
-        &["rev-parse", "--verify", &format!("{head}^{{commit}}")],
-    ) else {
+    let base = lineage.base.unwrap_or(ORIGIN_HEAD);
+    let start = if resolving {
+        resolved
+    } else {
+        named_commit(repo, head)
+    };
+    let Some(mut at) = start else {
         return Ok(Cleared {
             gaps,
             reviewed: None,
             stop: None,
+            resolved: Vec::new(),
         });
     };
     let mut gaps = gaps;
+    let mut resolved = Vec::new();
     let mut why = CleanUpdateError::TooLong { limit: MAX_UPDATES };
-    if is_ancestor(repo, &at, base).unwrap_or(false) {
+    let isolated = if is_ancestor(repo, &at, base).unwrap_or(false) {
         why = CleanUpdateError::BaseContainsHead {
             head: at.clone(),
-            base: base.to_owned(),
+            base: shown(base).to_owned(),
         };
+        None
     } else {
+        match Isolated::over(repo, &at) {
+            Ok(isolated) => Some(isolated),
+            Err(no) => {
+                why = no;
+                None
+            }
+        }
+    };
+    if let Some(isolated) = isolated {
         for _ in 0..MAX_UPDATES {
-            match clean_update(repo, &at, base) {
-                Ok(parent) => at = parent,
+            match merge_from_base(repo, &isolated, &at, base) {
+                Ok(merge) if merge.clean => at = merge.first,
+                Ok(merge) if resolution_at(&at) => {
+                    let read = resolvable(&isolated, &at, &merge)
+                        .and_then(|()| beyond_resolution(&isolated, &at, &merge));
+                    let open = match read {
+                        Err(reason) => {
+                            why = reason;
+                            break;
+                        }
+                        Ok(Some(gap)) => vec![gap],
+                        Ok(None) => resolution_gaps(&at),
+                    };
+                    if !open.is_empty() {
+                        why = CleanUpdateError::ResolutionGaps {
+                            commit: at,
+                            gaps: open,
+                        };
+                        break;
+                    }
+                    resolved.push(std::mem::replace(&mut at, merge.first));
+                }
+                Ok(_) => {
+                    why = CleanUpdateError::Conflicts { commit: at };
+                    break;
+                }
                 Err(reason) => {
                     why = reason;
                     break;
                 }
             }
             if reviewed_at(&at) {
-                let earlier = gaps_at(&at);
+                let earlier = gaps_at(&at, model || !resolved.is_empty());
                 if earlier.is_empty() {
                     return Ok(Cleared {
                         gaps: Vec::new(),
                         reviewed: Some(at),
                         stop: None,
+                        resolved,
                     });
                 }
                 gaps.push(format!(
-                    "the nearest reviewed commit before {head}, {at}, joined to it by clean updates, does not clear: {}",
+                    "the nearest reviewed commit before {head}, {at}, joined to it by {}, does not clear: {}",
+                    walked_updates(&resolved),
                     earlier.join("; ")
                 ));
                 return Ok(Cleared {
                     gaps,
                     reviewed: None,
                     stop: None,
+                    resolved,
                 });
             }
         }
     }
-    let step = full_name(target);
     let earlier = verdicts
         .reviews
         .iter()
         .any(|review| review.step == step && !review.at_head(head));
     if earlier {
         gaps.push(format!(
-            "no reviewed head before {head} is joined to it by clean updates from the base branch: {why}"
+            "no reviewed head before {head} is joined to it by {} from the base branch: {why}",
+            walked_updates(&resolved)
         ));
     }
     Ok(Cleared {
         gaps,
         reviewed: None,
         stop: Some(why),
+        resolved,
     })
 }
 
@@ -2001,6 +3328,133 @@ mod tests {
 
     fn report(block: &str, tail: &str) -> String {
         format!("# Review\n\nFindings follow.\n\n```{BLOCK}\n{block}```\n{tail}")
+    }
+
+    #[test]
+    fn a_scratch_repository_is_private_and_without_a_writable_parent_names_tmpdir() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("missing");
+        let objects = parent.path().as_os_str().as_encoded_bytes();
+        let borrowed = Borrowed {
+            objects: objects.to_vec(),
+            format: "sha1".to_owned(),
+        };
+        let isolated = Isolated::under(
+            vec![missing.clone(), parent.path().to_path_buf()],
+            &borrowed,
+            &[],
+            SHA,
+        )
+        .unwrap();
+        assert!(
+            isolated.dir.starts_with(parent.path()),
+            "{:?}",
+            isolated.dir
+        );
+        assert_eq!(
+            fs::metadata(&isolated.dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let refused = Isolated::under(
+            vec![missing.clone(), missing.join("deeper")],
+            &borrowed,
+            &[],
+            SHA,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "no scratch repository for reading the merges can be made in {} (No such file or directory (os error 2)) or {} (No such file or directory (os error 2)); set TMPDIR to a writable directory",
+                missing.display(),
+                missing.join("deeper").display()
+            )
+        );
+    }
+
+    #[test]
+    fn a_sha256_checkouts_shallow_entry_with_a_missing_parent_bounds_its_scratch_repository() {
+        let temp = tempfile::tempdir().unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=cm", "-c", "user.email=cm@example.com"])
+                .args(args)
+                .env("HOME", temp.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let origin = temp.path().join("origin");
+        let clone = temp.path().join("clone");
+        git(
+            temp.path(),
+            &[
+                "init",
+                "-q",
+                "--object-format=sha256",
+                origin.to_str().unwrap(),
+            ],
+        );
+        for message in ["one", "two"] {
+            git(&origin, &["commit", "-q", "--allow-empty", "-m", message]);
+        }
+        let url = format!("file://{}", origin.display());
+        git(
+            temp.path(),
+            &["clone", "-q", "--depth", "1", &url, clone.to_str().unwrap()],
+        );
+        let head = git(&clone, &["rev-parse", "HEAD"]);
+        assert_eq!(head.len(), 64);
+        let isolated = Isolated::over(&clone, &head).unwrap();
+        assert_eq!(
+            fs::read_to_string(isolated.dir.join("shallow")).unwrap(),
+            format!("{head}\n")
+        );
+    }
+
+    #[test]
+    fn a_scratch_directory_name_already_taken_is_passed_over() {
+        let parent = tempfile::tempdir().unwrap();
+        let next = SCRATCH_NAMES.load(std::sync::atomic::Ordering::Relaxed);
+        let taken: Vec<PathBuf> = (next..next + 50)
+            .map(|n| {
+                let dir = parent
+                    .path()
+                    .join(format!("cm-gate-{}-{n}", std::process::id()));
+                fs::create_dir(&dir).unwrap();
+                dir
+            })
+            .collect();
+        let dir = scratch_dir_under(parent.path()).unwrap();
+        assert!(!taken.contains(&dir), "{dir:?}");
+        assert!(dir.starts_with(parent.path()), "{dir:?}");
+    }
+
+    #[test]
+    fn a_scratch_tree_goes_past_directories_its_owner_cannot_list_and_follows_no_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let outside = parent.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("kept"), "kept\n").unwrap();
+        let tree = parent.path().join("tree");
+        let shut = tree.join("objects").join("shut");
+        fs::create_dir_all(shut.join("deeper")).unwrap();
+        fs::write(shut.join("deeper").join("object"), "object\n").unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("link")).unwrap();
+        for (dir, mode) in [(shut.join("deeper"), 0o300), (shut.clone(), 0o000)] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        remove_tree(&tree);
+        assert!(!tree.exists(), "{tree:?}");
+        assert!(outside.join("kept").is_file());
     }
 
     #[test]
@@ -2175,6 +3629,7 @@ mod tests {
                 pr: None,
                 part: None,
                 head: SHA.to_owned(),
+                kind: ReviewKind::Head,
                 verdict: Verdict::Accept,
                 stated: None,
                 report: CampaignFile::resolve(root, &copy).unwrap(),
@@ -2183,7 +3638,292 @@ mod tests {
         }
         let verdicts = Verdicts { reviews };
         HASHES.with(|hashes| hashes.set(0));
-        assert!(astra_gap(root, &target, &verdicts, None, SHA, None).is_empty());
+        assert!(astra_gap(root, &target, &verdicts, None, SHA, None, ReviewKind::Head).is_empty());
         assert_eq!(HASHES.with(Cell::get), 2);
+    }
+
+    #[test]
+    fn only_two_different_gitlinks_on_the_parents_stages_need_submodule_history() {
+        let (a, b) = ("1".repeat(40), "2".repeat(40));
+        let classified = |entries: &[(&str, &str, u8)]| {
+            let mut listed = format!("{SHA}\0");
+            for (mode, object, stage) in entries {
+                listed.push_str(&format!("{mode} {object} {stage}\tsub\0"));
+            }
+            listed.push('\0');
+            listing::<&[u8]>(listed.as_bytes()).map(|listing| {
+                listing
+                    .conflicts
+                    .values()
+                    .map(needs_submodule_history)
+                    .collect::<Vec<_>>()
+            })
+        };
+        let gitlink = "160000";
+        assert_eq!(
+            classified(&[(gitlink, &a, 1), (gitlink, &a, 2), (gitlink, &b, 3)]),
+            Some(vec![true])
+        );
+        assert_eq!(
+            classified(&[(gitlink, &b, 2), (gitlink, &a, 3)]),
+            Some(vec![true])
+        );
+        assert_eq!(
+            classified(&[(gitlink, &a, 1), (gitlink, &b, 2), (gitlink, &b, 3)]),
+            Some(vec![false])
+        );
+        assert_eq!(
+            classified(&[(gitlink, &a, 1), (gitlink, &b, 2)]),
+            Some(vec![false])
+        );
+        assert_eq!(
+            classified(&[(gitlink, &a, 1), (gitlink, &b, 3)]),
+            Some(vec![false])
+        );
+        assert_eq!(
+            classified(&[(gitlink, &a, 1), ("100644", &a, 2), (gitlink, &b, 3)]),
+            Some(vec![false])
+        );
+        assert_eq!(classified(&[(gitlink, &a, 4)]), None);
+        assert!(listing::<&[u8]>(format!("{SHA}\0160000 {a} 2 sub\0\0").as_bytes()).is_none());
+    }
+
+    #[test]
+    fn conflicted_paths_are_classified_and_checked_against_the_changed_ones_in_n_log_n_comparisons()
+    {
+        thread_local! {
+            static COMPARED: Cell<usize> = const { Cell::new(0) };
+        }
+        struct Counted<'a>(&'a [u8]);
+        impl PartialEq for Counted<'_> {
+            fn eq(&self, other: &Self) -> bool {
+                COMPARED.with(|compared| compared.set(compared.get() + 1));
+                self.0 == other.0
+            }
+        }
+        impl Eq for Counted<'_> {}
+        impl PartialOrd for Counted<'_> {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Counted<'_> {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                COMPARED.with(|compared| compared.set(compared.get() + 1));
+                self.0.cmp(other.0)
+            }
+        }
+        impl<'a> From<&'a [u8]> for Counted<'a> {
+            fn from(path: &'a [u8]) -> Self {
+                Counted(path)
+            }
+        }
+
+        let paths = 4096;
+        let mut listed = format!("{SHA}\0").into_bytes();
+        for path in 0..paths {
+            for stage in 1..=3 {
+                listed.extend(format!("100644 {SHA} {stage}\tdir/{path:05}.txt\0").bytes());
+            }
+        }
+        listed.push(0);
+        let changed: Vec<u8> = (0..paths)
+            .flat_map(|path| format!("M\0dir/{:05}.txt\0", 2 * path).into_bytes())
+            .collect();
+        let changed = changes(&changed).unwrap();
+        let listing = listing::<Counted>(&listed).unwrap();
+        assert_eq!(listing.conflicts.len(), paths);
+        let Ok(bounds) = bounds(listing) else {
+            panic!("no record, so nothing unbounded");
+        };
+        assert_eq!(beyond(&bounds, &changed).len(), paths / 2);
+        let lookups = 3 * paths + paths;
+        let compared = COMPARED.with(Cell::get);
+        assert!(
+            compared <= 4 * lookups * paths.ilog2() as usize,
+            "{compared}"
+        );
+    }
+
+    #[test]
+    fn a_merge_tree_listing_is_read_only_whole_up_to_its_last_record() {
+        let entry = format!("100644 {SHA} 2\tx~{SHA}\0");
+        let read = |records: &str| {
+            listing::<&[u8]>(format!("{SHA}\0{entry}\0{records}").as_bytes())
+                .unwrap()
+                .records
+                .map(|records| {
+                    records
+                        .iter()
+                        .map(|record| {
+                            let mut named: Vec<String> = record
+                                .paths
+                                .iter()
+                                .map(|path| String::from_utf8_lossy(path).into_owned())
+                                .collect();
+                            named.push(String::from_utf8_lossy(record.kind).into_owned());
+                            named
+                        })
+                        .collect::<Vec<_>>()
+                })
+        };
+        let moved = format!("2\0x~{SHA}\0x\0CONFLICT (file/directory)\0moved\n\0");
+        assert_eq!(
+            read(&format!(
+                "{moved}1\0x~{SHA}\0CONFLICT (modify/delete)\0kept\n\0"
+            )),
+            Some(vec![
+                vec![
+                    format!("x~{SHA}"),
+                    "x".to_owned(),
+                    "CONFLICT (file/directory)".to_owned()
+                ],
+                vec![format!("x~{SHA}"), "CONFLICT (modify/delete)".to_owned()],
+            ])
+        );
+        assert_eq!(read(""), Some(Vec::new()));
+        for unread in [
+            format!("{moved}\0"),
+            format!("{moved}\01\0x\0CONFLICT (contents)\0late\n\0"),
+            "two\0x\0CONFLICT (contents)\0text\n\0".to_owned(),
+            "3\0x\0y\0CONFLICT (contents)\0text\n\0".to_owned(),
+            "1\0x\0CONFLICT (contents)\0".to_owned(),
+        ] {
+            assert_eq!(read(&unread), None, "{unread:?}");
+        }
+        let unseparated = format!("{SHA}\0{entry}");
+        assert!(
+            listing::<&[u8]>(unseparated.as_bytes())
+                .unwrap()
+                .records
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn only_a_moved_aside_name_that_extends_its_own_path_is_read_as_made_up() {
+        let bounded = |staged: &[(&str, u8, &str)], paths: &[&str], kind: &str| {
+            let mut listed = format!("{SHA}\0");
+            for (mode, stage, path) in staged {
+                listed.push_str(&format!("{mode} {SHA} {stage}\t{path}\0"));
+            }
+            listed.push_str(&format!("\0{}\0", paths.len()));
+            for path in paths {
+                listed.push_str(&format!("{path}\0"));
+            }
+            listed.push_str(&format!("{kind}\0text\n\0"));
+            let listing = listing::<&[u8]>(listed.as_bytes()).unwrap();
+            match bounds(listing) {
+                Ok(bounds) => Ok((
+                    bounds
+                        .made_up
+                        .iter()
+                        .map(|(made_up, from)| {
+                            format!(
+                                "{} from {}",
+                                String::from_utf8_lossy(made_up),
+                                String::from_utf8_lossy(from)
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    bounds.paths.len(),
+                    bounds.displaced.len(),
+                )),
+                Err(Unbounded::Unreadable) => Err("unreadable".to_owned()),
+                Err(Unbounded::Unknown(kind)) => Err(String::from_utf8_lossy(kind).into_owned()),
+                Err(Unbounded::Unsupported(shape)) => Err(shape),
+            }
+        };
+        let moved = format!("x~{SHA}");
+        let file_directory = "CONFLICT (file/directory)";
+        assert_eq!(
+            bounded(&[("100644", 2, &moved)], &[&moved, "x"], file_directory),
+            Ok((vec![format!("{moved} from x")], 2, 1))
+        );
+        let suffixed = format!("x~{SHA}_1");
+        assert_eq!(
+            bounded(
+                &[("100644", 3, &suffixed)],
+                &[&suffixed, "x"],
+                file_directory
+            ),
+            Ok((vec![format!("{suffixed} from x")], 2, 1))
+        );
+        assert_eq!(
+            bounded(&[], &[&moved, "x"], file_directory),
+            Ok((Vec::new(), 0, 0))
+        );
+        for (mode, kind) in [("120000", "a symlink"), ("160000", "a submodule")] {
+            assert_eq!(
+                bounded(&[(mode, 2, &moved)], &[&moved, "x"], file_directory),
+                Err(format!(
+                    "its parents put {kind} at \"x\" against a directory"
+                ))
+            );
+        }
+        for unread in [
+            vec!["x", moved.as_str()],
+            vec![moved.as_str()],
+            vec![moved.as_str(), "x", "y"],
+            vec![moved.as_str(), "y"],
+            vec!["x-moved", "x"],
+        ] {
+            assert_eq!(
+                bounded(&[("100644", 2, &moved)], &unread, file_directory),
+                Err("unreadable".to_owned()),
+                "{unread:?}"
+            );
+        }
+        let distinct = "CONFLICT (distinct modes)";
+        let ours = format!("l~{SHA}");
+        let other = format!("l~{}", "1".repeat(40));
+        assert_eq!(
+            bounded(
+                &[("120000", 2, &ours), ("160000", 3, &other)],
+                &["l", &ours, &other],
+                distinct
+            ),
+            Err("its parents put a symlink and a submodule at \"l\"".to_owned())
+        );
+        assert_eq!(
+            bounded(
+                &[("100644", 2, &ours), ("120000", 3, "l")],
+                &["l", &ours],
+                distinct
+            ),
+            Err("its parents put a file and a symlink at \"l\"".to_owned())
+        );
+        for unread in [vec![other.as_str(), "l"], vec!["l"], vec!["l", "m~1"]] {
+            assert_eq!(
+                bounded(&[], &unread, distinct),
+                Err("unreadable".to_owned()),
+                "{unread:?}"
+            );
+        }
+        assert_eq!(
+            bounded(
+                &[],
+                &["e/new.txt", "d/new.txt"],
+                "CONFLICT (directory rename suggested)"
+            ),
+            Ok((Vec::new(), 2, 0))
+        );
+        for kind in [
+            "Auto-merging",
+            "CONFLICT (rename involved in collision)",
+            "CONFLICT (file in way of directory rename)",
+            "CONFLICT(directory rename collision)",
+            "CONFLICT(directory rename unclear split)",
+        ] {
+            assert_eq!(
+                bounded(&[("100644", 2, "y")], &["x"], kind),
+                Ok((Vec::new(), 1, 0)),
+                "{kind}"
+            );
+        }
+        assert_eq!(
+            bounded(&[], &["x"], "Path updated due to directory rename"),
+            Err("Path updated due to directory rename".to_owned())
+        );
     }
 }

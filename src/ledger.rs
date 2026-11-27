@@ -367,7 +367,7 @@ pub(crate) fn owner_queue_read(host: &dyn Host, root: &Path) -> Result<Outcome> 
     // Journal first: a failed journal write must never clear the unread refusal.
     let journal = journal_line(root, &at, "owner-queue read", &body)?;
     let mut campaign = store::load_campaign(root)?;
-    campaign.schema = crate::state::SCHEMA;
+    campaign.schema = campaign.schema.max(crate::state::SCHEMA);
     campaign.owner_queue_read = Some(crate::state::OwnerQueueRead {
         at: at.clone(),
         items: items.clone(),

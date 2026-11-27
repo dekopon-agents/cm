@@ -1226,6 +1226,20 @@ fn git_commit(repo: &Path, rev: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+fn is_ancestor(repo: &Path, ancestor: &str, of: &str) -> Option<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", ancestor, of])
+        .output()
+        .ok()?;
+    match output.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
 fn evidence_repos(repo: Option<&Path>, unit: &UnitState, target: &Target) -> Vec<PathBuf> {
     match (repo, &target.step) {
         (Some(repo), _) => vec![absolute(repo)],
@@ -1567,9 +1581,16 @@ fn merge_gate(
     let cleared =
         crate::verdict::merge_gaps(root, target, part, Some(&pr), &head, lineage.as_ref())?;
     if let Some(reviewed) = &cleared.reviewed {
-        lines.push(format!(
-            "- reviewed at {reviewed}; every commit since is a clean update from the base branch"
-        ));
+        lines.push(if cleared.resolved.is_empty() {
+            format!(
+                "- reviewed at {reviewed}; every commit since is a clean update from the base branch"
+            )
+        } else {
+            format!(
+                "- reviewed at {reviewed}; every commit since is a clean update from the base branch or a merge from it whose conflict resolution both families accepted ({})",
+                cleared.resolved.join(", ")
+            )
+        });
     }
     gaps.extend(cleared.gaps);
     match read.checks {
@@ -1807,7 +1828,7 @@ pub(crate) fn advance_held(
                             let Some(tag) = git_commit(repo, &format!("refs/tags/{tag}")) else {
                                 return false;
                             };
-                            crate::verdict::is_ancestor(repo, &sha, &tag) == Some(true)
+                            is_ancestor(repo, &sha, &tag) == Some(true)
                         })
                     });
                 if !contains
@@ -2214,7 +2235,7 @@ pub(crate) fn advance_held(
                             .sha
                             .as_deref()
                             .and_then(|old| git_commit(repo, old))
-                            .is_some_and(|old| crate::verdict::is_ancestor(repo, &old, &full_sha) == Some(true))
+                            .is_some_and(|old| is_ancestor(repo, &old, &full_sha) == Some(true))
                     {
                         violations.push(Violation::new(
                             &full,
@@ -2284,7 +2305,7 @@ pub(crate) fn advance_held(
                 repos.iter().filter_map(|repo| {
                     let sha = git_commit(repo, sha)?;
                     let tag = git_commit(repo, &format!("refs/tags/{tag}"))?;
-                    crate::verdict::is_ancestor(repo, &sha, &tag)
+                    is_ancestor(repo, &sha, &tag)
                 }).reduce(|left, right| left || right)
                     .ok_or_else(|| Violation::new(
                         &full,

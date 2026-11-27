@@ -257,16 +257,41 @@ struct Campaign {
 
 /// A campaign with the codex step S1 launched remotely and, with `pr`, at pr-open on PR 7.
 fn campaign(host: &Fake, pr: bool) -> Campaign {
-    let temp = tempfile::tempdir().unwrap();
+    let setup = Setup {
+        pr,
+        worktree: false,
+        lane: Lane::Codex,
+        home: None,
+    };
+    campaign_in(host, tempfile::tempdir().unwrap(), setup)
+}
+
+#[derive(Clone, Copy)]
+struct Setup<'a> {
+    pr: bool,
+    worktree: bool,
+    lane: Lane,
+    home: Option<&'a Path>,
+}
+
+fn campaign_in(host: &Fake, temp: tempfile::TempDir, setup: Setup) -> Campaign {
+    let run = |repo: &Path, args: &[&str]| match setup.home {
+        Some(home) => {
+            let output = scratch_git(home, repo, args);
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+        None => git(repo, args),
+    };
     let root = temp.path().join("campaign");
     assert!(commands::init(host, &root).unwrap().ok());
-    git(&root, &["init", "-q"]);
+    run(&root, &["init", "-q"]);
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q"]);
-    git(&repo, &["commit", "-q", "--allow-empty", "-m", "head"]);
+    run(&repo, &["init", "-q"]);
+    run(&repo, &["commit", "-q", "--allow-empty", "-m", "head"]);
     let declaration = Declaration {
-        lane: Some(Lane::Codex),
+        lane: Some(setup.lane),
         ..Declaration::default()
     };
     assert!(
@@ -280,14 +305,21 @@ fn campaign(host: &Fake, pr: bool) -> Campaign {
         coordinator: Some("session_a".into()),
         cap_min: None,
     };
-    let launched = commands::launch_remote(host, &root, &target(), None, &remote).unwrap();
+    let launched = commands::launch_remote(
+        host,
+        &root,
+        &target(),
+        setup.worktree.then_some(repo.as_path()),
+        &remote,
+    )
+    .unwrap();
     assert!(launched.ok(), "{:?}", launched.violations);
     let c = Campaign {
         _temp: temp,
         root,
         repo,
     };
-    if pr {
+    if setup.pr {
         let opened = commands::advance(
             host,
             &c.root,
@@ -295,7 +327,7 @@ fn campaign(host: &Fake, pr: bool) -> Campaign {
             &Phase::PrOpen,
             &Evidence {
                 pr: Some(PR.into()),
-                sha: Some(c.head()),
+                sha: Some(run(&c.repo, &["rev-parse", "HEAD"])),
                 ..Evidence::default()
             },
             None,
@@ -941,6 +973,7 @@ fn rising_counts_request_a_fresh_reader_until_one_is_recorded() {
         assert!(next.ok(), "{:?}", next.violations);
         assert_eq!(next.fields["fresh_readers"][0]["command"], command);
         assert_eq!(next.fields["fresh_readers"][0]["review"], "R2");
+        assert_eq!(next.fields["fresh_readers"][0].get("kind"), None);
         assert!(next.lines.iter().any(|line| line
             == &format!("1. fresh reader {STEP}: independent Opus, high effort — `{command}`")));
     }
@@ -4775,5 +4808,5922 @@ fn a_report_recorded_before_pr_open_is_not_recorded_again_as_another_family() {
     assert_eq!(
         rules(&record(&host, &c, &astra, "claude")),
         ["review-duplicate"]
+    );
+}
+
+fn scratch_git(home: &Path, repo: &Path, args: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "user.name=cm", "-c", "user.email=cm@example.com"])
+        .args(args)
+        .env("HOME", home)
+        .env("TMPDIR", home)
+        .env("GIT_CONFIG_GLOBAL", home.join("gitconfig"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap()
+}
+
+struct Scratch {
+    c: Campaign,
+    home: PathBuf,
+    base: String,
+    h1: String,
+}
+
+impl Scratch {
+    fn new(host: &Fake) -> Scratch {
+        Scratch::with(host, Lane::Codex, false)
+    }
+
+    fn with(host: &Fake, lane: Lane, worktree: bool) -> Scratch {
+        let temp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let origin = temp.path().join("origin.git");
+        let setup = Setup {
+            pr: true,
+            worktree,
+            lane,
+            home: Some(&home),
+        };
+        let c = campaign_in(host, temp, setup);
+        let mut s = Scratch {
+            c,
+            home,
+            base: String::new(),
+            h1: String::new(),
+        };
+        s.base = s.git(&["rev-parse", "--abbrev-ref", "HEAD"]);
+        let bare = scratch_git(
+            &s.home,
+            origin.parent().unwrap(),
+            &["init", "-q", "--bare", "origin.git"],
+        );
+        assert!(bare.status.success(), "{bare:?}");
+        s.git(&["remote", "add", "origin", origin.to_str().unwrap()]);
+        s.git(&["push", "-q", "origin", &s.base]);
+        s.git(&["remote", "set-head", "origin", &s.base]);
+        s.git(&["checkout", "-q", "-b", "feature"]);
+        s.h1 = s.commit("shared.txt", "feature\n");
+        s.astra(host, &s.h1, "h1", "ACCEPT");
+        claude_accept(host, &s.c, &s.h1);
+        s
+    }
+
+    fn git(&self, args: &[&str]) -> String {
+        let output = scratch_git(&self.home, &self.c.repo, args);
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn head(&self) -> String {
+        self.git(&["rev-parse", "HEAD"])
+    }
+
+    fn commit(&self, file: &str, text: &str) -> String {
+        fs::write(self.c.repo.join(file), text).unwrap();
+        self.git(&["add", file]);
+        self.git(&["commit", "-q", "-m", file]);
+        self.head()
+    }
+
+    fn on_main(&self, file: &str, text: &str) {
+        self.git(&["checkout", "-q", &self.base]);
+        self.commit(file, text);
+        self.git(&["push", "-q", "origin", &self.base]);
+        self.git(&["checkout", "-q", "feature"]);
+    }
+
+    fn merge_main(&self, resolution: Option<&str>) -> String {
+        let main = format!("origin/{}", self.base);
+        let merged = scratch_git(
+            &self.home,
+            &self.c.repo,
+            &["merge", "-q", "--no-edit", &main],
+        );
+        match resolution {
+            None => assert!(merged.status.success(), "{merged:?}"),
+            Some(text) => {
+                assert!(!merged.status.success(), "the merge conflicts: {merged:?}");
+                fs::write(self.c.repo.join("shared.txt"), text).unwrap();
+                self.git(&["add", "shared.txt"]);
+                self.git(&["commit", "-q", "--no-edit"]);
+            }
+        }
+        self.head()
+    }
+
+    fn astra(&self, host: &Fake, head: &str, name: &str, verdict: &str) {
+        let dir = format!("astra-review-7-{name}");
+        let report = self.c.report(&dir, head, &[], verdict);
+        self.c.receipt(&dir, head, "gpt-6-astra", "xhigh");
+        let recorded = record(host, &self.c, &report, "astra");
+        assert!(recorded.ok(), "{:?}", recorded.violations);
+    }
+
+    fn resolution(
+        &self,
+        host: &Fake,
+        reviewer: Option<&str>,
+        merge: &str,
+        name: &str,
+        findings: &[&str],
+    ) -> Outcome {
+        let verdict = if findings.is_empty() {
+            "ACCEPT"
+        } else {
+            "FIX REQUIRED"
+        };
+        let mut block = format!("head: {merge}\n");
+        for finding in findings {
+            block.push_str(finding);
+            block.push('\n');
+        }
+        let text = format!(
+            "# Resolution review by {}\n\nThe remerge diff only.\n\n```cm-review\n{block}```\n\n{verdict}\n",
+            reviewer.unwrap_or("nobody")
+        );
+        let report = if reviewer == Some("astra") {
+            let dir = format!("astra-review-7-{name}");
+            let report = self
+                .c
+                .write(&format!("{STEP}/evidence/{dir}/report.md"), &text);
+            self.c.receipt(&dir, merge, "gpt-6-astra", "xhigh");
+            report
+        } else {
+            self.c.write(&format!("drafts/{name}.md"), &text)
+        };
+        verdict::record_resolution(
+            host,
+            &self.c.root,
+            &target(),
+            &report,
+            reviewer,
+            None,
+            Some(&self.c.repo),
+        )
+        .unwrap()
+    }
+
+    fn accepted_resolution(&self, host: &Fake, merge: &str, name: &str) {
+        for reviewer in ["astra", "claude"] {
+            let recorded = self.resolution(
+                host,
+                Some(reviewer),
+                merge,
+                &format!("{name}-{reviewer}"),
+                &[],
+            );
+            assert!(recorded.ok(), "{:?}", recorded.violations);
+        }
+    }
+
+    fn cleared(&self) -> verdict::Cleared {
+        let tip = self.git(&["rev-parse", &self.base]);
+        let lineage = Lineage {
+            repo: &self.c.repo,
+            base: Some(&tip),
+        };
+        verdict::merge_gaps(
+            &self.c.root,
+            &target(),
+            None,
+            Some(PR),
+            &self.head(),
+            Some(&lineage),
+        )
+        .unwrap()
+    }
+
+    fn owed(&self, host: &Fake, head: &str) -> Vec<String> {
+        let forge = FakeForge::open(head, &[("fmt, clippy, test", "success")]);
+        let synced = cm::sync::sync(host, &forge, &self.c.root).unwrap();
+        assert!(synced.ok(), "{:?}", synced.violations);
+        let next = plan::next_at(&self.c.root, None, None, host.now).unwrap();
+        next.lines
+            .iter()
+            .filter_map(|line| line.split_once(". ").map(|(_, line)| line))
+            .filter(|line| line.starts_with("review-owed ") || line.starts_with("merge-ready "))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn merge(&self, host: &Fake) -> Outcome {
+        let head = self.head();
+        let forge = FakeForge {
+            base: Some(self.git(&["rev-parse", &self.base])),
+            ..FakeForge::open(&head, &[("fmt, clippy, test", "success")])
+        };
+        commands::advance_gated(
+            host,
+            &self.c.root,
+            &target(),
+            commands::Advance {
+                to: &Phase::Merged,
+                given: &Evidence {
+                    sha: Some(head),
+                    ..Evidence::default()
+                },
+                file: None,
+                repo: Some(&self.c.repo),
+                part: None,
+                by: &[],
+            },
+            &MergeGate {
+                forge: Some(&forge),
+                ..MergeGate::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn edit_ledger(&self, edit: impl FnOnce(&mut verdict::Verdicts)) {
+        let mut ledger = verdict::load(&self.c.root).unwrap();
+        edit(&mut ledger);
+        store::write_json(&self.c.root.join(".cm/verdicts.json"), &ledger).unwrap();
+    }
+
+    fn reviews(&self) -> usize {
+        verdict::load(&self.c.root).unwrap().reviews.len()
+    }
+
+    fn journal(&self) -> String {
+        fs::read_to_string(self.c.root.join("JOURNAL.md")).unwrap()
+    }
+}
+
+fn walk_gaps(cleared: &verdict::Cleared) -> Vec<String> {
+    match &cleared.stop {
+        Some(CleanUpdateError::ResolutionGaps { gaps, .. }) => gaps.clone(),
+        other => panic!("the walk stops at a merge's resolution reviews, not {other:?}"),
+    }
+}
+
+#[test]
+fn a_conflicted_merge_from_main_clears_once_both_families_accept_its_resolution() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    assert_eq!(
+        s.cleared().stop,
+        Some(CleanUpdateError::Conflicts {
+            commit: merge.clone()
+        })
+    );
+
+    let claude = s.resolution(&host, Some("claude"), &merge, "claude-resolution", &[]);
+    assert!(claude.ok(), "{:?}", claude.violations);
+    assert_eq!(claude.fields["kind"], "resolution");
+    assert_eq!(claude.fields["first_parent"], s.h1.as_str());
+    let one = s.cleared();
+    assert!(!one.gaps.is_empty());
+    assert!(
+        walk_gaps(&one).contains(&"no astra resolution ACCEPT".to_owned()),
+        "{:?}",
+        one.stop
+    );
+    let refused = s.merge(&host);
+    assert!(
+        rules(&refused).contains(&"merge-gate"),
+        "{:?}",
+        refused.violations
+    );
+    assert_eq!(s.c.state(), Phase::PrOpen);
+
+    let astra = s.resolution(&host, Some("astra"), &merge, "resolution", &[]);
+    assert!(astra.ok(), "{:?}", astra.violations);
+    let both = s.cleared();
+    assert!(both.gaps.is_empty(), "{:?}", both.gaps);
+    assert_eq!(both.reviewed.as_deref(), Some(s.h1.as_str()));
+    assert_eq!(both.resolved, vec![merge.clone()]);
+
+    let ledger: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(s.c.root.join(".cm/verdicts.json")).unwrap())
+            .unwrap();
+    let kinds: Vec<Option<&str>> = ledger["reviews"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|review| review.get("kind").map(|kind| kind.as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![None, None, Some("resolution"), Some("resolution")]
+    );
+
+    let merged = s.merge(&host);
+    assert!(merged.ok(), "{:?}", merged.violations);
+    assert!(
+        s.journal().contains(&format!(
+            "- reviewed at {}; every commit since is a clean update from the base branch or a merge from it whose conflict resolution both families accepted ({merge})",
+            s.h1
+        )),
+        "{}",
+        s.journal()
+    );
+}
+
+#[test]
+fn a_resolution_accept_is_never_an_accept_of_the_head() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    s.accepted_resolution(&host, &merge, "resolution");
+    assert!(s.cleared().gaps.is_empty());
+
+    let without_checkout =
+        verdict::merge_gaps(&s.c.root, &target(), None, Some(PR), &merge, None).unwrap();
+    assert!(
+        without_checkout
+            .gaps
+            .iter()
+            .any(|gap| gap.starts_with(&format!(
+                "only resolution reviews of {merge} are recorded (R3, R4)"
+            ))),
+        "{:?}",
+        without_checkout.gaps
+    );
+    let verdicts = verdict::load(&s.c.root).unwrap();
+    assert_eq!(
+        verdict::missing_reviews(&verdicts, STEP, &merge, Some(PR), None, true),
+        vec!["astra", "claude"]
+    );
+
+    let fix = s.c.report(
+        "head-review",
+        &merge,
+        &["F1 | contract | introduced | src/lib.rs:1 | broken"],
+        "FIX REQUIRED",
+    );
+    assert!(record(&host, &s.c, &fix, "claude").ok());
+    let governed = s.cleared();
+    assert_eq!(governed.stop, None);
+    assert!(
+        governed
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("R5.F1 unresolved")),
+        "{:?}",
+        governed.gaps
+    );
+}
+
+#[test]
+fn an_open_resolution_finding_or_an_unrecorded_receipt_at_the_merge_keeps_the_gate_shut() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let blocking = ["F1 | contract | exposed | shared.txt:1 | main's change breaks it"];
+    assert!(
+        s.resolution(&host, Some("astra"), &merge, "resolution-1", &blocking)
+            .ok()
+    );
+    assert!(
+        s.resolution(&host, Some("claude"), &merge, "claude-resolution", &[])
+            .ok()
+    );
+    assert_eq!(
+        walk_gaps(&s.cleared()),
+        vec!["R3.F1 unresolved", "no astra resolution ACCEPT"]
+    );
+
+    let ruling =
+        s.c.write("ruling.md", "Coordinator: F1 is main's to fix.\n");
+    assert!(
+        verdict::resolve(&host, &s.c.root, &target(), "R3.F1", "ruling.md", &ruling)
+            .unwrap()
+            .ok()
+    );
+    assert_eq!(walk_gaps(&s.cleared()), vec!["no astra resolution ACCEPT"]);
+
+    let unstated = s.c.write(
+        &format!("{STEP}/evidence/astra-review-7-unstated/report.md"),
+        &format!("# Astra resolution\n\nNo verdict line.\n\n```cm-review\nhead: {merge}\n```\n"),
+    );
+    s.c.receipt("astra-review-7-unstated", &merge, "gpt-6-astra", "xhigh");
+    assert!(
+        verdict::record_resolution(
+            &host,
+            &s.c.root,
+            &target(),
+            &unstated,
+            Some("astra"),
+            None,
+            Some(&s.c.repo),
+        )
+        .unwrap()
+        .ok()
+    );
+    assert_eq!(walk_gaps(&s.cleared()), vec!["no astra resolution ACCEPT"]);
+
+    assert!(
+        s.resolution(&host, Some("astra"), &merge, "resolution-2", &[])
+            .ok()
+    );
+    assert!(s.cleared().gaps.is_empty());
+
+    s.c.receipt_with(
+        "astra-review-7-unrecorded",
+        &merge,
+        "gpt-6-astra",
+        "xhigh",
+        |receipt| {
+            receipt["verdict"] = "FIX REQUIRED".into();
+        },
+    );
+    let bound = s.cleared();
+    assert_eq!(bound.stop, None);
+    assert!(
+        bound
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("astra-review-7-unrecorded/receipt.json")),
+        "{:?}",
+        bound.gaps
+    );
+}
+
+#[test]
+fn a_commit_after_an_accepted_resolution_needs_a_review_of_its_own() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    s.accepted_resolution(&host, &merge, "resolution");
+    let owed_at = |head: &str| {
+        vec![format!(
+            "review-owed {STEP}: PR {PR}: no astra and claude verdict at {} since 2026-11-25T06:00Z (0 waiting) — `cm brief {STEP}`",
+            &head[..12]
+        )]
+    };
+    assert_eq!(s.owed(&host, &merge), owed_at(&merge));
+    let fix = s.commit("fix.txt", "a fix after the merge\n");
+    assert_eq!(
+        s.cleared().stop,
+        Some(CleanUpdateError::NotMerge {
+            commit: fix.clone()
+        })
+    );
+    assert_eq!(s.owed(&host, &fix), owed_at(&fix));
+    let refused = s.merge(&host);
+    assert!(
+        rules(&refused).contains(&"merge-gate"),
+        "{:?}",
+        refused.violations
+    );
+
+    s.astra(&host, &fix, "fix", "ACCEPT");
+    claude_accept(&host, &s.c, &fix);
+    let merged = s.merge(&host);
+    assert!(merged.ok(), "{:?}", merged.violations);
+}
+
+#[test]
+fn a_second_merge_from_main_walks_back_through_the_first_resolution() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let first = s.merge_main(Some("feature and main\n"));
+    s.accepted_resolution(&host, &first, "resolution-1");
+
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    let cleared = s.cleared();
+    assert!(cleared.gaps.is_empty(), "{:?}", cleared.gaps);
+    assert_eq!(cleared.reviewed.as_deref(), Some(s.h1.as_str()));
+    assert_eq!(cleared.resolved, vec![first.clone()]);
+
+    s.on_main("shared.txt", "main again\n");
+    let second = s.merge_main(Some("feature and main again\n"));
+    assert_eq!(
+        s.cleared().stop,
+        Some(CleanUpdateError::Conflicts {
+            commit: second.clone()
+        })
+    );
+    let astra = s.resolution(&host, Some("astra"), &second, "resolution-2", &[]);
+    assert!(astra.ok(), "{:?}", astra.violations);
+    assert_eq!(astra.fields["first_parent"], clean.as_str());
+    assert_eq!(walk_gaps(&s.cleared()), vec!["no claude resolution ACCEPT"]);
+    assert!(
+        s.resolution(&host, Some("claude"), &second, "claude-resolution-2", &[])
+            .ok()
+    );
+    let merged = s.merge(&host);
+    assert!(merged.ok(), "{:?}", merged.violations);
+    assert!(
+        s.journal().contains(&format!(
+            "\n- reviewed at {}; every commit since is a clean update from the base branch or a merge from it whose conflict resolution both families accepted ({second}, {first})\n",
+            s.h1
+        )),
+        "{}",
+        s.journal()
+    );
+}
+
+#[test]
+fn an_amended_merge_loses_the_resolution_accepts_of_the_merge_it_replaced() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    s.accepted_resolution(&host, &merge, "resolution");
+    assert!(s.cleared().gaps.is_empty());
+    s.git(&["commit", "-q", "--amend", "-m", "Merge main, amended"]);
+    let amended = s.head();
+    assert_ne!(amended, merge);
+    assert_eq!(
+        s.cleared().stop,
+        Some(CleanUpdateError::Conflicts { commit: amended })
+    );
+    let refused = s.merge(&host);
+    assert!(
+        rules(&refused).contains(&"merge-gate"),
+        "{:?}",
+        refused.violations
+    );
+}
+
+#[test]
+fn a_resolution_review_stands_only_on_a_conflicted_merge_from_main_whose_first_parent_clears() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    let refused = |outcome: Outcome| -> String {
+        assert_eq!(
+            rules(&outcome),
+            ["review-resolution"],
+            "{:?}",
+            outcome.violations
+        );
+        assert_eq!(
+            s.reviews(),
+            2,
+            "a refused resolution review is not recorded"
+        );
+        outcome.violations[0].message.clone()
+    };
+    let family = "a resolution review counts only for its reviewer's family: name a Codex reviewer (astra, sol, terra, gpt-…) or a Claude one (claude, opus, fresh-opus, fable, sonnet, haiku) with --reviewer";
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    assert_eq!(
+        refused(s.resolution(&host, None, &merge, "nobody", &[])),
+        family
+    );
+    assert_eq!(
+        refused(s.resolution(&host, Some("bot"), &merge, "bot", &[])),
+        family
+    );
+    let report = s.c.report("no-checkout", &merge, &[], "ACCEPT");
+    assert_eq!(
+        refused(
+            verdict::record_resolution(
+                &host,
+                &s.c.root,
+                &target(),
+                &report,
+                Some("claude"),
+                None,
+                None,
+            )
+            .unwrap()
+        ),
+        "a resolution review is checked against the merge in a checkout; pass --repo <a checkout of the repo>"
+    );
+    s.git(&["remote", "set-head", "origin", "--delete"]);
+    assert_eq!(
+        refused(s.resolution(&host, Some("claude"), &merge, "no-origin-head", &[])),
+        format!(
+            "cannot read origin/HEAD, the base branch's tip, in {}; fetch the base branch there",
+            s.c.repo.display()
+        )
+    );
+    s.git(&["remote", "set-head", "origin", &s.base]);
+    assert_eq!(
+        refused(s.resolution(&host, Some("claude"), &s.h1, "not-a-merge", &[])),
+        format!("{} is not a merge from the base branch", &s.h1[..12])
+    );
+
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    assert_eq!(
+        refused(s.resolution(&host, Some("claude"), &clean, "clean", &[])),
+        format!(
+            "{} is a clean update from the base branch: its remerge diff is empty, so it needs no review",
+            &clean[..12]
+        )
+    );
+
+    s.git(&["checkout", "-q", "-b", "side", &s.base]);
+    let side = s.commit("shared.txt", "side\n");
+    s.git(&["checkout", "-q", "feature"]);
+    let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", "side"]);
+    assert!(!merged.status.success(), "the side merge conflicts");
+    fs::write(s.c.repo.join("shared.txt"), "feature and side\n").unwrap();
+    s.git(&["add", "shared.txt"]);
+    s.git(&["commit", "-q", "--no-edit"]);
+    let off_base = s.head();
+    assert_eq!(
+        refused(s.resolution(&host, Some("claude"), &off_base, "off-base", &[])),
+        format!(
+            "{} merges {} which is not on the base branch origin/HEAD",
+            &off_base[..12],
+            &side[..12]
+        )
+    );
+
+    s.git(&["reset", "-q", "--hard", &clean]);
+    let unreviewed = s.commit("fix.txt", "not reviewed\n");
+    s.on_main("shared.txt", "main again\n");
+    let over_unreviewed = s.merge_main(Some("feature, side and main\n"));
+    let parent = refused(s.resolution(&host, Some("claude"), &over_unreviewed, "parent", &[]));
+    assert!(
+        parent.starts_with(&format!(
+            "{}'s first parent {} does not clear the gate, so no resolution review can stand on it: ",
+            &over_unreviewed[..12],
+            &unreviewed[..12]
+        )),
+        "{parent}"
+    );
+}
+
+#[test]
+fn the_cli_records_a_resolution_review_only_under_kind_resolution() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let cm = |report: &Path, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("-C")
+            .arg(&s.c.root)
+            .args(["--json", "review", "record", STEP])
+            .arg(report)
+            .args(args)
+            .env("HOME", &s.home)
+            .env("TMPDIR", &s.home)
+            .env("GIT_CONFIG_GLOBAL", s.home.join("gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
+    };
+    let repo = s.c.repo.to_str().unwrap();
+    let resolution = s.c.report("cli-resolution", &merge, &[], "ACCEPT");
+    for usage in [
+        vec!["--reviewer", "claude", "--repo", repo],
+        vec!["--reviewer", "claude", "--kind", "delta", "--repo", repo],
+    ] {
+        let output = cm(&resolution, &usage);
+        assert_eq!(output.status.code(), Some(2), "{usage:?}: {output:?}");
+    }
+    assert_eq!(s.reviews(), 2);
+    let output = cm(
+        &resolution,
+        &[
+            "--reviewer",
+            "claude",
+            "--kind",
+            "resolution",
+            "--repo",
+            repo,
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["kind"], "resolution");
+    assert_eq!(json["first_parent"], s.h1.as_str());
+
+    let head = s.c.write(
+        "drafts/cli-head.md",
+        &format!(
+            "# Opus review\n\nThe whole head.\n\n```cm-review\nhead: {merge}\n```\n\nACCEPT\n"
+        ),
+    );
+    let output = cm(&head, &["--reviewer", "opus"]);
+    assert!(output.status.success(), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        json.get("kind").is_none() && json.get("first_parent").is_none(),
+        "{json}"
+    );
+    let kinds: Vec<verdict::ReviewKind> = verdict::load(&s.c.root)
+        .unwrap()
+        .reviews
+        .iter()
+        .map(|review| review.kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            verdict::ReviewKind::Head,
+            verdict::ReviewKind::Head,
+            verdict::ReviewKind::Resolution,
+            verdict::ReviewKind::Head
+        ]
+    );
+}
+
+#[test]
+fn a_resolution_review_reads_the_merge_in_the_steps_worktree_when_no_repo_is_named() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::with(&host, Lane::Codex, true);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let report = s.c.write(
+        "drafts/worktree-resolution.md",
+        &format!(
+            "# Resolution\n\nRead in the worktree.\n\n```cm-review\nhead: {merge}\n```\n\nACCEPT\n"
+        ),
+    );
+    let recorded = verdict::record_resolution(
+        &host,
+        &s.c.root,
+        &target(),
+        &report,
+        Some("claude"),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(recorded.ok(), "{:?}", recorded.violations);
+    assert_eq!(recorded.fields["first_parent"], s.h1.as_str());
+}
+
+#[test]
+fn a_ledger_cm_0_17_1_wrote_round_trips_byte_for_byte_and_keeps_its_records_on_a_new_review() {
+    let written = include_str!("fixtures/verdicts-0.17.1.json");
+    let host = at("2026-11-25T06:00:00Z");
+    let temp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let setup = Setup {
+        pr: true,
+        worktree: false,
+        lane: Lane::Codex,
+        home: Some(&home),
+    };
+    let c = campaign_in(&host, temp, setup);
+    let ledger = c.root.join(".cm/verdicts.json");
+    fs::write(&ledger, written).unwrap();
+    let resaved = c.root.join("resaved.json");
+    store::write_json(&resaved, &verdict::load(&c.root).unwrap()).unwrap();
+    assert_eq!(fs::read_to_string(&resaved).unwrap(), written);
+
+    claude_accept(&host, &c, &c.head());
+    let after = fs::read_to_string(&ledger).unwrap();
+    let kept = written.strip_suffix("\n  ]\n}\n").unwrap();
+    let next = verdict::load(&c.root).unwrap().reviews.len();
+    assert!(
+        after.starts_with(&format!("{kept},\n    {{\n      \"number\": {next},")),
+        "{after}"
+    );
+    assert!(!after.contains("\"kind\""), "{after}");
+}
+
+fn as_resolutions(ledger: &mut verdict::Verdicts, from: &str, to: &str) {
+    let copies: Vec<verdict::Recorded> = ledger
+        .reviews
+        .iter()
+        .filter(|review| review.at_head(from))
+        .map(|review| verdict::Recorded {
+            number: review.number + 100,
+            head: to.to_owned(),
+            kind: verdict::ReviewKind::Resolution,
+            ..review.clone()
+        })
+        .collect();
+    ledger.reviews.extend(copies);
+}
+
+fn schema(c: &Campaign) -> u64 {
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(c.root.join(".cm/state.json")).unwrap()).unwrap();
+    state["schema"].as_u64().unwrap()
+}
+
+fn scratch_cm(s: &Scratch, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_cm"))
+        .arg("-C")
+        .arg(&s.c.root)
+        .args(args)
+        .env("HOME", &s.home)
+        .env("TMPDIR", &s.home)
+        .env("GIT_CONFIG_GLOBAL", s.home.join("gitconfig"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn a_resolution_review_binds_the_full_merge_sha_when_its_report_names_a_prefix() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let prefix = &merge[..7];
+    let claude = s.resolution(&host, Some("claude"), prefix, "claude-prefix", &[]);
+    assert!(claude.ok(), "{:?}", claude.violations);
+    assert_eq!(claude.fields["head"], merge.as_str());
+    assert!(
+        s.resolution(&host, Some("astra"), prefix, "astra-prefix", &[])
+            .ok()
+    );
+    let recorded = verdict::load(&s.c.root).unwrap();
+    let heads: Vec<&str> = recorded.reviews[2..]
+        .iter()
+        .map(|review| review.head.as_str())
+        .collect();
+    assert_eq!(heads, [merge.as_str(), merge.as_str()]);
+    assert!(s.cleared().gaps.is_empty());
+
+    s.git(&["commit", "-q", "--amend", "-m", "Merge main, amended"]);
+    let amended = s.head();
+    let sharing = format!("{}{}", &amended[..7], &merge[7..]);
+    s.edit_ledger(|ledger| {
+        for review in &mut ledger.reviews[2..] {
+            review.head = sharing.clone();
+        }
+    });
+    assert_eq!(
+        s.cleared().stop,
+        Some(CleanUpdateError::Conflicts { commit: amended })
+    );
+}
+
+#[test]
+fn a_resolution_review_needs_both_families_at_the_first_parent_on_every_lane() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::with(&host, Lane::Pi, true);
+    let h2 = s.commit("more.txt", "claude only\n");
+    claude_accept(&host, &s.c, &h2);
+    let pi = verdict::merge_gaps(&s.c.root, &target(), None, Some(PR), &h2, None).unwrap();
+    assert!(pi.gaps.is_empty(), "{:?}", pi.gaps);
+
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let refused = s.resolution(&host, Some("claude"), &merge, "claude-resolution", &[]);
+    assert_eq!(
+        rules(&refused),
+        ["review-resolution"],
+        "{:?}",
+        refused.violations
+    );
+    let message = &refused.violations[0].message;
+    assert!(
+        message.starts_with(&format!(
+            "{}'s first parent {} does not clear the gate, so no resolution review can stand on it: ",
+            &merge[..12],
+            &h2[..12]
+        )) && message.contains(&format!("no astra ACCEPT of {h2} is recorded")),
+        "{message}"
+    );
+
+    s.astra(&host, &h2, "h2", "ACCEPT");
+    s.accepted_resolution(&host, &merge, "resolution");
+    let cleared = s.cleared();
+    assert!(cleared.gaps.is_empty(), "{:?}", cleared.gaps);
+    assert_eq!(cleared.reviewed.as_deref(), Some(h2.as_str()));
+
+    s.c.receipt_with(
+        "astra-review-7-late",
+        &h2,
+        "gpt-6-astra",
+        "xhigh",
+        |receipt| {
+            receipt["verdict"] = "FIX REQUIRED".into();
+        },
+    );
+    let landed = s.cleared();
+    assert!(
+        landed.gaps.iter().any(|gap| gap.contains(&format!(
+            "the nearest reviewed commit before {merge}, {h2}, joined to it by clean updates and merges whose conflict resolutions both families accepted ({merge}), does not clear"
+        )) && gap.contains("astra-review-7-late/receipt.json")),
+        "{:?}",
+        landed.gaps
+    );
+}
+
+#[test]
+fn a_merge_whose_parents_merge_cleanly_is_no_conflict_resolution() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("other.txt", "main\n");
+    s.commit("unreviewed.txt", "never reviewed\n");
+    let tree = s.git(&["rev-parse", "HEAD^{tree}"]);
+    let main = s.git(&["rev-parse", &format!("origin/{}", s.base)]);
+    let synthetic = s.git(&[
+        "commit-tree",
+        &tree,
+        "-p",
+        &s.h1,
+        "-p",
+        &main,
+        "-m",
+        "synthetic",
+    ]);
+    s.git(&["reset", "-q", "--hard", &synthetic]);
+    let root_commit = s.git(&["rev-list", "--max-parents=0", "HEAD"]);
+    let refused = |head: &str| {
+        let outcome = s.resolution(&host, Some("claude"), head, &format!("claude-{head}"), &[]);
+        assert_eq!(
+            rules(&outcome),
+            ["review-resolution"],
+            "{:?}",
+            outcome.violations
+        );
+        assert_eq!(
+            outcome.violations[0].message,
+            format!(
+                "{} is no conflict resolution a resolution review can cover: its parents merge without a conflict, so its remerge diff resolves none; it needs a review of its own",
+                &head[..12]
+            )
+        );
+    };
+    refused(&synthetic);
+    s.edit_ledger(|ledger| as_resolutions(ledger, &s.h1, &synthetic));
+    assert_eq!(
+        walk_gaps(&s.cleared()),
+        ["its parents merge without a conflict, so its remerge diff resolves none"]
+    );
+    assert!(rules(&s.merge(&host)).contains(&"merge-gate"));
+
+    let fix_tree = s.git(&["rev-parse", "HEAD^{tree}"]);
+    let old_main = s.git(&[
+        "commit-tree",
+        &fix_tree,
+        "-p",
+        &s.h1,
+        "-p",
+        &root_commit,
+        "-m",
+        "fix with an old main commit as second parent",
+    ]);
+    s.git(&["reset", "-q", "--hard", &old_main]);
+    refused(&old_main);
+}
+
+#[test]
+fn a_conflict_resolution_that_also_changes_other_files_is_refused() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let main = format!("origin/{}", s.base);
+    let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", &main]);
+    assert!(!merged.status.success(), "the merge conflicts");
+    fs::write(s.c.repo.join("shared.txt"), "feature and main\n").unwrap();
+    fs::write(s.c.repo.join("other.txt"), "an edit outside the conflict\n").unwrap();
+    s.git(&["add", "shared.txt", "other.txt"]);
+    s.git(&["commit", "-q", "--no-edit"]);
+    let merge = s.head();
+    let refused = s.resolution(&host, Some("claude"), &merge, "claude-resolution", &[]);
+    assert_eq!(
+        rules(&refused),
+        ["review-resolution"],
+        "{:?}",
+        refused.violations
+    );
+    assert_eq!(
+        refused.violations[0].message,
+        format!(
+            "{} is no conflict resolution a resolution review can cover: it changes \"other.txt\" beyond the files its parents conflict in; it needs a review of its own",
+            &merge[..12]
+        )
+    );
+    s.edit_ledger(|ledger| as_resolutions(ledger, &s.h1, &merge));
+    assert_eq!(
+        walk_gaps(&s.cleared()),
+        ["it changes \"other.txt\" beyond the files its parents conflict in"]
+    );
+}
+
+#[test]
+fn a_receipted_astra_resolution_accept_never_meets_the_heads_receipt_condition() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let unreceipted = s.c.write(
+        "drafts/astra-head.md",
+        &format!("# Astra review\n\nNo receipt.\n\n```cm-review\nhead: {merge}\n```\n\nACCEPT\n"),
+    );
+    assert!(record(&host, &s.c, &unreceipted, "astra").ok());
+    claude_accept(&host, &s.c, &merge);
+    let astra = s.resolution(&host, Some("astra"), &merge, "resolution", &[]);
+    assert!(astra.ok(), "{:?}", astra.violations);
+    let id = astra.fields["id"].as_str().unwrap().to_owned();
+    let at_head = verdict::merge_gaps(&s.c.root, &target(), None, Some(PR), &merge, None).unwrap();
+    assert!(
+        at_head.gaps.iter().any(|gap| gap.starts_with(&format!(
+            "no Astra receipt at {merge} with effective gpt-6-astra/xhigh; found "
+        )) && gap.contains(&format!(
+            "01-a/u/S1/evidence/astra-review-7-resolution/receipt.json (the receipt of {id}, a resolution review)"
+        ))),
+        "{:?}",
+        at_head.gaps
+    );
+    assert!(rules(&s.merge(&host)).contains(&"merge-gate"));
+    assert!(
+        s.owed(&host, &merge)
+            .iter()
+            .all(|line| !line.starts_with("merge-ready ")),
+    );
+}
+
+#[test]
+fn a_resolution_review_stamps_the_campaign_with_a_schema_cm_0_17_1_refuses() {
+    const READ_BY_0_17_1: u64 = 7;
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    let state = s.c.root.join(".cm/state.json");
+    assert_eq!(schema(&s.c), READ_BY_0_17_1);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let unstamped = fs::read(&state).unwrap();
+    let head = s.c.write(
+        "drafts/opus-head.md",
+        &format!("# Opus review\n\nThe head.\n\n```cm-review\nhead: {merge}\n```\n\nACCEPT\n"),
+    );
+    assert!(record(&host, &s.c, &head, "opus").ok());
+    assert_eq!(fs::read(&state).unwrap(), unstamped);
+
+    let first = s.resolution(&host, Some("claude"), &merge, "claude-resolution", &[]);
+    assert!(first.ok(), "{:?}", first.violations);
+    assert!(
+        first
+            .lines
+            .contains(&"the campaign is at schema 8 now; an older cm refuses it".to_owned()),
+        "{:?}",
+        first.lines
+    );
+    assert!(schema(&s.c) > READ_BY_0_17_1);
+    assert!(
+        s.journal()
+            .contains("- schema: the campaign is at schema 8 now; an older cm refuses it\n")
+    );
+    let second = s.resolution(&host, Some("astra"), &merge, "resolution", &[]);
+    assert!(!second.lines.iter().any(|line| line.contains("schema")));
+
+    let forge = FakeForge::open(&merge, &[("fmt, clippy, test", "success")]);
+    assert!(cm::sync::sync(&host, &forge, &s.c.root).unwrap().ok());
+    let read = scratch_cm(&s, &["owner-queue", "read"]);
+    assert!(read.status.success(), "{read:?}");
+    assert_eq!(schema(&s.c), 8);
+
+    let mut newer: serde_json::Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+    newer["schema"] = 9.into();
+    fs::write(&state, serde_json::to_string_pretty(&newer).unwrap()).unwrap();
+    let refused = scratch_cm(&s, &["next"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("has schema 9, newer than the schema 8 this cm"),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn an_astra_resolution_accept_without_its_receipt_leaves_the_merge_uncovered() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let report = s.c.write(
+        "drafts/astra-unreceipted.md",
+        &format!(
+            "# Astra resolution\n\nNo receipt.\n\n```cm-review\nhead: {merge}\n```\n\nACCEPT\n"
+        ),
+    );
+    let astra = verdict::record_resolution(
+        &host,
+        &s.c.root,
+        &target(),
+        &report,
+        Some("astra"),
+        None,
+        Some(&s.c.repo),
+    )
+    .unwrap();
+    assert!(astra.ok(), "{:?}", astra.violations);
+    assert!(
+        s.resolution(&host, Some("claude"), &merge, "claude-resolution", &[])
+            .ok()
+    );
+    let gaps = walk_gaps(&s.cleared());
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert!(
+        gaps[0].starts_with(&format!(
+            "no Astra receipt at {merge} with effective gpt-6-astra/xhigh; found "
+        )),
+        "{gaps:?}"
+    );
+}
+
+#[test]
+fn a_late_finding_at_the_first_parent_reopens_a_covered_merge() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    s.accepted_resolution(&host, &merge, "resolution");
+    assert!(s.cleared().gaps.is_empty());
+    let late = s.c.report(
+        "late",
+        &s.h1,
+        &["F1 | contract | introduced | src/lib.rs:1 | broken"],
+        "FIX REQUIRED",
+    );
+    let recorded = record(&host, &s.c, &late, "opus");
+    assert!(recorded.ok(), "{:?}", recorded.violations);
+    let id = recorded.fields["id"].as_str().unwrap().to_owned();
+    let reopened = s.cleared();
+    assert!(
+        reopened.gaps.iter().any(|gap| gap.starts_with(&format!(
+            "the nearest reviewed commit before {merge}, {}, joined to it by clean updates and merges whose conflict resolutions both families accepted ({merge}), does not clear: ",
+            s.h1
+        )) && gap.contains(&format!("{id}.F1 unresolved"))),
+        "{:?}",
+        reopened.gaps
+    );
+    assert!(rules(&s.merge(&host)).contains(&"merge-gate"));
+}
+
+#[test]
+fn an_octopus_merge_takes_no_resolution_review() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.git(&["checkout", "-q", "-b", "side", &s.base]);
+    let side = s.commit("side.txt", "side\n");
+    s.git(&["checkout", "-q", "feature"]);
+    s.on_main("other.txt", "main\n");
+    let main = s.git(&["rev-parse", &format!("origin/{}", s.base)]);
+    let tree = s.git(&["rev-parse", "HEAD^{tree}"]);
+    let octopus = s.git(&[
+        "commit-tree",
+        &tree,
+        "-p",
+        &s.h1,
+        "-p",
+        &main,
+        "-p",
+        &side,
+        "-m",
+        "octopus",
+    ]);
+    s.git(&["reset", "-q", "--hard", &octopus]);
+    let refused = s.resolution(&host, Some("claude"), &octopus, "claude-octopus", &[]);
+    assert_eq!(
+        rules(&refused),
+        ["review-resolution"],
+        "{:?}",
+        refused.violations
+    );
+    assert_eq!(
+        refused.violations[0].message,
+        format!("{} is not a merge from the base branch", &octopus[..12])
+    );
+    s.edit_ledger(|ledger| as_resolutions(ledger, &s.h1, &octopus));
+    assert_eq!(
+        s.cleared().stop,
+        Some(CleanUpdateError::NotMerge { commit: octopus })
+    );
+}
+
+#[test]
+fn resolution_reviews_recorded_for_another_pr_cover_nothing() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    s.accepted_resolution(&host, &merge, "resolution");
+    assert!(s.cleared().gaps.is_empty());
+    s.edit_ledger(|ledger| {
+        for review in &mut ledger.reviews[2..] {
+            review.pr = Some("https://github.com/o/r/pull/8".into());
+        }
+    });
+    let gaps = walk_gaps(&s.cleared());
+    assert!(
+        gaps.contains(&"no astra or claude resolution ACCEPT".to_owned()),
+        "{gaps:?}"
+    );
+}
+
+impl Scratch {
+    fn conflicted_with(&self, extra: impl FnOnce(&Scratch)) -> String {
+        self.on_main("shared.txt", "main\n");
+        let main = format!("origin/{}", self.base);
+        let merged = scratch_git(
+            &self.home,
+            &self.c.repo,
+            &["merge", "-q", "--no-edit", &main],
+        );
+        assert!(!merged.status.success(), "the merge conflicts: {merged:?}");
+        fs::write(self.c.repo.join("shared.txt"), "feature and main\n").unwrap();
+        extra(self);
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-q", "--no-edit"]);
+        self.head()
+    }
+
+    fn reviewed(&self, host: &Fake, name: &str) -> String {
+        let head = self.head();
+        self.astra(host, &head, name, "ACCEPT");
+        claude_accept(host, &self.c, &head);
+        head
+    }
+
+    fn on_main_with(&self, change: impl FnOnce(&Scratch)) {
+        self.git(&["checkout", "-q", &self.base]);
+        change(self);
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-q", "-m", "main"]);
+        self.git(&["push", "-q", "origin", &self.base]);
+        self.git(&["checkout", "-q", "feature"]);
+    }
+}
+
+fn beyond_the_conflict(s: &Scratch, host: &Fake, merge: &str, parent: &str, shown: &str) {
+    let gap = format!("it changes {shown} beyond the files its parents conflict in");
+    let refused = s.resolution(host, Some("claude"), merge, "claude-beyond", &[]);
+    assert_eq!(
+        rules(&refused),
+        ["review-resolution"],
+        "{:?}",
+        refused.violations
+    );
+    assert_eq!(
+        refused.violations[0].message,
+        format!(
+            "{} is no conflict resolution a resolution review can cover: {gap}; it needs a review of its own",
+            &merge[..12]
+        )
+    );
+    s.edit_ledger(|ledger| as_resolutions(ledger, parent, merge));
+    assert_eq!(walk_gaps(&s.cleared()), [gap]);
+}
+
+#[test]
+fn a_change_beyond_the_conflict_is_seen_by_its_exact_name() {
+    let host = at("2026-11-25T06:00:00Z");
+    for (name, shown) in [
+        (" shared.txt", "\" shared.txt\""),
+        ("shared.txt\n", "\"shared.txt\\n\""),
+        ("-shared.txt", "\"-shared.txt\""),
+        ("shared.tx", "\"shared.tx\""),
+        ("Shared.txt", "\"Shared.txt\""),
+    ] {
+        let s = Scratch::new(&host);
+        let merge = s.conflicted_with(|s| {
+            fs::write(s.c.repo.join(name), "unreviewed\n").unwrap();
+        });
+        beyond_the_conflict(&s, &host, &merge, &s.h1, shown);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn file_names_that_are_not_utf_8_are_compared_byte_for_byte() {
+    use std::os::unix::ffi::OsStrExt;
+    let named = |bytes: &[u8]| PathBuf::from(std::ffi::OsStr::from_bytes(bytes));
+    let (conflicted, colliding) = (named(b"caf\xe9.txt"), named(b"caf\xe8.txt"));
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main_with(|s| fs::write(s.c.repo.join(&conflicted), "base\n").unwrap());
+    s.merge_main(None);
+    fs::write(s.c.repo.join(&conflicted), "feature\n").unwrap();
+    s.git(&["commit", "-q", "-a", "-m", "feature edit"]);
+    let h2 = s.reviewed(&host, "h2");
+    s.on_main_with(|s| fs::write(s.c.repo.join(&conflicted), "main\n").unwrap());
+    let main = format!("origin/{}", s.base);
+    let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", &main]);
+    assert!(!merged.status.success(), "the merge conflicts: {merged:?}");
+    fs::write(s.c.repo.join(&conflicted), "feature and main\n").unwrap();
+    fs::write(s.c.repo.join(&colliding), "unreviewed\n").unwrap();
+    s.git(&["add", "-A"]);
+    s.git(&["commit", "-q", "--no-edit"]);
+    let merge = s.head();
+    beyond_the_conflict(&s, &host, &merge, &h2, "\"caf\\xe8.txt\"");
+}
+
+#[test]
+fn a_rename_never_hides_a_change_beyond_the_conflict() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("a.txt", "a line one\na line two\n");
+    s.on_main("u.txt", "u content\nmore u\n");
+    s.merge_main(None);
+    s.git(&["mv", "a.txt", "b.txt"]);
+    s.git(&["commit", "-q", "-m", "rename a to b"]);
+    let h2 = s.reviewed(&host, "h2");
+    s.on_main_with(|s| {
+        s.git(&["mv", "a.txt", "c.txt"]);
+    });
+    let main = format!("origin/{}", s.base);
+    let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", &main]);
+    assert!(!merged.status.success(), "the renames conflict: {merged:?}");
+    s.git(&["rm", "-q", "c.txt"]);
+    s.git(&["mv", "u.txt", "a.txt"]);
+    s.git(&["add", "-A"]);
+    s.git(&["commit", "-q", "--no-edit"]);
+    let merge = s.head();
+    beyond_the_conflict(&s, &host, &merge, &h2, "\"u.txt\"");
+}
+
+#[test]
+fn add_add_and_modify_delete_conflicts_stay_coverable() {
+    let host = at("2026-11-25T06:00:00Z");
+    let resolve_and_cover = |s: &Scratch, resolve: &dyn Fn(&Scratch)| {
+        let main = format!("origin/{}", s.base);
+        let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", &main]);
+        assert!(!merged.status.success(), "the merge conflicts: {merged:?}");
+        resolve(s);
+        s.git(&["add", "-A"]);
+        s.git(&["commit", "-q", "--no-edit"]);
+        let merge = s.head();
+        s.accepted_resolution(&host, &merge, "resolution");
+        let cleared = s.cleared();
+        assert!(cleared.gaps.is_empty(), "{:?}", cleared.gaps);
+        assert_eq!(cleared.resolved, [merge]);
+    };
+
+    let s = Scratch::new(&host);
+    fs::write(s.c.repo.join("new.txt"), "feature new\n").unwrap();
+    s.git(&["add", "new.txt"]);
+    s.git(&["commit", "-q", "-m", "add new"]);
+    s.reviewed(&host, "h2");
+    s.on_main_with(|s| fs::write(s.c.repo.join("new.txt"), "main new\n").unwrap());
+    resolve_and_cover(&s, &|s| {
+        fs::write(s.c.repo.join("new.txt"), "feature and main new\n").unwrap();
+    });
+
+    let s = Scratch::new(&host);
+    fs::write(s.c.repo.join("bin.dat"), [0u8, 1, 2, 3]).unwrap();
+    s.git(&["add", "bin.dat"]);
+    s.git(&["commit", "-q", "-m", "add binary"]);
+    s.reviewed(&host, "h2");
+    s.on_main_with(|s| fs::write(s.c.repo.join("bin.dat"), [0u8, 9, 9, 9]).unwrap());
+    resolve_and_cover(&s, &|s| {
+        fs::write(s.c.repo.join("bin.dat"), [0u8, 5, 5, 5]).unwrap();
+    });
+
+    let s = Scratch::new(&host);
+    s.on_main("m.txt", "base\n");
+    s.merge_main(None);
+    fs::write(s.c.repo.join("m.txt"), "feature\n").unwrap();
+    s.git(&["commit", "-q", "-a", "-m", "modify m"]);
+    s.reviewed(&host, "h2");
+    s.on_main_with(|s| {
+        s.git(&["rm", "-q", "m.txt"]);
+    });
+    resolve_and_cover(&s, &|s| {
+        s.git(&["rm", "-q", "m.txt"]);
+    });
+}
+
+#[test]
+fn a_ref_named_like_the_reports_head_never_redirects_the_record() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    s.git(&["commit", "-q", "--amend", "-m", "Merge main, amended"]);
+    let amended = s.head();
+    s.git(&["tag", &merge[..12], &amended]);
+    let refused = s.resolution(&host, Some("claude"), &merge[..12], "claude-tag", &[]);
+    assert_eq!(
+        rules(&refused),
+        ["review-resolution"],
+        "{:?}",
+        refused.violations
+    );
+    assert_eq!(
+        refused.violations[0].message,
+        format!(
+            "{} resolves to {amended} in {}, a commit it does not name: a ref of that name shadows it",
+            &merge[..12],
+            s.c.repo.display()
+        )
+    );
+}
+
+#[test]
+fn a_resolution_record_binds_only_its_full_merge_sha() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    s.accepted_resolution(&host, &merge, "resolution");
+    assert!(s.cleared().gaps.is_empty());
+    s.edit_ledger(|ledger| {
+        for review in &mut ledger.reviews[2..] {
+            review.head = merge[..8].to_owned();
+        }
+    });
+    let prefixed = s.cleared();
+    assert!(prefixed.resolved.is_empty());
+    assert!(!prefixed.gaps.is_empty());
+    assert!(rules(&s.merge(&host)).contains(&"merge-gate"));
+}
+
+fn gitlink(s: &Scratch, path: &str, sha: &str) {
+    s.git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{sha},{path}"),
+    ]);
+}
+
+const SUB_A: &str = "1111111111111111111111111111111111111111";
+const SUB_B: &str = "2222222222222222222222222222222222222222";
+
+fn with_submodule(host: &Fake, ignore: bool, before: Option<&str>) -> Scratch {
+    let s = Scratch::new(host);
+    s.on_main_with(|s| {
+        let ignore = if ignore { "\tignore = all\n" } else { "" };
+        fs::write(
+            s.c.repo.join(".gitmodules"),
+            format!("[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n{ignore}"),
+        )
+        .unwrap();
+        s.git(&["add", ".gitmodules"]);
+        if let Some(sha) = before {
+            gitlink(s, "sub", sha);
+        }
+    });
+    s.merge_main(None);
+    s
+}
+
+fn moves_sub(s: &Scratch, to: &str) -> String {
+    s.on_main("shared.txt", "main\n");
+    let main = format!("origin/{}", s.base);
+    let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", &main]);
+    assert!(!merged.status.success(), "the merge conflicts: {merged:?}");
+    fs::write(s.c.repo.join("shared.txt"), "feature and main\n").unwrap();
+    s.git(&["add", "shared.txt"]);
+    gitlink(s, "sub", to);
+    s.git(&["commit", "-q", "--no-edit"]);
+    s.head()
+}
+
+#[test]
+fn a_tree_id_and_a_long_name_are_paths_like_any_other() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    let merge = s.conflicted_with(|s| {
+        let (first, second) = (
+            s.git(&["rev-parse", "HEAD"]),
+            s.git(&["rev-parse", "MERGE_HEAD"]),
+        );
+        let listed = scratch_git(
+            &s.home,
+            &s.c.repo,
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "--no-messages",
+                "-z",
+                &first,
+                &second,
+            ],
+        );
+        let tree = String::from_utf8(listed.stdout).unwrap();
+        let tree = tree.split('\0').next().unwrap().to_owned();
+        fs::write(s.c.repo.join(&tree), "unreviewed\n").unwrap();
+        fs::write(s.c.repo.join("tree-id.txt"), &tree).unwrap();
+    });
+    let tree = fs::read_to_string(s.c.repo.join("tree-id.txt")).unwrap();
+    beyond_the_conflict(
+        &s,
+        &host,
+        &merge,
+        &s.h1,
+        &format!("\"{tree}\", \"tree-id.txt\""),
+    );
+
+    let long = "a-long-conflicted-file-name-one.txt";
+    let s = Scratch::new(&host);
+    s.on_main(long, "base\n");
+    s.merge_main(None);
+    fs::write(s.c.repo.join(long), "feature\n").unwrap();
+    s.git(&["commit", "-q", "-a", "-m", "feature edit"]);
+    let h2 = s.reviewed(&host, "h2");
+    s.on_main(long, "main\n");
+    let main = format!("origin/{}", s.base);
+    let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", &main]);
+    assert!(!merged.status.success(), "the merge conflicts: {merged:?}");
+    fs::write(s.c.repo.join(long), "feature and main\n").unwrap();
+    fs::write(
+        s.c.repo.join("a-long-conflicted-file-name-two.txt"),
+        "unreviewed\n",
+    )
+    .unwrap();
+    s.git(&["add", "-A"]);
+    s.git(&["commit", "-q", "--no-edit"]);
+    let merge = s.head();
+    beyond_the_conflict(
+        &s,
+        &host,
+        &merge,
+        &h2,
+        "\"a-long-conflicted-file-name-two.txt\"",
+    );
+}
+
+#[test]
+fn an_ignored_submodule_never_hides_a_change_beyond_the_conflict() {
+    let host = at("2026-11-25T06:00:00Z");
+    for (ignore, before) in [(true, Some(SUB_A)), (true, None), (false, Some(SUB_A))] {
+        let s = with_submodule(&host, ignore, before);
+        let merge = moves_sub(&s, SUB_B);
+        beyond_the_conflict(&s, &host, &merge, &s.h1, "\"sub\"");
+    }
+
+    let s = with_submodule(&host, true, Some(SUB_A));
+    s.git(&["config", "diff.ignoreSubmodules", "all"]);
+    s.git(&["config", "submodule.sub.ignore", "all"]);
+    let merge = moves_sub(&s, SUB_B);
+    beyond_the_conflict(&s, &host, &merge, &s.h1, "\"sub\"");
+
+    let s = with_submodule(&host, true, Some(SUB_A));
+    let merge = moves_sub(&s, SUB_B);
+    let report = s.c.report("claude-hostile", &merge, &[], "ACCEPT");
+    fs::write(
+        s.home.join("gitconfig"),
+        "[diff]\n\tignoreSubmodules = all\n\tnoprefix = true\n\trenames = copies\n[color]\n\tdiff = always\n",
+    )
+    .unwrap();
+    let repo = s.c.repo.to_str().unwrap();
+    let report = report.to_str().unwrap();
+    let refused = scratch_cm(
+        &s,
+        &[
+            "review",
+            "record",
+            STEP,
+            report,
+            "--reviewer",
+            "claude",
+            "--kind",
+            "resolution",
+            "--repo",
+            repo,
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stdout)
+            .contains("it changes \"sub\" beyond the files its parents conflict in"),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn a_clean_merge_that_moves_an_ignored_submodule_needs_its_own_review() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = with_submodule(&host, true, Some(SUB_A));
+    s.on_main("other.txt", "main\n");
+    s.merge_main(None);
+    gitlink(&s, "sub", SUB_B);
+    s.git(&["commit", "-q", "--amend", "--no-edit"]);
+    let moved = s.head();
+    assert_eq!(
+        s.cleared().stop,
+        Some(CleanUpdateError::Conflicts { commit: moved })
+    );
+    assert!(rules(&s.merge(&host)).contains(&"merge-gate"));
+}
+
+#[test]
+fn an_abbreviated_head_reaches_a_covered_merge_while_github_is_unread() {
+    let host = at("2026-11-25T06:00:00Z");
+    let gate = |s: &Scratch, head: &str| {
+        let ci = s.c.write("ci-green.md", "CI green at the head.\n");
+        let forge = FakeForge {
+            down: true,
+            ..FakeForge::open(head, &[])
+        };
+        commands::advance_gated(
+            &host,
+            &s.c.root,
+            &target(),
+            commands::Advance {
+                to: &Phase::Merged,
+                given: &Evidence {
+                    sha: Some(s.head()),
+                    ..Evidence::default()
+                },
+                file: None,
+                repo: Some(&s.c.repo),
+                part: None,
+                by: &[],
+            },
+            &MergeGate {
+                forge: Some(&forge),
+                head: Some(head.to_owned()),
+                ci_verified: Some(ci),
+                ..MergeGate::default()
+            },
+        )
+        .unwrap()
+    };
+
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    s.accepted_resolution(&host, &merge, "resolution");
+    let short = &merge[..12];
+    assert!(rules(&gate(&s, "deadbeefdead")).contains(&"merge-gate"));
+    s.git(&["tag", short, &s.h1]);
+    let shadowed = gate(&s, short);
+    assert!(
+        rules(&shadowed).contains(&"merge-gate"),
+        "{:?}",
+        shadowed.violations
+    );
+    assert_eq!(s.c.state(), Phase::PrOpen);
+    s.git(&["tag", "-d", short]);
+    let merged = gate(&s, short);
+    assert!(merged.ok(), "{:?}", merged.violations);
+
+    let s = Scratch::new(&host);
+    let merged = gate(&s, &s.h1[..12]);
+    assert!(merged.ok(), "{:?}", merged.violations);
+}
+
+fn offline_cm(s: &Scratch, args: &[&str]) -> std::process::Output {
+    offline_cm_in(s, None, args)
+}
+
+fn offline_cm_in<A: AsRef<std::ffi::OsStr>>(
+    s: &Scratch,
+    cwd: Option<&Path>,
+    args: &[A],
+) -> std::process::Output {
+    offline_cm_env(s, cwd, &[], args)
+}
+
+fn offline_cm_env<A: AsRef<std::ffi::OsStr>>(
+    s: &Scratch,
+    cwd: Option<&Path>,
+    env: &[(&str, &str)],
+    args: &[A],
+) -> std::process::Output {
+    offline_cm_under(s, cwd, env, None, args)
+}
+
+// A umask is set for cm alone, through sh: setting the test process's would reach every test.
+fn offline_cm_under<A: AsRef<std::ffi::OsStr>>(
+    s: &Scratch,
+    cwd: Option<&Path>,
+    env: &[(&str, &str)],
+    umask: Option<&str>,
+    args: &[A],
+) -> std::process::Output {
+    let bin = s.home.join("bin");
+    let gh = bin.join("gh");
+    if !gh.exists() {
+        fs::create_dir_all(&bin).unwrap();
+        support::write_executable(&gh, "#!/bin/sh\necho 'gh: offline' >&2\nexit 1\n");
+    }
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut command = match umask {
+        Some(umask) => {
+            let mut command = Command::new("sh");
+            command
+                .arg("-c")
+                .arg(format!("umask {umask} && exec \"$0\" \"$@\""))
+                .arg(env!("CARGO_BIN_EXE_cm"));
+            command
+        }
+        None => Command::new(env!("CARGO_BIN_EXE_cm")),
+    };
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    command
+        .arg("-C")
+        .arg(&s.c.root)
+        .args(args)
+        .env("HOME", &s.home)
+        .env("TMPDIR", &s.home)
+        .env("GIT_CONFIG_GLOBAL", s.home.join("gitconfig"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("PATH", path)
+        .envs(env.iter().copied())
+        .output()
+        .unwrap()
+}
+
+fn offline_merge(s: &Scratch, head: &str, repo: &Path) -> std::process::Output {
+    offline_merge_in(s, None, head, repo.as_os_str())
+}
+
+fn offline_merge_in(
+    s: &Scratch,
+    cwd: Option<&Path>,
+    head: &str,
+    repo: &std::ffi::OsStr,
+) -> std::process::Output {
+    offline_merge_env(s, cwd, &[], head, repo)
+}
+
+fn offline_merge_env(
+    s: &Scratch,
+    cwd: Option<&Path>,
+    env: &[(&str, &str)],
+    head: &str,
+    repo: &std::ffi::OsStr,
+) -> std::process::Output {
+    offline_merge_under(s, cwd, env, None, head, repo)
+}
+
+fn offline_merge_under(
+    s: &Scratch,
+    cwd: Option<&Path>,
+    env: &[(&str, &str)],
+    umask: Option<&str>,
+    head: &str,
+    repo: &std::ffi::OsStr,
+) -> std::process::Output {
+    use std::ffi::OsStr;
+    let ci = s.c.write("ci-green.md", "CI green at the head.\n");
+    let sha = s.head();
+    offline_cm_under(
+        s,
+        cwd,
+        env,
+        umask,
+        &[
+            OsStr::new("advance"),
+            OsStr::new(STEP),
+            OsStr::new("merged"),
+            OsStr::new("--sha"),
+            OsStr::new(&sha),
+            OsStr::new("--repo"),
+            repo,
+            OsStr::new("--head"),
+            OsStr::new(head),
+            OsStr::new("--ci-verified"),
+            ci.as_os_str(),
+        ],
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Knob {
+    Relative,
+    IgnoreSubmodules,
+    SubmoduleIgnore,
+    Textconv,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Scope {
+    Global,
+    Repo,
+}
+
+fn knob_history(host: &Fake) -> Scratch {
+    let s = Scratch::new(host);
+    s.on_main_with(|s| {
+        fs::create_dir_all(s.c.repo.join("dir")).unwrap();
+        fs::write(s.c.repo.join("dir/keep.txt"), "kept\n").unwrap();
+        fs::write(s.c.repo.join("data.dat"), "data one\n").unwrap();
+        fs::write(
+            s.c.repo.join(".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n",
+        )
+        .unwrap();
+        s.git(&["add", "-A"]);
+        gitlink(s, "sub", SUB_A);
+    });
+    s.merge_main(None);
+    s
+}
+
+fn hide(s: &Scratch, knob: Knob) -> &'static str {
+    match knob {
+        Knob::Relative => {
+            fs::write(s.c.repo.join("evil.txt"), "outside dir/\n").unwrap();
+            s.git(&["add", "evil.txt"]);
+            "\"evil.txt\""
+        }
+        Knob::IgnoreSubmodules | Knob::SubmoduleIgnore => {
+            gitlink(s, "sub", SUB_B);
+            "\"sub\""
+        }
+        Knob::Textconv => {
+            fs::write(s.c.repo.join("data.dat"), "data two\n").unwrap();
+            s.git(&["add", "data.dat"]);
+            "\"data.dat\""
+        }
+    }
+}
+
+fn turn_hostile(s: &Scratch, knob: Knob, scope: Scope) {
+    let pairs: &[(&str, &str)] = match knob {
+        Knob::Relative => &[("diff.relative", "true")],
+        Knob::IgnoreSubmodules => &[("diff.ignoreSubmodules", "all")],
+        Knob::SubmoduleIgnore => &[("submodule.sub.ignore", "all")],
+        Knob::Textconv => &[("diff.lossy.textconv", "sh -c 'echo same'")],
+    };
+    let attributes = "*.dat diff=lossy\n";
+    match scope {
+        Scope::Global => {
+            let mut config = String::new();
+            for (key, value) in pairs {
+                let (section, name) = key.rsplit_once('.').unwrap();
+                let section = match section.split_once('.') {
+                    Some((outer, inner)) => format!("{outer} \"{inner}\""),
+                    None => section.to_owned(),
+                };
+                config.push_str(&format!("[{section}]\n\t{name} = {value}\n"));
+            }
+            if matches!(knob, Knob::Textconv) {
+                let file = s.home.join("attributes");
+                fs::write(&file, attributes).unwrap();
+                config.push_str(&format!("[core]\n\tattributesFile = {}\n", file.display()));
+            }
+            fs::write(s.home.join("gitconfig"), config).unwrap();
+        }
+        Scope::Repo => {
+            for (key, value) in pairs {
+                s.git(&["config", key, value]);
+            }
+            if matches!(knob, Knob::Textconv) {
+                fs::create_dir_all(s.c.repo.join(".git/info")).unwrap();
+                fs::write(s.c.repo.join(".git/info/attributes"), attributes).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn no_configuration_or_attribute_hides_a_change_from_record_walk_or_waiver() {
+    let host = at("2026-11-25T06:00:00Z");
+    let knobs = [
+        Knob::Relative,
+        Knob::IgnoreSubmodules,
+        Knob::SubmoduleIgnore,
+        Knob::Textconv,
+    ];
+    for knob in knobs {
+        for scope in [Scope::Global, Scope::Repo] {
+            for subdir in [false, true] {
+                let row = format!("{knob:?} {scope:?} subdir={subdir}");
+
+                let s = knob_history(&host);
+                s.on_main("shared.txt", "main\n");
+                let main = format!("origin/{}", s.base);
+                let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", &main]);
+                assert!(!merged.status.success(), "{row}: the merge conflicts");
+                fs::write(s.c.repo.join("shared.txt"), "feature and main\n").unwrap();
+                s.git(&["add", "shared.txt"]);
+                let shown = hide(&s, knob);
+                s.git(&["commit", "-q", "--no-edit"]);
+                let merge = s.head();
+                turn_hostile(&s, knob, scope);
+                let repo = if subdir {
+                    s.c.repo.join("dir")
+                } else {
+                    s.c.repo.clone()
+                };
+                let report = s.c.report("claude-hostile", &merge, &[], "ACCEPT");
+                let record = offline_cm(
+                    &s,
+                    &[
+                        "review",
+                        "record",
+                        STEP,
+                        report.to_str().unwrap(),
+                        "--reviewer",
+                        "claude",
+                        "--kind",
+                        "resolution",
+                        "--repo",
+                        repo.to_str().unwrap(),
+                    ],
+                );
+                assert_eq!(record.status.code(), Some(1), "{row}: record {record:?}");
+                assert!(
+                    String::from_utf8_lossy(&record.stdout).contains(&format!(
+                        "it changes {shown} beyond the files its parents conflict in"
+                    )),
+                    "{row}: record {record:?}"
+                );
+                s.edit_ledger(|ledger| as_resolutions(ledger, &s.h1, &merge));
+                let walk = offline_merge(&s, &merge, &repo);
+                assert_eq!(walk.status.code(), Some(1), "{row}: walk {walk:?}");
+                assert!(
+                    String::from_utf8_lossy(&walk.stdout).contains(&format!(
+                        "resolution reviews do not clear it: it changes {shown} beyond the files its parents conflict in"
+                    )),
+                    "{row}: walk {walk:?}"
+                );
+                assert_eq!(s.c.state(), Phase::PrOpen, "{row}: walk");
+
+                let s = knob_history(&host);
+                s.on_main("other.txt", "main\n");
+                s.merge_main(None);
+                hide(&s, knob);
+                s.git(&["commit", "-q", "--amend", "--no-edit"]);
+                let clean = s.head();
+                turn_hostile(&s, knob, scope);
+                let repo = if subdir {
+                    s.c.repo.join("dir")
+                } else {
+                    s.c.repo.clone()
+                };
+                let waiver = offline_merge(&s, &clean, &repo);
+                assert_eq!(waiver.status.code(), Some(1), "{row}: waiver {waiver:?}");
+                assert!(
+                    String::from_utf8_lossy(&waiver.stdout).contains("needs its own review"),
+                    "{row}: waiver {waiver:?}"
+                );
+            }
+        }
+    }
+}
+
+fn signed_and_shown(s: &Scratch) {
+    let gpg = s.home.join("bin").join("gpg-stub");
+    fs::create_dir_all(gpg.parent().unwrap()).unwrap();
+    support::write_executable(
+        &gpg,
+        r#"#!/bin/sh
+cat >/dev/null
+case " $* " in
+*" --verify "*) echo 'gpg: a signature shown' >&2; exit 1 ;;
+esac
+echo '[GNUPG:] SIG_CREATED ' >&2
+printf '%s\n' '-----BEGIN PGP SIGNATURE-----' '' 'stub' '-----END PGP SIGNATURE-----'
+"#,
+    );
+    s.git(&["config", "gpg.program", gpg.to_str().unwrap()]);
+    s.git(&["config", "commit.gpgsign", "true"]);
+    s.git(&["config", "log.showSignature", "true"]);
+}
+
+#[test]
+fn a_shown_signature_is_no_change_to_a_resolution_and_still_no_clean_update() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    signed_and_shown(&s);
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    let shown = s.git(&["show", "--remerge-diff", "--format=", &clean]);
+    assert!(shown.contains("gpg: a signature shown"), "{shown}");
+    let refused = offline_merge(&s, &clean, &s.c.repo);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stdout).contains(&format!(
+            "{} resolved merge conflicts; it needs its own review",
+            &clean[..12]
+        )),
+        "{refused:?}"
+    );
+    assert_eq!(s.c.state(), Phase::PrOpen);
+
+    let s = Scratch::new(&host);
+    signed_and_shown(&s);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    s.accepted_resolution(&host, &merge, "signed");
+    let merged = offline_merge(&s, &merge, &s.c.repo);
+    assert!(merged.status.success(), "{merged:?}");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Rewrite {
+    Replace,
+    Graft,
+}
+
+fn rewritten(host: &Fake, rewrite: Rewrite, conflicted: bool) -> (Scratch, String) {
+    let s = Scratch::new(host);
+    let held = match rewrite {
+        Rewrite::Replace => {
+            s.on_main(
+                if conflicted {
+                    "shared.txt"
+                } else {
+                    "other.txt"
+                },
+                "main\n",
+            );
+            None
+        }
+        Rewrite::Graft => {
+            s.on_main_with(|s| {
+                if conflicted {
+                    fs::write(s.c.repo.join("shared.txt"), "main\n").unwrap();
+                }
+                fs::write(s.c.repo.join("evil.txt"), "smuggled\n").unwrap();
+            });
+            let held = s.git(&["rev-parse", &s.base]);
+            s.on_main_with(|s| fs::remove_file(s.c.repo.join("evil.txt")).unwrap());
+            Some(held)
+        }
+    };
+    let honest = s.merge_main(conflicted.then_some("feature and main\n"));
+    fs::write(s.c.repo.join("evil.txt"), "smuggled\n").unwrap();
+    s.git(&["add", "evil.txt"]);
+    s.git(&["commit", "-q", "--amend", "--no-edit"]);
+    let merge = s.head();
+    match held {
+        None => {
+            s.git(&["replace", &merge, &honest]);
+        }
+        Some(held) => {
+            let parents = s.git(&["rev-list", "--parents", "-n", "1", &merge]);
+            let first = parents.split_whitespace().nth(1).unwrap();
+            let info = s.c.repo.join(".git").join("info");
+            fs::create_dir_all(&info).unwrap();
+            fs::write(info.join("grafts"), format!("{merge} {first} {held}\n")).unwrap();
+        }
+    }
+    let seen = s.git(&["show", "--remerge-diff", "--format=", "--name-only", &merge]);
+    let hidden = if conflicted { "shared.txt" } else { "" };
+    assert_eq!(seen, hidden, "{rewrite:?} hides evil.txt from plain git");
+    (s, merge)
+}
+
+#[test]
+fn no_replace_ref_or_graft_rewrites_what_record_walk_or_waiver_read() {
+    let host = at("2026-11-25T06:00:00Z");
+    for rewrite in [Rewrite::Replace, Rewrite::Graft] {
+        let (s, merge) = rewritten(&host, rewrite, true);
+        let report = s.c.report("claude-rewritten", &merge, &[], "ACCEPT");
+        let record = offline_cm(
+            &s,
+            &[
+                "review",
+                "record",
+                STEP,
+                report.to_str().unwrap(),
+                "--reviewer",
+                "claude",
+                "--kind",
+                "resolution",
+                "--repo",
+                s.c.repo.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            record.status.code(),
+            Some(1),
+            "{rewrite:?}: record {record:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&record.stdout)
+                .contains("it changes \"evil.txt\" beyond the files its parents conflict in"),
+            "{rewrite:?}: record {record:?}"
+        );
+        s.edit_ledger(|ledger| as_resolutions(ledger, &s.h1, &merge));
+        let walk = offline_merge(&s, &merge, &s.c.repo);
+        assert_eq!(walk.status.code(), Some(1), "{rewrite:?}: walk {walk:?}");
+        assert!(
+            String::from_utf8_lossy(&walk.stdout).contains(
+                "resolution reviews do not clear it: it changes \"evil.txt\" beyond the files its parents conflict in"
+            ),
+            "{rewrite:?}: walk {walk:?}"
+        );
+        assert_eq!(s.c.state(), Phase::PrOpen, "{rewrite:?}: walk");
+
+        let (s, clean) = rewritten(&host, rewrite, false);
+        let waiver = offline_merge(&s, &clean, &s.c.repo);
+        assert_eq!(
+            waiver.status.code(),
+            Some(1),
+            "{rewrite:?}: waiver {waiver:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&waiver.stdout).contains(&format!(
+                "{} resolved merge conflicts; it needs its own review",
+                &clean[..12]
+            )),
+            "{rewrite:?}: waiver {waiver:?}"
+        );
+        assert_eq!(s.c.state(), Phase::PrOpen, "{rewrite:?}: waiver");
+    }
+}
+
+#[test]
+fn a_clean_update_that_a_replace_ref_or_graft_disguised_is_waived() {
+    let host = at("2026-11-25T06:00:00Z");
+    for rewrite in [Rewrite::Replace, Rewrite::Graft] {
+        let s = Scratch::new(&host);
+        s.on_main("other.txt", "main\n");
+        let clean = s.merge_main(None);
+        match rewrite {
+            Rewrite::Replace => {
+                fs::write(s.c.repo.join("evil.txt"), "seen\n").unwrap();
+                s.git(&["add", "evil.txt"]);
+                s.git(&["commit", "-q", "--amend", "--no-edit"]);
+                let disguise = s.head();
+                s.git(&["reset", "-q", "--hard", &clean]);
+                s.git(&["replace", &clean, &disguise]);
+                let seen = s.git(&["show", "--remerge-diff", "--format=", "--name-only", &clean]);
+                assert_eq!(seen, "evil.txt", "{rewrite:?}");
+            }
+            Rewrite::Graft => {
+                let info = s.c.repo.join(".git").join("info");
+                fs::create_dir_all(&info).unwrap();
+                fs::write(info.join("grafts"), format!("{clean} {}\n", s.h1)).unwrap();
+                let seen = s.git(&["rev-list", "--parents", "-n", "1", &clean]);
+                assert_eq!(seen, format!("{clean} {}", s.h1), "{rewrite:?}");
+            }
+        }
+        let merged = offline_merge(&s, &clean, &s.c.repo);
+        assert!(merged.status.success(), "{rewrite:?}: {merged:?}");
+    }
+}
+
+fn logging_git(s: &Scratch) -> PathBuf {
+    let quote = |path: &Path| shell_quoted(path);
+    let git = real_git();
+    let log = s.home.join("git.log");
+    let bin = s.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    support::write_executable(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"${{GIT_NO_REPLACE_OBJECTS-}}\" \"${{GIT_GRAFT_FILE-}}\" \"${{GIT_DIR-}}\" \"${{GIT_CONFIG_GLOBAL-}}\" \"$*\" >> {}\nexec {} \"$@\"\n",
+            quote(&log),
+            quote(&git)
+        ),
+    );
+    log
+}
+
+#[derive(Default)]
+struct Logged {
+    checkout: Vec<String>,
+    isolated: Vec<(PathBuf, String)>,
+}
+
+// `cm advance` reads `--sha` itself, outside the gate.
+fn logged(s: &Scratch, log: &Path, into: &mut Logged) {
+    let canonical = fs::canonicalize(&s.c.repo).unwrap();
+    let checkouts = [
+        format!("-C {} ", s.c.repo.display()),
+        format!("-C {} ", canonical.display()),
+    ];
+    let sha = format!("rev-parse --verify --quiet {}^{{commit}}", s.head());
+    for line in fs::read_to_string(log).unwrap().lines() {
+        let fields: Vec<&str> = line.splitn(5, '\t').collect();
+        let [replace, graft, dir, global, args] = fields[..] else {
+            panic!("{line}");
+        };
+        let uncached = args.strip_prefix("-c core.commitGraph=false -c core.multiPackIndex=false ");
+        let ignores = replace == "1" && graft == "/dev/null/grafts" && uncached.is_some();
+        let args = uncached.unwrap_or(args);
+        if !dir.is_empty() {
+            assert!(ignores && global == "/dev/null", "{line}");
+            into.isolated.push((PathBuf::from(dir), args.to_owned()));
+        } else if let Some(call) = checkouts
+            .iter()
+            .find_map(|checkout| args.strip_prefix(checkout.as_str()))
+        {
+            if ignores {
+                into.checkout.push(call.to_owned());
+            } else {
+                assert_eq!(
+                    call, sha,
+                    "a git command in the checkout reads rewritten history"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_gate_git_command_ignores_rewritten_history_and_merge_listings_run_isolated() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let (first, second) = (
+        s.git(&["rev-parse", &format!("{merge}^1")]),
+        s.git(&["rev-parse", &format!("{merge}^2")]),
+    );
+    let log = logging_git(&s);
+    let report = s.c.report("claude-logged", &merge, &[], "ACCEPT");
+    let record = offline_cm(
+        &s,
+        &[
+            "review",
+            "record",
+            STEP,
+            report.to_str().unwrap(),
+            "--reviewer",
+            "claude",
+            "--kind",
+            "resolution",
+            "--repo",
+            s.c.repo.to_str().unwrap(),
+        ],
+    );
+    assert!(record.status.success(), "{record:?}");
+    let short = &merge[..12];
+    let walk = offline_merge(&s, short, &s.c.repo);
+    assert_eq!(walk.status.code(), Some(1), "{walk:?}");
+    assert!(
+        String::from_utf8_lossy(&walk.stdout).contains("no astra resolution ACCEPT"),
+        "{walk:?}"
+    );
+    let mut calls = Logged::default();
+    logged(&s, &log, &mut calls);
+
+    let s = Scratch::new(&host);
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    let log = logging_git(&s);
+    let waiver = offline_merge(&s, &clean, &s.c.repo);
+    assert!(waiver.status.success(), "{waiver:?}");
+    logged(&s, &log, &mut calls);
+
+    let listing = "show --remerge-diff --format= --no-renames --ignore-submodules=none --no-ext-diff --no-textconv --no-relative --no-color";
+    for site in [
+        "rev-parse --verify refs/remotes/origin/HEAD^{commit}".to_owned(),
+        format!("rev-parse --verify {merge}^{{commit}}"),
+        format!("rev-parse --verify --quiet {short}^{{commit}}"),
+        format!("rev-parse --verify --quiet {clean}^{{commit}}"),
+        "rev-parse --path-format=absolute --git-path objects".to_owned(),
+        "rev-parse --show-object-format".to_owned(),
+        "rev-list --parents -n 1 ".to_owned(),
+        "merge-base --is-ancestor ".to_owned(),
+        format!("{listing} {clean}"),
+    ] {
+        assert!(
+            calls.checkout.iter().any(|call| call.starts_with(&site)),
+            "{site}: {:#?}",
+            calls.checkout
+        );
+    }
+    for site in [
+        "init --bare --quiet --template= --shared=0700 --object-format=sha1".to_owned(),
+        format!("merge-tree --write-tree -z {first} {second}"),
+        "diff-tree -r -z --no-renames --ignore-submodules=none --no-relative --name-status "
+            .to_owned(),
+        format!("{listing} {clean}"),
+    ] {
+        assert!(
+            calls
+                .isolated
+                .iter()
+                .any(|(_, call)| call.starts_with(&site)),
+            "{site}: {:#?}",
+            calls.isolated
+        );
+    }
+    assert!(
+        !calls
+            .checkout
+            .iter()
+            .any(|call| call.starts_with("merge-tree")
+                || call.starts_with("diff-tree")
+                || call.starts_with("ls-tree")),
+        "{:#?}",
+        calls.checkout
+    );
+    for (dir, _) in &calls.isolated {
+        assert!(!dir.starts_with(&s.c.repo) && !dir.exists(), "{dir:?}");
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MergeKnob {
+    Committed,
+    InfoAttributes,
+    WorktreeAttributes,
+    GlobalAttributes,
+    AttrSource,
+    RepoConfig,
+    GlobalConfig,
+    ConfigCount,
+    ConfigParameters,
+}
+
+type Knobs<'a> = &'a [MergeKnob];
+type Setting<'a> = (&'a str, &'a str);
+
+fn plain_git(s: &Scratch, env: &[(&str, &str)], args: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .arg("-C")
+        .arg(&s.c.repo)
+        .args(args)
+        .env("HOME", &s.home)
+        .env("TMPDIR", &s.home)
+        .env("GIT_CONFIG_GLOBAL", s.home.join("gitconfig"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .envs(env.iter().copied())
+        .output()
+        .unwrap()
+}
+
+fn turn_merge_knobs(
+    s: &Scratch,
+    knobs: Knobs,
+    attribute: &str,
+    (key, value): Setting,
+) -> Vec<(&'static str, String)> {
+    let mut env = Vec::new();
+    for knob in knobs {
+        match knob {
+            MergeKnob::Committed => {}
+            MergeKnob::InfoAttributes => {
+                let info = s.c.repo.join(".git").join("info");
+                fs::create_dir_all(&info).unwrap();
+                fs::write(info.join("attributes"), attribute).unwrap();
+            }
+            MergeKnob::WorktreeAttributes => {
+                fs::write(s.c.repo.join(".gitattributes"), attribute).unwrap();
+            }
+            MergeKnob::GlobalAttributes => {
+                let file = s.home.join("attributes");
+                fs::write(&file, attribute).unwrap();
+                fs::write(
+                    s.home.join("gitconfig"),
+                    format!("[core]\n\tattributesFile = {}\n", file.display()),
+                )
+                .unwrap();
+            }
+            MergeKnob::AttrSource => {
+                s.git(&["checkout", "-q", "--orphan", "attributes"]);
+                s.git(&["rm", "-r", "-f", "-q", "."]);
+                fs::write(s.c.repo.join(".gitattributes"), attribute).unwrap();
+                s.git(&["add", ".gitattributes"]);
+                s.git(&["commit", "-q", "-m", "attributes"]);
+                env.push(("GIT_ATTR_SOURCE", s.head()));
+                s.git(&["checkout", "-q", "-f", "feature"]);
+                s.git(&["branch", "-q", "-D", "attributes"]);
+            }
+            MergeKnob::RepoConfig => {
+                s.git(&["config", key, value]);
+            }
+            MergeKnob::GlobalConfig => {
+                let (section, name) = key.rsplit_once('.').unwrap();
+                let section = match section.split_once('.') {
+                    Some((outer, inner)) => format!("{outer} \"{inner}\""),
+                    None => section.to_owned(),
+                };
+                fs::write(
+                    s.home.join("gitconfig"),
+                    format!("[{section}]\n\t{name} = {value}\n"),
+                )
+                .unwrap();
+            }
+            MergeKnob::ConfigCount => {
+                env.extend([
+                    ("GIT_CONFIG_COUNT", "1".to_owned()),
+                    ("GIT_CONFIG_KEY_0", key.to_owned()),
+                    ("GIT_CONFIG_VALUE_0", value.to_owned()),
+                ]);
+            }
+            MergeKnob::ConfigParameters => {
+                env.push(("GIT_CONFIG_PARAMETERS", format!("'{key}'='{value}'")));
+            }
+        }
+    }
+    env
+}
+
+fn merge_by_hand(s: &Scratch, files: &[(&str, &str)]) -> String {
+    let main = format!("origin/{}", s.base);
+    scratch_git(
+        &s.home,
+        &s.c.repo,
+        &["merge", "-q", "--no-commit", "--no-ff", &main],
+    );
+    for (file, text) in files {
+        fs::write(s.c.repo.join(file), text).unwrap();
+        s.git(&["add", file]);
+    }
+    s.git(&["commit", "-q", "--no-edit"]);
+    s.head()
+}
+
+fn widened_merge(host: &Fake, committed: Option<&str>) -> (Scratch, String, String) {
+    let s = Scratch::new(host);
+    let lines: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+    s.on_main_with(|s| fs::write(s.c.repo.join("both.txt"), &lines).unwrap());
+    s.merge_main(None);
+    let feature = lines.replace("line 1\n", "feature 1\n");
+    fs::write(s.c.repo.join("both.txt"), &feature).unwrap();
+    s.git(&["commit", "-q", "-am", "feature 1"]);
+    let h2 = s.reviewed(host, "h2");
+    s.on_main_with(|s| {
+        fs::write(
+            s.c.repo.join("both.txt"),
+            lines.replace("line 9\n", "main 9\n"),
+        )
+        .unwrap();
+        fs::write(s.c.repo.join("shared.txt"), "main\n").unwrap();
+        if let Some(attribute) = committed {
+            fs::write(s.c.repo.join(".gitattributes"), attribute).unwrap();
+        }
+    });
+    let both = feature
+        .replace("line 9\n", "main 9\n")
+        .replace("line 5\n", "rewritten 5\n");
+    let merge = merge_by_hand(
+        &s,
+        &[("shared.txt", "feature and main\n"), ("both.txt", &both)],
+    );
+    (s, h2, merge)
+}
+
+#[test]
+fn no_local_or_committed_merge_attribute_or_setting_widens_a_conflict_or_hides_a_resolution() {
+    let host = at("2026-11-25T06:00:00Z");
+    let none = ("", "");
+    let binary = ("merge.default", "binary");
+    let fail = ("merge.fail.driver", "false");
+    let minus = "both.txt -merge\n";
+    let widening: [(Knobs, &str, Setting); 10] = [
+        (&[MergeKnob::Committed], minus, none),
+        (&[MergeKnob::InfoAttributes], minus, none),
+        (&[MergeKnob::WorktreeAttributes], minus, none),
+        (&[MergeKnob::GlobalAttributes], minus, none),
+        (&[MergeKnob::AttrSource], minus, none),
+        (
+            &[MergeKnob::InfoAttributes, MergeKnob::RepoConfig],
+            "both.txt merge=fail\n",
+            fail,
+        ),
+        (&[MergeKnob::RepoConfig], "", binary),
+        (&[MergeKnob::GlobalConfig], "", binary),
+        (&[MergeKnob::ConfigCount], "", binary),
+        (&[MergeKnob::ConfigParameters], "", binary),
+    ];
+    for (knobs, attribute, config) in widening {
+        let row = format!("{knobs:?} {attribute:?} {config:?}");
+        let committed = knobs.contains(&MergeKnob::Committed).then_some(attribute);
+        let (s, h2, merge) = widened_merge(&host, committed);
+        let parents = s.git(&["rev-list", "--parents", "-n", "1", &merge]);
+        let parents: Vec<&str> = parents.split_whitespace().skip(1).collect();
+        let env = turn_merge_knobs(&s, knobs, attribute, config);
+        let env: Vec<(&str, &str)> = env
+            .iter()
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect();
+        let conflicted = plain_git(
+            &s,
+            &env,
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "--no-messages",
+                parents[0],
+                parents[1],
+            ],
+        );
+        assert!(
+            String::from_utf8_lossy(&conflicted.stdout).contains("both.txt"),
+            "{row}: the checkout's conflict is widened {conflicted:?}"
+        );
+        let report = s.c.report("claude-widened", &merge, &[], "ACCEPT");
+        let record = offline_cm_env(
+            &s,
+            None,
+            &env,
+            &[
+                "review",
+                "record",
+                STEP,
+                report.to_str().unwrap(),
+                "--reviewer",
+                "claude",
+                "--kind",
+                "resolution",
+                "--repo",
+                s.c.repo.to_str().unwrap(),
+            ],
+        );
+        let beyond = "it changes \"both.txt\" beyond the files its parents conflict in";
+        assert_eq!(record.status.code(), Some(1), "{row}: record {record:?}");
+        assert!(
+            String::from_utf8_lossy(&record.stdout).contains(beyond),
+            "{row}: record {record:?}"
+        );
+        s.edit_ledger(|ledger| as_resolutions(ledger, &h2, &merge));
+        let walk = offline_merge_env(&s, None, &env, &merge, s.c.repo.as_os_str());
+        assert_eq!(walk.status.code(), Some(1), "{row}: walk {walk:?}");
+        assert!(
+            String::from_utf8_lossy(&walk.stdout)
+                .contains(&format!("resolution reviews do not clear it: {beyond}")),
+            "{row}: walk {walk:?}"
+        );
+        assert_eq!(s.c.state(), Phase::PrOpen, "{row}: walk");
+    }
+
+    let keep = ("merge.keep.driver", "true");
+    let union = "shared.txt merge=union\n";
+    let hiding: [(Knobs, &str, Setting, &str); 7] = [
+        (&[MergeKnob::Committed], union, none, "feature\nmain\n"),
+        (&[MergeKnob::InfoAttributes], union, none, "feature\nmain\n"),
+        (
+            &[MergeKnob::WorktreeAttributes],
+            union,
+            none,
+            "feature\nmain\n",
+        ),
+        (
+            &[MergeKnob::GlobalAttributes],
+            union,
+            none,
+            "feature\nmain\n",
+        ),
+        (&[MergeKnob::AttrSource], union, none, "feature\nmain\n"),
+        (
+            &[MergeKnob::InfoAttributes, MergeKnob::RepoConfig],
+            "shared.txt merge=keep\n",
+            keep,
+            "feature\n",
+        ),
+        (
+            &[MergeKnob::InfoAttributes, MergeKnob::ConfigCount],
+            "shared.txt merge=keep\n",
+            keep,
+            "feature\n",
+        ),
+    ];
+    for (knobs, attribute, config, resolution) in hiding {
+        let row = format!("{knobs:?} {attribute:?} {config:?}");
+        let s = Scratch::new(&host);
+        s.on_main_with(|s| {
+            fs::write(s.c.repo.join("shared.txt"), "main\n").unwrap();
+            if knobs.contains(&MergeKnob::Committed) {
+                fs::write(s.c.repo.join(".gitattributes"), attribute).unwrap();
+            }
+        });
+        let merge = merge_by_hand(&s, &[("shared.txt", resolution)]);
+        let env = turn_merge_knobs(&s, knobs, attribute, config);
+        let env: Vec<(&str, &str)> = env
+            .iter()
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect();
+        let shown = plain_git(&s, &env, &["show", "--remerge-diff", "--format=", &merge]);
+        assert!(
+            shown.status.success() && shown.stdout.is_empty(),
+            "{row}: the resolution is hidden from the checkout {shown:?}"
+        );
+        let waiver = offline_merge_env(&s, None, &env, &merge, s.c.repo.as_os_str());
+        assert_eq!(waiver.status.code(), Some(1), "{row}: waiver {waiver:?}");
+        assert!(
+            String::from_utf8_lossy(&waiver.stdout).contains(&format!(
+                "{} resolved merge conflicts; it needs its own review",
+                &merge[..12]
+            )),
+            "{row}: waiver {waiver:?}"
+        );
+        assert_eq!(s.c.state(), Phase::PrOpen, "{row}: waiver");
+    }
+}
+
+fn sha1(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let (tool, args): (&str, &[&str]) = if Command::new("sha1sum").arg("--version").output().is_ok()
+    {
+        ("sha1sum", &[])
+    } else {
+        ("shasum", &["-a", "1"])
+    };
+    let mut child = Command::new(tool)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(bytes).unwrap();
+    let sum = String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap();
+    raw_oid(&sum[..40])
+}
+
+fn raw_oid(hex: &str) -> Vec<u8> {
+    (0..hex.len() / 2)
+        .map(|at| u8::from_str_radix(&hex[2 * at..2 * at + 2], 16).unwrap())
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Cache {
+    CommitGraph,
+    MultiPackIndex,
+}
+
+fn forge(s: &Scratch, cache: Cache, commit: &str, honest: &str) {
+    let objects = s.c.repo.join(".git").join("objects");
+    let (path, table, width, copied) = match cache {
+        Cache::CommitGraph => {
+            s.git(&["commit-graph", "write", "--reachable"]);
+            (objects.join("info").join("commit-graph"), 8, 36, 28)
+        }
+        Cache::MultiPackIndex => {
+            s.git(&["repack", "-a", "-d", "-q"]);
+            s.git(&["multi-pack-index", "write"]);
+            (objects.join("pack").join("multi-pack-index"), 12, 8, 8)
+        }
+    };
+    let mut file = fs::read(&path).unwrap();
+    let chunk = |id: &[u8]| {
+        (0..usize::from(file[6]))
+            .map(|at| table + 12 * at)
+            .find(|&at| &file[at..at + 4] == id)
+            .map(|at| u64::from_be_bytes(file[at + 4..at + 12].try_into().unwrap()) as usize)
+            .unwrap()
+    };
+    let (oids, fanout) = (chunk(b"OIDL"), chunk(b"OIDF"));
+    let entries = match cache {
+        Cache::CommitGraph => chunk(b"CDAT"),
+        Cache::MultiPackIndex => chunk(b"OOFF"),
+    };
+    let count = u32::from_be_bytes(file[fanout + 4 * 255..fanout + 4 * 256].try_into().unwrap());
+    let index = |sha: &str| {
+        let oid = raw_oid(sha);
+        (0..count as usize)
+            .find(|at| file[oids + 20 * at..oids + 20 * at + 20] == oid[..])
+            .unwrap()
+    };
+    let (from, to) = (
+        entries + width * index(honest),
+        entries + width * index(commit),
+    );
+    file.copy_within(from..from + copied, to);
+    let end = file.len() - 20;
+    let sum = sha1(&file[..end]);
+    file[end..].copy_from_slice(&sum);
+    fs::remove_file(&path).unwrap();
+    fs::write(&path, file).unwrap();
+    let honest_parents = s.git(&["rev-list", "--parents", "-n", "1", honest]);
+    let parents = s.git(&["rev-list", "--parents", "-n", "1", commit]);
+    assert_eq!(
+        parents.split_once(' ').unwrap().1,
+        honest_parents.split_once(' ').unwrap().1,
+        "{cache:?}"
+    );
+    let listed = |sha: &str| s.git(&["show", "--remerge-diff", "--format=", "--name-only", sha]);
+    assert_eq!(listed(commit), listed(honest), "{cache:?}");
+}
+
+fn forged_history(
+    host: &Fake,
+    beyond: bool,
+    resolution: Option<&str>,
+) -> (Scratch, String, String) {
+    let s = Scratch::new(host);
+    s.on_main(
+        if resolution.is_some() {
+            "shared.txt"
+        } else {
+            "other.txt"
+        },
+        "main\n",
+    );
+    s.git(&["checkout", "-q", "-b", "honest"]);
+    let honest = s.merge_main(resolution);
+    s.git(&["checkout", "-q", "feature"]);
+    if !beyond {
+        s.commit("evil.txt", "unreviewed\n");
+    }
+    let mut merge = s.merge_main(resolution);
+    if beyond {
+        fs::write(s.c.repo.join("evil.txt"), "beyond\n").unwrap();
+        s.git(&["add", "evil.txt"]);
+        s.git(&["commit", "-q", "--amend", "--no-edit"]);
+        merge = s.head();
+    }
+    (s, merge, honest)
+}
+
+fn hand_written_resolutions(s: &Scratch, merge: &str) {
+    let dir = "astra-review-7-hand";
+    let report = s.c.report(dir, merge, &[], "ACCEPT");
+    s.c.receipt(dir, merge, "gpt-6-astra", "xhigh");
+    let report = cm::evidence::CampaignFile::resolve(&s.c.root, &report).unwrap();
+    s.edit_ledger(|ledger| {
+        as_resolutions(ledger, &s.h1, merge);
+        for review in ledger.reviews.iter_mut().filter(|review| {
+            review.kind == verdict::ReviewKind::Resolution
+                && review.reviewer.as_deref() == Some("astra")
+        }) {
+            review.report = report.clone();
+        }
+    });
+}
+
+fn record_claude_resolution(s: &Scratch, merge: &str) -> std::process::Output {
+    record_claude_resolution_env(s, &[], merge)
+}
+
+fn record_claude_resolution_env(
+    s: &Scratch,
+    env: &[(&str, &str)],
+    merge: &str,
+) -> std::process::Output {
+    let report = s.c.report("claude-forged", merge, &[], "ACCEPT");
+    offline_cm_env(
+        s,
+        None,
+        env,
+        &[
+            "review",
+            "record",
+            STEP,
+            report.to_str().unwrap(),
+            "--reviewer",
+            "claude",
+            "--kind",
+            "resolution",
+            "--repo",
+            s.c.repo.to_str().unwrap(),
+        ],
+    )
+}
+
+#[test]
+fn no_cache_of_the_checkout_changes_what_the_gate_reads_for_a_commit() {
+    let host = at("2026-11-25T06:00:00Z");
+    let resolved = Some("feature and main\n");
+    for cache in [Cache::CommitGraph, Cache::MultiPackIndex] {
+        let (s, merge, honest) = forged_history(&host, false, resolved);
+        forge(&s, cache, &merge, &honest);
+        let record = record_claude_resolution(&s, &merge);
+        assert_eq!(
+            record.status.code(),
+            Some(1),
+            "{cache:?}: record {record:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&record.stdout).contains("does not clear the gate"),
+            "{cache:?}: record {record:?}"
+        );
+        hand_written_resolutions(&s, &merge);
+        let walk = offline_merge(&s, &merge, &s.c.repo);
+        assert_eq!(walk.status.code(), Some(1), "{cache:?}: walk {walk:?}");
+        assert!(
+            String::from_utf8_lossy(&walk.stdout).contains("is not a merge from the base branch"),
+            "{cache:?}: walk {walk:?}"
+        );
+        assert_eq!(s.c.state(), Phase::PrOpen, "{cache:?}: walk");
+
+        let (s, merge, honest) = forged_history(&host, true, resolved);
+        forge(&s, cache, &merge, &honest);
+        let beyond = "it changes \"evil.txt\" beyond the files its parents conflict in";
+        let record = record_claude_resolution(&s, &merge);
+        assert_eq!(
+            record.status.code(),
+            Some(1),
+            "{cache:?}: record {record:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&record.stdout).contains(beyond),
+            "{cache:?}: record {record:?}"
+        );
+        hand_written_resolutions(&s, &merge);
+        let walk = offline_merge(&s, &merge, &s.c.repo);
+        assert_eq!(walk.status.code(), Some(1), "{cache:?}: walk {walk:?}");
+        assert!(
+            String::from_utf8_lossy(&walk.stdout).contains(beyond),
+            "{cache:?}: walk {walk:?}"
+        );
+
+        let (s, clean, honest) = forged_history(&host, false, None);
+        forge(&s, cache, &clean, &honest);
+        let waiver = offline_merge(&s, &clean, &s.c.repo);
+        assert_eq!(
+            waiver.status.code(),
+            Some(1),
+            "{cache:?}: waiver {waiver:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&waiver.stdout).contains("is not a merge from the base branch"),
+            "{cache:?}: waiver {waiver:?}"
+        );
+        assert_eq!(s.c.state(), Phase::PrOpen, "{cache:?}: waiver");
+    }
+}
+
+fn round_report(s: &Scratch, name: &str, head: &str, findings: &[&str], verdict: &str) -> String {
+    let mut block = format!("head: {head}\n");
+    for finding in findings {
+        block.push_str(finding);
+        block.push('\n');
+    }
+    let report = s.c.write(
+        &format!("drafts/{name}.md"),
+        &format!("# {name}\n\n```cm-review\n{block}```\n\n{verdict}\n"),
+    );
+    report.to_str().unwrap().to_owned()
+}
+
+#[test]
+fn convergence_compares_a_resolution_round_only_with_resolution_rounds_of_its_merge() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    let accept = round_report(&s, "fresh-h1", &s.h1, &[], "ACCEPT");
+    let recorded = offline_cm(
+        &s,
+        &[
+            "review",
+            "record",
+            STEP,
+            &accept,
+            "--reviewer",
+            "fresh-opus",
+        ],
+    );
+    assert!(recorded.status.success(), "{recorded:?}");
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let repo = s.c.repo.to_str().unwrap();
+    let one = "F1 | contract | introduced | shared.txt:1 | the resolution drops main's line";
+    let two = "F2 | contract | introduced | shared.txt:1 | the resolution keeps a marker";
+    let resolution = |name: &str, reviewer: &str, findings: &[&str]| {
+        let report = round_report(&s, name, &merge, findings, "FIX REQUIRED");
+        offline_cm(
+            &s,
+            &[
+                "review",
+                "record",
+                STEP,
+                &report,
+                "--reviewer",
+                reviewer,
+                "--kind",
+                "resolution",
+                "--repo",
+                repo,
+            ],
+        )
+    };
+    let fresh = resolution("fresh-resolution", "fresh-opus", &[one]);
+    assert!(fresh.status.success(), "{fresh:?}");
+    let out = String::from_utf8_lossy(&fresh.stdout);
+    assert!(
+        !out.contains("converging: false") && !out.contains("non-converging"),
+        "{out}"
+    );
+    assert_eq!(s.c.state(), Phase::PrOpen);
+    assert!(
+        !fs::read_to_string(s.c.root.join("OWNER-QUEUE.md"))
+            .unwrap_or_default()
+            .contains("non-converging fresh reader")
+    );
+
+    let first = resolution("claude-resolution-1", "claude", &[one]);
+    assert!(first.status.success(), "{first:?}");
+    let second = resolution("claude-resolution-2", "claude", &[one, two]);
+    assert!(
+        String::from_utf8_lossy(&second.stdout).contains("converging: false"),
+        "{second:?}"
+    );
+
+    s.git(&[
+        "commit",
+        "-q",
+        "--amend",
+        "-m",
+        "the same resolution, amended",
+    ]);
+    let amended = s.head();
+    let three =
+        "F3 | contract | introduced | shared.txt:1 | the resolution drops the feature's line";
+    let report = round_report(
+        &s,
+        "claude-amended",
+        &amended,
+        &[one, two, three],
+        "FIX REQUIRED",
+    );
+    let other = offline_cm(
+        &s,
+        &[
+            "review",
+            "record",
+            STEP,
+            &report,
+            "--reviewer",
+            "claude",
+            "--kind",
+            "resolution",
+            "--repo",
+            repo,
+        ],
+    );
+    assert!(other.status.success(), "{other:?}");
+    assert!(
+        String::from_utf8_lossy(&other.stdout).contains("converging: true"),
+        "{other:?}"
+    );
+}
+
+#[test]
+fn a_fresh_reader_is_due_only_when_a_round_rises_against_rounds_of_its_kind() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let repo = s.c.repo.to_str().unwrap();
+    let one = "F1 | contract | introduced | shared.txt:1 | the resolution drops main's line";
+    let two = "F2 | contract | introduced | shared.txt:1 | the resolution keeps a marker";
+    for (name, findings, due) in [
+        ("claude-first", &[one][..], false),
+        ("claude-second", &[one, two][..], true),
+    ] {
+        let report = round_report(&s, name, &merge, findings, "FIX REQUIRED");
+        let recorded = offline_cm(
+            &s,
+            &[
+                "review",
+                "record",
+                STEP,
+                &report,
+                "--reviewer",
+                "claude",
+                "--kind",
+                "resolution",
+                "--repo",
+                repo,
+            ],
+        );
+        assert!(recorded.status.success(), "{name}: {recorded:?}");
+        let next = offline_cm(&s, &["next"]);
+        assert_eq!(
+            String::from_utf8_lossy(&next.stdout).contains("fresh reader"),
+            due,
+            "{name}: {next:?}"
+        );
+    }
+}
+
+#[test]
+fn the_fresh_reader_cm_next_asks_for_takes_the_round_that_clears_it() {
+    let host = at("2026-11-25T06:00:00Z");
+    for (worktree, gone) in [(true, false), (false, false), (true, true)] {
+        let s = Scratch::with(&host, Lane::Codex, worktree);
+        if gone {
+            let unit = s.c.root.join("01-a/u");
+            let mut state = store::load_unit(&unit).unwrap();
+            state.steps.get_mut("S1").unwrap().worktree =
+                s.home.join("gone").to_str().unwrap().to_owned();
+            commands::write_unit(&unit, &state).unwrap();
+        }
+        let worktree = worktree && !gone;
+        s.on_main("shared.txt", "main\n");
+        let merge = s.merge_main(Some("feature and main\n"));
+        let repo = s.c.repo.to_str().unwrap().to_owned();
+        let one = "F1 | contract | introduced | shared.txt:1 | the resolution drops main's line";
+        let two = "F2 | contract | introduced | shared.txt:1 | the resolution keeps a marker";
+        for (name, findings) in [
+            ("claude-first", &[one][..]),
+            ("claude-second", &[one, two][..]),
+        ] {
+            let report = round_report(&s, name, &merge, findings, "FIX REQUIRED");
+            let mut args = vec![
+                "review",
+                "record",
+                STEP,
+                &report,
+                "--reviewer",
+                "claude",
+                "--kind",
+                "resolution",
+            ];
+            if !worktree {
+                args.extend(["--repo", &repo]);
+            }
+            let recorded = offline_cm(&s, &args);
+            assert!(recorded.status.success(), "{name}: {recorded:?}");
+        }
+        let next = offline_cm(&s, &["next"]);
+        let out = String::from_utf8_lossy(&next.stdout).into_owned();
+        let line = out
+            .lines()
+            .find(|line| line.contains("fresh reader"))
+            .unwrap_or_else(|| panic!("{out}"));
+        assert!(
+            line.contains(&format!("on the conflict resolution of {merge}")),
+            "{line}"
+        );
+        let command = line.rsplit_once(" — `").unwrap().1.trim_end_matches('`');
+        assert_eq!(
+            command.contains(" --repo '<checkout>'"),
+            !worktree,
+            "{command}"
+        );
+        let item = &plan::next_at(&s.c.root, None, None, host.now)
+            .unwrap()
+            .fields["fresh_readers"][0];
+        assert_eq!(item["kind"], "resolution", "{item}");
+        assert_eq!(item["command"], command, "{item}");
+        let report = round_report(&s, "fresh-resolution", &merge, &[], "ACCEPT");
+        let args: Vec<String> = command
+            .split_whitespace()
+            .skip(1)
+            .map(|word| match word {
+                "'<fresh-review-report>'" => report.clone(),
+                "'<checkout>'" => repo.clone(),
+                word => word.to_owned(),
+            })
+            .collect();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let followed = offline_cm(&s, &args);
+        assert!(followed.status.success(), "{command}: {followed:?}");
+        let next = offline_cm(&s, &["next"]);
+        assert!(
+            !String::from_utf8_lossy(&next.stdout).contains("fresh reader"),
+            "{next:?}"
+        );
+    }
+}
+
+#[test]
+fn a_fresh_resolution_round_is_measured_only_against_resolution_rounds_of_its_merge() {
+    let host = at("2026-11-25T06:00:00Z");
+    let one = "F1 | contract | introduced | shared.txt:1 | the resolution drops main's line";
+    let two = "F2 | contract | introduced | shared.txt:1 | the resolution keeps a marker";
+    let three =
+        "F3 | contract | introduced | shared.txt:1 | the resolution drops the feature's line";
+    let four = "F4 | contract | introduced | shared.txt:1 | the resolution reorders the lines";
+    let record =
+        |s: &Scratch, name: &str, head: &str, reviewer: &str, findings: &[&str], kind: bool| {
+            let report = round_report(s, name, head, findings, "FIX REQUIRED");
+            let repo = s.c.repo.to_str().unwrap().to_owned();
+            let mut args = vec!["review", "record", STEP, &report, "--reviewer", reviewer];
+            if kind {
+                args.extend(["--kind", "resolution", "--repo", &repo]);
+            }
+            let recorded = offline_cm(s, &args);
+            assert!(recorded.status.success(), "{name}: {recorded:?}");
+            String::from_utf8_lossy(&recorded.stdout).into_owned()
+        };
+
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let main = s.git(&["rev-parse", &format!("origin/{}", s.base)]);
+    record(&s, "claude-head-1", &main, "claude", &[one], false);
+    record(&s, "claude-head-2", &main, "claude", &[one, two], false);
+    let merge = s.merge_main(Some("feature and main\n"));
+    let fresh = record(
+        &s,
+        "fresh-resolution",
+        &merge,
+        "fresh-opus",
+        &[one, two, three],
+        true,
+    );
+    assert!(!fresh.contains("converging: false"), "{fresh}");
+    assert_eq!(s.c.state(), Phase::PrOpen);
+
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    record(&s, "claude-resolution-1", &merge, "claude", &[one], true);
+    record(
+        &s,
+        "claude-resolution-2",
+        &merge,
+        "claude",
+        &[one, two],
+        true,
+    );
+    record(
+        &s,
+        "opus-head",
+        &merge,
+        "opus",
+        &[one, two, three, four],
+        false,
+    );
+    let fresh = record(
+        &s,
+        "fresh-resolution",
+        &merge,
+        "fresh-opus",
+        &[one, two, three],
+        true,
+    );
+    assert!(fresh.contains("converging: false"), "{fresh}");
+}
+
+#[test]
+fn a_git_dir_in_the_environment_never_moves_the_repository_the_gate_reads() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    let side = side_branch(&s, "shared.txt", "side\n");
+    let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", "side"]);
+    assert!(!merged.status.success(), "{merged:?}");
+    fs::write(s.c.repo.join("shared.txt"), "feature and side\n").unwrap();
+    s.git(&["add", "shared.txt"]);
+    s.git(&["commit", "-q", "--no-edit"]);
+    let merge = s.head();
+    let mirror = s.home.join("mirror.git");
+    let cloned = scratch_git(
+        &s.home,
+        &s.home,
+        &[
+            "clone",
+            "-q",
+            "--mirror",
+            s.c.repo.to_str().unwrap(),
+            mirror.to_str().unwrap(),
+        ],
+    );
+    assert!(cloned.status.success(), "{cloned:?}");
+    let moved = scratch_git(
+        &s.home,
+        &mirror,
+        &["update-ref", "refs/remotes/origin/HEAD", &side],
+    );
+    assert!(moved.status.success(), "{moved:?}");
+    let report = s.c.report("claude-redirected", &merge, &[], "ACCEPT");
+    let record = offline_cm_env(
+        &s,
+        None,
+        &[("GIT_DIR", mirror.to_str().unwrap())],
+        &[
+            "review",
+            "record",
+            STEP,
+            report.to_str().unwrap(),
+            "--reviewer",
+            "claude",
+            "--kind",
+            "resolution",
+            "--repo",
+            s.c.repo.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(record.status.code(), Some(1), "{record:?}");
+    assert!(
+        String::from_utf8_lossy(&record.stdout)
+            .contains("which is not on the base branch origin/HEAD"),
+        "{record:?}"
+    );
+
+    let s = Scratch::new(&host);
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    let stale = s.home.join("stale.git");
+    let cloned = scratch_git(
+        &s.home,
+        &s.home,
+        &[
+            "clone",
+            "-q",
+            "--mirror",
+            s.c.repo.to_str().unwrap(),
+            stale.to_str().unwrap(),
+        ],
+    );
+    assert!(cloned.status.success(), "{cloned:?}");
+    let moved = scratch_git(
+        &s.home,
+        &stale,
+        &["update-ref", "refs/remotes/origin/HEAD", &s.h1],
+    );
+    assert!(moved.status.success(), "{moved:?}");
+    let waived = offline_merge_env(
+        &s,
+        None,
+        &[("GIT_DIR", stale.to_str().unwrap())],
+        &clean,
+        s.c.repo.as_os_str(),
+    );
+    assert!(waived.status.success(), "{waived:?}");
+}
+
+#[test]
+fn a_resolution_review_reads_a_worktree_its_git_directory_or_a_bare_repository() {
+    let host = at("2026-11-25T06:00:00Z");
+    for shape in ["worktree", "git directory", "bare"] {
+        let place = |s: &Scratch| -> PathBuf {
+            match shape {
+                "worktree" => s.c.repo.clone(),
+                "git directory" => s.c.repo.join(".git"),
+                _ => {
+                    let bare = s.home.join("bare.git");
+                    let cloned = scratch_git(
+                        &s.home,
+                        &s.home,
+                        &[
+                            "clone",
+                            "-q",
+                            "--mirror",
+                            s.c.repo.to_str().unwrap(),
+                            bare.to_str().unwrap(),
+                        ],
+                    );
+                    assert!(cloned.status.success(), "{cloned:?}");
+                    bare
+                }
+            }
+        };
+        let s = Scratch::new(&host);
+        s.on_main("shared.txt", "main\n");
+        let merge = s.merge_main(Some("feature and main\n"));
+        let repo = place(&s);
+        for reviewer in ["claude", "astra"] {
+            let recorded = record_in(&s, None, repo.as_os_str(), reviewer, &merge);
+            assert!(
+                recorded.status.success(),
+                "{shape}: {reviewer} {recorded:?}"
+            );
+        }
+        let merged = offline_merge(&s, &merge, &repo);
+        assert!(merged.status.success(), "{shape}: merged {merged:?}");
+
+        let s = Scratch::new(&host);
+        s.on_main("other.txt", "main\n");
+        let clean = s.merge_main(None);
+        let repo = place(&s);
+        let waived = offline_merge(&s, &clean, &repo);
+        assert!(waived.status.success(), "{shape}: waiver {waived:?}");
+    }
+}
+
+#[test]
+fn a_named_head_at_a_resolving_step_meets_the_head_reviews_of_the_commit_it_names() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    s.accepted_resolution(&host, &merge, "resolution");
+    s.astra(&host, &merge, "head", "ACCEPT");
+    claude_accept(&host, &s.c, &merge);
+    let merged = offline_merge(&s, "HEAD", &s.c.repo);
+    assert!(merged.status.success(), "{merged:?}");
+}
+
+#[test]
+fn no_git_test_variable_brings_back_a_cache_the_gate_turns_off() {
+    let host = at("2026-11-25T06:00:00Z");
+    let env = [
+        ("GIT_TEST_COMMIT_GRAPH", "1"),
+        ("GIT_TEST_MULTI_PACK_INDEX", "1"),
+        ("GIT_TEST_SPLIT_INDEX", "1"),
+    ];
+    for cache in [Cache::CommitGraph, Cache::MultiPackIndex] {
+        let (s, merge, honest) = forged_history(&host, false, Some("feature and main\n"));
+        forge(&s, cache, &merge, &honest);
+        let record = record_claude_resolution_env(&s, &env, &merge);
+        assert_eq!(
+            record.status.code(),
+            Some(1),
+            "{cache:?}: record {record:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&record.stdout).contains("does not clear the gate"),
+            "{cache:?}: record {record:?}"
+        );
+        hand_written_resolutions(&s, &merge);
+        let walk = offline_merge_env(&s, None, &env, &merge, s.c.repo.as_os_str());
+        assert_eq!(walk.status.code(), Some(1), "{cache:?}: walk {walk:?}");
+        assert_eq!(s.c.state(), Phase::PrOpen, "{cache:?}: walk");
+
+        let (s, clean, honest) = forged_history(&host, false, None);
+        forge(&s, cache, &clean, &honest);
+        let waiver = offline_merge_env(&s, None, &env, &clean, s.c.repo.as_os_str());
+        assert_eq!(
+            waiver.status.code(),
+            Some(1),
+            "{cache:?}: waiver {waiver:?}"
+        );
+        assert_eq!(s.c.state(), Phase::PrOpen, "{cache:?}: waiver");
+    }
+}
+
+// Where each scratch repository cm made was initialised, in order.
+fn scratch_inits(log: &Path) -> Vec<PathBuf> {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.splitn(5, '\t').collect();
+            (fields.len() == 5 && fields[4].contains(" init --bare "))
+                .then(|| PathBuf::from(fields[2]))
+        })
+        .collect()
+}
+
+#[test]
+fn the_scratch_repository_finds_a_writable_absolute_home() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    let log = logging_git(&s);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    fs::create_dir_all(s.home.join("relative-tmp")).unwrap();
+    let relative = [("TMPDIR", "relative-tmp")];
+    for reviewer in ["claude", "astra"] {
+        let recorded = record_env(
+            &s,
+            Some(&s.home),
+            &relative,
+            s.c.repo.as_os_str(),
+            reviewer,
+            &merge,
+        );
+        assert!(
+            recorded.status.success(),
+            "relative TMPDIR: {reviewer} {recorded:?}"
+        );
+    }
+    let merged = offline_merge_env(&s, Some(&s.home), &relative, &merge, s.c.repo.as_os_str());
+    assert!(merged.status.success(), "relative TMPDIR: {merged:?}");
+    let inits = scratch_inits(&log);
+    assert_eq!(inits.len(), 3, "{inits:?}");
+    for dir in &inits {
+        assert!(dir.starts_with(s.home.join("relative-tmp")), "{inits:?}");
+    }
+
+    for temp in ["writable", "missing", ""] {
+        let s = Scratch::new(&host);
+        let log = logging_git(&s);
+        s.on_main("other.txt", "main\n");
+        let clean = s.merge_main(None);
+        let (dir, under) = match temp {
+            "writable" => (s.home.join(temp), s.home.join(temp)),
+            "missing" => (s.home.join(temp), PathBuf::from("/tmp")),
+            _ => (PathBuf::new(), PathBuf::from("/tmp")),
+        };
+        if temp == "writable" {
+            fs::create_dir_all(&dir).unwrap();
+        }
+        let env = [("TMPDIR", dir.to_str().unwrap())];
+        let waived = offline_merge_env(&s, Some(&s.home), &env, &clean, s.c.repo.as_os_str());
+        assert!(waived.status.success(), "TMPDIR {temp:?}: {waived:?}");
+        let inits = scratch_inits(&log);
+        assert!(
+            inits.len() == 1 && inits[0].starts_with(&under),
+            "TMPDIR {temp:?}: {inits:?}"
+        );
+    }
+}
+
+fn submodule_history(host: &Fake) -> (Scratch, [String; 3]) {
+    let s = Scratch::new(host);
+    let sub = s.home.join("subrepo");
+    let made = scratch_git(&s.home, &s.home, &["init", "-q", sub.to_str().unwrap()]);
+    assert!(made.status.success(), "{made:?}");
+    let commits: Vec<String> = ["A", "B", "C"]
+        .iter()
+        .map(|name| {
+            fs::write(sub.join("s.txt"), name).unwrap();
+            scratch_git(&s.home, &sub, &["add", "s.txt"]);
+            scratch_git(&s.home, &sub, &["commit", "-q", "-m", name]);
+            let head = scratch_git(&s.home, &sub, &["rev-parse", "HEAD"]);
+            String::from_utf8(head.stdout).unwrap().trim().to_owned()
+        })
+        .collect();
+    let at = |s: &Scratch, commit: &str| {
+        let moved = scratch_git(&s.home, &s.c.repo.join("sub"), &["checkout", "-q", commit]);
+        assert!(moved.status.success(), "{moved:?}");
+    };
+    s.on_main_with(|s| {
+        let added = scratch_git(
+            &s.home,
+            &s.c.repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                sub.to_str().unwrap(),
+                "sub",
+            ],
+        );
+        assert!(added.status.success(), "{added:?}");
+        at(s, &commits[0]);
+    });
+    s.merge_main(None);
+    at(&s, &commits[1]);
+    s.git(&["add", "sub"]);
+    s.git(&["commit", "-q", "-m", "sub to B"]);
+    s.reviewed(host, "h2");
+    s.on_main_with(|s| at(s, &commits[2]));
+    at(&s, &commits[1]);
+    (
+        s,
+        [commits[0].clone(), commits[1].clone(), commits[2].clone()],
+    )
+}
+
+#[test]
+fn a_submodule_moved_on_both_sides_is_read_without_its_objects() {
+    let host = at("2026-11-25T06:00:00Z");
+    let (s, _) = submodule_history(&host);
+    let clean = s.merge_main(None);
+    let shown = s.git(&["show", "--remerge-diff", "--format=", &clean]);
+    assert!(
+        shown.is_empty(),
+        "the checkout fast-forwards the submodule: {shown}"
+    );
+    let refused = offline_merge(&s, &clean, &s.c.repo);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stdout).contains(&format!(
+            "{} resolved merge conflicts; it needs its own review",
+            &clean[..12]
+        )),
+        "{refused:?}"
+    );
+
+    let (s, [first, _, _]) = submodule_history(&host);
+    let main = format!("origin/{}", s.base);
+    scratch_git(
+        &s.home,
+        &s.c.repo,
+        &["merge", "-q", "--no-commit", "--no-ff", &main],
+    );
+    s.git(&[
+        "update-index",
+        "--cacheinfo",
+        &format!("160000,{first},sub"),
+    ]);
+    s.git(&["commit", "-q", "--no-edit"]);
+    let merge = s.head();
+    let record = record_claude_resolution(&s, &merge);
+    assert_eq!(record.status.code(), Some(1), "{record:?}");
+    assert!(
+        String::from_utf8_lossy(&record.stdout).contains(SUBMODULE_HISTORY),
+        "{record:?}"
+    );
+}
+
+const SUBMODULE_HISTORY: &str = "its parents set the submodule \"sub\" to different commits, which only the submodule's history can merge";
+
+const SUB_C: &str = "3333333333333333333333333333333333333333";
+
+fn unlink(s: &Scratch, path: &str) {
+    s.git(&["update-index", "--force-remove", path]);
+    let _ = fs::remove_dir(s.c.repo.join(path));
+}
+
+fn put(s: &Scratch, mode: &str, object: &str, path: &str) {
+    s.git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("{mode},{object},{path}"),
+    ]);
+}
+
+fn put_file(s: &Scratch, path: &str, text: &str) {
+    if let Some(dir) = Path::new(path).parent() {
+        fs::create_dir_all(s.c.repo.join(dir)).unwrap();
+    }
+    let _ = fs::remove_dir(s.c.repo.join(path));
+    fs::write(s.c.repo.join(path), text).unwrap();
+    s.git(&["add", path]);
+}
+
+// Whatever names the checkout's merge left unmerged entries under go, so a resolution adds only
+// what it keeps.
+fn clear_unmerged(s: &Scratch) {
+    let listed = scratch_git(&s.home, &s.c.repo, &["ls-files", "-u", "-z"]);
+    let mut paths: Vec<String> = String::from_utf8(listed.stdout)
+        .unwrap()
+        .split('\0')
+        .filter_map(|entry| entry.split_once('\t').map(|(_, path)| path.to_owned()))
+        .collect();
+    paths.dedup();
+    for path in paths {
+        s.git(&["update-index", "--force-remove", &path]);
+    }
+}
+
+fn blob(s: &Scratch, at: &str, path: &str) -> String {
+    s.git(&["rev-parse", &format!("{at}:{path}")])
+}
+
+fn conflict_merge(
+    host: &Fake,
+    base: &dyn Fn(&Scratch),
+    ours: &dyn Fn(&Scratch),
+    theirs: &dyn Fn(&Scratch),
+    resolve: &dyn Fn(&Scratch, &str),
+) -> (Scratch, String) {
+    let s = Scratch::new(host);
+    let on_main = |s: &Scratch, change: &dyn Fn(&Scratch)| {
+        s.git(&["checkout", "-q", &s.base]);
+        change(s);
+        s.git(&["commit", "-q", "--allow-empty", "-m", "main"]);
+        s.git(&["push", "-q", "origin", &s.base]);
+        s.git(&["checkout", "-q", "feature"]);
+    };
+    on_main(&s, base);
+    s.merge_main(None);
+    ours(&s);
+    s.git(&["commit", "-q", "--allow-empty", "-m", "ours"]);
+    let h2 = s.reviewed(host, "h2");
+    on_main(&s, theirs);
+    let main = format!("origin/{}", s.base);
+    let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", &main]);
+    assert!(!merged.status.success(), "the merge conflicts: {merged:?}");
+    clear_unmerged(&s);
+    resolve(&s, &h2);
+    s.git(&["commit", "-q", "--no-edit"]);
+    let merge = s.head();
+    (s, merge)
+}
+
+const FOUR: &str = "one\ntwo\nthree\nfour\n";
+
+fn made_up(path: &str, h2: &str) -> String {
+    format!("{path}~{h2}")
+}
+
+fn resolve_shared(s: &Scratch, _: &str) {
+    put_file(s, "shared.txt", "feature and main\n");
+}
+
+fn keep_ours_x(s: &Scratch, h2: &str) {
+    s.git(&["update-index", "--force-remove", "x/inner.txt"]);
+    put(s, "100644", &blob(s, h2, "x"), "x");
+}
+
+fn from_main(s: &Scratch, from: &str, to: &str) {
+    let main = format!("origin/{}", s.base);
+    put(s, "100644", &blob(s, &main, from), to);
+}
+
+type Change<'a> = &'a dyn Fn(&Scratch);
+type Resolve<'a> = &'a dyn Fn(&Scratch, &str);
+type Row<'a> = (
+    &'a str,
+    Change<'a>,
+    Change<'a>,
+    Change<'a>,
+    Resolve<'a>,
+    Option<Refused>,
+);
+
+#[derive(Clone, Copy)]
+enum Refused {
+    Beyond(&'static [&'static str]),
+    // Each name git moved an entry aside to, `{first}` or `{main}` standing for the side's commit.
+    Keeps(&'static [&'static str]),
+    History,
+    Shape(&'static str),
+}
+
+impl Refused {
+    // What the refusal must say; diff-tree's order across a file and a directory is not pinned.
+    fn says(self, first: &str, main: &str) -> Vec<String> {
+        match self {
+            Refused::Beyond(paths) => paths
+                .iter()
+                .map(|path| format!("\"{path}\""))
+                .chain(["beyond the files its parents conflict in".to_owned()])
+                .collect(),
+            Refused::Keeps(names) => vec![
+                names
+                    .iter()
+                    .map(|name| {
+                        let (from, _) = name.split_once('~').unwrap();
+                        let name = name.replace("{first}", first).replace("{main}", main);
+                        format!(
+                            "it keeps \"{name}\", where git moved \"{from}\" aside for a conflict"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ],
+            Refused::History => vec![SUBMODULE_HISTORY.to_owned()],
+            Refused::Shape(shape) => vec![format!("{shape}, a conflict shape cm does not read")],
+        }
+    }
+}
+
+#[test]
+fn a_merge_stands_on_resolution_reviews_where_it_differs_from_gits_own_merge_only_where_its_conflicts_allow()
+ {
+    let host = at("2026-11-25T06:00:00Z");
+    let none: Change = &|_| {};
+    use Refused::*;
+
+    let sub_base: Change = &|s| gitlink(s, "sub", SUB_A);
+    let sub_ours: Change = &|s| gitlink(s, "sub", SUB_B);
+    let sub_dir: Change = &|s| {
+        unlink(s, "sub");
+        put_file(s, "sub/inner.txt", "a directory\n");
+    };
+    let sub_gone: Change = &|s| unlink(s, "sub");
+    let sub_file: Change = &|s| {
+        unlink(s, "sub");
+        put_file(s, "sub", "a file\n");
+    };
+    let sub_same: Change = &|s| {
+        gitlink(s, "sub", SUB_B);
+        put_file(s, "shared.txt", "main\n");
+    };
+    let x_base: Change = &|s| put_file(s, "x", "a file\n");
+    let x_ours: Change = &|s| put_file(s, "x", "ours\n");
+    let x_dir: Change = &|s| {
+        s.git(&["rm", "-q", "x"]);
+        put_file(s, "x/inner.txt", "a directory\n");
+    };
+    let y_base: Change = &|s| put_file(s, "y", "y\n");
+    let y_ours: Change = &|s| put_file(s, "y", "ours\n");
+    let y_theirs: Change = &|s| put_file(s, "y", "theirs\n");
+    let y_gone: Change = &|s| {
+        s.git(&["rm", "-q", "y"]);
+    };
+    let r_base: Change = &|s| put_file(s, "r", FOUR);
+    let r_moved: Change = &|s| {
+        s.git(&["mv", "r", "r2"]);
+    };
+    let r_gone: Change = &|s| {
+        s.git(&["rm", "-q", "r"]);
+    };
+    let q_base: Change = &|s| put_file(s, "q", FOUR);
+    let q_ours: Change = &|s| {
+        s.git(&["mv", "q", "q-ours"]);
+    };
+    let q_theirs: Change = &|s| {
+        s.git(&["mv", "q", "q-theirs"]);
+    };
+    let m_ours: Change = &|s| put_file(s, "m", "ours\n");
+    let m_theirs: Change = &|s| {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(s.c.repo.join("m"), "theirs\n").unwrap();
+        fs::set_permissions(s.c.repo.join("m"), fs::Permissions::from_mode(0o755)).unwrap();
+        s.git(&["add", "m"]);
+    };
+    let l_ours: Change = &|s| put_file(s, "l", "a file\n");
+    let l_theirs: Change = &|s| {
+        std::os::unix::fs::symlink("target", s.c.repo.join("l")).unwrap();
+        s.git(&["add", "l"]);
+    };
+    let shared_theirs: Change = &|s| put_file(s, "shared.txt", "main\n");
+    let kept_base: Change = &|s| put_file(s, "kept.txt", "kept\n");
+    let sub_theirs: Change = &|s| gitlink(s, "sub", SUB_C);
+    let resolved: Resolve = &resolve_shared;
+
+    let x_and_beside: Change = &|s| {
+        put_file(s, "x", "a file\n");
+        put_file(s, "x.txt", "beside\n");
+    };
+    let x_theirs: Change = &|s| put_file(s, "x", "theirs\n");
+    let x_link: Change = &|s| {
+        std::os::unix::fs::symlink("target", s.c.repo.join("x")).unwrap();
+        s.git(&["add", "x"]);
+    };
+    let x_dir_only: Change = &|s| put_file(s, "x/inner.txt", "a directory\n");
+    let d_base: Change = &|s| {
+        put_file(s, "d/a.txt", "a\n");
+        put_file(s, "d/b.txt", "b\n");
+    };
+    let d_moved: Change = &|s| {
+        s.git(&["mv", "d", "e"]);
+    };
+    let d_added: Change = &|s| {
+        put_file(s, "d/new.txt", "new\n");
+        shared_theirs(s);
+    };
+    let d_added_alone: Change = &|s| put_file(s, "d/new.txt", "new\n");
+    let d_and_top: Change = &|s| {
+        d_base(s);
+        put_file(s, "top", FOUR);
+    };
+    let top_into_d: Change = &|s| {
+        s.git(&["mv", "top", "d/top"]);
+        shared_theirs(s);
+    };
+    let old_base: Change = &|s| {
+        put_file(s, "old/a.txt", "a\n");
+        put_file(s, "old/b.txt", "b\n");
+    };
+    let old_added: Change = &|s| put_file(s, "old/new.txt", "new\n");
+    let old_moved: Change = &|s| {
+        s.git(&["mv", "old", "new"]);
+        shared_theirs(s);
+    };
+    let bin_base: Change = &|s| put_file(s, "bin", "a\0base\n");
+    let bin_ours: Change = &|s| put_file(s, "bin", "a\0ours\n");
+    let bin_theirs: Change = &|s| put_file(s, "bin", "a\0theirs\n");
+    let auto_base: Change = &|s| put_file(s, "auto.txt", "1\n2\n3\n4\n5\n6\n7\n8\n");
+    let auto_ours: Change = &|s| put_file(s, "auto.txt", "one\n2\n3\n4\n5\n6\n7\n8\n");
+    let auto_theirs: Change = &|s| {
+        put_file(s, "auto.txt", "1\n2\n3\n4\n5\n6\n7\neight\n");
+        shared_theirs(s);
+    };
+    let sub_l: Change = &|s| gitlink(s, "l", SUB_C);
+    let a_base: Change = &|s| put_file(s, "a", FOUR);
+    let a_and_b: Change = &|s| {
+        put_file(s, "a", "one\ntwo\nours\nfour\n");
+        put_file(s, "b", "other\n");
+    };
+    let a_to_b: Change = &|s| {
+        s.git(&["mv", "a", "b"]);
+        put_file(s, "b", "one\ntwo\ntheirs\nfour\n");
+    };
+    let d_split: Change = &|s| {
+        fs::create_dir_all(s.c.repo.join("e")).unwrap();
+        fs::create_dir_all(s.c.repo.join("f")).unwrap();
+        s.git(&["mv", "d/a.txt", "e/a.txt"]);
+        s.git(&["mv", "d/b.txt", "f/b.txt"]);
+    };
+    let d_added_c: Change = &|s| {
+        put_file(s, "d/c.txt", "c\n");
+        shared_theirs(s);
+    };
+    let d_and_e_added: Change = &|s| {
+        put_file(s, "d/new.txt", "new\n");
+        put_file(s, "e/new.txt", "in the way\n");
+        shared_theirs(s);
+    };
+    let d_and_g: Change = &|s| {
+        put_file(s, "d/a.txt", "a\n");
+        put_file(s, "g/b.txt", "b\n");
+    };
+    let d_and_g_joined: Change = &|s| {
+        fs::create_dir_all(s.c.repo.join("e")).unwrap();
+        s.git(&["mv", "d/a.txt", "e/a.txt"]);
+        s.git(&["mv", "g/b.txt", "e/b.txt"]);
+    };
+    let d_and_g_added: Change = &|s| {
+        put_file(s, "d/new.txt", "d\n");
+        put_file(s, "g/new.txt", "g\n");
+        shared_theirs(s);
+    };
+    let x_and_a: Change = &|s| {
+        put_file(s, "x", "a file\n");
+        put_file(s, "a", FOUR);
+    };
+    let a_into_x: Change = &|s| {
+        s.git(&["rm", "-q", "x"]);
+        fs::create_dir_all(s.c.repo.join("x")).unwrap();
+        s.git(&["mv", "a", "x/a"]);
+    };
+
+    let rows: Vec<Row> = vec![
+        (
+            "submodule against a directory, keep the directory",
+            sub_base,
+            sub_ours,
+            sub_dir,
+            &|s, _| unlink(s, "sub"),
+            Some(Shape(
+                "its parents put a submodule at \"sub\" against a directory",
+            )),
+        ),
+        (
+            "submodule against a directory, keep the submodule",
+            sub_base,
+            sub_ours,
+            sub_dir,
+            &|s, _| {
+                s.git(&["update-index", "--force-remove", "sub/inner.txt"]);
+                gitlink(s, "sub", SUB_B);
+            },
+            Some(Shape(
+                "its parents put a submodule at \"sub\" against a directory",
+            )),
+        ),
+        (
+            "submodule against a directory, keep both where git moved it",
+            sub_base,
+            sub_ours,
+            sub_dir,
+            &|s, h2| {
+                unlink(s, "sub");
+                gitlink(s, &made_up("sub", h2), SUB_B);
+            },
+            Some(Shape(
+                "its parents put a submodule at \"sub\" against a directory",
+            )),
+        ),
+        (
+            "submodule against a directory, keep both as the checkout names it",
+            sub_base,
+            sub_ours,
+            sub_dir,
+            &|s, _| {
+                unlink(s, "sub");
+                gitlink(s, "sub~HEAD", SUB_B);
+            },
+            Some(Shape(
+                "its parents put a submodule at \"sub\" against a directory",
+            )),
+        ),
+        (
+            "a submodule main deleted, deleted",
+            sub_base,
+            sub_ours,
+            sub_gone,
+            &|_, _| {},
+            None,
+        ),
+        (
+            "a submodule main deleted, the first parent's change kept",
+            sub_base,
+            sub_ours,
+            sub_gone,
+            &|s, _| gitlink(s, "sub", SUB_B),
+            None,
+        ),
+        (
+            "a submodule the first parent deleted, main's change kept",
+            sub_base,
+            sub_gone,
+            sub_theirs,
+            &|s, _| gitlink(s, "sub", SUB_C),
+            None,
+        ),
+        (
+            "a submodule against a file, keep the file",
+            sub_base,
+            sub_file,
+            sub_theirs,
+            &|s, h2| put(s, "100644", &blob(s, h2, "sub"), "sub"),
+            Some(Shape("its parents put a file and a submodule at \"sub\"")),
+        ),
+        (
+            "a submodule against a file, keep the submodule",
+            sub_base,
+            sub_file,
+            sub_theirs,
+            &|s, _| gitlink(s, "sub", SUB_C),
+            Some(Shape("its parents put a file and a submodule at \"sub\"")),
+        ),
+        (
+            "a submodule both parents set to the same commit, with a conflict elsewhere",
+            sub_base,
+            sub_ours,
+            sub_same,
+            resolved,
+            None,
+        ),
+        (
+            "file against a directory, keep the directory",
+            x_base,
+            x_ours,
+            x_dir,
+            &|s, _| unlink(s, "x"),
+            None,
+        ),
+        (
+            "file against a directory, keep the file",
+            x_base,
+            x_ours,
+            x_dir,
+            &keep_ours_x,
+            None,
+        ),
+        (
+            "file against a directory, keep both where git moved it",
+            x_base,
+            x_ours,
+            x_dir,
+            &|s, h2| {
+                unlink(s, "x");
+                put(s, "100644", &blob(s, h2, "x"), &made_up("x", h2));
+            },
+            Some(Keeps(&["x~{first}"])),
+        ),
+        (
+            "file against a directory, keep both as the checkout names it",
+            x_base,
+            x_ours,
+            x_dir,
+            &|s, h2| {
+                unlink(s, "x");
+                put(s, "100644", &blob(s, h2, "x"), "x~HEAD");
+            },
+            Some(Beyond(&["x~HEAD"])),
+        ),
+        (
+            "file against a directory, keep the moved file edited where git moved it",
+            x_base,
+            x_ours,
+            x_dir,
+            &|s, h2| put_file(s, &made_up("x", h2), "edited\n"),
+            Some(Keeps(&["x~{first}"])),
+        ),
+        (
+            "file against a directory, keep the file and delete a file named after it",
+            x_and_beside,
+            x_ours,
+            x_dir,
+            &|s, h2| {
+                keep_ours_x(s, h2);
+                unlink(s, "x.txt");
+            },
+            Some(Beyond(&["x.txt"])),
+        ),
+        (
+            "main's file against the first parent's directory, keep main's file",
+            x_base,
+            x_dir,
+            x_theirs,
+            &|s, _| {
+                s.git(&["update-index", "--force-remove", "x/inner.txt"]);
+                from_main(s, "x", "x");
+            },
+            None,
+        ),
+        (
+            "main's file against the first parent's directory, keep both where git moved it",
+            x_base,
+            x_dir,
+            x_theirs,
+            &|s, _| {
+                let main = s.git(&["rev-parse", &format!("origin/{}", s.base)]);
+                from_main(s, "x", &made_up("x", &main));
+            },
+            Some(Keeps(&["x~{main}"])),
+        ),
+        (
+            "a symlink against a directory, keep the symlink",
+            none,
+            x_link,
+            x_dir_only,
+            &|s, h2| {
+                s.git(&["update-index", "--force-remove", "x/inner.txt"]);
+                put(s, "120000", &blob(s, h2, "x"), "x");
+            },
+            Some(Shape(
+                "its parents put a symlink at \"x\" against a directory",
+            )),
+        ),
+        (
+            "a file main adds to a directory the first parent renamed, kept where git moved it",
+            d_base,
+            d_moved,
+            d_added,
+            &|s, h2| {
+                resolve_shared(s, h2);
+                from_main(s, "d/new.txt", "e/new.txt");
+            },
+            None,
+        ),
+        (
+            "a file main adds to a directory the first parent renamed, kept where main put it",
+            d_base,
+            d_moved,
+            d_added,
+            &|s, h2| {
+                resolve_shared(s, h2);
+                from_main(s, "d/new.txt", "d/new.txt");
+            },
+            None,
+        ),
+        (
+            "a file main adds to a directory the first parent renamed, dropped",
+            d_base,
+            d_moved,
+            d_added,
+            resolved,
+            None,
+        ),
+        (
+            "a file main adds to a directory the first parent renamed, kept elsewhere",
+            d_base,
+            d_moved,
+            d_added,
+            &|s, h2| {
+                resolve_shared(s, h2);
+                from_main(s, "d/new.txt", "e/other.txt");
+            },
+            Some(Beyond(&["e/other.txt"])),
+        ),
+        (
+            "a file main adds to a directory the first parent renamed, the only conflict, edited where git moved it",
+            d_base,
+            d_moved,
+            d_added_alone,
+            &|s, _| put_file(s, "e/new.txt", "edited\n"),
+            None,
+        ),
+        (
+            "a file the first parent adds to a directory main renamed, kept where git moved it",
+            old_base,
+            old_added,
+            old_moved,
+            &|s, h2| {
+                resolve_shared(s, h2);
+                put(s, "100644", &blob(s, h2, "old/new.txt"), "new/new.txt");
+            },
+            None,
+        ),
+        (
+            "a file main renames into a directory the first parent renamed, kept where git moved it",
+            d_and_top,
+            d_moved,
+            top_into_d,
+            &|s, h2| {
+                resolve_shared(s, h2);
+                from_main(s, "d/top", "e/top");
+            },
+            None,
+        ),
+        (
+            "a rename both parents changed onto a path the first parent added, resolved there",
+            a_base,
+            a_and_b,
+            a_to_b,
+            &|s, _| put_file(s, "b", "one\ntwo\nboth\nfour\nother\n"),
+            None,
+        ),
+        (
+            "a file main adds to a directory the first parent split, kept where main put it",
+            d_base,
+            d_split,
+            d_added_c,
+            resolved,
+            None,
+        ),
+        (
+            "a file main adds to a directory the first parent split, moved after the split",
+            d_base,
+            d_split,
+            d_added_c,
+            &|s, h2| {
+                resolve_shared(s, h2);
+                unlink(s, "d/c.txt");
+                from_main(s, "d/c.txt", "e/c.txt");
+            },
+            Some(Beyond(&["e/c.txt"])),
+        ),
+        (
+            "a file main adds to a directory the first parent renamed onto a file main adds",
+            d_base,
+            d_moved,
+            d_and_e_added,
+            resolved,
+            None,
+        ),
+        (
+            "files main adds to two directories the first parent joined, kept where main put them",
+            d_and_g,
+            d_and_g_joined,
+            d_and_g_added,
+            resolved,
+            None,
+        ),
+        (
+            "files main adds to two directories the first parent joined, one moved into the join",
+            d_and_g,
+            d_and_g_joined,
+            d_and_g_added,
+            &|s, h2| {
+                resolve_shared(s, h2);
+                from_main(s, "d/new.txt", "e/new.txt");
+            },
+            Some(Beyond(&["e/new.txt"])),
+        ),
+        (
+            "a file both parents renamed, one into a directory replacing a file, kept there",
+            x_and_a,
+            a_into_x,
+            a_to_b,
+            &|s, _| from_main(s, "b", "x/a"),
+            None,
+        ),
+        (
+            "a file both parents renamed, one into a directory replacing a file, the file kept",
+            x_and_a,
+            a_into_x,
+            a_to_b,
+            &|s, _| {
+                from_main(s, "b", "b");
+                from_main(s, "x", "x");
+            },
+            Some(Beyond(&["x"])),
+        ),
+        (
+            "modify/delete, keep the change",
+            y_base,
+            y_ours,
+            y_gone,
+            &|s, h2| put(s, "100644", &blob(s, h2, "y"), "y"),
+            None,
+        ),
+        (
+            "modify/delete, delete",
+            y_base,
+            y_ours,
+            y_gone,
+            &|s, _| unlink(s, "y"),
+            None,
+        ),
+        (
+            "delete/modify, keep the change",
+            y_base,
+            y_gone,
+            y_theirs,
+            &|s, _| put_file(s, "y", "theirs\n"),
+            None,
+        ),
+        (
+            "delete/modify, delete",
+            y_base,
+            y_gone,
+            y_theirs,
+            &|s, _| unlink(s, "y"),
+            None,
+        ),
+        (
+            "rename/delete, keep the rename",
+            r_base,
+            r_moved,
+            r_gone,
+            &|s, _| put_file(s, "r2", FOUR),
+            None,
+        ),
+        (
+            "rename/delete, delete",
+            r_base,
+            r_moved,
+            r_gone,
+            &|s, _| unlink(s, "r2"),
+            None,
+        ),
+        (
+            "rename/rename, keep the first parent's name",
+            q_base,
+            q_ours,
+            q_theirs,
+            &|s, _| {
+                unlink(s, "q");
+                unlink(s, "q-theirs");
+                put_file(s, "q-ours", FOUR);
+            },
+            None,
+        ),
+        (
+            "rename/rename, keep both names",
+            q_base,
+            q_ours,
+            q_theirs,
+            &|s, _| {
+                unlink(s, "q");
+                put_file(s, "q-ours", FOUR);
+                put_file(s, "q-theirs", FOUR);
+            },
+            None,
+        ),
+        (
+            "rename/rename, keep the base's name",
+            q_base,
+            q_ours,
+            q_theirs,
+            &|s, _| {
+                unlink(s, "q-ours");
+                unlink(s, "q-theirs");
+                put_file(s, "q", FOUR);
+            },
+            None,
+        ),
+        (
+            "add/add with different modes, keep the first parent's",
+            none,
+            m_ours,
+            m_theirs,
+            &|s, h2| put(s, "100644", &blob(s, h2, "m"), "m"),
+            None,
+        ),
+        (
+            "add/add with different modes, keep main's",
+            none,
+            m_ours,
+            m_theirs,
+            &|s, _| {
+                let main = format!("origin/{}", s.base);
+                put(s, "100755", &blob(s, &main, "m"), "m");
+            },
+            None,
+        ),
+        (
+            "a file against a symlink, keep the file",
+            none,
+            l_ours,
+            l_theirs,
+            &|s, h2| {
+                unlink(s, "l");
+                put(s, "100644", &blob(s, h2, "l"), "l");
+            },
+            Some(Shape("its parents put a file and a symlink at \"l\"")),
+        ),
+        (
+            "a file against a symlink, keep the symlink",
+            none,
+            l_ours,
+            l_theirs,
+            &|s, _| {
+                let main = format!("origin/{}", s.base);
+                unlink(s, "l");
+                put(s, "120000", &blob(s, &main, "l"), "l");
+            },
+            Some(Shape("its parents put a file and a symlink at \"l\"")),
+        ),
+        (
+            "a file against a symlink, keep both where git moved the file",
+            none,
+            l_ours,
+            l_theirs,
+            &|s, h2| {
+                let main = format!("origin/{}", s.base);
+                unlink(s, "l");
+                put(s, "120000", &blob(s, &main, "l"), "l");
+                put(s, "100644", &blob(s, h2, "l"), &made_up("l", h2));
+            },
+            Some(Shape("its parents put a file and a symlink at \"l\"")),
+        ),
+        (
+            "a symlink against a submodule, neither kept",
+            none,
+            l_theirs,
+            sub_l,
+            &|_, _| {},
+            Some(Shape("its parents put a symlink and a submodule at \"l\"")),
+        ),
+        (
+            "a symlink against a submodule, keep the symlink",
+            none,
+            l_theirs,
+            sub_l,
+            &|s, h2| put(s, "120000", &blob(s, h2, "l"), "l"),
+            Some(Shape("its parents put a symlink and a submodule at \"l\"")),
+        ),
+        (
+            "a symlink against a submodule, keep both where git moved them",
+            none,
+            l_theirs,
+            sub_l,
+            &|s, h2| {
+                let main = s.git(&["rev-parse", &format!("origin/{}", s.base)]);
+                put(s, "120000", &blob(s, h2, "l"), &made_up("l", h2));
+                gitlink(s, &made_up("l", &main), SUB_C);
+            },
+            Some(Shape("its parents put a symlink and a submodule at \"l\"")),
+        ),
+        (
+            "a content conflict resolved at its path",
+            none,
+            none,
+            shared_theirs,
+            resolved,
+            None,
+        ),
+        (
+            "a binary content conflict resolved at its path",
+            bin_base,
+            bin_ours,
+            bin_theirs,
+            &|s, _| put_file(s, "bin", "a\0both\n"),
+            None,
+        ),
+        (
+            "a content conflict and a change to a file git merged cleanly",
+            auto_base,
+            auto_ours,
+            auto_theirs,
+            &|s, h2| {
+                resolve_shared(s, h2);
+                put_file(s, "auto.txt", "one\n2\n3\n4\n5\n6\n7\nchanged\n");
+            },
+            Some(Beyond(&["auto.txt"])),
+        ),
+        (
+            "a content conflict resolved at a path that differs only in case",
+            none,
+            none,
+            shared_theirs,
+            &|s, _| {
+                unlink(s, "shared.txt");
+                put_file(s, "Shared.txt", "feature and main\n");
+            },
+            Some(Beyond(&["Shared.txt"])),
+        ),
+        (
+            "a content conflict and a file the merge adds",
+            none,
+            none,
+            shared_theirs,
+            &|s, h2| {
+                resolve_shared(s, h2);
+                put_file(s, "evil.txt", "beyond\n");
+            },
+            Some(Beyond(&["evil.txt"])),
+        ),
+        (
+            "a content conflict and a file neither parent changed",
+            kept_base,
+            none,
+            shared_theirs,
+            &|s, h2| {
+                resolve_shared(s, h2);
+                put_file(s, "kept.txt", "changed\n");
+            },
+            Some(Beyond(&["kept.txt"])),
+        ),
+        (
+            "a submodule both parents set to different commits",
+            sub_base,
+            sub_ours,
+            sub_theirs,
+            &|s, _| gitlink(s, "sub", SUB_C),
+            Some(History),
+        ),
+    ];
+    for (name, base, ours, theirs, resolve, refused) in rows {
+        let (s, merge) = conflict_merge(&host, base, ours, theirs, resolve);
+        let h2 = s.git(&["rev-parse", &format!("{merge}^1")]);
+        let main = s.git(&["rev-parse", &format!("{merge}^2")]);
+        match refused {
+            None => {
+                for reviewer in ["claude", "astra"] {
+                    let recorded =
+                        record_env(&s, None, &[], s.c.repo.as_os_str(), reviewer, &merge);
+                    assert!(
+                        recorded.status.success(),
+                        "{name}, {reviewer}: {recorded:?}"
+                    );
+                }
+                let merged = offline_merge(&s, &merge, &s.c.repo);
+                assert!(merged.status.success(), "{name}: {merged:?}");
+            }
+            Some(refused) => {
+                let says = refused.says(&h2, &main);
+                let record = record_claude_resolution(&s, &merge);
+                assert_eq!(record.status.code(), Some(1), "{name}: {record:?}");
+                hand_written_resolutions(&s, &merge);
+                let walked = offline_merge(&s, &merge, &s.c.repo);
+                assert_eq!(walked.status.code(), Some(1), "{name}: {walked:?}");
+                for (at, out) in [("record", &record), ("walk", &walked)] {
+                    let out = String::from_utf8_lossy(&out.stdout);
+                    for part in &says {
+                        assert!(
+                            out.contains(part.as_str()),
+                            "{name} at {at}: {part} in {out}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn shallow_clone(s: &Scratch, name: &str, feature_depth: &str, main_depth: &str) -> PathBuf {
+    s.git(&["push", "-q", "-f", "origin", "feature"]);
+    let origin = format!("file://{}", s.git(&["remote", "get-url", "origin"]));
+    let clone = s.home.join(name);
+    let cloned = scratch_git(
+        &s.home,
+        &s.home,
+        &[
+            "clone",
+            "-q",
+            "--depth",
+            feature_depth,
+            "-b",
+            "feature",
+            &origin,
+            clone.to_str().unwrap(),
+        ],
+    );
+    assert!(cloned.status.success(), "{cloned:?}");
+    let main = format!("{0}:refs/remotes/origin/{0}", s.base);
+    for args in [
+        vec![
+            "fetch",
+            "-q",
+            "--depth",
+            main_depth,
+            "origin",
+            main.as_str(),
+        ],
+        vec!["remote", "set-head", "origin", s.base.as_str()],
+    ] {
+        let done = scratch_git(&s.home, &clone, &args);
+        assert!(done.status.success(), "{args:?}: {done:?}");
+    }
+    assert!(clone.join(".git/shallow").exists());
+    clone
+}
+
+fn shallow_history(host: &Fake, second: Option<&str>) -> (Scratch, String, PathBuf) {
+    let s = Scratch::new(host);
+    s.on_main("m.txt", "one\n");
+    let reviewed = s.merge_main(None);
+    s.astra(host, &reviewed, "reviewed", "ACCEPT");
+    claude_accept(host, &s.c, &reviewed);
+    match second {
+        None => s.on_main("m.txt", "two\n"),
+        Some(_) => s.on_main("shared.txt", "main\n"),
+    }
+    let merge = s.merge_main(second);
+    let shallow = shallow_clone(&s, "shallow", "3", "2");
+    let first = s.git(&["rev-parse", &format!("{}^", s.h1)]);
+    let mut boundary: Vec<String> = fs::read_to_string(shallow.join(".git/shallow"))
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    boundary.sort();
+    let mut want = vec![
+        s.h1.clone(),
+        s.git(&["rev-parse", &format!("{reviewed}^2")]),
+    ];
+    want.sort();
+    assert_eq!(boundary, want);
+    assert!(!present(&shallow, &s.home, &first));
+    (s, merge, shallow)
+}
+
+#[test]
+fn a_shallow_checkout_is_read_in_the_scratch_repository_within_its_boundary() {
+    let host = at("2026-11-25T06:00:00Z");
+    let (s, clean, shallow) = shallow_history(&host, None);
+    let shown = scratch_git(
+        &s.home,
+        &shallow,
+        &["show", "--remerge-diff", "--format=", &clean],
+    );
+    assert!(
+        shown.status.success() && shown.stdout.is_empty(),
+        "{shown:?}"
+    );
+    let waived = offline_merge(&s, &clean, &shallow);
+    assert!(waived.status.success(), "{waived:?}");
+
+    let (s, merge, shallow) = shallow_history(&host, Some("feature and main\n"));
+    let above = shallow_base(&merge, &s.h1);
+    let recorded = record_env(&s, None, &[], shallow.as_os_str(), "claude", &merge);
+    assert_eq!(recorded.status.code(), Some(1), "{recorded:?}");
+    assert!(
+        String::from_utf8_lossy(&recorded.stdout).contains(&above),
+        "{recorded:?}"
+    );
+    hand_written_resolutions(&s, &merge);
+    let walked = offline_merge(&s, &merge, &shallow);
+    assert_eq!(walked.status.code(), Some(1), "{walked:?}");
+    assert!(
+        String::from_utf8_lossy(&walked.stdout).contains(&above),
+        "{walked:?}"
+    );
+
+    let (s, merge, _) = shallow_history(&host, Some("feature and main\n"));
+    let deeper = shallow_clone(&s, "deeper", "4", "2");
+    for reviewer in ["claude", "astra"] {
+        let recorded = record_env(&s, None, &[], deeper.as_os_str(), reviewer, &merge);
+        assert!(recorded.status.success(), "{reviewer}: {recorded:?}");
+    }
+    let merged = offline_merge(&s, &merge, &deeper);
+    assert!(merged.status.success(), "{merged:?}");
+
+    let (s, clean, shallow) = shallow_history(&host, None);
+    faulty_git(&s, &s.home, Fault::Boundary);
+    let refused = offline_merge(&s, &clean, &shallow);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let said = String::from_utf8_lossy(&refused.stdout);
+    assert!(
+        said.contains(&format!(
+            "reading {}'s merge in the scratch repository {}/cm-gate-",
+            &clean[..12],
+            s.home.display()
+        )) && said.contains("failed: fatal: injected rev-list"),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn a_shallow_file_the_scratch_repository_cannot_take_moves_it_to_tmp_and_stops_the_gate_only_where_both_fail()
+ {
+    let host = at("2026-11-25T06:00:00Z");
+    for fault in [Fault::TempShallow, Fault::EveryShallow] {
+        let (s, clean, shallow) = shallow_history(&host, None);
+        let temp = s.home.join("temp");
+        fs::create_dir_all(&temp).unwrap();
+        faulty_git(&s, &temp, fault);
+        let env = [("TMPDIR", temp.to_str().unwrap())];
+        let waived = offline_merge_env(&s, None, &env, &clean, shallow.as_os_str());
+        if fault == Fault::TempShallow {
+            assert!(waived.status.success(), "{waived:?}");
+        } else {
+            assert_eq!(waived.status.code(), Some(1), "{waived:?}");
+            let said = String::from_utf8_lossy(&waived.stdout);
+            assert!(
+                said.contains(&format!(
+                    "no scratch repository for reading the merges can be made in {} (File exists (os error 17)) or /tmp (File exists (os error 17)); set TMPDIR to a writable directory",
+                    temp.display()
+                )),
+                "{waived:?}"
+            );
+        }
+        assert_eq!(fs::read_dir(&temp).unwrap().count(), 0, "{fault:?}");
+    }
+}
+
+fn present(repo: &Path, home: &Path, commit: &str) -> bool {
+    scratch_git(
+        home,
+        repo,
+        &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+    )
+    .status
+    .success()
+}
+
+#[test]
+fn the_scratch_repository_stops_at_a_shallow_entry_with_a_missing_parent_and_reads_past_one_whose_parents_are_all_there()
+ {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("m.txt", "one\n");
+    let cut = s.merge_main(None);
+    s.on_main("m.txt", "two\n");
+    let reviewed = s.merge_main(None);
+    s.astra(&host, &reviewed, "reviewed", "ACCEPT");
+    claude_accept(&host, &s.c, &reviewed);
+    s.on_main("m.txt", "three\n");
+    let clean = s.merge_main(None);
+    // The feature clone's depth cuts `cut` from h1; main's deeper fetch brings its main parent.
+    let shallow = shallow_clone(&s, "kept", "3", "4");
+    let boundary = fs::read_to_string(shallow.join(".git/shallow")).unwrap();
+    assert!(boundary.lines().any(|entry| entry == cut), "{boundary}");
+    let main_parent = s.git(&["rev-parse", &format!("{cut}^2")]);
+    assert!(present(&shallow, &s.home, &main_parent));
+    assert!(!present(&shallow, &s.home, &s.h1));
+    let waived = offline_merge(&s, &clean, &shallow);
+    assert!(waived.status.success(), "{waived:?}");
+
+    let s = Scratch::new(&host);
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    // Main's deeper fetch brings h1's parent, and h1 stays listed.
+    let shallow = shallow_clone(&s, "past", "2", "3");
+    let boundary = fs::read_to_string(shallow.join(".git/shallow")).unwrap();
+    assert_eq!(boundary, format!("{}\n", s.h1));
+    let first = s.git(&["rev-parse", &format!("{}^", s.h1)]);
+    assert!(present(&shallow, &s.home, &first));
+    let main = s.git(&["rev-parse", &s.base]);
+    let in_checkout = scratch_git(&s.home, &shallow, &["merge-base", "--all", &s.h1, &main]);
+    assert!(
+        in_checkout.status.code() == Some(1) && in_checkout.stdout.is_empty(),
+        "{in_checkout:?}"
+    );
+    let waived = offline_merge(&s, &clean, &shallow);
+    assert!(waived.status.success(), "{waived:?}");
+}
+
+#[test]
+fn a_shallow_checkout_that_cuts_a_criss_cross_merge_above_its_merge_base_is_no_resolution() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    let before = s.git(&["rev-parse", &s.base]);
+    s.on_main("p.txt", "p\n");
+    s.merge_main(None);
+    s.reviewed(&host, "taken");
+    s.commit("c1.txt", "c1\n");
+    s.git(&["checkout", "-q", "-b", "side", &before]);
+    s.commit("s1.txt", "s1\n");
+    s.git(&["checkout", "-q", "feature"]);
+    s.git(&["merge", "-q", "--no-edit", "side"]);
+    s.commit("c3.txt", "c3\n");
+    s.reviewed(&host, "c3");
+    s.on_main_with(|s| {
+        s.git(&["rm", "-q", "p.txt"]);
+    });
+    s.git(&["checkout", "-q", &s.base]);
+    s.git(&["merge", "-q", "--no-edit", "side"]);
+    s.git(&["push", "-q", "origin", &s.base]);
+    s.git(&["checkout", "-q", "feature"]);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let shallow = shallow_clone(&s, "criss-cross", "4", "3");
+    let boundary = fs::read_to_string(shallow.join(".git/shallow")).unwrap();
+    let says = |out: &std::process::Output| {
+        let out = String::from_utf8_lossy(&out.stdout);
+        boundary
+            .lines()
+            .any(|entry| out.contains(&shallow_base(&merge, entry)))
+    };
+    let recorded = record_env(&s, None, &[], shallow.as_os_str(), "claude", &merge);
+    assert_eq!(recorded.status.code(), Some(1), "{recorded:?}");
+    assert!(says(&recorded), "{boundary} {recorded:?}");
+    hand_written_resolutions(&s, &merge);
+    let walked = offline_merge(&s, &merge, &shallow);
+    assert_eq!(walked.status.code(), Some(1), "{walked:?}");
+    assert!(says(&walked), "{boundary} {walked:?}");
+    let merged = offline_merge(&s, &merge, &s.c.repo);
+    assert!(merged.status.success(), "{merged:?}");
+}
+
+fn shallow_base(merge: &str, shallow: &str) -> String {
+    format!(
+        "{}'s parents reach the checkout's shallow boundary at {} above their merge base",
+        &merge[..12],
+        &shallow[..12]
+    )
+}
+
+fn no_merge_base(merge: &str) -> String {
+    format!(
+        "{}'s parents have no merge base in the history the checkout holds, so it is no conflict resolution a resolution review can cover",
+        &merge[..12]
+    )
+}
+
+#[test]
+fn a_merge_whose_parents_have_no_merge_base_in_the_scratch_repository_is_waived_when_clean_and_no_resolution()
+ {
+    let host = at("2026-11-25T06:00:00Z");
+    let refused = |out: &std::process::Output, merge: &str| {
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(&no_merge_base(merge)),
+            "{out:?}"
+        );
+    };
+    let s = Scratch::new(&host);
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    let cut = shallow_clone(&s, "cut", "2", "1");
+    let shown = scratch_git(
+        &s.home,
+        &cut,
+        &["show", "--remerge-diff", "--format=", &clean],
+    );
+    assert!(
+        shown.status.success() && shown.stdout.is_empty(),
+        "{shown:?}"
+    );
+    let waived = offline_merge(&s, &clean, &cut);
+    assert!(waived.status.success(), "{waived:?}");
+
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let cut = shallow_clone(&s, "cut", "2", "1");
+    refused(
+        &record_env(&s, None, &[], cut.as_os_str(), "claude", &merge),
+        &merge,
+    );
+    hand_written_resolutions(&s, &merge);
+    refused(&offline_merge(&s, &merge, &cut), &merge);
+}
+
+fn reverting_merge(host: &Fake, conflicted: bool) -> (Scratch, String) {
+    let s = Scratch::new(host);
+    s.on_main("x.txt", "before\n");
+    let before = s.git(&["rev-parse", &s.base]);
+    s.on_main("x.txt", "changed\n");
+    let taken = s.merge_main(None);
+    s.astra(host, &taken, "taken", "ACCEPT");
+    claude_accept(host, &s.c, &taken);
+    s.on_main("x.txt", "before\n");
+    let revert = s.git(&["rev-parse", &s.base]);
+    s.git(&["checkout", "-q", "-b", "side", &before]);
+    s.commit("h.txt", "side\n");
+    if conflicted {
+        s.commit("shared.txt", "main\n");
+    }
+    s.git(&["checkout", "-q", &s.base]);
+    s.git(&["merge", "-q", "--no-edit", "side"]);
+    s.git(&["push", "-q", "origin", &s.base]);
+    s.git(&["checkout", "-q", "feature"]);
+    let main = format!("origin/{}", s.base);
+    let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-commit", &main]);
+    assert_eq!(merged.status.success(), !conflicted, "{merged:?}");
+    fs::write(s.c.repo.join("x.txt"), "changed\n").unwrap();
+    if conflicted {
+        fs::write(s.c.repo.join("shared.txt"), "feature and main\n").unwrap();
+    }
+    s.git(&["add", "x.txt", "shared.txt"]);
+    s.git(&["commit", "-q", "--no-edit"]);
+    let merge = s.head();
+    fs::write(s.c.repo.join(".git/shallow"), format!("{revert}\n")).unwrap();
+    let shown = scratch_git(
+        &s.home,
+        &s.c.repo,
+        &["show", "--remerge-diff", "--format=", &merge, "--", "x.txt"],
+    );
+    assert!(
+        shown.status.success() && shown.stdout.is_empty(),
+        "the checkout's own read takes the older merge base: {shown:?}"
+    );
+    (s, merge)
+}
+
+#[test]
+fn a_shallow_entry_over_parents_the_checkout_holds_moves_no_merge_base_of_the_waiver_record_or_walk()
+ {
+    let host = at("2026-11-25T06:00:00Z");
+    let (s, merge) = reverting_merge(&host, false);
+    let waived = offline_merge(&s, &merge, &s.c.repo);
+    assert_eq!(waived.status.code(), Some(1), "{waived:?}");
+    assert!(
+        String::from_utf8_lossy(&waived.stdout).contains(&format!(
+            "{} resolved merge conflicts; it needs its own review",
+            &merge[..12]
+        )),
+        "{waived:?}"
+    );
+
+    let (s, merge) = reverting_merge(&host, true);
+    let recorded = record_claude_resolution(&s, &merge);
+    assert_eq!(recorded.status.code(), Some(1), "{recorded:?}");
+    let said = String::from_utf8_lossy(&recorded.stdout);
+    assert!(
+        said.contains("is no conflict resolution a resolution review can cover")
+            && said.contains("x.txt"),
+        "{recorded:?}"
+    );
+    hand_written_resolutions(&s, &merge);
+    let walked = offline_merge(&s, &merge, &s.c.repo);
+    assert_eq!(walked.status.code(), Some(1), "{walked:?}");
+    let said = String::from_utf8_lossy(&walked.stdout);
+    assert!(
+        said.contains(&format!(
+            "{}'s resolution reviews do not clear it",
+            &merge[..12]
+        )) && said.contains("x.txt"),
+        "{walked:?}"
+    );
+}
+
+#[test]
+fn a_shallow_file_the_gate_cannot_read_or_whose_line_is_not_exactly_an_object_id_stops_it_as_unreadable()
+ {
+    let host = at("2026-11-25T06:00:00Z");
+    for listed in ["a directory", "an id and a digit"] {
+        let s = Scratch::new(&host);
+        s.on_main("other.txt", "main\n");
+        let clean = s.merge_main(None);
+        let shallow = s.c.repo.join(".git/shallow");
+        match listed {
+            "a directory" => fs::create_dir(&shallow).unwrap(),
+            _ => fs::write(&shallow, format!("{}0\n", s.h1)).unwrap(),
+        }
+        // git reads a directory as no boundary, and a line as the id it starts with.
+        let shown = scratch_git(
+            &s.home,
+            &s.c.repo,
+            &["show", "--remerge-diff", "--format=", &clean],
+        );
+        assert!(
+            shown.status.success() && shown.stdout.is_empty(),
+            "{listed}: {shown:?}"
+        );
+        let waived = offline_merge(&s, &clean, &s.c.repo);
+        assert_eq!(waived.status.code(), Some(1), "{listed}: {waived:?}");
+        assert!(
+            String::from_utf8_lossy(&waived.stdout).contains(&format!(
+                "cannot read {} in {}",
+                &clean[..12],
+                s.c.repo.display()
+            )),
+            "{listed}: {waived:?}"
+        );
+    }
+}
+
+#[test]
+fn an_error_git_prints_about_the_checkouts_own_objects_stops_a_clean_update_in_the_scratch_repository()
+ {
+    let host = at("2026-11-25T06:00:00Z");
+    for fault in ["alternate", "pack index"] {
+        let s = Scratch::new(&host);
+        s.on_main("other.txt", "main\n");
+        let clean = s.merge_main(None);
+        let objects = s.c.repo.join(".git/objects");
+        if fault == "alternate" {
+            let gone = s.home.join("gone").join("objects");
+            fs::write(
+                objects.join("info").join("alternates"),
+                format!("{}\n", gone.display()),
+            )
+            .unwrap();
+        } else {
+            let pack = objects
+                .join("pack")
+                .join(format!("pack-{}", "0".repeat(40)));
+            for extension in ["idx", "pack"] {
+                fs::write(pack.with_extension(extension), "garbage").unwrap();
+            }
+        }
+        let shown = scratch_git(
+            &s.home,
+            &s.c.repo,
+            &["show", "--remerge-diff", "--format=", &clean],
+        );
+        assert!(
+            shown.status.success()
+                && shown.stdout.is_empty()
+                && String::from_utf8_lossy(&shown.stderr).starts_with("error: "),
+            "{fault}: {shown:?}"
+        );
+        let waived = offline_merge(&s, &clean, &s.c.repo);
+        assert_eq!(waived.status.code(), Some(1), "{fault}: {waived:?}");
+        let said = String::from_utf8_lossy(&waived.stdout);
+        assert!(
+            said.contains(&format!(
+                "reading {}'s merge in the scratch repository ",
+                &clean[..12]
+            )) && said.contains(" failed: error: "),
+            "{fault}: {waived:?}"
+        );
+    }
+}
+
+fn real_git() -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("git"))
+        .find(|git| git.is_file())
+        .unwrap()
+}
+
+fn shell_quoted(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Fault {
+    TempIsAFile,
+    TempInit,
+    TempAlternates,
+    EveryInit,
+    MergeTree,
+    TreeDiff,
+    Bases,
+    SilentBases,
+    Boundary,
+    WaiverRead,
+    QuietTreeDiff,
+    QuietWaiverRead,
+    WarnedWaiverRead,
+    UnreadTree,
+    OddTreeDiff,
+    TrailingRecord,
+    UnknownRecord,
+    TempShallow,
+    EveryShallow,
+}
+
+// A `git` first on cm's PATH that fails one step of the scratch repository's setup or use; the
+// scratch repository's commands reach it through PATH and are told apart by their GIT_DIR.
+fn faulty_git(s: &Scratch, temp: &Path, fault: Fault) {
+    let git = shell_quoted(&real_git());
+    let under_temp = format!("{}/cm-gate-*", shell_quoted(temp));
+    let fail = |step: &str| format!("echo 'fatal: injected {step}' >&2; exit 128");
+    let quiet = |said: &str, step: &str| format!("echo '{said}: injected {step}' >&2; exit 0");
+    let then = |printed: &str| format!("{git} \"$@\"; status=$?; printf '{printed}'; exit $status");
+    let unknown = "1\\0shared.txt\\0CONFLICT (unheard of)\\0a type no git prints\\n\\0";
+    let (pattern, action) = match fault {
+        Fault::TempIsAFile => return,
+        Fault::TempInit => (format!("{under_temp}'|init'"), fail("init")),
+        Fault::TempAlternates => (
+            format!("{under_temp}'|init'"),
+            format!("{git} \"$@\" && mkdir \"$GIT_DIR/objects/info/alternates\"; exit $?"),
+        ),
+        Fault::EveryInit => ("*/cm-gate-*'|init'".to_owned(), fail("init")),
+        Fault::MergeTree => ("*/cm-gate-*'|merge-tree'".to_owned(), fail("merge-tree")),
+        Fault::TreeDiff => ("*/cm-gate-*'|diff-tree'".to_owned(), fail("diff-tree")),
+        Fault::Bases => ("*/cm-gate-*'|merge-base'".to_owned(), fail("merge-base")),
+        Fault::SilentBases => ("*/cm-gate-*'|merge-base'".to_owned(), "exit 3".to_owned()),
+        Fault::Boundary => ("*/cm-gate-*'|rev-list'".to_owned(), fail("rev-list")),
+        Fault::WaiverRead => ("*/cm-gate-*'|show'".to_owned(), fail("show")),
+        Fault::QuietTreeDiff => (
+            "*/cm-gate-*'|diff-tree'".to_owned(),
+            quiet("fatal", "diff-tree"),
+        ),
+        Fault::QuietWaiverRead => ("*/cm-gate-*'|show'".to_owned(), quiet("error", "show")),
+        Fault::WarnedWaiverRead => (
+            "*/cm-gate-*'|show'".to_owned(),
+            format!(
+                "echo 'warning: injected show' >&2; echo 'hint: an error: past the start' >&2; exec {git} \"$@\""
+            ),
+        ),
+        Fault::UnreadTree => (
+            "*/cm-gate-*'|merge-tree'".to_owned(),
+            format!("printf g; exec {git} \"$@\""),
+        ),
+        Fault::OddTreeDiff => ("*/cm-gate-*'|diff-tree'".to_owned(), then("M\\0")),
+        Fault::TrailingRecord => (
+            "*/cm-gate-*'|merge-tree'".to_owned(),
+            then(&format!("\\0{unknown}")),
+        ),
+        Fault::UnknownRecord => ("*/cm-gate-*'|merge-tree'".to_owned(), then(unknown)),
+        Fault::TempShallow => (
+            format!("{under_temp}'|init'"),
+            format!("{git} \"$@\" && mkdir \"$GIT_DIR/shallow\"; exit $?"),
+        ),
+        Fault::EveryShallow => (
+            "*/cm-gate-*'|init'".to_owned(),
+            format!("{git} \"$@\" && mkdir \"$GIT_DIR/shallow\"; exit $?"),
+        ),
+    };
+    let bin = s.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    support::write_executable(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\ncase \"${{GIT_DIR-}}|$5\" in\n{pattern}) {action} ;;\nesac\nexec {git} \"$@\"\n"
+        ),
+    );
+}
+
+#[test]
+fn each_step_of_the_scratch_repository_fails_its_parent_or_names_the_scratch_repository() {
+    use Fault::*;
+    let host = at("2026-11-25T06:00:00Z");
+    let gate = |fault: Fault| {
+        let s = Scratch::new(&host);
+        let temp = if fault == TempIsAFile {
+            let file = s.home.join("temp-file");
+            fs::write(&file, "not a directory\n").unwrap();
+            file
+        } else {
+            let dir = s.home.join("temp");
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        faulty_git(&s, &temp, fault);
+        (s, temp)
+    };
+    for fault in [
+        TempIsAFile,
+        TempInit,
+        TempAlternates,
+        EveryInit,
+        MergeTree,
+        TreeDiff,
+        Bases,
+        SilentBases,
+        Boundary,
+        WaiverRead,
+        QuietTreeDiff,
+        QuietWaiverRead,
+        WarnedWaiverRead,
+    ] {
+        let (s, temp) = gate(fault);
+        let env = [("TMPDIR", temp.to_str().unwrap())];
+        let no_scratch = format!(
+            "no scratch repository for reading the merges can be made in {} (fatal: injected init) or /tmp (fatal: injected init); set TMPDIR to a writable directory",
+            temp.display()
+        );
+        let in_scratch = |step: &str, merge: &str| {
+            vec![
+                format!(
+                    "reading {}'s merge in the scratch repository {}/cm-gate-",
+                    &merge[..12],
+                    temp.display()
+                ),
+                format!("failed: fatal: injected {step}"),
+            ]
+        };
+        let silent = |merge: &str| {
+            let mut says = in_scratch("merge-base", merge);
+            says[1] = "failed: git exit status: 3".to_owned();
+            says
+        };
+        let refused_with = |out: &std::process::Output, why: &[String]| {
+            assert_eq!(out.status.code(), Some(1), "{fault:?}: {out:?}");
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(!text.contains("cannot read"), "{fault:?}: {text}");
+            for part in why {
+                assert!(text.contains(part.as_str()), "{fault:?}: {part} in {text}");
+            }
+        };
+
+        s.on_main("shared.txt", "main\n");
+        let merge = s.merge_main(Some("feature and main\n"));
+        // A full checkout lists no shallow entry, so no boundary is read.
+        let at_record_and_walk = match fault {
+            TempIsAFile | TempInit | TempAlternates | WaiverRead | QuietWaiverRead
+            | WarnedWaiverRead | Boundary => None,
+            EveryInit => Some(vec![no_scratch.clone()]),
+            MergeTree => Some(in_scratch("merge-tree", &merge)),
+            TreeDiff | QuietTreeDiff => Some(in_scratch("diff-tree", &merge)),
+            UnreadTree | OddTreeDiff | TrailingRecord | UnknownRecord | TempShallow
+            | EveryShallow => unreachable!(),
+            Bases => Some(in_scratch("merge-base", &merge)),
+            SilentBases => Some(silent(&merge)),
+        };
+        match &at_record_and_walk {
+            None => {
+                for reviewer in ["claude", "astra"] {
+                    let recorded =
+                        record_env(&s, None, &env, s.c.repo.as_os_str(), reviewer, &merge);
+                    assert!(
+                        recorded.status.success(),
+                        "{fault:?} {reviewer}: {recorded:?}"
+                    );
+                }
+                let merged = offline_merge_env(&s, None, &env, &merge, s.c.repo.as_os_str());
+                assert!(merged.status.success(), "{fault:?}: {merged:?}");
+            }
+            Some(why) => {
+                let recorded = record_env(&s, None, &env, s.c.repo.as_os_str(), "claude", &merge);
+                refused_with(&recorded, why);
+                hand_written_resolutions(&s, &merge);
+                let walked = offline_merge_env(&s, None, &env, &merge, s.c.repo.as_os_str());
+                refused_with(&walked, why);
+            }
+        }
+
+        let (s, other) = gate(fault);
+        let env = [("TMPDIR", other.to_str().unwrap())];
+        let no_scratch = no_scratch.replace(temp.to_str().unwrap(), other.to_str().unwrap());
+        let moved = |parts: Vec<String>| {
+            parts
+                .into_iter()
+                .map(|part| part.replace(temp.to_str().unwrap(), other.to_str().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let in_scratch = |step: &str, merge: &str| moved(in_scratch(step, merge));
+        s.on_main("other.txt", "main\n");
+        let clean = s.merge_main(None);
+        let waived = offline_merge_env(&s, None, &env, &clean, s.c.repo.as_os_str());
+        match fault {
+            TempIsAFile | TempInit | TempAlternates | MergeTree | TreeDiff | QuietTreeDiff
+            | WarnedWaiverRead | Boundary | Bases | SilentBases => {
+                assert!(waived.status.success(), "{fault:?}: {waived:?}");
+            }
+            UnreadTree | OddTreeDiff | TrailingRecord | UnknownRecord | TempShallow
+            | EveryShallow => unreachable!(),
+            EveryInit => refused_with(&waived, std::slice::from_ref(&no_scratch)),
+            WaiverRead => refused_with(&waived, &in_scratch("show", &clean)),
+            QuietWaiverRead => {
+                let mut says = in_scratch("show", &clean);
+                says[1] = "failed: error: injected show".to_owned();
+                refused_with(&waived, &says);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_scratch_listing_cm_cannot_read_or_a_record_of_a_type_it_does_not_know_stops_the_gate() {
+    use Fault::*;
+    let host = at("2026-11-25T06:00:00Z");
+    for fault in [UnreadTree, OddTreeDiff, TrailingRecord, UnknownRecord] {
+        let s = Scratch::new(&host);
+        let temp = s.home.join("temp");
+        fs::create_dir_all(&temp).unwrap();
+        faulty_git(&s, &temp, fault);
+        let env = [("TMPDIR", temp.to_str().unwrap())];
+        s.on_main("shared.txt", "main\n");
+        let merge = s.merge_main(Some("feature and main\n"));
+        let unread = |step: &str| {
+            vec![
+                format!(
+                    "reading {}'s merge in the scratch repository {}/cm-gate-",
+                    &merge[..12],
+                    temp.display()
+                ),
+                format!("failed: git {step} listed an entry cm cannot read"),
+            ]
+        };
+        let says = match fault {
+            UnreadTree | TrailingRecord => unread("merge-tree"),
+            OddTreeDiff => unread("diff-tree"),
+            _ => vec![
+                "git's merge of its parents reports a message of a type cm does not read, \"CONFLICT (unheard of)\""
+                    .to_owned(),
+            ],
+        };
+        let recorded = record_env(&s, None, &env, s.c.repo.as_os_str(), "claude", &merge);
+        hand_written_resolutions(&s, &merge);
+        let walked = offline_merge_env(&s, None, &env, &merge, s.c.repo.as_os_str());
+        for (at, out) in [("record", &recorded), ("walk", &walked)] {
+            assert_eq!(out.status.code(), Some(1), "{fault:?} at {at}: {out:?}");
+            let text = String::from_utf8_lossy(&out.stdout);
+            for part in &says {
+                assert!(
+                    text.contains(part.as_str()),
+                    "{fault:?} at {at}: {part} in {text}"
+                );
+            }
+        }
+    }
+}
+
+fn mktree(s: &Scratch, entries: &str) -> String {
+    use std::io::Write;
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(&s.c.repo)
+        .arg("mktree")
+        .env("HOME", &s.home)
+        .env("GIT_CONFIG_GLOBAL", s.home.join("gitconfig"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(entries.as_bytes())
+        .unwrap();
+    let made = child.wait_with_output().unwrap();
+    assert!(made.status.success(), "{made:?}");
+    String::from_utf8(made.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
+fn beneath_an_entry_put_back_in_place_of_a_directory_only_the_directorys_deletions_pass() {
+    let host = at("2026-11-25T06:00:00Z");
+    let (s, merge) = conflict_merge(
+        &host,
+        &|s| put_file(s, "x", "a file\n"),
+        &|s| put_file(s, "x", "ours\n"),
+        &|s| {
+            s.git(&["rm", "-q", "x"]);
+            put_file(s, "x/inner.txt", "a directory\n");
+        },
+        &keep_ours_x,
+    );
+    fs::write(s.home.join("edited.txt"), "edited\n").unwrap();
+    let edited = s.git(&[
+        "hash-object",
+        "-w",
+        s.home.join("edited.txt").to_str().unwrap(),
+    ]);
+    let beneath = mktree(&s, &format!("100644 blob {edited}\tinner.txt\n"));
+    let root = s.git(&["ls-tree", &merge]);
+    let both = mktree(&s, &format!("{root}\n040000 tree {beneath}\tx\n"));
+    let crafted = s.git(&[
+        "commit-tree",
+        &both,
+        "-p",
+        &format!("{merge}^1"),
+        "-p",
+        &format!("{merge}^2"),
+        "-m",
+        "the file and a changed directory",
+    ]);
+    s.git(&["update-ref", "HEAD", &crafted]);
+    let says = Refused::Beyond(&["x/inner.txt"]).says("", "");
+    let record = record_claude_resolution(&s, &crafted);
+    hand_written_resolutions(&s, &crafted);
+    let walked = offline_merge(&s, &crafted, &s.c.repo);
+    for (at, out) in [("record", &record), ("walk", &walked)] {
+        assert_eq!(out.status.code(), Some(1), "{at}: {out:?}");
+        let text = String::from_utf8_lossy(&out.stdout);
+        for part in &says {
+            assert!(text.contains(part.as_str()), "{at}: {part} in {text}");
+        }
+    }
+}
+
+const REDIRECTING: [&str; 9] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_SHALLOW_FILE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_INDEX_FILE",
+    "GIT_TEST_ANYTHING",
+];
+
+// A `git` first on cm's PATH that logs each command with the redirecting variables it was given.
+fn redirect_logging_git(s: &Scratch) -> PathBuf {
+    let log = s.home.join("redirects.log");
+    let bin = s.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    support::write_executable(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\n{{ printf '%s' \"$*\"; for name in {}; do eval \"[ -n \\\"\\${{$name+x}}\\\" ]\" && printf '\\t%s' \"$name\"; done; printf '\\n'; }} >> {}\nexec {} \"$@\"\n",
+            REDIRECTING.join(" "),
+            shell_quoted(&log),
+            shell_quoted(&real_git())
+        ),
+    );
+    log
+}
+
+fn mirror_of(s: &Scratch, name: &str) -> PathBuf {
+    let mirror = s.home.join(name);
+    let cloned = scratch_git(
+        &s.home,
+        &s.home,
+        &[
+            "clone",
+            "-q",
+            "--mirror",
+            s.c.repo.to_str().unwrap(),
+            mirror.to_str().unwrap(),
+        ],
+    );
+    assert!(cloned.status.success(), "{cloned:?}");
+    mirror
+}
+
+#[test]
+fn no_redirecting_variable_reaches_a_checkout_read_of_the_gate() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let log = redirect_logging_git(&s);
+    let mirror = mirror_of(&s, "mirror.git");
+    let objects = mirror.join("objects");
+    let shallow = s.home.join("shallow");
+    fs::write(&shallow, "").unwrap();
+    let index = s.home.join("index");
+    let values = [
+        mirror.to_str().unwrap(),
+        s.c.repo.to_str().unwrap(),
+        mirror.to_str().unwrap(),
+        objects.to_str().unwrap(),
+        objects.to_str().unwrap(),
+        shallow.to_str().unwrap(),
+        "refs/elsewhere/",
+        index.to_str().unwrap(),
+        "1",
+    ];
+    let env: Vec<(&str, &str)> = REDIRECTING.into_iter().zip(values).collect();
+    for reviewer in ["claude", "astra"] {
+        let recorded = record_env(&s, None, &env, s.c.repo.as_os_str(), reviewer, &merge);
+        assert!(recorded.status.success(), "{reviewer}: {recorded:?}");
+    }
+    let merged = offline_merge_env(&s, None, &env, &merge, s.c.repo.as_os_str());
+    assert!(merged.status.success(), "{merged:?}");
+    let reads: Vec<String> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("core.commitGraph=false") && line.contains(" -C "))
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        reads
+            .iter()
+            .any(|read| read.contains("merge-base --is-ancestor")),
+        "{reads:#?}"
+    );
+    for read in &reads {
+        assert!(
+            !read.contains('\t'),
+            "a redirecting variable reached {read}"
+        );
+    }
+}
+
+#[test]
+fn a_shallow_file_common_dir_or_object_directory_in_the_environment_moves_no_read_of_the_gate() {
+    let host = at("2026-11-25T06:00:00Z");
+
+    let s = Scratch::new(&host);
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    let shallow = s.home.join("shallow");
+    fs::write(&shallow, format!("{clean}\n")).unwrap();
+    let env = [("GIT_SHALLOW_FILE", shallow.to_str().unwrap())];
+    let waived = offline_merge_env(&s, None, &env, &clean, s.c.repo.as_os_str());
+    assert!(waived.status.success(), "GIT_SHALLOW_FILE: {waived:?}");
+
+    // Both take objects from the empty repository, so a read that kept either would miss the merge.
+    for name in ["GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"] {
+        let s = Scratch::new(&host);
+        s.on_main("shared.txt", "main\n");
+        let merge = s.merge_main(Some("feature and main\n"));
+        let empty = s.home.join("empty.git");
+        let made = scratch_git(
+            &s.home,
+            &s.home,
+            &["init", "-q", "--bare", empty.to_str().unwrap()],
+        );
+        assert!(made.status.success(), "{made:?}");
+        let value = if name == "GIT_COMMON_DIR" {
+            empty
+        } else {
+            empty.join("objects")
+        };
+        let env = [(name, value.to_str().unwrap())];
+        let recorded = record_env(&s, None, &env, s.c.repo.as_os_str(), "claude", &merge);
+        assert!(recorded.status.success(), "{name}: {recorded:?}");
+    }
+}
+
+// A `git` first on cm's PATH that logs the umask each scratch repository command runs under, the
+// scratch repository's mode at its init and its alternates file's mode at each later command. The
+// checkout's reads run under 077, so that the umask under test reaches only cm and the scratch
+// repository.
+fn umask_logging_git(s: &Scratch) -> [PathBuf; 3] {
+    let logs = ["umasks", "modes", "alternates"].map(|log| s.home.join(log));
+    let bin = s.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let [umasks, modes, alternates] = logs.each_ref().map(|log| shell_quoted(log));
+    support::write_executable(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\ncase \"${{GIT_DIR-}}\" in\n*/cm-gate-*)\n  umask >> {umasks}\n  if [ \"$5\" = init ]; then (umask 022; stat -c %a \"$GIT_DIR\" >> {modes})\n  else (umask 022; stat -c %a \"$GIT_DIR/objects/info/alternates\" >> {alternates}); fi ;;\n*) umask 077 ;;\nesac\nexec {} \"$@\"\n",
+            shell_quoted(&real_git())
+        ),
+    );
+    logs
+}
+
+#[test]
+fn the_scratch_repository_and_its_files_are_private_and_gone_whatever_the_umask() {
+    let host = at("2026-11-25T06:00:00Z");
+    for umask in [
+        "0000", "0022", "0077", "0277", "0377", "0477", "0577", "0777",
+    ] {
+        for history in ["clean", "reviewed resolution", "unreviewed resolution"] {
+            let s = Scratch::new(&host);
+            let temp = s.home.join("temp");
+            fs::create_dir_all(&temp).unwrap();
+            let env = [("TMPDIR", temp.to_str().unwrap())];
+            let logs = umask_logging_git(&s);
+            let repo = s.c.repo.as_os_str();
+            let under = Some(umask);
+            let merged = if history == "clean" {
+                s.on_main("other.txt", "main\n");
+                let clean = s.merge_main(None);
+                offline_merge_under(&s, None, &env, under, &clean, repo)
+            } else {
+                s.on_main("shared.txt", "main\n");
+                let merge = s.merge_main(Some("feature and main\n"));
+                if history == "reviewed resolution" {
+                    for reviewer in ["claude", "astra"] {
+                        let recorded = record_env(&s, None, &env, repo, reviewer, &merge);
+                        assert!(
+                            recorded.status.success(),
+                            "{umask} {reviewer}: {recorded:?}"
+                        );
+                    }
+                }
+                offline_merge_under(&s, None, &env, under, &merge, repo)
+            };
+            if history == "unreviewed resolution" {
+                assert_eq!(merged.status.code(), Some(1), "{umask}: {merged:?}");
+                assert!(
+                    String::from_utf8_lossy(&merged.stdout)
+                        .contains("resolved merge conflicts; it needs its own review"),
+                    "{umask}: {merged:?}"
+                );
+            } else {
+                assert!(merged.status.success(), "{umask} {history}: {merged:?}");
+            }
+            let [umasks, modes, alternates] =
+                logs.map(|log| fs::read_to_string(log).unwrap_or_default());
+            let read_there = history != "unreviewed resolution";
+            for (log, want, made) in [
+                (&umasks, "0077", true),
+                (&modes, "700", true),
+                (&alternates, "600", read_there),
+            ] {
+                assert!(
+                    log.is_empty() != made && log.lines().all(|line| line == want),
+                    "{umask} {history}: {want} in {log}"
+                );
+            }
+            assert_eq!(
+                fs::read_dir(&temp).unwrap().count(),
+                0,
+                "{umask} {history}: {merged:?}"
+            );
+        }
+    }
+}
+
+// git 2.56, given a umask that leaves it no temporary object directory, prints an error, no remerge
+// diff, and exits 0; a `git` first on cm's PATH does that in the checkout.
+#[test]
+fn a_resolution_whose_checkout_remerge_diff_is_an_error_and_exit_0_is_still_read_in_the_scratch_repository()
+ {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let bin = s.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    support::write_executable(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\ncase \"${{GIT_DIR-}}| $* \" in\n'|'*' --remerge-diff '*) echo 'error: unable to create temporary object directory' >&2; exit 0 ;;\nesac\nexec {} \"$@\"\n",
+            shell_quoted(&real_git())
+        ),
+    );
+    let waived = offline_merge(&s, &merge, &s.c.repo);
+    assert_eq!(waived.status.code(), Some(1), "{waived:?}");
+    assert!(
+        String::from_utf8_lossy(&waived.stdout).contains(&format!(
+            "{} resolved merge conflicts; it needs its own review",
+            &merge[..12]
+        )),
+        "{waived:?}"
+    );
+    for reviewer in ["claude", "astra"] {
+        let recorded = record_env(&s, None, &[], s.c.repo.as_os_str(), reviewer, &merge);
+        assert!(recorded.status.success(), "{reviewer}: {recorded:?}");
+    }
+    let merged = offline_merge(&s, &merge, &s.c.repo);
+    assert!(merged.status.success(), "{merged:?}");
+}
+
+#[test]
+fn a_killed_gate_leaves_its_scratch_repository_in_tmpdir_and_no_later_gate_removes_it() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    let temp = s.home.join("temp");
+    fs::create_dir_all(&temp).unwrap();
+    let env = [("TMPDIR", temp.to_str().unwrap())];
+    let bin = s.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let git = bin.join("git");
+    support::write_executable(
+        &git,
+        &format!(
+            "#!/bin/sh\ncase \"${{GIT_DIR-}}|$5\" in\n*/cm-gate-*'|show') kill -9 \"$PPID\"; exit 1 ;;\nesac\nexec {} \"$@\"\n",
+            shell_quoted(&real_git())
+        ),
+    );
+    let killed = offline_merge_env(&s, None, &env, &clean, s.c.repo.as_os_str());
+    assert_eq!(killed.status.code(), None, "{killed:?}");
+    let left = || -> Vec<String> {
+        fs::read_dir(&temp)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect()
+    };
+    let leftover = left();
+    assert!(
+        leftover.len() == 1 && leftover[0].starts_with("cm-gate-"),
+        "{leftover:?}"
+    );
+    fs::remove_file(&git).unwrap();
+    let merged = offline_merge_env(&s, None, &env, &clean, s.c.repo.as_os_str());
+    assert!(merged.status.success(), "{merged:?}");
+    assert_eq!(left(), leftover);
+}
+
+#[test]
+fn the_gate_trusts_the_checkout_it_reads() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    let ran = s.home.join("driver-ran");
+    fs::write(
+        s.c.repo.join(".git/info/attributes"),
+        "shared.txt merge=marker\n",
+    )
+    .unwrap();
+    s.git(&[
+        "config",
+        "merge.marker.driver",
+        &format!("touch {}; exit 1", shell_quoted(&ran)),
+    ]);
+    let recorded = record_claude_resolution(&s, &merge);
+    assert!(recorded.status.success(), "{recorded:?}");
+    assert!(ran.exists(), "the checkout's merge driver ran");
+
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let honest = s.merge_main(Some("feature and main\n"));
+    let honest_tree = s.git(&["rev-parse", &format!("{honest}^{{tree}}")]);
+    fs::write(s.c.repo.join("evil.txt"), "beyond\n").unwrap();
+    s.git(&["add", "evil.txt"]);
+    s.git(&["commit", "-q", "--amend", "--no-edit"]);
+    let merge = s.head();
+    let refused = record_claude_resolution(&s, &merge);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let tree = s.git(&["rev-parse", &format!("{merge}^{{tree}}")]);
+    let loose = |id: &str| s.c.repo.join(".git/objects").join(&id[..2]).join(&id[2..]);
+    fs::remove_file(loose(&tree)).unwrap();
+    fs::copy(loose(&honest_tree), loose(&tree)).unwrap();
+    let admitted = record_claude_resolution(&s, &merge);
+    assert!(admitted.status.success(), "{admitted:?}");
+
+    let s = Scratch::new(&host);
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    fs::write(s.c.repo.join(".git/shallow"), format!("{clean}\n")).unwrap();
+    let cut = offline_merge(&s, &clean, &s.c.repo);
+    assert_eq!(cut.status.code(), Some(1), "{cut:?}");
+    assert!(
+        String::from_utf8_lossy(&cut.stdout).contains("is not a merge from the base branch"),
+        "{cut:?}"
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Shadow {
+    Tag,
+    Branch,
+}
+
+fn shadow(s: &Scratch, shadow: Shadow, name: &str, at: &str) {
+    match shadow {
+        Shadow::Tag => s.git(&["tag", name, at]),
+        Shadow::Branch => s.git(&["branch", name, at]),
+    };
+}
+
+fn side_branch(s: &Scratch, file: &str, text: &str) -> String {
+    s.git(&["checkout", "-q", "-b", "side", &s.base]);
+    let side = s.commit(file, text);
+    s.git(&["checkout", "-q", "feature"]);
+    side
+}
+
+#[test]
+fn no_local_ref_named_origin_head_stands_in_for_the_base() {
+    let host = at("2026-11-25T06:00:00Z");
+    let off_base = "which is not on the base branch origin/HEAD";
+    for kind in [Shadow::Tag, Shadow::Branch] {
+        let s = Scratch::new(&host);
+        let side = side_branch(&s, "shared.txt", "side\n");
+        let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", "side"]);
+        assert!(!merged.status.success(), "{kind:?}: {merged:?}");
+        fs::write(s.c.repo.join("shared.txt"), "feature and side\n").unwrap();
+        s.git(&["add", "shared.txt"]);
+        s.git(&["commit", "-q", "--no-edit"]);
+        let merge = s.head();
+        shadow(&s, kind, "origin/HEAD", &side);
+        assert_eq!(s.git(&["rev-parse", "origin/HEAD"]), side, "{kind:?}");
+        let report = s.c.report("claude-shadowed", &merge, &[], "ACCEPT");
+        let record = offline_cm(
+            &s,
+            &[
+                "review",
+                "record",
+                STEP,
+                report.to_str().unwrap(),
+                "--reviewer",
+                "claude",
+                "--kind",
+                "resolution",
+                "--repo",
+                s.c.repo.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(record.status.code(), Some(1), "{kind:?}: record {record:?}");
+        assert!(
+            String::from_utf8_lossy(&record.stdout).contains(off_base),
+            "{kind:?}: record {record:?}"
+        );
+        s.edit_ledger(|ledger| as_resolutions(ledger, &s.h1, &merge));
+        let walk = offline_merge(&s, &merge, &s.c.repo);
+        assert_eq!(walk.status.code(), Some(1), "{kind:?}: walk {walk:?}");
+        assert!(
+            String::from_utf8_lossy(&walk.stdout).contains(off_base),
+            "{kind:?}: walk {walk:?}"
+        );
+
+        let s = Scratch::new(&host);
+        let side = side_branch(&s, "other.txt", "side\n");
+        let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", "side"]);
+        assert!(merged.status.success(), "{kind:?}: {merged:?}");
+        let clean = s.head();
+        shadow(&s, kind, "origin/HEAD", &side);
+        let waiver = offline_merge(&s, &clean, &s.c.repo);
+        assert_eq!(waiver.status.code(), Some(1), "{kind:?}: waiver {waiver:?}");
+        assert!(
+            String::from_utf8_lossy(&waiver.stdout).contains(off_base),
+            "{kind:?}: waiver {waiver:?}"
+        );
+        assert_eq!(s.c.state(), Phase::PrOpen, "{kind:?}: waiver");
+
+        let s = Scratch::new(&host);
+        let side = side_branch(&s, "side.txt", "side\n");
+        s.on_main("other.txt", "main\n");
+        let clean = s.merge_main(None);
+        shadow(&s, kind, "origin/HEAD", &side);
+        let merged = offline_merge(&s, &clean, &s.c.repo);
+        assert!(merged.status.success(), "{kind:?}: off the base {merged:?}");
+    }
+}
+
+#[test]
+fn a_head_named_by_a_ref_means_one_commit_or_takes_no_walk() {
+    let host = at("2026-11-25T06:00:00Z");
+    let covered = |host: &Fake| {
+        let s = Scratch::new(host);
+        s.on_main("shared.txt", "main\n");
+        let merge = s.merge_main(Some("feature and main\n"));
+        s.accepted_resolution(host, &merge, "resolution");
+        s.git(&["tag", "covered", &merge]);
+        (s, merge)
+    };
+    for head in ["HEAD", "feature", "covered"] {
+        let (s, _) = covered(&host);
+        let merged = offline_merge(&s, head, &s.c.repo);
+        assert!(merged.status.success(), "{head}: {merged:?}");
+        assert_eq!(s.c.state(), Phase::Merged, "{head}");
+    }
+    for kind in [Shadow::Tag, Shadow::Branch] {
+        let (s, merge) = covered(&host);
+        let name = match kind {
+            Shadow::Tag => "feature",
+            Shadow::Branch => "covered",
+        };
+        shadow(&s, kind, name, &s.h1);
+        let shadowed = offline_merge(&s, name, &s.c.repo);
+        assert_eq!(shadowed.status.code(), Some(1), "{kind:?}: {shadowed:?}");
+        assert_eq!(s.c.state(), Phase::PrOpen, "{kind:?}");
+        assert_eq!(s.head(), merge, "{kind:?}");
+    }
+
+    let clean_update = |host: &Fake| {
+        let s = Scratch::new(host);
+        s.on_main("other.txt", "main\n");
+        let clean = s.merge_main(None);
+        let tree = format!("{clean}^{{tree}}");
+        let main = s.git(&["rev-parse", &format!("origin/{}", s.base)]);
+        let twin = s.git(&["commit-tree", &tree, "-p", &s.h1, "-p", &main, "-m", "twin"]);
+        (s, clean, twin)
+    };
+    let (s, clean, twin) = clean_update(&host);
+    s.git(&["tag", "feature", &twin]);
+    let shadowed = offline_merge(&s, "feature", &s.c.repo);
+    assert_eq!(shadowed.status.code(), Some(1), "{shadowed:?}");
+    s.git(&["tag", "-d", "feature"]);
+    let merged = offline_merge(&s, "feature", &s.c.repo);
+    assert!(merged.status.success(), "{merged:?}");
+    assert_eq!(s.head(), clean);
+
+    let (s, _, twin) = clean_update(&host);
+    s.git(&["tag", "origin", &twin]);
+    let shadowed = offline_merge(&s, "origin", &s.c.repo);
+    assert_eq!(shadowed.status.code(), Some(1), "{shadowed:?}");
+    let merged = offline_merge(&s, &twin, &s.c.repo);
+    assert!(merged.status.success(), "{merged:?}");
+
+    let (s, clean, twin) = clean_update(&host);
+    let short = &clean[..12];
+    s.git(&["tag", short, &twin]);
+    let shadowed = offline_merge(&s, short, &s.c.repo);
+    assert_eq!(shadowed.status.code(), Some(1), "{shadowed:?}");
+    s.git(&["tag", "-d", short]);
+    let merged = offline_merge(&s, short, &s.c.repo);
+    assert!(merged.status.success(), "{merged:?}");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Reach {
+    Argument,
+    Link,
+    Cwd,
+}
+
+fn not_utf_8(s: &mut Scratch, reach: Reach) -> (Option<PathBuf>, std::ffi::OsString) {
+    use std::os::unix::ffi::OsStrExt;
+    let temp = s.c.repo.parent().unwrap().to_path_buf();
+    let dir = temp.join(std::ffi::OsStr::from_bytes(b"d\xff\"\nr"));
+    fs::create_dir_all(&dir).unwrap();
+    let moved = dir.join("repo");
+    fs::rename(&s.c.repo, &moved).unwrap();
+    s.c.repo = moved.clone();
+    match reach {
+        Reach::Argument => (None, moved.into_os_string()),
+        Reach::Link => {
+            let link = temp.join("link");
+            std::os::unix::fs::symlink(&moved, &link).unwrap();
+            (None, link.into_os_string())
+        }
+        Reach::Cwd => (Some(dir), "repo".into()),
+    }
+}
+
+fn record_in(
+    s: &Scratch,
+    cwd: Option<&Path>,
+    repo: &std::ffi::OsStr,
+    reviewer: &str,
+    merge: &str,
+) -> std::process::Output {
+    record_env(s, cwd, &[], repo, reviewer, merge)
+}
+
+fn record_env(
+    s: &Scratch,
+    cwd: Option<&Path>,
+    env: &[(&str, &str)],
+    repo: &std::ffi::OsStr,
+    reviewer: &str,
+    merge: &str,
+) -> std::process::Output {
+    use std::ffi::OsStr;
+    let text = format!(
+        "# Resolution review by {reviewer}\n\nThe remerge diff only.\n\n```cm-review\nhead: {merge}\n```\n\nACCEPT\n"
+    );
+    let report = if reviewer == "astra" {
+        let dir = "astra-review-7-bytes";
+        let report =
+            s.c.write(&format!("{STEP}/evidence/{dir}/report.md"), &text);
+        s.c.receipt(dir, merge, "gpt-6-astra", "xhigh");
+        report
+    } else {
+        s.c.write(&format!("drafts/{reviewer}-bytes.md"), &text)
+    };
+    offline_cm_env(
+        s,
+        cwd,
+        env,
+        &[
+            OsStr::new("review"),
+            OsStr::new("record"),
+            OsStr::new(STEP),
+            report.as_os_str(),
+            OsStr::new("--reviewer"),
+            OsStr::new(reviewer),
+            OsStr::new("--kind"),
+            OsStr::new("resolution"),
+            OsStr::new("--repo"),
+            repo,
+        ],
+    )
+}
+
+#[test]
+fn a_checkout_whose_path_is_not_utf_8_is_read_like_any_other() {
+    let host = at("2026-11-25T06:00:00Z");
+    for reach in [Reach::Argument, Reach::Link, Reach::Cwd] {
+        let mut s = Scratch::new(&host);
+        s.on_main("shared.txt", "main\n");
+        let merge = s.merge_main(Some("feature and main\n"));
+        let (cwd, repo) = not_utf_8(&mut s, reach);
+        for reviewer in ["claude", "astra"] {
+            let recorded = record_in(&s, cwd.as_deref(), &repo, reviewer, &merge);
+            assert!(
+                recorded.status.success(),
+                "{reach:?}: {reviewer} {recorded:?}"
+            );
+        }
+        let merged = offline_merge_in(&s, cwd.as_deref(), &merge, &repo);
+        assert!(merged.status.success(), "{reach:?}: merged {merged:?}");
+        assert_eq!(s.c.state(), Phase::Merged, "{reach:?}: merged");
+
+        let mut s = Scratch::new(&host);
+        s.on_main("shared.txt", "main\n");
+        let merge = s.merge_main(Some("feature and main\n"));
+        s.accepted_resolution(&host, &merge, "earlier");
+        let (cwd, repo) = not_utf_8(&mut s, reach);
+        let walked = offline_merge_in(&s, cwd.as_deref(), &merge[..12], &repo);
+        assert!(walked.status.success(), "{reach:?}: walk {walked:?}");
+        assert_eq!(s.c.state(), Phase::Merged, "{reach:?}: walk");
+
+        let mut s = Scratch::new(&host);
+        s.on_main("other.txt", "main\n");
+        let clean = s.merge_main(None);
+        let (cwd, repo) = not_utf_8(&mut s, reach);
+        let waived = offline_merge_in(&s, cwd.as_deref(), &clean, &repo);
+        assert!(waived.status.success(), "{reach:?}: waiver {waived:?}");
+        assert_eq!(s.c.state(), Phase::Merged, "{reach:?}: waiver");
+
+        let mut s = Scratch::new(&host);
+        s.on_main("shared.txt", "main\n");
+        s.merge_main(Some("feature and main\n"));
+        fs::write(s.c.repo.join("evil.txt"), "beyond\n").unwrap();
+        s.git(&["add", "evil.txt"]);
+        s.git(&["commit", "-q", "--amend", "--no-edit"]);
+        let merge = s.head();
+        let (cwd, repo) = not_utf_8(&mut s, reach);
+        let refused = record_in(&s, cwd.as_deref(), &repo, "claude", &merge);
+        let beyond = "it changes \"evil.txt\" beyond the files its parents conflict in";
+        assert_eq!(refused.status.code(), Some(1), "{reach:?}: {refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stdout).contains(beyond),
+            "{reach:?}: {refused:?}"
+        );
+        s.edit_ledger(|ledger| as_resolutions(ledger, &s.h1, &merge));
+        let walk = offline_merge_in(&s, cwd.as_deref(), &merge, &repo);
+        assert_eq!(walk.status.code(), Some(1), "{reach:?}: {walk:?}");
+        assert!(
+            String::from_utf8_lossy(&walk.stdout).contains(beyond),
+            "{reach:?}: {walk:?}"
+        );
+    }
+}
+
+#[test]
+fn a_step_without_a_resolution_record_takes_the_requested_head_as_given() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("other.txt", "main\n");
+    s.merge_main(None);
+    let merged = offline_merge(&s, "HEAD", &s.c.repo);
+    assert!(merged.status.success(), "{merged:?}");
+
+    let s = Scratch::new(&host);
+    let fix = s.commit("fix.txt", "unreviewed\n");
+    let short = &fix[..6];
+    let refused = offline_merge(&s, short, &s.c.repo);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let gates: Vec<String> = String::from_utf8_lossy(&refused.stdout)
+        .lines()
+        .filter(|line| line.contains("merge-gate"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(gates.len(), 3, "{gates:?}");
+    assert!(gates[0].contains(&format!("no Astra receipt at {short} with effective")));
+    assert!(gates[1].contains(&format!("no review of {short} is recorded")));
+    assert!(gates[2].contains(&format!(
+        "no reviewed head before {short} is joined to it by clean updates from the base branch: {} is not a merge from the base branch",
+        &fix[..12]
+    )));
+}
+
+#[test]
+fn case_never_decides_which_head_or_record_binds() {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    s.accepted_resolution(&host, &merge, "resolution");
+    s.edit_ledger(|ledger| {
+        for review in &mut ledger.reviews[2..] {
+            review.head = review.head.to_uppercase();
+        }
+    });
+    assert!(s.cleared().gaps.is_empty(), "{:?}", s.cleared().gaps);
+    let merged = offline_merge(&s, &merge[..12].to_uppercase(), &s.c.repo);
+    assert!(merged.status.success(), "{merged:?}");
+}
+
+#[test]
+fn each_resolution_binding_site_reads_only_full_merge_shas() {
+    let host = at("2026-11-25T06:00:00Z");
+    let covered = |s: &Scratch| -> String {
+        s.on_main("shared.txt", "main\n");
+        let merge = s.merge_main(Some("feature and main\n"));
+        s.accepted_resolution(&host, &merge, "resolution");
+        merge
+    };
+    let shorten = |s: &Scratch, reviewer: &str, merge: &str| {
+        s.edit_ledger(|ledger| {
+            for review in &mut ledger.reviews[2..] {
+                if review.reviewer.as_deref() == Some(reviewer) {
+                    review.head = merge[..8].to_owned();
+                }
+            }
+        });
+    };
+
+    let s = Scratch::new(&host);
+    let merge = covered(&s);
+    shorten(&s, "claude", &merge);
+    assert_eq!(walk_gaps(&s.cleared()), ["no claude resolution ACCEPT"]);
+
+    let s = Scratch::new(&host);
+    let merge = covered(&s);
+    shorten(&s, "astra", &merge);
+    let unexcluded = s.cleared();
+    assert_eq!(unexcluded.stop, None);
+    assert!(
+        unexcluded.gaps.iter().any(|gap| gap.contains(&format!(
+            "astra-review-7-resolution-astra/receipt.json records the Astra review at {merge}, but it is not recorded"
+        ))),
+        "{:?}",
+        unexcluded.gaps
+    );
+
+    let s = Scratch::new(&host);
+    s.on_main("shared.txt", "main\n");
+    let merge = s.merge_main(Some("feature and main\n"));
+    for reviewer in ["astra", "claude"] {
+        let report = s.c.write(
+            &format!("drafts/{reviewer}-unreceipted.md"),
+            &format!("# {reviewer}\n\nNo receipt.\n\n```cm-review\nhead: {merge}\n```\n\nACCEPT\n"),
+        );
+        assert!(
+            verdict::record_resolution(
+                &host,
+                &s.c.root,
+                &target(),
+                &report,
+                Some(reviewer),
+                None,
+                Some(&s.c.repo),
+            )
+            .unwrap()
+            .ok()
+        );
+    }
+    shorten(&s, "astra", &merge);
+    shorten(&s, "claude", &merge);
+    assert_eq!(
+        s.cleared().stop,
+        Some(CleanUpdateError::Conflicts { commit: merge })
     );
 }
