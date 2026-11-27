@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -2345,11 +2345,9 @@ pub enum CleanUpdateError {
         commit: String,
         gaps: Vec<String>,
     },
-    /// No parent directory took a scratch repository; each with why.
     NoScratch {
         tried: Vec<(PathBuf, String)>,
     },
-    /// git failed in the scratch repository it was reading `commit` in.
     Scratch {
         commit: String,
         dir: PathBuf,
@@ -2461,9 +2459,7 @@ fn merge_from_base(
             base: shown(base).to_owned(),
         });
     }
-    let empty = |reader| {
-        remerge_diff(reader, commit, Listing::Waiver).map(|diff| diff.trim_ascii().is_empty())
-    };
+    let empty = |reader| remerge_diff(reader, commit).map(|diff| diff.trim_ascii().is_empty());
     // Empty in the checkout, as the waiver always asked, and where no local merge setting reaches.
     let clean = empty(Reader::Checkout(repo))? && empty(Reader::Isolated(isolated))?;
     Ok(Merge {
@@ -2473,24 +2469,13 @@ fn merge_from_base(
     })
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Listing {
-    Waiver,
-    Paths,
-}
-
-// Every listing the gate reads as a complete account of a merge comes from here, with each flag
-// that would let configuration or attributes leave a change out: a relative or submodule-blind
-// diff, a textconv or external driver, colour, renames folding two paths into one. Only the paths
-// leave out a signature check's output: in the waiver's patch it still makes a signed merge no
-// clean update under `log.showSignature`, as it always has, because leaving it out there would
-// let the waiver accept more.
-fn remerge_diff(
-    reader: Reader<'_>,
-    commit: &str,
-    listing: Listing,
-) -> Result<Vec<u8>, CleanUpdateError> {
-    let mut args = vec![
+// The waiver's account of a merge, with each flag that would let configuration or attributes leave
+// a change out: a relative or submodule-blind diff, a textconv or external driver, colour, renames
+// folding two paths into one. A signature check's output stays in: it makes a signed merge no
+// clean update under `log.showSignature`, as it always has, since leaving it out would let the
+// waiver accept more.
+fn remerge_diff(reader: Reader<'_>, commit: &str) -> Result<Vec<u8>, CleanUpdateError> {
+    let args = [
         "show",
         "--remerge-diff",
         "--format=",
@@ -2500,11 +2485,8 @@ fn remerge_diff(
         "--no-textconv",
         "--no-relative",
         "--no-color",
+        commit,
     ];
-    if listing == Listing::Paths {
-        args.extend(["--no-show-signature", "--name-only", "-z"]);
-    }
-    args.push(commit);
     match reader {
         Reader::Checkout(repo) => {
             git_bytes(repo, &args).ok_or_else(|| CleanUpdateError::Unreadable {
@@ -2592,21 +2574,45 @@ fn needs_submodule_history(stages: &Stages<'_>) -> bool {
     matches!(stages, [_, Some((GITLINK, ours)), Some((GITLINK, theirs))] if ours != theirs)
 }
 
+// `git diff-tree --name-status -z`: a status and a path for each path where two trees differ.
+fn changes(listed: &[u8]) -> Option<Vec<(&[u8], &[u8])>> {
+    let fields = nul_paths(listed);
+    fields.len().is_multiple_of(2).then(|| {
+        fields
+            .chunks(2)
+            .map(|change| (change[0], change[1]))
+            .collect()
+    })
+}
+
 fn beyond<'a, K: Ord + From<&'a [u8]>>(
     conflicts: &BTreeMap<K, Stages<'_>>,
-    changed: &'a [u8],
+    changed: &[(&[u8], &'a [u8])],
 ) -> Vec<&'a [u8]> {
-    nul_paths(changed)
-        .into_iter()
+    changed
+        .iter()
+        .map(|(_, path)| *path)
         .filter(|path| !conflicts.contains_key(&K::from(path)))
         .collect()
 }
 
+fn quoted_paths(paths: impl IntoIterator<Item = impl AsRef<[u8]>>) -> String {
+    paths
+        .into_iter()
+        .map(|path| format!("\"{}\"", path.as_ref().escape_ascii()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// The merge stands on resolution reviews when it differs from git's own merge of its parents only
+// at the paths that merge lists as conflicted. Both come from one merge-tree run: its tree and its
+// stage entries.
 fn beyond_resolution(
     isolated: &Isolated,
     commit: &str,
     merge: &Merge,
 ) -> Result<Option<String>, CleanUpdateError> {
+    let failed = |why: &str| isolated.failed(commit, why.to_owned());
     let merged = isolated
         .output(&[
             "merge-tree",
@@ -2627,34 +2633,94 @@ fn beyond_resolution(
         }
         _ => return Err(isolated.failed(commit, failure(&merged))),
     };
-    let conflicts = conflicts::<&[u8]>(&listed).ok_or_else(|| {
-        isolated.failed(
-            commit,
-            "git merge-tree listed an entry cm cannot read".to_owned(),
-        )
-    })?;
-    let submodules: Vec<String> = conflicts
+    let unlisted = || failed("git merge-tree listed an entry cm cannot read");
+    let tree = nul_paths(&listed)
+        .first()
+        .and_then(|tree| std::str::from_utf8(tree).ok())
+        .filter(|tree| tree.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(unlisted)?;
+    let conflicts = conflicts::<&[u8]>(&listed).ok_or_else(unlisted)?;
+    let submodules: Vec<&[u8]> = conflicts
         .iter()
         .filter(|(_, stages)| needs_submodule_history(stages))
-        .map(|(path, _)| format!("\"{}\"", path.escape_ascii()))
+        .map(|(path, _)| *path)
         .collect();
     if !submodules.is_empty() {
         return Ok(Some(format!(
             "its parents set the submodule {} to different commits, which only the submodule's history can merge",
-            submodules.join(", ")
+            quoted_paths(submodules)
         )));
     }
-    let changed = remerge_diff(Reader::Isolated(isolated), commit, Listing::Paths)?;
-    let beyond: Vec<String> = beyond(&conflicts, &changed)
-        .into_iter()
-        .map(|path| format!("\"{}\"", path.escape_ascii()))
-        .collect();
-    Ok((!beyond.is_empty()).then(|| {
-        format!(
+    let listed = isolated
+        .bytes(&[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--no-renames",
+            "--ignore-submodules=none",
+            "--no-relative",
+            "--name-status",
+            tree,
+            commit,
+        ])
+        .map_err(|why| isolated.failed(commit, why))?;
+    let changed =
+        changes(&listed).ok_or_else(|| failed("git diff-tree listed an entry cm cannot read"))?;
+    let beyond = beyond(&conflicts, &changed);
+    if !beyond.is_empty() {
+        return Ok(Some(format!(
             "it changes {} beyond the files its parents conflict in",
-            beyond.join(", ")
+            quoted_paths(beyond)
+        )));
+    }
+    // A path merge-tree moved a file or submodule aside to is in no tree the merge comes from;
+    // keeping it, or the entry under any other new name, is no resolution of the conflict.
+    let made_up = made_up(isolated, commit, merge, &conflicts)?;
+    let deleted: BTreeSet<&[u8]> = changed
+        .iter()
+        .filter(|(status, _)| *status == b"D")
+        .map(|(_, path)| *path)
+        .collect();
+    let kept: Vec<&[u8]> = made_up
+        .into_iter()
+        .filter(|path| !deleted.contains(path))
+        .collect();
+    Ok((!kept.is_empty()).then(|| {
+        format!(
+            "it keeps {}, which git made up for a conflict",
+            quoted_paths(kept)
         )
     }))
+}
+
+// The conflicted paths that are in neither parent nor any merge base.
+fn made_up<'a>(
+    isolated: &Isolated,
+    commit: &str,
+    merge: &Merge,
+    conflicts: &BTreeMap<&'a [u8], Stages<'_>>,
+) -> Result<Vec<&'a [u8]>, CleanUpdateError> {
+    let bases = isolated
+        .bytes(&["merge-base", "--all", &merge.first, &merge.second])
+        .map_err(|why| isolated.failed(commit, why))?;
+    let bases = String::from_utf8_lossy(&bases).into_owned();
+    let mut trees = Vec::new();
+    for at in [merge.first.as_str(), merge.second.as_str()]
+        .into_iter()
+        .chain(bases.split_whitespace())
+    {
+        trees.push(
+            isolated
+                .bytes(&["ls-tree", "-r", "-z", "--name-only", "--full-tree", at])
+                .map_err(|why| isolated.failed(commit, why))?,
+        );
+    }
+    let real: BTreeSet<&[u8]> = trees.iter().flat_map(|tree| nul_paths(tree)).collect();
+    Ok(conflicts
+        .keys()
+        .copied()
+        .filter(|path| !real.contains(path))
+        .collect())
 }
 
 /// The gate's (a) and (b) for a codex step about to merge at `head`.
@@ -3231,8 +3297,9 @@ mod tests {
             }
         }
         let changed: Vec<u8> = (0..paths)
-            .flat_map(|path| format!("dir/{:05}.txt\0", 2 * path).into_bytes())
+            .flat_map(|path| format!("M\0dir/{:05}.txt\0", 2 * path).into_bytes())
             .collect();
+        let changed = changes(&changed).unwrap();
         let conflicts = conflicts::<Counted>(&listed).unwrap();
         assert_eq!(conflicts.len(), paths);
         assert_eq!(beyond(&conflicts, &changed).len(), paths / 2);

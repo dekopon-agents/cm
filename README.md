@@ -909,30 +909,33 @@ commit as every ref of that name (under `refs/`, a tag, a branch or a remote-tra
 the walk does not run. A step that holds a resolution review also matches receipts and reviews
 to that commit; any other step matches them to `--head` as given.
 
-A merge from the base branch whose parents conflict, and whose remerge diff touches only the
-files they conflict in, may instead stand on resolution reviews recorded at it with `cm review
+A merge from the base branch whose parents conflict, and which differs from git's own merge of
+them only at the paths that merge leaves conflicted, may instead stand on resolution reviews recorded at it with `cm review
 record … --kind resolution` (owner, 2026-11-25). Those reviews, and the receipts of their
 reports, do not stop the walk as a review of the merge would. The walk passes such a merge when
 Astra and a Claude reviewer have each recorded an explicit resolution ACCEPT there, none of its
 resolution reviews has an unresolved blocking finding (a resolved FIX REQUIRED is no ACCEPT), and
 every finished Astra receipt at the merge is the receipt of an Astra resolution report recorded
 there. It then goes on to the merge's first parent, which must clear with both families' ACCEPTs
-on any lane, so a later merge from the base branch walks back through an earlier one. Which
-files the parents conflict in, and which files the merge changes, are both read in the scratch
-repository above, so git's default merge of the commits decides them and no merge attribute,
-driver or `merge.*` setting, committed or local, does: a `-merge` or `binary` attribute makes no
-file conflicted, a merge whose parents merge there without a conflict, or that changes other files,
-does not pass this way, and a signature check's output is no such file. Nor does a merge whose
-parents set a submodule to two different commits: without the submodule's objects their merge
-cannot be read. Any other conflict on a submodule, one parent deleting it or putting a file or
-directory in its place, is read like a file's. A resolution review is never an ACCEPT of the head, and its receipt never meets (a) at
+on any lane, so a later merge from the base branch walks back through an earlier one. Git's own
+merge is made in the scratch repository above: one `git merge-tree --write-tree` run gives its
+tree and the paths it lists as conflicted, and the merge is compared with that tree path by path,
+with renames not folded. So git's default merge of the commits decides both, and no merge
+attribute, driver or `merge.*` setting, committed or local, does: a `-merge` or `binary`
+attribute makes no file conflicted, and a merge whose parents merge there without a conflict, or
+that differs from git's merge at any other path, does not pass this way. Where git moves a file
+or a submodule aside, for a directory or for an entry of another type, it lists the path it made
+up for it, one in neither parent nor any merge base, as conflicted, and that path must not
+remain: a merge that keeps both entries, under that name or a new one, does not pass. Against a
+directory only the moved entry is conflicted, so a merge that keeps the directory passes, and one
+that keeps the file or the submodule, deleting the directory's files, does not. Nor does a merge
+whose parents set a submodule to two different commits: without the submodule's objects their
+merge cannot be read. Any other conflict on a submodule, one parent deleting it or putting a file
+or directory in its place, is read like a file's. A resolution review is never an ACCEPT of the head, and its receipt never meets (a) at
 the head: without a checkout, (a) and (b) must hold at the merge itself, and a review of the head
 recorded at the merge governs it. Any commit after the merge needs its own review, and so does
 the merge once it is amended. The journal entry of the `merged` move names each merge the walk
-passed this way. In a file/directory conflict git moves the file aside, named `x~<40 hex>` by
-`git merge-tree` and `x~<abbrev> (<subject>)` by the remerge diff: its ordinary resolution is
-refused, naming a path no commit holds, and only a merge that keeps the file as
-`x~<abbrev> (<subject>)` passes; such a merge may also add a file named `x~<40 hex>`.
+passed this way.
 
 When cm cannot read the PR or its checks from GitHub, (c) refuses unless `--ci-verified <path>`
 names a campaign file showing green CI; the head is then `--head`, else the SHA recorded at

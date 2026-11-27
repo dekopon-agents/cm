@@ -6392,89 +6392,6 @@ fn a_clean_merge_that_moves_an_ignored_submodule_needs_its_own_review() {
     assert!(rules(&s.merge(&host)).contains(&"merge-gate"));
 }
 
-fn file_directory_merge(
-    host: &Fake,
-    resolve: impl FnOnce(&Scratch, &str, &str),
-) -> (Scratch, String, String) {
-    let s = Scratch::new(host);
-    fs::write(s.c.repo.join("x"), "a file\n").unwrap();
-    s.git(&["add", "x"]);
-    s.git(&["commit", "-q", "-m", "x is a file"]);
-    let h2 = s.reviewed(host, "h2");
-    s.on_main_with(|s| {
-        fs::create_dir_all(s.c.repo.join("x")).unwrap();
-        fs::write(s.c.repo.join("x/inner.txt"), "a directory\n").unwrap();
-    });
-    let main = format!("origin/{}", s.base);
-    let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", &main]);
-    assert!(!merged.status.success(), "x conflicts: {merged:?}");
-    let aside = fs::read_dir(&s.c.repo)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .find(|name| name.starts_with("x~"))
-        .unwrap();
-    resolve(&s, &aside, &h2);
-    s.git(&["add", "-A"]);
-    s.git(&["commit", "-q", "--no-edit"]);
-    let merge = s.head();
-    (s, merge, h2)
-}
-
-fn record_through_cm(s: &Scratch, merge: &str) -> std::process::Output {
-    let report = s.c.report("claude-file-dir", merge, &[], "ACCEPT");
-    scratch_cm(
-        s,
-        &[
-            "review",
-            "record",
-            STEP,
-            report.to_str().unwrap(),
-            "--reviewer",
-            "claude",
-            "--kind",
-            "resolution",
-            "--repo",
-            s.c.repo.to_str().unwrap(),
-        ],
-    )
-}
-
-#[test]
-fn a_file_directory_conflict_stands_only_where_the_moved_file_keeps_its_remerge_name() {
-    let host = at("2026-11-25T06:00:00Z");
-    let (s, merge, h2) = file_directory_merge(&host, |s, aside, _| {
-        fs::rename(s.c.repo.join(aside), s.c.repo.join("x.file")).unwrap();
-    });
-    let refused = record_through_cm(&s, &merge);
-    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
-    let out = String::from_utf8_lossy(&refused.stdout);
-    assert!(
-        out.contains("\"x.file\"") && out.contains(&format!("\"x~{} (x is a file)\"", &h2[..7])),
-        "{out}"
-    );
-
-    let (s, merge, _) = file_directory_merge(&host, |s, aside, h2| {
-        fs::rename(
-            s.c.repo.join(aside),
-            s.c.repo.join(format!("x~{} (x is a file)", &h2[..7])),
-        )
-        .unwrap();
-    });
-    let kept = record_through_cm(&s, &merge);
-    assert!(kept.status.success(), "{kept:?}");
-
-    let (s, merge, _) = file_directory_merge(&host, |s, aside, h2| {
-        fs::rename(
-            s.c.repo.join(aside),
-            s.c.repo.join(format!("x~{} (x is a file)", &h2[..7])),
-        )
-        .unwrap();
-        fs::write(s.c.repo.join(format!("x~{h2}")), "added in the merge\n").unwrap();
-    });
-    let added = record_through_cm(&s, &merge);
-    assert!(added.status.success(), "{added:?}");
-}
-
 #[test]
 fn an_abbreviated_head_reaches_a_covered_merge_while_github_is_unread() {
     let host = at("2026-11-25T06:00:00Z");
@@ -7112,8 +7029,11 @@ fn every_gate_git_command_ignores_rewritten_history_and_merge_listings_run_isola
     }
     for site in [
         "init --bare --quiet --template= --shared=0700 --object-format=sha1".to_owned(),
-        "merge-tree --write-tree ".to_owned(),
-        format!("{listing} --no-show-signature --name-only -z {merge}"),
+        "merge-tree --write-tree --no-messages -z ".to_owned(),
+        "diff-tree -r -z --no-renames --ignore-submodules=none --no-relative --name-status "
+            .to_owned(),
+        "merge-base --all ".to_owned(),
+        "ls-tree -r -z --name-only --full-tree ".to_owned(),
         format!("{listing} {clean}"),
     ] {
         assert!(
@@ -7129,7 +7049,9 @@ fn every_gate_git_command_ignores_rewritten_history_and_merge_listings_run_isola
         !calls
             .checkout
             .iter()
-            .any(|call| call.starts_with("merge-tree") || call.contains("--name-only")),
+            .any(|call| call.starts_with("merge-tree")
+                || call.starts_with("diff-tree")
+                || call.starts_with("ls-tree")),
         "{:#?}",
         calls.checkout
     );
@@ -8303,17 +8225,6 @@ fn a_submodule_moved_on_both_sides_is_read_without_its_objects() {
 
 const SUBMODULE_HISTORY: &str = "its parents set the submodule \"sub\" to different commits, which only the submodule's history can merge";
 
-#[derive(Clone, Copy, Debug)]
-enum Gitlinks {
-    ModifyDelete,
-    DeleteModify,
-    BothModified,
-    AddAdd,
-    SameOnBoth,
-    AgainstFile,
-    AgainstDirectory,
-}
-
 const SUB_C: &str = "3333333333333333333333333333333333333333";
 
 fn unlink(s: &Scratch, path: &str) {
@@ -8321,150 +8232,543 @@ fn unlink(s: &Scratch, path: &str) {
     let _ = fs::remove_dir(s.c.repo.join(path));
 }
 
-fn set_aside(s: &Scratch) -> String {
-    s.git(&["ls-files"])
-        .lines()
-        .find(|path| path.starts_with("sub~"))
-        .unwrap()
-        .to_owned()
+fn put(s: &Scratch, mode: &str, object: &str, path: &str) {
+    s.git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("{mode},{object},{path}"),
+    ]);
 }
 
-fn gitlink_merge(
+fn put_file(s: &Scratch, path: &str, text: &str) {
+    if let Some(dir) = Path::new(path).parent() {
+        fs::create_dir_all(s.c.repo.join(dir)).unwrap();
+    }
+    let _ = fs::remove_dir(s.c.repo.join(path));
+    fs::write(s.c.repo.join(path), text).unwrap();
+    s.git(&["add", path]);
+}
+
+// Whatever names the checkout's merge left unmerged entries under go, so a resolution adds only
+// what it keeps.
+fn clear_unmerged(s: &Scratch) {
+    let listed = scratch_git(&s.home, &s.c.repo, &["ls-files", "-u", "-z"]);
+    let mut paths: Vec<String> = String::from_utf8(listed.stdout)
+        .unwrap()
+        .split('\0')
+        .filter_map(|entry| entry.split_once('\t').map(|(_, path)| path.to_owned()))
+        .collect();
+    paths.dedup();
+    for path in paths {
+        s.git(&["update-index", "--force-remove", &path]);
+    }
+}
+
+fn blob(s: &Scratch, at: &str, path: &str) -> String {
+    s.git(&["rev-parse", &format!("{at}:{path}")])
+}
+
+// A base main sets up first, a reviewed first parent and main's change to it, and the merge from
+// main, which conflicts; `resolve` settles the index before the merge is committed.
+fn conflict_merge(
     host: &Fake,
-    shape: Gitlinks,
-    resolve: impl FnOnce(&Scratch, &str),
+    base: &dyn Fn(&Scratch),
+    ours: &dyn Fn(&Scratch),
+    theirs: &dyn Fn(&Scratch),
+    resolve: &dyn Fn(&Scratch, &str),
 ) -> (Scratch, String) {
-    use Gitlinks::*;
     let s = Scratch::new(host);
     let on_main = |s: &Scratch, change: &dyn Fn(&Scratch)| {
         s.git(&["checkout", "-q", &s.base]);
         change(s);
-        s.git(&["commit", "-q", "-m", "main"]);
+        s.git(&["commit", "-q", "--allow-empty", "-m", "main"]);
         s.git(&["push", "-q", "origin", &s.base]);
         s.git(&["checkout", "-q", "feature"]);
     };
-    if !matches!(shape, AddAdd) {
-        on_main(&s, &|s| gitlink(s, "sub", SUB_A));
-        s.merge_main(None);
-    }
-    match shape {
-        DeleteModify => unlink(&s, "sub"),
-        AgainstFile => {
-            unlink(&s, "sub");
-            s.commit("sub", "a file\n");
-        }
-        _ => gitlink(&s, "sub", SUB_B),
-    }
-    s.git(&["commit", "-q", "--allow-empty", "-m", "sub on feature"]);
+    on_main(&s, base);
+    s.merge_main(None);
+    ours(&s);
+    s.git(&["commit", "-q", "--allow-empty", "-m", "ours"]);
     let h2 = s.reviewed(host, "h2");
-    on_main(&s, &|s| match shape {
-        ModifyDelete => unlink(s, "sub"),
-        SameOnBoth => {
-            gitlink(s, "sub", SUB_B);
-            fs::write(s.c.repo.join("shared.txt"), "main\n").unwrap();
-            s.git(&["add", "shared.txt"]);
-        }
-        AgainstDirectory => {
-            unlink(s, "sub");
-            fs::create_dir_all(s.c.repo.join("sub")).unwrap();
-            fs::write(s.c.repo.join("sub/inner.txt"), "a directory\n").unwrap();
-            s.git(&["add", "sub/inner.txt"]);
-        }
-        _ => gitlink(s, "sub", SUB_C),
-    });
+    on_main(&s, theirs);
     let main = format!("origin/{}", s.base);
     let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-edit", &main]);
-    assert!(!merged.status.success(), "{shape:?} conflicts: {merged:?}");
+    assert!(!merged.status.success(), "the merge conflicts: {merged:?}");
+    clear_unmerged(&s);
     resolve(&s, &h2);
     s.git(&["commit", "-q", "--no-edit"]);
     let merge = s.head();
     (s, merge)
 }
 
-#[test]
-fn a_gitlink_conflict_stands_on_its_stages_unless_both_parents_set_different_commits() {
-    use Gitlinks::*;
-    let host = at("2026-11-25T06:00:00Z");
-    let moved = |h2: &str| format!("sub~{} (sub on feature)", &h2[..7]);
-    let admitted = |shape: Gitlinks, resolve: &dyn Fn(&Scratch, &str)| {
-        let (s, merge) = gitlink_merge(&host, shape, resolve);
-        for reviewer in ["claude", "astra"] {
-            let recorded = record_env(&s, None, &[], s.c.repo.as_os_str(), reviewer, &merge);
-            assert!(
-                recorded.status.success(),
-                "{shape:?} {reviewer}: {recorded:?}"
-            );
-        }
-        let merged = offline_merge(&s, &merge, &s.c.repo);
-        assert!(merged.status.success(), "{shape:?}: {merged:?}");
-    };
-    let refused =
-        |shape: Gitlinks, resolve: &dyn Fn(&Scratch, &str), why: &dyn Fn(&str) -> String| {
-            let (s, merge) = gitlink_merge(&host, shape, |s, h2| resolve(s, h2));
-            let h2 = s.git(&["rev-parse", &format!("{merge}^1")]);
-            let why = why(&h2);
-            let record = record_claude_resolution(&s, &merge);
-            assert_eq!(record.status.code(), Some(1), "{shape:?}: {record:?}");
-            let out = String::from_utf8_lossy(&record.stdout);
-            assert!(out.contains(&why), "{shape:?}: {out}");
-            hand_written_resolutions(&s, &merge);
-            let walked = offline_merge(&s, &merge, &s.c.repo);
-            assert_eq!(walked.status.code(), Some(1), "{shape:?}: {walked:?}");
-            let out = String::from_utf8_lossy(&walked.stdout);
-            assert!(out.contains(&why), "{shape:?} on the walk: {out}");
-        };
-    let history = |_: &str| SUBMODULE_HISTORY.to_owned();
+const FOUR: &str = "one\ntwo\nthree\nfour\n";
 
-    admitted(ModifyDelete, &|s, _| unlink(s, "sub"));
-    admitted(DeleteModify, &|s, _| unlink(s, "sub"));
-    admitted(DeleteModify, &|s, _| gitlink(s, "sub", SUB_C));
-    refused(BothModified, &|s, _| gitlink(s, "sub", SUB_C), &history);
-    refused(AddAdd, &|s, _| gitlink(s, "sub", SUB_C), &history);
-    admitted(SameOnBoth, &|s, _| {
-        fs::write(s.c.repo.join("shared.txt"), "feature and main\n").unwrap();
-        s.git(&["add", "shared.txt"]);
-    });
-    admitted(AgainstFile, &|s, h2| {
-        let aside = set_aside(s);
-        gitlink(s, "sub", SUB_C);
-        fs::rename(s.c.repo.join(&aside), s.c.repo.join(moved(h2))).unwrap();
-        s.git(&["update-index", "--force-remove", &aside]);
-        s.git(&["add", &moved(h2)]);
-    });
-    refused(
-        AgainstFile,
-        &|s, _| {
-            let aside = set_aside(s);
-            unlink(s, "sub");
-            fs::rename(s.c.repo.join(&aside), s.c.repo.join("sub")).unwrap();
-            s.git(&["update-index", "--force-remove", &aside]);
-            s.git(&["add", "sub"]);
-        },
-        &|h2| {
-            format!(
-                "it changes \"{}\" beyond the files its parents conflict in",
-                moved(h2)
-            )
-        },
-    );
-    admitted(AgainstDirectory, &|s, h2| {
-        let aside = set_aside(s);
-        s.git(&["update-index", "--force-remove", &aside]);
-        gitlink(s, &moved(h2), SUB_B);
-    });
-    refused(
-        AgainstDirectory,
-        &|s, _| {
-            let aside = set_aside(s);
-            s.git(&["update-index", "--force-remove", &aside]);
-        },
-        &|h2| {
-            format!(
-                "it changes \"{}\" beyond the files its parents conflict in",
-                moved(h2)
-            )
-        },
-    );
+fn made_up(path: &str, h2: &str) -> String {
+    format!("{path}~{h2}")
+}
+
+fn resolve_shared(s: &Scratch, _: &str) {
+    put_file(s, "shared.txt", "feature and main\n");
+}
+
+type Change<'a> = &'a dyn Fn(&Scratch);
+type Resolve<'a> = &'a dyn Fn(&Scratch, &str);
+type Row<'a> = (
+    &'a str,
+    Change<'a>,
+    Change<'a>,
+    Change<'a>,
+    Resolve<'a>,
+    Option<Refused>,
+);
+
+#[derive(Clone, Copy)]
+enum Refused {
+    Beyond(&'static [&'static str]),
+    Keeps(&'static str),
+    History,
+}
+
+impl Refused {
+    // What the refusal must say; diff-tree's order across a file and a directory is not pinned.
+    fn says(self, h2: &str) -> Vec<String> {
+        match self {
+            Refused::Beyond(paths) => paths
+                .iter()
+                .map(|path| format!("\"{path}\""))
+                .chain(["beyond the files its parents conflict in".to_owned()])
+                .collect(),
+            Refused::Keeps(path) => {
+                vec![format!(
+                    "it keeps \"{path}~{h2}\", which git made up for a conflict"
+                )]
+            }
+            Refused::History => vec![SUBMODULE_HISTORY.to_owned()],
+        }
+    }
+}
+
+#[test]
+fn a_merge_stands_on_resolution_reviews_where_it_differs_from_gits_own_merge_only_at_conflicted_paths()
+ {
+    let host = at("2026-11-25T06:00:00Z");
+    let none: Change = &|_| {};
+    use Refused::*;
+
+    let sub_base: Change = &|s| gitlink(s, "sub", SUB_A);
+    let sub_ours: Change = &|s| gitlink(s, "sub", SUB_B);
+    let sub_dir: Change = &|s| {
+        unlink(s, "sub");
+        put_file(s, "sub/inner.txt", "a directory\n");
+    };
+    let sub_gone: Change = &|s| unlink(s, "sub");
+    let sub_file: Change = &|s| {
+        unlink(s, "sub");
+        put_file(s, "sub", "a file\n");
+    };
+    let sub_same: Change = &|s| {
+        gitlink(s, "sub", SUB_B);
+        put_file(s, "shared.txt", "main\n");
+    };
+    let x_base: Change = &|s| put_file(s, "x", "a file\n");
+    let x_ours: Change = &|s| put_file(s, "x", "ours\n");
+    let x_dir: Change = &|s| {
+        s.git(&["rm", "-q", "x"]);
+        put_file(s, "x/inner.txt", "a directory\n");
+    };
+    let y_base: Change = &|s| put_file(s, "y", "y\n");
+    let y_ours: Change = &|s| put_file(s, "y", "ours\n");
+    let y_theirs: Change = &|s| put_file(s, "y", "theirs\n");
+    let y_gone: Change = &|s| {
+        s.git(&["rm", "-q", "y"]);
+    };
+    let r_base: Change = &|s| put_file(s, "r", FOUR);
+    let r_moved: Change = &|s| {
+        s.git(&["mv", "r", "r2"]);
+    };
+    let r_gone: Change = &|s| {
+        s.git(&["rm", "-q", "r"]);
+    };
+    let q_base: Change = &|s| put_file(s, "q", FOUR);
+    let q_ours: Change = &|s| {
+        s.git(&["mv", "q", "q-ours"]);
+    };
+    let q_theirs: Change = &|s| {
+        s.git(&["mv", "q", "q-theirs"]);
+    };
+    let m_ours: Change = &|s| put_file(s, "m", "ours\n");
+    let m_theirs: Change = &|s| {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(s.c.repo.join("m"), "theirs\n").unwrap();
+        fs::set_permissions(s.c.repo.join("m"), fs::Permissions::from_mode(0o755)).unwrap();
+        s.git(&["add", "m"]);
+    };
+    let l_ours: Change = &|s| put_file(s, "l", "a file\n");
+    let l_theirs: Change = &|s| {
+        std::os::unix::fs::symlink("target", s.c.repo.join("l")).unwrap();
+        s.git(&["add", "l"]);
+    };
+    let shared_theirs: Change = &|s| put_file(s, "shared.txt", "main\n");
+    let kept_base: Change = &|s| put_file(s, "kept.txt", "kept\n");
+    let sub_theirs: Change = &|s| gitlink(s, "sub", SUB_C);
+    let resolved: Resolve = &resolve_shared;
+
+    let rows: Vec<Row> = vec![
+        (
+            "submodule against a directory, keep the directory",
+            sub_base,
+            sub_ours,
+            sub_dir,
+            &|s, _| unlink(s, "sub"),
+            None,
+        ),
+        (
+            "submodule against a directory, keep the submodule",
+            sub_base,
+            sub_ours,
+            sub_dir,
+            &|s, _| {
+                s.git(&["update-index", "--force-remove", "sub/inner.txt"]);
+                gitlink(s, "sub", SUB_B);
+            },
+            Some(Beyond(&["sub", "sub/inner.txt"])),
+        ),
+        (
+            "submodule against a directory, keep both where git moved it",
+            sub_base,
+            sub_ours,
+            sub_dir,
+            &|s, h2| {
+                unlink(s, "sub");
+                gitlink(s, &made_up("sub", h2), SUB_B);
+            },
+            Some(Keeps("sub")),
+        ),
+        (
+            "submodule against a directory, keep both as the checkout names it",
+            sub_base,
+            sub_ours,
+            sub_dir,
+            &|s, _| {
+                unlink(s, "sub");
+                gitlink(s, "sub~HEAD", SUB_B);
+            },
+            Some(Beyond(&["sub~HEAD"])),
+        ),
+        (
+            "a submodule main deleted, deleted",
+            sub_base,
+            sub_ours,
+            sub_gone,
+            &|_, _| {},
+            None,
+        ),
+        (
+            "a submodule main deleted, the first parent's change kept",
+            sub_base,
+            sub_ours,
+            sub_gone,
+            &|s, _| gitlink(s, "sub", SUB_B),
+            None,
+        ),
+        (
+            "a submodule the first parent deleted, main's change kept",
+            sub_base,
+            sub_gone,
+            sub_theirs,
+            &|s, _| gitlink(s, "sub", SUB_C),
+            None,
+        ),
+        (
+            "a submodule against a file, keep the file",
+            sub_base,
+            sub_file,
+            sub_theirs,
+            &|s, h2| put(s, "100644", &blob(s, h2, "sub"), "sub"),
+            None,
+        ),
+        (
+            "a submodule against a file, keep the submodule",
+            sub_base,
+            sub_file,
+            sub_theirs,
+            &|s, _| gitlink(s, "sub", SUB_C),
+            None,
+        ),
+        (
+            "a submodule both parents set to the same commit, with a conflict elsewhere",
+            sub_base,
+            sub_ours,
+            sub_same,
+            resolved,
+            None,
+        ),
+        (
+            "file against a directory, keep the directory",
+            x_base,
+            x_ours,
+            x_dir,
+            &|s, _| unlink(s, "x"),
+            None,
+        ),
+        (
+            "file against a directory, keep the file",
+            x_base,
+            x_ours,
+            x_dir,
+            &|s, h2| {
+                s.git(&["update-index", "--force-remove", "x/inner.txt"]);
+                put(s, "100644", &blob(s, h2, "x"), "x");
+            },
+            Some(Beyond(&["x", "x/inner.txt"])),
+        ),
+        (
+            "file against a directory, keep both where git moved it",
+            x_base,
+            x_ours,
+            x_dir,
+            &|s, h2| {
+                unlink(s, "x");
+                put(s, "100644", &blob(s, h2, "x"), &made_up("x", h2));
+            },
+            Some(Keeps("x")),
+        ),
+        (
+            "file against a directory, keep both as the checkout names it",
+            x_base,
+            x_ours,
+            x_dir,
+            &|s, h2| {
+                unlink(s, "x");
+                put(s, "100644", &blob(s, h2, "x"), "x~HEAD");
+            },
+            Some(Beyond(&["x~HEAD"])),
+        ),
+        (
+            "modify/delete, keep the change",
+            y_base,
+            y_ours,
+            y_gone,
+            &|s, h2| put(s, "100644", &blob(s, h2, "y"), "y"),
+            None,
+        ),
+        (
+            "modify/delete, delete",
+            y_base,
+            y_ours,
+            y_gone,
+            &|s, _| unlink(s, "y"),
+            None,
+        ),
+        (
+            "delete/modify, keep the change",
+            y_base,
+            y_gone,
+            y_theirs,
+            &|s, _| put_file(s, "y", "theirs\n"),
+            None,
+        ),
+        (
+            "delete/modify, delete",
+            y_base,
+            y_gone,
+            y_theirs,
+            &|s, _| unlink(s, "y"),
+            None,
+        ),
+        (
+            "rename/delete, keep the rename",
+            r_base,
+            r_moved,
+            r_gone,
+            &|s, _| put_file(s, "r2", FOUR),
+            None,
+        ),
+        (
+            "rename/delete, delete",
+            r_base,
+            r_moved,
+            r_gone,
+            &|s, _| unlink(s, "r2"),
+            None,
+        ),
+        (
+            "rename/rename, keep the first parent's name",
+            q_base,
+            q_ours,
+            q_theirs,
+            &|s, _| {
+                unlink(s, "q");
+                unlink(s, "q-theirs");
+                put_file(s, "q-ours", FOUR);
+            },
+            None,
+        ),
+        (
+            "rename/rename, keep both names",
+            q_base,
+            q_ours,
+            q_theirs,
+            &|s, _| {
+                unlink(s, "q");
+                put_file(s, "q-ours", FOUR);
+                put_file(s, "q-theirs", FOUR);
+            },
+            None,
+        ),
+        (
+            "rename/rename, keep the base's name",
+            q_base,
+            q_ours,
+            q_theirs,
+            &|s, _| {
+                unlink(s, "q-ours");
+                unlink(s, "q-theirs");
+                put_file(s, "q", FOUR);
+            },
+            None,
+        ),
+        (
+            "add/add with different modes, keep the first parent's",
+            none,
+            m_ours,
+            m_theirs,
+            &|s, h2| put(s, "100644", &blob(s, h2, "m"), "m"),
+            None,
+        ),
+        (
+            "add/add with different modes, keep main's",
+            none,
+            m_ours,
+            m_theirs,
+            &|s, _| {
+                let main = format!("origin/{}", s.base);
+                put(s, "100755", &blob(s, &main, "m"), "m");
+            },
+            None,
+        ),
+        (
+            "a file against a symlink, keep the file",
+            none,
+            l_ours,
+            l_theirs,
+            &|s, h2| {
+                unlink(s, "l");
+                put(s, "100644", &blob(s, h2, "l"), "l");
+            },
+            None,
+        ),
+        (
+            "a file against a symlink, keep the symlink",
+            none,
+            l_ours,
+            l_theirs,
+            &|s, _| {
+                let main = format!("origin/{}", s.base);
+                unlink(s, "l");
+                put(s, "120000", &blob(s, &main, "l"), "l");
+            },
+            None,
+        ),
+        (
+            "a file against a symlink, keep both where git moved the file",
+            none,
+            l_ours,
+            l_theirs,
+            &|s, h2| {
+                let main = format!("origin/{}", s.base);
+                unlink(s, "l");
+                put(s, "120000", &blob(s, &main, "l"), "l");
+                put(s, "100644", &blob(s, h2, "l"), &made_up("l", h2));
+            },
+            Some(Keeps("l")),
+        ),
+        (
+            "a content conflict resolved at its path",
+            none,
+            none,
+            shared_theirs,
+            resolved,
+            None,
+        ),
+        (
+            "a content conflict resolved at a path that differs only in case",
+            none,
+            none,
+            shared_theirs,
+            &|s, _| {
+                unlink(s, "shared.txt");
+                put_file(s, "Shared.txt", "feature and main\n");
+            },
+            Some(Beyond(&["Shared.txt"])),
+        ),
+        (
+            "a content conflict and a file the merge adds",
+            none,
+            none,
+            shared_theirs,
+            &|s, h2| {
+                resolve_shared(s, h2);
+                put_file(s, "evil.txt", "beyond\n");
+            },
+            Some(Beyond(&["evil.txt"])),
+        ),
+        (
+            "a content conflict and a file neither parent changed",
+            kept_base,
+            none,
+            shared_theirs,
+            &|s, h2| {
+                resolve_shared(s, h2);
+                put_file(s, "kept.txt", "changed\n");
+            },
+            Some(Beyond(&["kept.txt"])),
+        ),
+        (
+            "a submodule both parents set to different commits",
+            sub_base,
+            sub_ours,
+            sub_theirs,
+            &|s, _| gitlink(s, "sub", SUB_C),
+            Some(History),
+        ),
+    ];
+    for (name, base, ours, theirs, resolve, refused) in rows {
+        let (s, merge) = conflict_merge(&host, base, ours, theirs, resolve);
+        let h2 = s.git(&["rev-parse", &format!("{merge}^1")]);
+        match refused {
+            None => {
+                for reviewer in ["claude", "astra"] {
+                    let recorded =
+                        record_env(&s, None, &[], s.c.repo.as_os_str(), reviewer, &merge);
+                    assert!(
+                        recorded.status.success(),
+                        "{name}, {reviewer}: {recorded:?}"
+                    );
+                }
+                let merged = offline_merge(&s, &merge, &s.c.repo);
+                assert!(merged.status.success(), "{name}: {merged:?}");
+            }
+            Some(refused) => {
+                let says = refused.says(&h2);
+                let record = record_claude_resolution(&s, &merge);
+                assert_eq!(record.status.code(), Some(1), "{name}: {record:?}");
+                hand_written_resolutions(&s, &merge);
+                let walked = offline_merge(&s, &merge, &s.c.repo);
+                assert_eq!(walked.status.code(), Some(1), "{name}: {walked:?}");
+                for (at, out) in [("record", &record), ("walk", &walked)] {
+                    let out = String::from_utf8_lossy(&out.stdout);
+                    for part in &says {
+                        assert!(
+                            out.contains(part.as_str()),
+                            "{name} at {at}: {part} in {out}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn real_git() -> PathBuf {
@@ -8485,7 +8789,10 @@ enum Fault {
     TempAlternates,
     EveryInit,
     MergeTree,
-    Listing,
+    TreeDiff,
+    Bases,
+    Trees,
+    WaiverRead,
 }
 
 // A `git` first on cm's PATH that fails one step of the scratch repository's setup or use; the
@@ -8503,7 +8810,10 @@ fn faulty_git(s: &Scratch, temp: &Path, fault: Fault) {
         ),
         Fault::EveryInit => ("*/cm-gate-*'|init'".to_owned(), fail("init")),
         Fault::MergeTree => ("*/cm-gate-*'|merge-tree'".to_owned(), fail("merge-tree")),
-        Fault::Listing => ("*/cm-gate-*'|show'".to_owned(), fail("show")),
+        Fault::TreeDiff => ("*/cm-gate-*'|diff-tree'".to_owned(), fail("diff-tree")),
+        Fault::Bases => ("*/cm-gate-*'|merge-base'".to_owned(), fail("merge-base")),
+        Fault::Trees => ("*/cm-gate-*'|ls-tree'".to_owned(), fail("ls-tree")),
+        Fault::WaiverRead => ("*/cm-gate-*'|show'".to_owned(), fail("show")),
     };
     let bin = s.home.join("bin");
     fs::create_dir_all(&bin).unwrap();
@@ -8539,7 +8849,10 @@ fn each_step_of_the_scratch_repository_fails_its_parent_or_names_the_scratch_rep
         TempAlternates,
         EveryInit,
         MergeTree,
-        Listing,
+        TreeDiff,
+        Bases,
+        Trees,
+        WaiverRead,
     ] {
         let (s, temp) = gate(fault);
         let env = [("TMPDIR", temp.to_str().unwrap())];
@@ -8569,10 +8882,12 @@ fn each_step_of_the_scratch_repository_fails_its_parent_or_names_the_scratch_rep
         s.on_main("shared.txt", "main\n");
         let merge = s.merge_main(Some("feature and main\n"));
         let at_record_and_walk = match fault {
-            TempIsAFile | TempInit | TempAlternates => None,
+            TempIsAFile | TempInit | TempAlternates | WaiverRead => None,
             EveryInit => Some(vec![no_scratch.clone()]),
             MergeTree => Some(in_scratch("merge-tree", &merge)),
-            Listing => Some(in_scratch("show", &merge)),
+            TreeDiff => Some(in_scratch("diff-tree", &merge)),
+            Bases => Some(in_scratch("merge-base", &merge)),
+            Trees => Some(in_scratch("ls-tree", &merge)),
         };
         match &at_record_and_walk {
             None => {
@@ -8609,11 +8924,11 @@ fn each_step_of_the_scratch_repository_fails_its_parent_or_names_the_scratch_rep
         let clean = s.merge_main(None);
         let waived = offline_merge_env(&s, None, &env, &clean, s.c.repo.as_os_str());
         match fault {
-            TempIsAFile | TempInit | TempAlternates | MergeTree => {
+            TempIsAFile | TempInit | TempAlternates | MergeTree | TreeDiff | Bases | Trees => {
                 assert!(waived.status.success(), "{fault:?}: {waived:?}");
             }
             EveryInit => refused_with(&waived, std::slice::from_ref(&no_scratch)),
-            Listing => refused_with(&waived, &in_scratch("show", &clean)),
+            WaiverRead => refused_with(&waived, &in_scratch("show", &clean)),
         }
     }
 }
