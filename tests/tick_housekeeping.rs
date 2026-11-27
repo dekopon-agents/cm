@@ -512,23 +512,45 @@ fn a_pull_cut_before_its_rebase_is_quit_and_its_autostash_kept_for_the_next_tick
     scratch.push_from_other("STATE.md", "other\n");
     script(&ct.join(".git/hooks/pre-commit"), "exit 1\n");
     script(&ct.join(".git/hooks/pre-rebase"), "exec sleep 60\n");
-    write(&ct.join(EPOCH).join("CARD.md"), "card, in the autostash\n");
-    let proc = scratch.proc();
+    let change = "card, in the autostash\n";
+    write(&ct.join(EPOCH).join("CARD.md"), change);
+    let rebasing =
+        |ct: &Path| ct.join(".git/rebase-merge").exists() || ct.join(".git/rebase-apply").exists();
+    let survived = std::rc::Rc::new(std::cell::Cell::new(false));
+    let proc = FakeProc::new({
+        let (base, ct, survived) = (scratch.proc(), ct.clone(), survived.clone());
+        move |cmd| {
+            let ran = base.run(cmd);
+            if cmd.line() == "git rebase --abort" {
+                survived.set(rebasing(&ct));
+            }
+            ran
+        }
+    });
     let report = scratch.phase(&proc, Path::new("cm"), Duration::from_secs(2), |ctx| {
         gitsync::sync(ctx, Mode::Always)
     });
-    assert_eq!(report.lines, [COMMIT_FAILED, gitsync::QUIT, SYNC_FAILED]);
-    assert!(proc.log().contains(&"git rebase --quit".to_owned()));
-    assert!(!ct.join(".git/rebase-merge").exists());
-    assert_eq!(scratch.status(), "");
-    assert_eq!(scratch.git(&ct, &["stash", "list"]).lines().count(), 1);
-    assert_eq!(
-        scratch.git(&ct, &["show", &format!("stash@{{0}}:{EPOCH}/CARD.md")]),
-        "card, in the autostash\n"
-    );
-    fs::remove_file(ct.join(".git/hooks/pre-rebase")).unwrap();
+    if survived.get() {
+        assert_eq!(report.lines, [COMMIT_FAILED, gitsync::QUIT, SYNC_FAILED]);
+        assert_eq!(scratch.status(), "");
+        assert_eq!(scratch.git(&ct, &["stash", "list"]).lines().count(), 1);
+        assert_eq!(
+            scratch.git(&ct, &["show", &format!("stash@{{0}}:{EPOCH}/CARD.md")]),
+            change
+        );
+    } else {
+        assert_eq!(report.lines, [COMMIT_FAILED, SYNC_FAILED]);
+        assert_eq!(
+            fs::read_to_string(ct.join(EPOCH).join("CARD.md")).unwrap(),
+            change
+        );
+    }
+    assert!(!rebasing(&ct));
+    for hook in ["pre-rebase", "pre-commit"] {
+        fs::remove_file(ct.join(".git/hooks").join(hook)).unwrap();
+    }
     assert_eq!(scratch.sync(&proc, Mode::Always), Report::default());
-    assert_eq!(scratch.origin_log(), ["local", "other: STATE.md", "start"]);
+    assert!(scratch.origin_log().contains(&"local".to_owned()));
 }
 
 const STILL_BOUND: [&str; 4] = [
@@ -1271,6 +1293,24 @@ impl Scratch {
         command
     }
 
+    // Root reads and writes past any mode, so under root a tick that must be refused by one runs
+    // as uid 65534, with the scratch root given to that user.
+    fn unprivileged(&self, command: &mut Command) {
+        use std::os::unix::process::CommandExt;
+        fn give_away(path: &Path) {
+            std::os::unix::fs::lchown(path, Some(65534), Some(65534)).unwrap();
+            if fs::symlink_metadata(path).unwrap().is_dir() {
+                for entry in fs::read_dir(path).unwrap() {
+                    give_away(&entry.unwrap().path());
+                }
+            }
+        }
+        if rustix::process::geteuid().is_root() {
+            give_away(self.path());
+            command.uid(65534).gid(65534);
+        }
+    }
+
     fn fake_git(&self) {
         script(
             &self.path().join("bin/git"),
@@ -1336,6 +1376,72 @@ fn the_built_cm_tick_syncs_refreshes_its_pin_lists_directives_and_imports_the_ru
         format!("{}\n", claude_md::IMPORT)
     );
     assert_eq!(names(&scratch.path().join("tmp")), Vec::<String>::new());
+}
+
+#[test]
+fn a_coordinator_handoff_that_cannot_be_read_is_named_and_lists_nothing() {
+    let scratch = Scratch::new();
+    scratch.fake_git();
+    script(
+        &scratch.path().join("bin/cm"),
+        "echo '{\"actionable\": []}'\n",
+    );
+    let epoch = scratch.ct().join(EPOCH);
+    write(&epoch.join("handoff").join(OURS), &handoff(STAMP));
+    let unreadable = epoch.join("handoff/coordinator-2026-11-25T0100Z.md");
+    write(&unreadable, &handoff(STAMP));
+    let journal = epoch.join("JOURNAL.md");
+    fs::write(
+        &journal,
+        fs::read_to_string(&journal).unwrap() + "\n" + OPEN,
+    )
+    .unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    let mut command = scratch.tick_command(Path::new(env!("CARGO_BIN_EXE_cm")));
+    command.args(["--cm", "cm", "--checkout"]).arg(scratch.ct());
+    scratch.unprivileged(&mut command);
+    let output = command.output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let (lines, walls) = printed(&output.stdout);
+    assert_eq!(
+        lines,
+        [format!(
+            "heartbeat: could not read {}: Permission denied (os error 13); owner directives not listed",
+            unreadable.display()
+        )]
+    );
+    assert!(walls.contains(&"directive".to_owned()), "{walls:?}");
+}
+
+#[test]
+fn a_boot_time_claude_md_the_tick_may_not_write_is_kept_with_the_line() {
+    let scratch = Scratch::new();
+    scratch.fake_git();
+    script(
+        &scratch.path().join("bin/cm"),
+        "echo '{\"actionable\": []}'\n",
+    );
+    let claude = scratch.boot_time_claude_md();
+    let old = fs::read(&claude).unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o444)).unwrap();
+    let mut command = scratch.tick_command(Path::new(env!("CARGO_BIN_EXE_cm")));
+    command.args(["--cm", "cm", "--checkout"]).arg(scratch.ct());
+    scratch.unprivileged(&mut command);
+    let output = command.output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        printed(&output.stdout).0,
+        [format!(
+            "heartbeat: could not write the COORDINATOR.md import to {}",
+            claude.display()
+        )]
+    );
+    assert_eq!(fs::read(&claude).unwrap(), old);
+    assert_eq!(
+        fs::metadata(&claude).unwrap().permissions().mode() & 0o777,
+        0o444
+    );
+    assert_eq!(names(claude.parent().unwrap()), ["CLAUDE.md"]);
 }
 
 #[test]

@@ -120,30 +120,6 @@ pub(crate) fn within_size_limit(file: &File, len: usize) -> std::io::Result<()> 
     }
 }
 
-// Root's CAP_DAC_OVERRIDE and CAP_DAC_READ_SEARCH leave the calling thread's effective set until
-// this is dropped, so a test holds root to a file's mode bits as it holds any other user.
-#[cfg(test)]
-pub(crate) struct Unprivileged(rustix::thread::CapabilitySets);
-
-#[cfg(test)]
-impl Unprivileged {
-    pub(crate) fn new() -> Self {
-        use rustix::thread::{CapabilitySet, capabilities, set_capabilities};
-        let held = capabilities(None).unwrap();
-        let mut dropped = held;
-        dropped.effective -= CapabilitySet::DAC_OVERRIDE | CapabilitySet::DAC_READ_SEARCH;
-        set_capabilities(None, dropped).unwrap();
-        Unprivileged(held)
-    }
-}
-
-#[cfg(test)]
-impl Drop for Unprivileged {
-    fn drop(&mut self) {
-        let _ = rustix::thread::set_capabilities(None, self.0);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
@@ -399,49 +375,45 @@ mod tests {
 
     #[test]
     fn a_boot_time_claude_md_is_replaced_only_when_this_process_may_write_the_file_itself() {
-        for unprivileged in [false, true] {
-            let _held = unprivileged.then(Unprivileged::new);
-            let home = own_dir();
-            let claude = home.path().join(".claude");
-            fs::create_dir(&claude).unwrap();
-            let path = claude.join("CLAUDE.md");
-            let old = format!("{BOOT_TIME}\nold rules\n");
-            fs::write(&path, &old).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
-            let may_write = rustix::fs::accessat(
-                rustix::fs::CWD,
-                &path,
-                rustix::fs::Access::WRITE_OK,
-                rustix::fs::AtFlags::EACCESS,
-            )
-            .is_ok();
-            assert!(!(unprivileged && may_write));
-            let report = tick(Some(home.path()));
-            if may_write {
-                assert_eq!(
-                    report.lines,
-                    ["rules: now imported from tools/cloud-env/COORDINATOR.md; read it"]
-                );
-                assert_eq!(fs::read_to_string(&path).unwrap(), format!("{IMPORT}\n"));
-            } else {
-                assert_eq!(
-                    report.lines,
-                    [format!(
-                        "heartbeat: could not write the COORDINATOR.md import to {}",
-                        path.display()
-                    )]
-                );
-                assert!(report.failed);
-                assert_eq!(fs::read_to_string(&path).unwrap(), old);
-            }
-            let meta = fs::metadata(&path).unwrap();
-            assert_eq!(meta.permissions().mode() & 0o777, 0o444);
-            let left: Vec<_> = fs::read_dir(&claude)
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect();
-            assert_eq!(left, ["CLAUDE.md"]);
+        let home = own_dir();
+        let claude = home.path().join(".claude");
+        fs::create_dir(&claude).unwrap();
+        let path = claude.join("CLAUDE.md");
+        let old = format!("{BOOT_TIME}\nold rules\n");
+        fs::write(&path, &old).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        let may_write = rustix::fs::accessat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::Access::WRITE_OK,
+            rustix::fs::AtFlags::EACCESS,
+        )
+        .is_ok();
+        let report = tick(Some(home.path()));
+        if may_write {
+            assert_eq!(
+                report.lines,
+                ["rules: now imported from tools/cloud-env/COORDINATOR.md; read it"]
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), format!("{IMPORT}\n"));
+        } else {
+            assert_eq!(
+                report.lines,
+                [format!(
+                    "heartbeat: could not write the COORDINATOR.md import to {}",
+                    path.display()
+                )]
+            );
+            assert!(report.failed);
+            assert_eq!(fs::read_to_string(&path).unwrap(), old);
         }
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o444);
+        let left: Vec<_> = fs::read_dir(&claude)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["CLAUDE.md"]);
     }
 
     #[test]

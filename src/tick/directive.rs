@@ -940,49 +940,6 @@ mod tests {
     }
 
     #[test]
-    fn a_coordinator_handoff_that_cannot_be_read_is_named_and_lists_nothing() {
-        use std::os::unix::fs::PermissionsExt;
-        let ct = tempfile::Builder::new()
-            .prefix("directive-test-")
-            .tempdir_in(std::env::current_exe().unwrap().parent().unwrap())
-            .unwrap();
-        let epoch = Path::new("store/epochs/e");
-        let handoff = ct.path().join(epoch).join("handoff");
-        std::fs::create_dir_all(&handoff).unwrap();
-        let named = format!("Handoff: role=coordinator stamp_entry={STAMP}\n");
-        std::fs::write(handoff.join("coordinator-a.md"), &named).unwrap();
-        let unreadable = handoff.join("coordinator-b.md");
-        std::fs::write(&unreadable, &named).unwrap();
-        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
-        std::fs::write(
-            ct.path().join(epoch).join("JOURNAL.md"),
-            journal("## 2026-11-25T04:05Z — Owner directive: open\n"),
-        )
-        .unwrap();
-        let _held = crate::tick::claude_md::Unprivileged::new();
-        let proc = crate::tick::proc::FakeProc::new(|cmd| panic!("no child runs: {}", cmd.line()));
-        let env = crate::tick::act::Env::default();
-        let ctx = Ctx::new(
-            ct.path(),
-            epoch,
-            &proc,
-            &env,
-            std::ffi::OsStr::new("cm"),
-            BUDGET,
-        );
-        assert_eq!(
-            run(&ctx),
-            Report {
-                lines: vec![format!(
-                    "heartbeat: could not read {}: Permission denied (os error 13); owner directives not listed",
-                    unreadable.display()
-                )],
-                failed: true
-            }
-        );
-    }
-
-    #[test]
     fn a_pickup_marker_without_its_em_dash_picks_nothing_up() {
         for marker in [
             "Directive picked up: ",
