@@ -2629,15 +2629,34 @@ const GITLINK: &[u8] = b"160000";
 // first parent, the second parent; none where that side has no such path.
 type Stages<'a> = [Option<(&'a [u8], &'a [u8])>; 3];
 
-// After the tree id, one `<mode> <object> <stage>\t<path>` entry per stage of each conflict. The
-// key is generic so that a test can count the comparisons.
-fn conflicts<'a, K: Ord + From<&'a [u8]>>(listed: &'a [u8]) -> Option<BTreeMap<K, Stages<'a>>> {
+struct Record<'a> {
+    paths: Vec<&'a [u8]>,
+    kind: &'a [u8],
+}
+
+// The records are none when what follows the stage entries is not a whole list of them, as when
+// git appends its advice on a submodule it cannot merge.
+struct Listing<'a, K> {
+    tree: &'a str,
+    conflicts: BTreeMap<K, Stages<'a>>,
+    records: Option<Vec<Record<'a>>>,
+}
+
+// `git merge-tree --write-tree -z`: the tree id, one `<mode> <object> <stage>\t<path>` entry per
+// stage of each conflict, an empty entry, then for each message the number of paths it names,
+// those paths, its type and its text. The key is generic so that a test can count the comparisons.
+fn listing<'a, K: Ord + From<&'a [u8]>>(listed: &'a [u8]) -> Option<Listing<'a, K>> {
+    let mut fields = listed.split(|byte| *byte == 0);
+    let tree = fields
+        .next()
+        .and_then(|tree| std::str::from_utf8(tree).ok())
+        .filter(|tree| tree.bytes().all(|byte| byte.is_ascii_hexdigit()))?;
     let mut conflicts: BTreeMap<K, Stages<'a>> = BTreeMap::new();
-    for entry in nul_paths(listed).into_iter().skip(1) {
+    for entry in fields.by_ref().take_while(|entry| !entry.is_empty()) {
         let tab = entry.iter().position(|byte| *byte == b'\t')?;
-        let mut fields = entry[..tab].split(|byte| *byte == b' ');
-        let (mode, object) = (fields.next()?, fields.next()?);
-        let stage = match fields.next()? {
+        let mut parts = entry[..tab].split(|byte| *byte == b' ');
+        let (mode, object) = (parts.next()?, parts.next()?);
+        let stage = match parts.next()? {
             b"1" => 0,
             b"2" => 1,
             b"3" => 2,
@@ -2645,7 +2664,26 @@ fn conflicts<'a, K: Ord + From<&'a [u8]>>(listed: &'a [u8]) -> Option<BTreeMap<K
         };
         conflicts.entry(K::from(&entry[tab + 1..])).or_default()[stage] = Some((mode, object));
     }
-    Some(conflicts)
+    Some(Listing {
+        tree,
+        conflicts,
+        records: records(&mut fields),
+    })
+}
+
+fn records<'a>(fields: &mut impl Iterator<Item = &'a [u8]>) -> Option<Vec<Record<'a>>> {
+    let mut records = Vec::new();
+    loop {
+        let count = fields.next()?;
+        if count.is_empty() {
+            return fields.next().is_none().then_some(records);
+        }
+        let count: usize = std::str::from_utf8(count).ok()?.parse().ok()?;
+        let paths: Vec<&[u8]> = fields.by_ref().take(count).collect();
+        let kind = fields.next()?;
+        fields.next()?;
+        records.push(Record { paths, kind });
+    }
 }
 
 // The scratch repository holds no submodule's objects. A gitlink conflict with one side absent,
@@ -2653,6 +2691,73 @@ fn conflicts<'a, K: Ord + From<&'a [u8]>>(listed: &'a [u8]) -> Option<BTreeMap<K
 // submodule's history to merge.
 fn needs_submodule_history(stages: &Stages<'_>) -> bool {
     matches!(stages, [_, Some((GITLINK, ours)), Some((GITLINK, theirs))] if ours != theirs)
+}
+
+// Beneath a displaced path a resolution may only delete, once the entry is back at that path; a
+// made-up name, kept with the path its entry came from, must not remain.
+struct Bounds<'a, K> {
+    paths: BTreeSet<K>,
+    displaced: BTreeSet<K>,
+    made_up: Vec<(&'a [u8], &'a [u8])>,
+}
+
+enum Unbounded<'a> {
+    Unreadable,
+    Unknown(&'a [u8]),
+}
+
+// git names an entry it moves aside `<path>~<the side's name>`, with a suffix when that is taken.
+fn moved_aside(made_up: &[u8], from: &[u8]) -> bool {
+    made_up
+        .strip_prefix(from)
+        .is_some_and(|rest| rest.first() == Some(&b'~'))
+}
+
+// The record types of git 2.43 to 2.56. A file/directory record names the made-up path first, a
+// distinct-types one the original path first; the original path of a distinct-types conflict is
+// conflicted only while git leaves one entry at it.
+fn bounds<'a, K: Ord + From<&'a [u8]>>(
+    listing: Listing<'a, K>,
+) -> Result<Bounds<'a, K>, Unbounded<'a>> {
+    let records = listing.records.ok_or(Unbounded::Unreadable)?;
+    let mut bounds = Bounds {
+        paths: listing.conflicts.into_keys().collect(),
+        displaced: BTreeSet::new(),
+        made_up: Vec::new(),
+    };
+    for Record { paths, kind } in records {
+        match (kind, &paths[..]) {
+            (
+                b"Auto-merging"
+                | b"CONFLICT (contents)"
+                | b"CONFLICT (binary)"
+                | b"CONFLICT (modify/delete)"
+                | b"CONFLICT (rename/delete)"
+                | b"CONFLICT (rename/rename)",
+                _,
+            ) => {}
+            (b"CONFLICT (directory rename suggested)", named) => {
+                bounds.paths.extend(named.iter().map(|path| K::from(*path)));
+            }
+            (b"CONFLICT (file/directory)", [made_up, from]) if moved_aside(made_up, from) => {
+                bounds.paths.insert(K::from(*from));
+                bounds.displaced.insert(K::from(*from));
+                bounds.made_up.push((*made_up, *from));
+            }
+            (b"CONFLICT (distinct modes)", [from, made_up @ ..])
+                if !made_up.is_empty() && made_up.iter().all(|path| moved_aside(path, from)) =>
+            {
+                bounds
+                    .made_up
+                    .extend(made_up.iter().map(|made_up| (*made_up, *from)));
+            }
+            (b"CONFLICT (file/directory)" | b"CONFLICT (distinct modes)", _) => {
+                return Err(Unbounded::Unreadable);
+            }
+            (kind, _) => return Err(Unbounded::Unknown(kind)),
+        }
+    }
+    Ok(bounds)
 }
 
 // `git diff-tree --name-status -z`: a status and a path for each path where two trees differ.
@@ -2667,13 +2772,25 @@ fn changes(listed: &[u8]) -> Option<Vec<(&[u8], &[u8])>> {
 }
 
 fn beyond<'a, K: Ord + From<&'a [u8]>>(
-    conflicts: &BTreeMap<K, Stages<'_>>,
+    bounds: &Bounds<'_, K>,
     changed: &[(&[u8], &'a [u8])],
 ) -> Vec<&'a [u8]> {
+    let restored: BTreeSet<K> = changed
+        .iter()
+        .map(|(_, path)| K::from(path))
+        .filter(|path| bounds.displaced.contains(path))
+        .collect();
+    let beneath_restored = |path: &'a [u8]| {
+        path.iter()
+            .enumerate()
+            .any(|(at, byte)| *byte == b'/' && restored.contains(&K::from(&path[..at])))
+    };
     changed
         .iter()
+        .filter(|(status, path)| {
+            !bounds.paths.contains(&K::from(path)) && !(*status == b"D" && beneath_restored(path))
+        })
         .map(|(_, path)| *path)
-        .filter(|path| !conflicts.contains_key(&K::from(path)))
         .collect()
 }
 
@@ -2686,8 +2803,8 @@ fn quoted_paths(paths: impl IntoIterator<Item = impl AsRef<[u8]>>) -> String {
 }
 
 // The merge stands on resolution reviews when it differs from git's own merge of its parents only
-// at the paths that merge lists as conflicted. Both come from one merge-tree run: its tree and its
-// stage entries.
+// where that merge's conflicts bound a resolution. Both come from one merge-tree run: its tree,
+// its stage entries and its typed records.
 fn beyond_resolution(
     isolated: &Isolated,
     commit: &str,
@@ -2698,7 +2815,6 @@ fn beyond_resolution(
         .output(&[
             "merge-tree",
             "--write-tree",
-            "--no-messages",
             "-z",
             &merge.first,
             &merge.second,
@@ -2715,13 +2831,9 @@ fn beyond_resolution(
         _ => return Err(isolated.failed(commit, failure(&merged))),
     };
     let unlisted = || failed("git merge-tree listed an entry cm cannot read");
-    let tree = nul_paths(&listed)
-        .first()
-        .and_then(|tree| std::str::from_utf8(tree).ok())
-        .filter(|tree| tree.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(unlisted)?;
-    let conflicts = conflicts::<&[u8]>(&listed).ok_or_else(unlisted)?;
-    let submodules: Vec<&[u8]> = conflicts
+    let listing = listing::<&[u8]>(&listed).ok_or_else(unlisted)?;
+    let submodules: Vec<&[u8]> = listing
+        .conflicts
         .iter()
         .filter(|(_, stages)| needs_submodule_history(stages))
         .map(|(path, _)| *path)
@@ -2732,6 +2844,17 @@ fn beyond_resolution(
             quoted_paths(submodules)
         )));
     }
+    let tree = listing.tree;
+    let bounds = match bounds(listing) {
+        Ok(bounds) => bounds,
+        Err(Unbounded::Unreadable) => return Err(unlisted()),
+        Err(Unbounded::Unknown(kind)) => {
+            return Ok(Some(format!(
+                "git's merge of its parents reports a message of a type cm does not read, {}",
+                quoted_paths([kind])
+            )));
+        }
+    };
     let listed = isolated
         .bytes(&[
             "diff-tree",
@@ -2747,61 +2870,31 @@ fn beyond_resolution(
         .map_err(|why| isolated.failed(commit, why))?;
     let changed =
         changes(&listed).ok_or_else(|| failed("git diff-tree listed an entry cm cannot read"))?;
-    let beyond = beyond(&conflicts, &changed);
+    let beyond = beyond(&bounds, &changed);
     if !beyond.is_empty() {
         return Ok(Some(format!(
             "it changes {} beyond the files its parents conflict in",
             quoted_paths(beyond)
         )));
     }
-    // A path merge-tree moved a file or submodule aside to is in no tree the merge comes from;
-    // keeping it, or the entry under any other new name, is no resolution of the conflict.
-    let made_up = made_up(isolated, commit, merge, &conflicts)?;
     let deleted: BTreeSet<&[u8]> = changed
         .iter()
         .filter(|(status, _)| *status == b"D")
         .map(|(_, path)| *path)
         .collect();
-    let kept: Vec<&[u8]> = made_up
+    let kept: Vec<String> = bounds
+        .made_up
         .into_iter()
-        .filter(|path| !deleted.contains(path))
+        .filter(|(made_up, _)| !deleted.contains(made_up))
+        .map(|(made_up, from)| {
+            format!(
+                "it keeps {}, where git moved {} aside for a conflict",
+                quoted_paths([made_up]),
+                quoted_paths([from])
+            )
+        })
         .collect();
-    Ok((!kept.is_empty()).then(|| {
-        format!(
-            "it keeps {}, which git made up for a conflict",
-            quoted_paths(kept)
-        )
-    }))
-}
-
-// The conflicted paths that are in neither parent nor any merge base.
-fn made_up<'a>(
-    isolated: &Isolated,
-    commit: &str,
-    merge: &Merge,
-    conflicts: &BTreeMap<&'a [u8], Stages<'_>>,
-) -> Result<Vec<&'a [u8]>, CleanUpdateError> {
-    let bases = isolated
-        .bytes(&["merge-base", "--all", &merge.first, &merge.second])
-        .map_err(|why| isolated.failed(commit, why))?;
-    let bases = String::from_utf8_lossy(&bases).into_owned();
-    let mut trees = Vec::new();
-    for at in [merge.first.as_str(), merge.second.as_str()]
-        .into_iter()
-        .chain(bases.split_whitespace())
-    {
-        trees.push(
-            isolated
-                .bytes(&["ls-tree", "-r", "-z", "--name-only", "--full-tree", at])
-                .map_err(|why| isolated.failed(commit, why))?,
-        );
-    }
-    let real: BTreeSet<&[u8]> = trees.iter().flat_map(|tree| nul_paths(tree)).collect();
-    Ok(conflicts
-        .keys()
-        .copied()
-        .filter(|path| !real.contains(path))
-        .collect())
+    Ok((!kept.is_empty()).then(|| kept.join("; ")))
 }
 
 /// The gate's (a) and (b) for a codex step about to merge at `head`.
@@ -3320,8 +3413,10 @@ mod tests {
             for (mode, object, stage) in entries {
                 listed.push_str(&format!("{mode} {object} {stage}\tsub\0"));
             }
-            conflicts::<&[u8]>(listed.as_bytes()).map(|conflicts| {
-                conflicts
+            listed.push('\0');
+            listing::<&[u8]>(listed.as_bytes()).map(|listing| {
+                listing
+                    .conflicts
                     .values()
                     .map(needs_submodule_history)
                     .collect::<Vec<_>>()
@@ -3353,10 +3448,7 @@ mod tests {
             Some(vec![false])
         );
         assert_eq!(classified(&[(gitlink, &a, 4)]), None);
-        assert_eq!(
-            conflicts::<&[u8]>(format!("{SHA}\0160000 {a} 2 sub\0").as_bytes()),
-            None
-        );
+        assert!(listing::<&[u8]>(format!("{SHA}\0160000 {a} 2 sub\0\0").as_bytes()).is_none());
     }
 
     #[test]
@@ -3397,18 +3489,160 @@ mod tests {
                 listed.extend(format!("100644 {SHA} {stage}\tdir/{path:05}.txt\0").bytes());
             }
         }
+        listed.push(0);
         let changed: Vec<u8> = (0..paths)
             .flat_map(|path| format!("M\0dir/{:05}.txt\0", 2 * path).into_bytes())
             .collect();
         let changed = changes(&changed).unwrap();
-        let conflicts = conflicts::<Counted>(&listed).unwrap();
-        assert_eq!(conflicts.len(), paths);
-        assert_eq!(beyond(&conflicts, &changed).len(), paths / 2);
+        let listing = listing::<Counted>(&listed).unwrap();
+        assert_eq!(listing.conflicts.len(), paths);
+        let Ok(bounds) = bounds(listing) else {
+            panic!("no record, so nothing unbounded");
+        };
+        assert_eq!(beyond(&bounds, &changed).len(), paths / 2);
         let lookups = 3 * paths + paths;
         let compared = COMPARED.with(Cell::get);
         assert!(
             compared <= 4 * lookups * paths.ilog2() as usize,
             "{compared}"
+        );
+    }
+
+    #[test]
+    fn a_merge_tree_listing_is_read_only_whole_up_to_its_last_record() {
+        let entry = format!("100644 {SHA} 2\tx~{SHA}\0");
+        let read = |records: &str| {
+            listing::<&[u8]>(format!("{SHA}\0{entry}\0{records}").as_bytes())
+                .unwrap()
+                .records
+                .map(|records| {
+                    records
+                        .iter()
+                        .map(|record| {
+                            let mut named: Vec<String> = record
+                                .paths
+                                .iter()
+                                .map(|path| String::from_utf8_lossy(path).into_owned())
+                                .collect();
+                            named.push(String::from_utf8_lossy(record.kind).into_owned());
+                            named
+                        })
+                        .collect::<Vec<_>>()
+                })
+        };
+        let moved = format!("2\0x~{SHA}\0x\0CONFLICT (file/directory)\0moved\n\0");
+        assert_eq!(
+            read(&format!(
+                "{moved}1\0x~{SHA}\0CONFLICT (modify/delete)\0kept\n\0"
+            )),
+            Some(vec![
+                vec![
+                    format!("x~{SHA}"),
+                    "x".to_owned(),
+                    "CONFLICT (file/directory)".to_owned()
+                ],
+                vec![format!("x~{SHA}"), "CONFLICT (modify/delete)".to_owned()],
+            ])
+        );
+        assert_eq!(read(""), Some(Vec::new()));
+        for unread in [
+            format!("{moved}\0"),
+            format!("{moved}\01\0x\0CONFLICT (contents)\0late\n\0"),
+            "two\0x\0CONFLICT (contents)\0text\n\0".to_owned(),
+            "3\0x\0y\0CONFLICT (contents)\0text\n\0".to_owned(),
+            "1\0x\0CONFLICT (contents)\0".to_owned(),
+        ] {
+            assert_eq!(read(&unread), None, "{unread:?}");
+        }
+        let unseparated = format!("{SHA}\0{entry}");
+        assert!(
+            listing::<&[u8]>(unseparated.as_bytes())
+                .unwrap()
+                .records
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn only_a_moved_aside_name_that_extends_its_own_path_is_read_as_made_up() {
+        let bounded = |paths: &[&str], kind: &str| {
+            let mut listed = format!("{SHA}\0\0{}\0", paths.len());
+            for path in paths {
+                listed.push_str(&format!("{path}\0"));
+            }
+            listed.push_str(&format!("{kind}\0text\n\0"));
+            let listing = listing::<&[u8]>(listed.as_bytes()).unwrap();
+            match bounds(listing) {
+                Ok(bounds) => Ok((
+                    bounds
+                        .made_up
+                        .iter()
+                        .map(|(made_up, from)| {
+                            format!(
+                                "{} from {}",
+                                String::from_utf8_lossy(made_up),
+                                String::from_utf8_lossy(from)
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    bounds.paths.len(),
+                    bounds.displaced.len(),
+                )),
+                Err(Unbounded::Unreadable) => Err("unreadable".to_owned()),
+                Err(Unbounded::Unknown(kind)) => Err(String::from_utf8_lossy(kind).into_owned()),
+            }
+        };
+        let moved = format!("x~{SHA}");
+        let file_directory = "CONFLICT (file/directory)";
+        assert_eq!(
+            bounded(&[&moved, "x"], file_directory),
+            Ok((vec![format!("{moved} from x")], 1, 1))
+        );
+        assert_eq!(
+            bounded(&[&format!("x~{SHA}_1"), "x"], file_directory),
+            Ok((vec![format!("x~{SHA}_1 from x")], 1, 1))
+        );
+        for unread in [
+            vec!["x", moved.as_str()],
+            vec![moved.as_str()],
+            vec![moved.as_str(), "x", "y"],
+            vec![moved.as_str(), "y"],
+            vec!["x-moved", "x"],
+        ] {
+            assert_eq!(
+                bounded(&unread, file_directory),
+                Err("unreadable".to_owned()),
+                "{unread:?}"
+            );
+        }
+        let distinct = "CONFLICT (distinct modes)";
+        let other = format!("l~{}", "1".repeat(40));
+        assert_eq!(
+            bounded(&["l", &format!("l~{SHA}"), &other], distinct),
+            Ok((
+                vec![format!("l~{SHA} from l"), format!("{other} from l")],
+                0,
+                0
+            ))
+        );
+        for unread in [vec![other.as_str(), "l"], vec!["l"], vec!["l", "m~1"]] {
+            assert_eq!(
+                bounded(&unread, distinct),
+                Err("unreadable".to_owned()),
+                "{unread:?}"
+            );
+        }
+        assert_eq!(
+            bounded(
+                &["e/new.txt", "d/new.txt"],
+                "CONFLICT (directory rename suggested)"
+            ),
+            Ok((Vec::new(), 2, 0))
+        );
+        assert_eq!(bounded(&["x"], "Auto-merging"), Ok((Vec::new(), 0, 0)));
+        assert_eq!(
+            bounded(&["x"], "CONFLICT (rename involved in collision)"),
+            Err("CONFLICT (rename involved in collision)".to_owned())
         );
     }
 }

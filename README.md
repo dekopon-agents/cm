@@ -925,7 +925,7 @@ the walk does not run. A step that holds a resolution review also matches receip
 to that commit; any other step matches them to `--head` as given.
 
 A merge from the base branch whose parents conflict, and which differs from git's own merge of
-them only at the paths that merge leaves conflicted, may instead stand on resolution reviews recorded at it with `cm review
+them only where that merge's conflicts allow (below), may instead stand on resolution reviews recorded at it with `cm review
 record … --kind resolution` (owner, 2026-11-25). Those reviews, and the receipts of their
 reports, do not stop the walk as a review of the merge would. The walk passes such a merge when
 Astra and a Claude reviewer have each recorded an explicit resolution ACCEPT there, none of its
@@ -934,19 +934,29 @@ every finished Astra receipt at the merge is the receipt of an Astra resolution 
 there. It then goes on to the merge's first parent, which must clear with both families' ACCEPTs
 on any lane, so a later merge from the base branch walks back through an earlier one. Git's own
 merge is made in the scratch repository above: one `git merge-tree --write-tree` run gives its
-tree and the paths it lists as conflicted, and the merge is compared with that tree path by path,
-with renames not folded. So git's default merge of the commits decides both, and no merge
-attribute, driver or `merge.*` setting, committed or local, does: a `-merge` or `binary`
-attribute makes no file conflicted, and a merge whose parents merge there without a conflict, or
-that differs from git's merge at any other path, does not pass this way. Where git moves a file
-or a submodule aside, for a directory or for an entry of another type, it lists the path it made
-up for it, one in neither parent nor any merge base, as conflicted, and that path must not
-remain: a merge that keeps both entries, under that name or a new one, does not pass. Against a
-directory only the moved entry is conflicted, so a merge that keeps the directory passes, and one
-that keeps the file or the submodule, deleting the directory's files, does not. Nor does a merge
-whose parents set a submodule to two different commits: without the submodule's objects their
-merge cannot be read. Any other conflict on a submodule, one parent deleting it or putting a file
-or directory in its place, is read like a file's. A resolution review is never an ACCEPT of the head, and its receipt never meets (a) at
+tree, the paths it lists as conflicted and a typed record of each conflict, and the merge is
+compared with that tree path by path, with renames not folded. So git's default merge of the
+commits decides all three, and no merge attribute, driver or `merge.*` setting, committed or
+local, does: a `-merge` or `binary` attribute makes no file conflicted, and a merge whose parents
+merge there without a conflict, or that differs from git's merge at any path its conflicts do not
+allow, does not pass this way. The merge may differ at a conflicted path. Where git suggests
+moving a file one parent put in a directory the other parent renamed
+(`CONFLICT (file location)`), it lists the file's path in the renamed directory as conflicted,
+and the merge may keep the file there or put it back at the path its parent gave it. Where git
+moves a file, symlink or submodule aside, for a directory (`CONFLICT (file/directory)`) or for an
+entry of another type (`CONFLICT (distinct types)`), the record names the path it made up for
+the entry, `<path>~` and the commit of the parent it came from, and that path must not remain: a
+merge that keeps both entries, under that name or a new one, does not pass. Against a directory
+the merge may keep the directory, or put the entry back at its own path and delete the
+directory's files; no other change beneath that path passes. Against an entry of another type
+the path itself is conflicted only while git leaves one of the two entries there: for a symlink
+against a submodule git moves both aside, so no merge that keeps either passes. Git's other
+records, `Auto-merging` and content, binary, modify/delete, rename/delete and rename/rename
+conflicts, allow nothing more, and a record of any other type, such as a directory rename git
+could not apply, stops the merge passing this way. Nor does a merge whose parents set a
+submodule to two different commits: without the submodule's objects their merge cannot be read.
+Any other conflict on a submodule, one parent deleting it or putting a file or directory in its
+place, is read like a file's. A resolution review is never an ACCEPT of the head, and its receipt never meets (a) at
 the head: without a checkout, (a) and (b) must hold at the merge itself, and a review of the head
 recorded at the merge governs it. Any commit after the merge needs its own review, and so does
 the merge once it is amended. The journal entry of the `merged` move names each merge the walk
