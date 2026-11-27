@@ -1937,17 +1937,24 @@ fn indent(line: &str) -> usize {
 // A fence closes only on a run of its own character at least as long as the opener, with nothing
 // after it and indented at most three columns past its container (a list item's content column
 // when the opener is on the item's line, else the margin): anything else is fenced content, as
-// CommonMark reads it. A line dedented out of the item would end the item and could open another
-// fence; it is read as fenced too, so an unclosed fence in a list item hides the rest of the body.
+// CommonMark reads it. A non-blank line dedented out of the item ends the item and can open another
+// fence that later lines would have to be matched against, so from that line on nothing in the body
+// is read: an unclosed fence in a list item hides the rest of the body.
 fn states_unpause(body: &str) -> bool {
     let mut fence: Option<(char, usize, usize)> = None;
+    let mut hidden = false;
     let text = body
         .lines()
         .map(|raw| {
             let depth = indent(raw);
             let line = raw.trim();
+            if hidden {
+                return ";".to_owned();
+            }
             if let Some((mark, open, at)) = fence {
-                if (at..=at + 3).contains(&depth)
+                if !line.is_empty() && depth < at {
+                    hidden = true;
+                } else if (at..=at + 3).contains(&depth)
                     && line.len() >= open
                     && line.chars().all(|c| c == mark)
                 {
