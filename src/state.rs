@@ -677,6 +677,21 @@ impl After {
         step(text).map(After::Merged)
     }
 
+    // Whether a text `parse` refuses was refused for its step id: that refusal alone lists every
+    // gate form. It follows `parse`'s own order of prefixes.
+    pub(crate) fn refuses_step(text: &str) -> bool {
+        if text.starts_with("tag:") || text.starts_with("deployed:") {
+            return false;
+        }
+        if text.starts_with("pr-open:") {
+            return true;
+        }
+        match text.strip_prefix("pin:") {
+            Some(pin) => pin.rsplit_once('@').is_some_and(|(_, sha)| is_commit(sha)),
+            None => true,
+        }
+    }
+
     pub fn target(&self) -> String {
         match self {
             After::Merged(target) | After::PrOpen(target) => target.clone(),

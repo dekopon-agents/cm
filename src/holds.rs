@@ -339,10 +339,14 @@ pub fn known_red(
             violations.push(crate::commands::after_refusal(
                 host,
                 root,
-                &full,
-                &target.unit,
-                ("--until", args.until),
+                (&full, &target.unit),
+                crate::commands::Gate {
+                    id: "until",
+                    nth: 0,
+                    text: args.until,
+                },
                 message,
+                None,
             ));
             None
         }

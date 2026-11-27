@@ -15,7 +15,7 @@ use crate::host::{Host, Invoked};
 use crate::idea::{self, Maturity, Word};
 use crate::lint;
 use crate::outcome::{Arg, Input, Move, Next, Outcome, Violation};
-use crate::state::{Evidence, LANES, Lane, Work};
+use crate::state::{Evidence, LANES, Lane, Phase, Work};
 use crate::store::{self, Target, parse_target};
 use crate::tick::proc::FileSizeLimit;
 
@@ -751,7 +751,6 @@ fn reviewer_name(text: &str) -> Result<String, String> {
         .ok_or_else(|| "expected a reviewer name of letters, digits, `.`, `_` and `-`".into())
 }
 
-// A refusal raised while reading an argument against the campaign: `main` prints it as any other.
 #[derive(Debug)]
 struct Refused(Vec<Violation>);
 
@@ -771,7 +770,7 @@ fn refused(violation: Violation) -> anyhow::Error {
 fn target(
     host: &dyn Host,
     root: &Path,
-    text: &str,
+    (text, slot): (&str, Slot),
     with_step: bool,
 ) -> std::result::Result<Target, Violation> {
     parse_target(text, with_step).map_err(|cause| {
@@ -784,20 +783,26 @@ fn target(
         commands::nearest_refusal(
             host,
             root,
-            "step-unknown",
-            (text, with_step),
+            (text, "step-unknown"),
+            (text, slot, with_step),
             cause,
             list.into_iter().collect(),
         )
     })
 }
 
+const TARGET: Slot = Slot::Positional("target");
+
 fn step_target(host: &dyn Host, root: &Path, text: &str) -> Result<Target> {
-    target(host, root, text, true).map_err(refused)
+    target(host, root, (text, TARGET), true).map_err(refused)
 }
 
 fn any_target(host: &dyn Host, root: &Path, text: &str) -> Result<Target> {
-    target(host, root, text, false).map_err(refused)
+    target(host, root, (text, TARGET), false).map_err(refused)
+}
+
+fn step_option(host: &dyn Host, root: &Path, text: &str, id: &str) -> Result<Target> {
+    target(host, root, (text, Slot::Option(id, 0)), true).map_err(refused)
 }
 
 fn lane(host: &dyn Host, path: &str, text: &str) -> Result<Lane> {
@@ -809,7 +814,7 @@ fn lane(host: &dyn Host, path: &str, text: &str) -> Result<Lane> {
             .filter(|(edits, _)| *edits <= 2)
             .min_by_key(|(edits, _)| *edits)
             .map(|(_, lane)| lane)
-            && let Some(each) = commands::again_with(host, text, near.name())
+            && let Some(each) = commands::again(host, Slot::Option("lane", 0), near.name())
         {
             moves.push((format!("when you meant {near}"), each));
         }
@@ -1023,9 +1028,10 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             plan_revision,
         } => {
             let root = root()?;
-            let to = status
-                .parse::<Status>()
-                .map_err(|cause| refused(epoch::move_refusal(host, &root, status, cause)))?;
+            let to = status.parse::<Status>().map_err(|cause| {
+                let given = (skill_revision.is_some(), plan_revision.is_some());
+                refused(epoch::move_refusal(host, &root, given, cause))
+            })?;
             epoch::epoch(
                 host,
                 &root,
@@ -1197,13 +1203,22 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             waiver,
             part,
         } => {
-            if !by.is_empty() && state != "superseded" {
-                return Err(conflict("--by applies only to superseded").into());
-            }
             let root = root()?;
             let target = any_target(host, &root, target)?;
-            let state = commands::advance_state(host, &root, &target, part.as_deref(), state)
-                .map_err(refused)?;
+            let asked = commands::Asked {
+                part: part.as_deref(),
+                evidence: file.is_some(),
+                by: !by.is_empty(),
+            };
+            let state =
+                commands::advance_state(host, &root, &target, &asked, state).map_err(refused)?;
+            if asked.by && state != Phase::Superseded {
+                return Err(Misuse {
+                    verbs: &["advance"],
+                    message: "--by applies only to superseded",
+                }
+                .into());
+            }
             let evidence = Evidence {
                 sha: sha.clone(),
                 pr: pr.clone(),
@@ -1316,7 +1331,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             let root = root()?;
             let block = block
                 .as_deref()
-                .map(|text| step_target(host, &root, text))
+                .map(|text| step_option(host, &root, text, "block"))
                 .transpose()?;
             crate::ledger::owner_queue_add_blocking(
                 host,
@@ -1360,7 +1375,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             let root = root()?;
             let step = step
                 .as_deref()
-                .map(|text| step_target(host, &root, text))
+                .map(|text| step_option(host, &root, text, "step"))
                 .transpose()?;
             crate::ledger::mac_lane_add_with_step(
                 host,
@@ -1407,25 +1422,15 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             ..
         } => {
             let waited = match crate::review::wait_root(cli.root.as_deref()) {
-                Ok(Some(root)) => match target(host, &root, text, true) {
-                    Ok(target) => crate::review::wait(
-                        &root,
-                        &target,
-                        head,
-                        reviewer,
-                        part.as_deref(),
-                        *deadline,
-                    )
-                    .unwrap_or_else(crate::review::WaitOutcome::unreadable),
-                    // A wait refuses with exit 2 and `wait_status: refused`, carrying this
-                    // refusal whole.
-                    Err(violation) => {
-                        let (mut outcome, exit) =
-                            crate::review::WaitOutcome::refused(text, violation.rule, "").finish();
-                        outcome.violations = vec![violation];
-                        return Ok((outcome, exit));
-                    }
-                },
+                Ok(Some(root)) => crate::review::wait(
+                    &root,
+                    &step_target(host, &root, text)?,
+                    head,
+                    reviewer,
+                    part.as_deref(),
+                    *deadline,
+                )
+                .unwrap_or_else(crate::review::WaitOutcome::unreadable),
                 Ok(None) => crate::review::WaitOutcome::refused(
                     ".cm",
                     "no-campaign",
@@ -1645,46 +1650,190 @@ pub fn resolved(root: Option<&Path>, host: &dyn Host, mut outcome: Outcome) -> O
     outcome
 }
 
-fn conflict(message: &str) -> clap::Error {
-    Cli::command().error(clap::error::ErrorKind::ArgumentConflict, message)
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Role {
+    Program,
+    Verb(String),
+    Flag(String),
+    Inline(String),
+    Switch(String),
+    Value(String),
+    Positional(String),
+    End,
+    Unknown,
+}
+
+// Each word's role as clap's parser assigns it: a repair edits the argument it means and a usage
+// error names the subcommand clap was in, whatever text the other arguments hold.
+fn roles(argv: &[String]) -> Vec<Role> {
+    let mut command = Cli::command();
+    command.build();
+    let mut roles = vec![Role::Program];
+    let (mut slot, mut found, mut ended) = (0, false, false);
+    let mut words = argv.iter().skip(1);
+    while let Some(word) = words.next() {
+        let option = |test: &dyn Fn(&clap::Arg) -> bool| {
+            command
+                .get_arguments()
+                .find(|arg| !arg.is_positional() && test(arg))
+                .map(|arg| (arg.get_id().to_string(), arg.get_action().takes_values()))
+        };
+        let short = word
+            .strip_prefix('-')
+            .filter(|rest| !rest.is_empty() && !rest.starts_with('-'));
+        let role = if ended {
+            None
+        } else if word == "--" {
+            ended = true;
+            Some(Role::End)
+        } else if let Some(long) = word.strip_prefix("--") {
+            let (name, inline) = match long.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (long, false),
+            };
+            Some(match option(&|arg| arg.get_long() == Some(name)) {
+                Some((id, true)) if inline => Role::Inline(id),
+                Some((id, true)) => Role::Flag(id),
+                Some((id, false)) => Role::Switch(id),
+                None => Role::Unknown,
+            })
+        } else if let Some(rest) = short {
+            let letter = rest.chars().next();
+            Some(match option(&|arg| arg.get_short() == letter) {
+                Some((id, true)) if rest.len() > 1 => Role::Inline(id),
+                Some((id, true)) => Role::Flag(id),
+                Some((id, false)) => Role::Switch(id),
+                None => Role::Unknown,
+            })
+        } else if !(command.is_args_conflicts_with_subcommands_set() && found)
+            && let Some(sub) = command.find_subcommand(word).cloned()
+        {
+            command = sub;
+            (slot, found) = (0, false);
+            Some(Role::Verb(command.get_name().to_owned()))
+        } else {
+            None
+        };
+        let role = role.unwrap_or_else(|| {
+            let positionals: Vec<&clap::Arg> = command.get_positionals().collect();
+            let Some(arg) = positionals.get(slot) else {
+                return Role::Unknown;
+            };
+            found = true;
+            if arg
+                .get_num_args()
+                .is_none_or(|range| range.max_values() <= 1)
+            {
+                slot += 1;
+            }
+            Role::Positional(arg.get_id().to_string())
+        });
+        let value = match &role {
+            Role::Flag(id) => Some(id.clone()),
+            _ => None,
+        };
+        roles.push(role);
+        if let Some(id) = value
+            && words.next().is_some()
+        {
+            roles.push(Role::Value(id));
+        }
+    }
+    roles
+}
+
+fn lossy(args: &[OsString]) -> Vec<String> {
+    args.iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
 }
 
 fn json_wanted(args: &[OsString]) -> bool {
-    let mut value = false;
-    for arg in args.iter().skip(1) {
-        if std::mem::take(&mut value) {
-            continue;
-        }
-        if arg == "--" {
-            break;
-        }
-        if arg == "--json" {
-            return true;
-        }
-        value = arg == "-C" || arg == "--root";
-    }
-    false
+    roles(&lossy(args)).contains(&Role::Switch("json".to_owned()))
 }
 
-// clap's error does not say which subcommand it was reading, so it is matched again from argv.
 fn verbs(args: &[OsString]) -> Vec<String> {
-    let mut command = Cli::command();
-    let mut verbs = Vec::new();
-    let mut value = false;
-    for arg in args.iter().skip(1) {
-        if std::mem::take(&mut value) {
-            continue;
+    roles(&lossy(args))
+        .into_iter()
+        .filter_map(|role| match role {
+            Role::Verb(verb) => Some(verb),
+            _ => None,
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Slot<'a> {
+    Positional(&'a str),
+    Option(&'a str, usize),
+}
+
+fn option_at(roles: &[Role], id: &str, nth: usize) -> Option<(usize, bool)> {
+    roles
+        .iter()
+        .enumerate()
+        .filter_map(|(at, role)| match role {
+            Role::Flag(flag) if flag == id => Some((at, false)),
+            Role::Inline(flag) if flag == id => Some((at, true)),
+            _ => None,
+        })
+        .nth(nth)
+}
+
+// A positional value cannot begin with `-` without `--`, so none is offered there; an option's
+// is attached to its flag.
+pub(crate) fn replaced(argv: &[String], slot: Slot, to: &str) -> Option<Vec<String>> {
+    let roles = roles(argv);
+    let mut argv = argv.to_vec();
+    match slot {
+        Slot::Positional(id) => {
+            let at = roles
+                .iter()
+                .position(|role| *role == Role::Positional(id.to_owned()))?;
+            if to.starts_with('-') {
+                return None;
+            }
+            argv[at] = to.to_owned();
         }
-        if arg == "--" {
-            break;
-        }
-        value = arg == "-C" || arg == "--root";
-        if let Some(sub) = arg.to_str().and_then(|word| command.find_subcommand(word)) {
-            verbs.push(sub.get_name().to_owned());
-            command = sub.clone();
+        Slot::Option(id, nth) => {
+            let (at, inline) = option_at(&roles, id, nth)?;
+            if inline {
+                let (flag, _) = argv[at].split_once('=')?;
+                argv[at] = format!("{flag}={to}");
+            } else if to.starts_with('-') {
+                argv[at] = format!("{}={to}", argv[at]);
+                argv.remove(at + 1);
+            } else {
+                *argv.get_mut(at + 1)? = to.to_owned();
+            }
         }
     }
-    verbs
+    Some(argv)
+}
+
+pub(crate) fn dropped(argv: &[String], id: &str, nth: usize) -> Option<Vec<String>> {
+    let (at, inline) = option_at(&roles(argv), id, nth)?;
+    let mut argv = argv.to_vec();
+    argv.drain(at..if inline { at + 1 } else { at + 2 });
+    Some(argv)
+}
+
+// `cm amend` refuses a call that changes nothing, so dropping its only change is no move.
+pub(crate) fn amends_nothing(argv: &[String]) -> bool {
+    let roles = roles(argv);
+    roles.contains(&Role::Verb("amend".to_owned()))
+        && roles.iter().all(|role| match role {
+            Role::Flag(id) | Role::Inline(id) | Role::Switch(id) => id == "json" || id == "root",
+            _ => true,
+        })
+}
+
+fn without(argv: &[String], id: &str) -> Vec<String> {
+    let mut argv = argv.to_vec();
+    while let Some(fewer) = dropped(&argv, id, 0) {
+        argv = fewer;
+    }
+    argv
 }
 
 fn usage_line(verbs: &[String]) -> (String, Vec<String>) {
@@ -1724,9 +1873,8 @@ fn usage_cause(error: &clap::Error, path: &str, subcommands: &[String]) -> Strin
     cause
 }
 
-// Without `--json` the refusal goes to stderr, where clap printed usage errors.
 fn usage(args: &[OsString], error: &clap::Error) -> ExitCode {
-    use clap::error::ErrorKind;
+    use clap::error::{ContextKind, ErrorKind};
     if matches!(
         error.kind(),
         ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
@@ -1735,20 +1883,44 @@ fn usage(args: &[OsString], error: &clap::Error) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let verbs = verbs(args);
+    let (_, subcommands) = usage_line(&verbs);
+    let cause = usage_cause(error, &path_of(&verbs), &subcommands);
+    let line = error.get(ContextKind::Usage).map(|usage| {
+        let usage = usage.to_string();
+        usage
+            .strip_prefix("Usage: ")
+            .unwrap_or(&usage)
+            .trim()
+            .to_owned()
+    });
+    misused(args, verbs, cause, line)
+}
+
+// A misuse cm itself finds after clap accepted the words; it names its own verbs.
+#[derive(Debug)]
+struct Misuse {
+    verbs: &'static [&'static str],
+    message: &'static str,
+}
+
+impl std::fmt::Display for Misuse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+
+impl std::error::Error for Misuse {}
+
+fn misused(args: &[OsString], verbs: Vec<String>, cause: String, line: Option<String>) -> ExitCode {
     let path = path_of(&verbs);
-    let (line, subcommands) = usage_line(&verbs);
+    let line = line.unwrap_or_else(|| usage_line(&verbs).0);
     // The usage line keeps clap's `<…>` and `[…]` words, so it is no command line the parse
     // check could accept.
     let shape = Move {
         when: None,
         argv: line.split_whitespace().map(Arg::from).collect(),
     };
-    let violation = Violation::refuse(
-        path.clone(),
-        "usage",
-        usage_cause(error, &path, &subcommands),
-        shape.into(),
-    );
+    let violation = Violation::refuse(path, "usage", cause, shape.into());
     if json_wanted(args) {
         let command = verbs.first().map_or("cm", String::as_str);
         println!("{}", Outcome::refused(vec![violation]).to_json(command));
@@ -1765,27 +1937,6 @@ fn path_of(verbs: &[String]) -> String {
         .join(" ")
 }
 
-fn without_root(argv: &[String]) -> Vec<String> {
-    let mut kept = Vec::new();
-    let mut words = argv.iter();
-    while let Some(word) = words.next() {
-        match word.as_str() {
-            "--" => {
-                kept.push(word.clone());
-                kept.extend(words.by_ref().cloned());
-            }
-            "-C" | "--root" => {
-                words.next();
-            }
-            word if word.starts_with("--root=") || (word.starts_with("-C") && word.len() > 2) => {}
-            _ => kept.push(word.clone()),
-        }
-    }
-    kept
-}
-
-// `path` as the caller's shell names it: relative to the current directory when they share
-// more than the filesystem root.
 fn shown(path: &Path, cwd: &Path) -> Option<String> {
     let common = cwd
         .ancestors()
@@ -1826,15 +1977,14 @@ fn no_campaign(missing: &store::NoCampaign, cli: &Cli, host: &dyn Host) -> Viola
             .as_deref()
             .map_or(Some("."), Path::to_str)
             .map(|dir| {
-                Next::run(crate::outcome::cm(
-                    vec!["cm".to_owned()],
-                    ["init".into(), dir.into()],
-                ))
+                let mut init = vec!["init".into()];
+                init.extend(crate::outcome::last(dir));
+                Next::run(crate::outcome::cm(vec!["cm".to_owned()], init))
             });
         return Violation::refuse_printed(path, "io", cause, next);
     };
     let cwd = current_dir();
-    let rest = host.argv().map(|argv| without_root(&argv[1..]));
+    let rest = host.argv().map(|argv| without(&argv, "root").split_off(1));
     let names: Vec<String> = live
         .iter()
         .map(|epoch| epoch.display().to_string())
@@ -1843,11 +1993,13 @@ fn no_campaign(missing: &store::NoCampaign, cli: &Cli, host: &dyn Host) -> Viola
         .iter()
         .zip(&names)
         .filter_map(|(epoch, name)| {
-            let mut argv = vec![
-                "cm".to_owned(),
-                "-C".to_owned(),
-                shown(&checkout.join(epoch), &cwd)?,
-            ];
+            let dir = shown(&checkout.join(epoch), &cwd)?;
+            let mut argv = vec!["cm".to_owned()];
+            if dir.starts_with('-') {
+                argv.push(format!("--root={dir}"));
+            } else {
+                argv.extend(["-C".to_owned(), dir]);
+            }
             argv.extend(rest.clone()?);
             Some((
                 format!("when the work belongs to {name}"),
@@ -1928,10 +2080,8 @@ pub fn main() -> ExitCode {
         Err(error) => return usage(&args, &error),
     };
     if matches!(cli.command, Commands::Tick { .. }) && cli.root.is_some() {
-        return usage(
-            &args,
-            &conflict("cm tick chooses its own epoch: name the checkout with --checkout, not -C"),
-        );
+        let cause = "cm tick chooses its own epoch: name the checkout with --checkout, not -C";
+        return misused(&args, vec!["tick".to_owned()], cause.to_owned(), None);
     }
     if let Commands::Tick {
         checkout,
@@ -1993,8 +2143,9 @@ pub fn main() -> ExitCode {
             exit
         }
         Err(error) => {
-            if let Some(misused) = error.downcast_ref::<clap::Error>() {
-                return usage(&args, misused);
+            if let Some(misuse) = error.downcast_ref::<Misuse>() {
+                let verbs = misuse.verbs.iter().map(|verb| (*verb).to_owned()).collect();
+                return misused(&args, verbs, misuse.message.to_owned(), None);
             }
             let violation = io_refusal(&error, &cli, &host, command);
             if cli.json {
@@ -2006,5 +2157,64 @@ pub fn main() -> ExitCode {
             }
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    #[test]
+    fn an_option_value_that_names_a_subcommand_is_read_as_the_value() {
+        let words = argv(&["cm", "review", "--model", "wait", "--bogus"]);
+        let verbs: Vec<Role> = roles(&words)
+            .into_iter()
+            .filter(|role| matches!(role, Role::Verb(_)))
+            .collect();
+        assert_eq!(verbs, [Role::Verb("review".to_owned())]);
+    }
+
+    #[test]
+    fn a_dash_led_option_value_is_attached_and_a_positional_one_is_not_offered() {
+        let words = argv(&["cm", "init", "01-a/u/s", "--lane", "x", "--after", "a"]);
+        assert_eq!(
+            replaced(&words, Slot::Option("after", 0), "-b").unwrap(),
+            argv(&["cm", "init", "01-a/u/s", "--lane", "x", "--after=-b"])
+        );
+        assert_eq!(replaced(&words, Slot::Positional("dir"), "-b"), None);
+        assert_eq!(
+            dropped(&words, "lane", 0).unwrap(),
+            argv(&["cm", "init", "01-a/u/s", "--after", "a"])
+        );
+    }
+
+    #[test]
+    fn a_repeated_value_is_edited_at_the_occurrence_named() {
+        let words = argv(&["cm", "amend", "01-a/u/s", "--after", "g", "--after=g"]);
+        assert_eq!(
+            replaced(&words, Slot::Option("after", 1), "h").unwrap(),
+            argv(&["cm", "amend", "01-a/u/s", "--after", "g", "--after=h"])
+        );
+        assert_eq!(
+            replaced(&words, Slot::Positional("target"), "01-a/u/t").unwrap(),
+            argv(&["cm", "amend", "01-a/u/t", "--after", "g", "--after=g"])
+        );
+    }
+
+    #[test]
+    fn words_after_the_end_of_options_are_positionals() {
+        let words = argv(&["cm", "journal", "--", "--json"]);
+        assert!(!roles(&words).contains(&Role::Switch("json".to_owned())));
+        assert_eq!(
+            without(
+                &argv(&["cm", "-C", "x", "--root=y", "journal", "t"]),
+                "root"
+            ),
+            argv(&["cm", "journal", "t"])
+        );
     }
 }

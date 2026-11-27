@@ -51,7 +51,7 @@ or unit id, the `advance` state with its `blocked:until:` condition, an `--after
 or `known-red --until` gate, a `--lane`, a `cm epoch` move) and an I/O error. 2 is a usage error,
 rule `usage`: an unknown subcommand or flag, a missing argument, or a value clap reads by its
 shape (a commit SHA, a reviewer name, `owner/name`, a pin, a number). `--help` and `--version`
-exit 0. `review wait` additionally uses 3 for its deadline and 4 for unreadable campaign/unit/review state in that command, and refuses with 2.
+exit 0. `review wait` additionally uses 3 for its deadline and 4 for unreadable campaign/unit/review state in that command, and refuses an unknown step or part of a well-formed id with 2.
 
 A refusal prints `path[:line]: rule: cause` as its first line, then its next move(s), indented: the
 exact command with cm's real values filled in (step, claim, item number), and a quoted
@@ -78,16 +78,20 @@ the campaign's values, and it writes nothing:
 
 | Rule | When | `next` |
 |---|---|---|
-| `step-unknown` | a step or unit id that is not `<NN-name>/<unit>[/<step>]`, or, for `cm advance`, one its unit does not declare (`unit-missing` when the unit is absent) | the same command with each declared id within two edits of it, else with the steps of the unit it names (five at most); then `cm next`, or for `cm advance` the `cm init … --lane '<lane>'` that declares it |
-| `block-condition` | a `blocked:` reason that is not one word, or a `blocked:until:` condition cm cannot read, `owner-queue:<word>` and `owner-queue:0` among them | `cm owner-queue add … --block <step>`, and `cm advance <step> blocked:until:owner-queue:<N>` for each open numbered item; for a step condition, the nearest declared steps; for a reason, the reason as one word |
-| `advance-refused` | an `advance` state that is no state | the same command with the track's next legal state, the one `advance-refused` names when a move is out of order; `cm launch <step>` from drafted; `nothing` when the track is final |
-| `after-parse` | a gate cm cannot read | the same command with the nearest declared step as the gate, or without the gate (`known-red --until`, which it requires: the step's own merge when no step is near) |
+| `step-unknown` | a step or unit id that is not `<NN-name>/<unit>[/<step>]`, or, for `cm advance`, `cm amend` and `cm unblock`, one its unit does not declare (`unit-missing`, at the unit's path, when the unit is absent) | the same command with each declared id within two edits of it, else with the steps of the unit it names (five at most); then `cm next`, or for `cm advance` the `cm init … --lane '<lane>'` that declares it |
+| `block-condition` | a `blocked:` reason that is not one word; a `blocked:until:` condition cm cannot read, `owner-queue:<word>` and `owner-queue:0` among them; or one naming a step or release that is not declared, or the blocked step itself | `cm owner-queue add … --block <step>`, and `cm advance <step> blocked:until:owner-queue:<N>` for each open numbered item; for a step condition, the nearest declared steps other than the blocked one; for a reason, the reason as one word; `nothing` when the step is final |
+| `advance-refused` | an `advance` state that is no state | the same command with a state the advance accepts: `superseded` when `--by` is given, else a state within two edits of the word, else the next legal one (`done` for a step that finishes with evidence); `--evidence '<evidence-file>'` when that state needs one and none was given; `cm launch <step>` from drafted, with `--worktree '<checkout>'` on a local lane; `nothing` when the track is final or is a deployed part |
+| `after-parse` | a gate cm cannot read | the same command with the nearest declared step other than the declaring one as the gate (a pin keeps its revision only when it is a commit, else takes that step's recorded head, else is left out), with each of the step's own gates for `--drop-after`, or without the gate unless that leaves `cm amend` nothing to change; `cm next` when none is left (`known-red --until` has no gate to drop) |
 | `lane-unknown` | a `--lane` that names no lane | the same command with the nearest lane, or with `'<lane>'` |
-| `epoch-status` | a `cm epoch` word that is no move | `cm epoch` with the move EPOCH.md is ready for, or each move under the status it follows when EPOCH.md has none |
+| `epoch-status` | a `cm epoch` word that is no move | `cm epoch` with the move EPOCH.md is ready for, and `'<revision>'` for each pin it needs that EPOCH.md holds null, or each move under the status it follows when EPOCH.md has none; `cm close` first when closing an epoch whose campaign is open |
+
+A move edits the argument it repairs where clap reads it, by its place in the command, never by
+its text, so other arguments that hold the same words are left as they were.
 
 A usage error's one move is the verb's usage line as clap renders it (`cm advance [OPTIONS]
-<TARGET> <STATE>`): its `<…>` and `[…]` words are clap's own placeholders, so it never runs as is.
-Its path is the verbs it reached (`cm owner-queue strike`), and without `--json` it prints on
+<TARGET> <STATE>`), the one in clap's error when it has one: its `<…>` and `[…]` words are clap's
+own placeholders, so it never runs as is. Its path is the subcommands clap was reading (`cm
+owner-queue strike`), an option's value never among them, and without `--json` it prints on
 stderr, where clap printed it.
 
 An error that has no refusal of its own is rule `io`, its path the file it failed on, and its JSON
@@ -97,8 +101,11 @@ object keeps the error text as `error`. Without `--json` it prints on stderr:
 |---|---|
 | a `.cm/*.json` cm cannot read or parse | `git checkout HEAD -- <path>`, as `git -C <campaign> …` when cm runs from elsewhere |
 | `.cm/lock` cm cannot take | the same command again |
-| no campaign at or above the folder | in a campaign-trail checkout, the same command as `cm -C store/epochs/<slug> …` for its one PLANNING or WORKING epoch (one move per epoch when there are several), the path relative to the current folder; anywhere else `cm init <dir>` |
+| no campaign at or above the folder | in a campaign-trail checkout, the same command as `cm -C store/epochs/<slug> …` for its one PLANNING or WORKING epoch (one move per epoch when there are several), the path relative to the current folder; anywhere else `cm init <dir>`. A path that begins with `-` is passed as `--root=<path>` and `cm init -- <dir>` |
 | anything else | the same command again |
+
+`cm lint` still finds its campaign its own way: an unreadable campaign `.cm/state.json` reads to it
+as `no-campaign`.
 
 | Command | Contract |
 |---|---|

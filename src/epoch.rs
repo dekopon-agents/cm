@@ -8,7 +8,7 @@ use anyhow::Result;
 use crate::commands::closed;
 use crate::host::Host;
 use crate::journal;
-use crate::outcome::{Next, Outcome, Violation};
+use crate::outcome::{Input, Next, Outcome, Violation};
 use crate::store::{self, lock, write_atomic};
 
 pub const EPOCH: &str = "EPOCH.md";
@@ -81,15 +81,21 @@ impl std::str::FromStr for Status {
     }
 }
 
-pub(crate) fn move_refusal(host: &dyn Host, root: &Path, text: &str, message: String) -> Violation {
+// Each move is one `epoch` would take: its pins named when EPOCH.md holds them null, and closing
+// only once the campaign has.
+pub(crate) fn move_refusal(
+    host: &dyn Host,
+    root: &Path,
+    (skill, plan): (bool, bool),
+    message: String,
+) -> Violation {
     const MOVES: [(Status, Status); 3] = [
         (Status::Open, Status::Planning),
         (Status::Planning, Status::Working),
         (Status::Working, Status::Closed),
     ];
-    let at = fs::read_to_string(root.join(EPOCH))
-        .ok()
-        .and_then(|epoch| status(&epoch));
+    let epoch = fs::read_to_string(root.join(EPOCH)).unwrap_or_default();
+    let at = status(&epoch);
     if at == Some(Status::Closed) {
         return Violation::refuse(
             EPOCH,
@@ -98,12 +104,35 @@ pub(crate) fn move_refusal(host: &dyn Host, root: &Path, text: &str, message: St
             Next::settled("EPOCH.md is CLOSED, and nothing follows it"),
         );
     }
+    let lines: Vec<String> = epoch.lines().map(str::to_owned).collect();
+    let null =
+        |pin: Pin| front(&lines).is_none_or(|front| is_null(value(&lines, &front, pin.key())));
+    let open = store::load_campaign(root).is_ok_and(|campaign| campaign.closed.is_none());
     let moves = MOVES
         .into_iter()
         .filter(|(from, _)| at.is_none_or(|at| at == *from))
         .filter_map(|(from, to)| {
-            crate::commands::again_with(host, text, &to.to_string())
-                .map(|each| (format!("when EPOCH.md is {}", from.label()), each))
+            let when = format!("when EPOCH.md is {}", from.label());
+            if to == Status::Closed && open {
+                let prefix = host.prefix()?;
+                let close = crate::outcome::Move::new(crate::outcome::cm(prefix, ["close".into()]));
+                return Some((format!("{when}: the campaign closes first"), close));
+            }
+            let mut each = crate::commands::again(
+                host,
+                crate::cli::Slot::Positional("status"),
+                &to.to_string(),
+            )?;
+            for pin in to.pins() {
+                let given = match pin {
+                    Pin::Skill => skill,
+                    Pin::Plan => plan,
+                };
+                if !given && null(*pin) {
+                    each = each.set(pin.flag(), Input::Revision);
+                }
+            }
+            Some((when, each))
         })
         .collect();
     crate::commands::refuse_moves(EPOCH, "epoch-status", message, moves)
