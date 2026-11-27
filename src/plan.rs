@@ -2009,11 +2009,12 @@ fn indent(line: &str) -> usize {
 // after it and indented at most three columns past its container (a list item's content column
 // when the opener is on the item's line, else the margin): anything else is fenced content. Two
 // lines end what this reading can follow, so from either on nothing in the body is read: a
-// non-blank line dedented out of an open list-item fence, which ends the item and can open another
-// fence, and a fence run on a line indented four columns, which in a list item can open one. Where
-// this differs from CommonMark it skips more, never less.
+// non-blank line inside an open fence indented less than the item's content column or, for an
+// opener not on an item's line, less than the opener (in a list item it ends the item and can open
+// another fence), and a fence run on a line indented four columns, which in a list item can open
+// one. Where this differs from CommonMark it skips more, never less.
 fn states_unpause(body: &str) -> bool {
-    let mut fence: Option<(char, usize, usize)> = None;
+    let mut fence: Option<(char, usize, usize, usize)> = None;
     let mut hidden = false;
     let text = body
         .lines()
@@ -2023,8 +2024,8 @@ fn states_unpause(body: &str) -> bool {
             if hidden {
                 return ";".to_owned();
             }
-            if let Some((mark, open, at)) = fence {
-                if !line.is_empty() && depth < at {
+            if let Some((mark, open, at, floor)) = fence {
+                if !line.is_empty() && depth < floor {
                     hidden = true;
                 } else if (at..=at + 3).contains(&depth)
                     && line.len() >= open
@@ -2041,7 +2042,7 @@ fn states_unpause(body: &str) -> bool {
             let item = list_item(line);
             if let Some((mark, open)) = fence_run(item.unwrap_or(line)) {
                 let column = item.map_or(0, |rest| depth + line.len() - rest.len());
-                fence = Some((mark, open, column));
+                fence = Some((mark, open, column, column.max(depth)));
                 return ";".to_owned();
             }
             match item {

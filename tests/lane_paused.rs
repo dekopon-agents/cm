@@ -576,6 +576,14 @@ fn with_the_journal_fallback_a_later_note_recalling_or_planning_the_unpause_reop
         ),
         (
             RESUMED,
+            "- notes\n  ~~~\n~~~\npaused = false in LIMITS.toml.\n~~~",
+        ),
+        (
+            RESUMED,
+            "1. notes\n   ~~~\n~~~\npaused = false in LIMITS.toml.\n~~~",
+        ),
+        (
+            RESUMED,
             "1. ~~~\n~~~~\n   ~~~\npaused = false in LIMITS.toml.\n~~~~",
         ),
         (
