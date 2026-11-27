@@ -182,9 +182,10 @@ fn unpicked_by(
     let mut below = false;
     let mut directives = Vec::new();
     let mut pickups = Vec::new();
-    let mut read = 0usize;
+    let (mut read, mut number) = (0usize, 0usize);
     each_line(journal, |line| {
         read = read.saturating_add(line.len() + 1);
+        number += 1;
         if !below {
             examined(heading.len().min(line.len()));
             below = line.starts_with(&heading);
@@ -192,23 +193,28 @@ fn unpicked_by(
             directives.push(line[b"## ".len()..].to_vec());
         }
         if after_each(line, PICKED_UP).next().is_some() {
-            pickups.push(line.to_vec());
+            pickups.push((number, line.to_vec()));
         }
     })?;
     if !below {
         return Ok(None);
     }
     let mut index = Pickups::of(&directives, base, read.saturating_mul(probes_per_byte));
-    for line in &pickups {
-        index.scan(line);
+    let mut lines = Vec::new();
+    if let Some(at) = pickups.iter().position(|(_, line)| !index.scan(line)) {
+        lines.push(format!(
+            "heartbeat: pickups in JOURNAL.md from line {} on ({} line(s)) were not checked: the scan stops at {probes_per_byte} probes per byte; some owner directives below may be picked up already",
+            pickups[at].0,
+            pickups.len() - at
+        ));
     }
-    Ok(Some(
+    lines.extend(
         directives
             .iter()
             .filter(|directive| !index.picked(directive))
-            .map(|directive| format!("owner-directive: {}", String::from_utf8_lossy(directive)))
-            .collect(),
-    ))
+            .map(|directive| format!("owner-directive: {}", String::from_utf8_lossy(directive))),
+    );
+    Ok(Some(lines))
 }
 
 // heartbeat.sh ran one `grep -F` per directive. Here every heading is hashed once and filed by
@@ -280,7 +286,7 @@ impl<'a> Pickups<'a> {
     // A line's prefix hashes are made BLOCK positions at a time, and each pickup whose text would
     // end in the block is checked against each length then, so a line of any size holds 32 KiB
     // of hashes, not eight bytes for each of its own.
-    fn scan(&mut self, line: &[u8]) {
+    fn scan(&mut self, line: &[u8]) -> bool {
         let Pickups {
             base,
             headings,
@@ -315,14 +321,14 @@ impl<'a> Pickups<'a> {
             for (length, next) in fits.iter().zip(&mut next) {
                 examined(1);
                 let Some(left) = probes.checked_sub(1) else {
-                    return;
+                    return false;
                 };
                 *probes = left;
                 while let Some(&start) =
                     starts.get(*next).filter(|&&start| start + length.len < end)
                 {
                     let Some(left) = probes.checked_sub(1) else {
-                        return;
+                        return false;
                     };
                     *probes = left;
                     let text = minus(
@@ -341,6 +347,7 @@ impl<'a> Pickups<'a> {
             }
             first = end;
         }
+        true
     }
 }
 
@@ -763,8 +770,16 @@ mod tests {
                 .collect();
             let sizes: Vec<usize> = texts.iter().map(Vec::len).collect();
             grows_with_its_input(shape, &sizes, &work, 16);
+            let listed = unpicked_by(texts[0].as_slice(), STAMP.as_bytes(), BASE, SHAPE_PROBES)
+                .unwrap()
+                .map(|lines| {
+                    lines
+                        .into_iter()
+                        .filter(|line| !line.starts_with("heartbeat: pickups in JOURNAL.md"))
+                        .collect::<Vec<_>>()
+                });
             assert_eq!(
-                unpicked_by(texts[0].as_slice(), STAMP.as_bytes(), BASE, SHAPE_PROBES).unwrap(),
+                listed,
                 grep_f_per_directive(&texts[0], STAMP.as_bytes()),
                 "{shape}"
             );
@@ -859,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn past_its_probe_budget_the_scan_lists_the_directives_it_has_not_found() {
+    fn past_its_probe_budget_the_scan_names_the_pickups_it_left_and_lists_what_it_has_not_found() {
         let text = below_stamp(format!(
             "## 1 — Owner directive: a\n## 1 — Owner directive: b\n{MARKER}1 — Owner directive: a\n"
         ));
@@ -873,10 +888,29 @@ mod tests {
         assert_eq!(
             listed(0),
             Some(vec![
+                "heartbeat: pickups in JOURNAL.md from line 4 on (1 line(s)) were not checked: the scan stops at 0 probes per byte; some owner directives below may be picked up already".to_owned(),
                 "owner-directive: 1 — Owner directive: a".to_owned(),
                 "owner-directive: 1 — Owner directive: b".to_owned()
             ])
         );
+    }
+
+    #[test]
+    fn the_scan_stops_at_the_first_probe_past_its_budget_and_says_so() {
+        let directives: Vec<Vec<u8>> = ["1 — Owner directive: a", "1 — Owner directive: b"]
+            .iter()
+            .map(|heading| heading.as_bytes().to_vec())
+            .collect();
+        let line = |heading: &[u8]| [MARKER.as_bytes(), heading].concat();
+        let (first, second) = (line(&directives[0]), line(&directives[1]));
+        let mut index = Pickups::of(&directives, BASE, 2);
+        assert!(index.scan(&first));
+        assert!(!index.scan(&second));
+        assert!(index.picked(&directives[0]));
+        assert!(!index.picked(&directives[1]));
+        let mut index = Pickups::of(&directives, BASE, 4);
+        assert!(index.scan(&first) && index.scan(&second));
+        assert!(index.picked(&directives[1]));
     }
 
     #[test]
