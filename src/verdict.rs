@@ -2122,12 +2122,11 @@ mod gate_git {
     }
 }
 
-// What the scratch repository takes from the checkout: its objects, their format and its shallow
-// boundary. Grafts and replace refs stay off, as in the checkout's own reads.
+// What the scratch repository takes from the checkout: its objects and their format. Grafts and
+// replace refs stay off, as in the checkout's own reads.
 struct Borrowed {
     objects: Vec<u8>,
     format: String,
-    shallow: Option<Vec<u8>>,
 }
 
 // The umask narrows the mode a file is created with, so it is set again.
@@ -2186,20 +2185,73 @@ impl Isolated {
         if shallow.pop() != Some(b'\n') {
             return Err(unreadable());
         }
-        // The checkout's reads stop at its shallow boundary, so the scratch repository's must too.
-        let shallow = match fs::read(
+        // git reads a shallow file it cannot open as no boundary; the gate does not guess.
+        let listed = match fs::read(
             <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(shallow),
         ) {
-            Ok(boundary) => Some(boundary),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Ok(listed) => listed,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(_) => return Err(unreadable()),
         };
-        let borrowed = Borrowed {
-            objects,
-            format,
-            shallow,
-        };
-        Isolated::under(scratch_parents(), &borrowed)
+        // Each entry reaches git as an argument, so only a full object id may.
+        let width = if format == "sha256" { 64 } else { 40 };
+        let entries = std::str::from_utf8(&listed)
+            .ok()
+            .and_then(|listed| {
+                listed
+                    .lines()
+                    .map(|entry| {
+                        (entry.len() == width && entry.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                            .then_some(entry)
+                    })
+                    .collect::<Option<Vec<&str>>>()
+            })
+            .ok_or_else(unreadable)?;
+        let isolated = Isolated::under(scratch_parents(), &Borrowed { objects, format })?;
+        isolated
+            .bound(&entries)
+            .map_err(|why| isolated.failed(commit, why))?;
+        Ok(isolated)
+    }
+
+    // A listed commit with a parent missing from the objects is where git can read no further.
+    // Past one whose parents are all there, forged or left by a later fetch, the scratch repository
+    // reads on, so that no entry hides a merge base the objects hold.
+    fn bound(&self, entries: &[&str]) -> Result<(), String> {
+        let listed = self.commits(&["--parents"], entries)?;
+        let parents: BTreeSet<&str> = listed
+            .iter()
+            .flat_map(|commit| commit.split(' ').skip(1))
+            .collect();
+        let parents: Vec<&str> = parents.into_iter().collect();
+        let present = self.commits(&[], &parents)?;
+        let present: BTreeSet<&str> = present.iter().map(String::as_str).collect();
+        let mut boundary = String::new();
+        for commit in &listed {
+            let mut ids = commit.split(' ');
+            let id = ids.next().unwrap_or_default();
+            if ids.any(|parent| !present.contains(parent)) {
+                boundary.push_str(id);
+                boundary.push('\n');
+            }
+        }
+        if boundary.is_empty() {
+            return Ok(());
+        }
+        write_private(&self.dir.join("shallow"), boundary.as_bytes())
+    }
+
+    fn commits(&self, flags: &[&str], names: &[&str]) -> Result<Vec<String>, String> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args = vec!["rev-list", "--no-walk", "--ignore-missing"];
+        args.extend(flags);
+        args.extend(names);
+        args.push("--");
+        let listed = String::from_utf8(self.bytes(&args)?)
+            .map_err(|_| "git rev-list listed a commit cm cannot read".to_owned())?;
+        Ok(listed.lines().map(str::to_owned).collect())
     }
 
     fn under(parents: Vec<PathBuf>, borrowed: &Borrowed) -> Result<Isolated, CleanUpdateError> {
@@ -2228,9 +2280,6 @@ impl Isolated {
         ])?;
         let alternates = isolated.dir.join("objects").join("info").join("alternates");
         write_private(&alternates, &quoted(&borrowed.objects))?;
-        if let Some(boundary) = &borrowed.shallow {
-            write_private(&isolated.dir.join("shallow"), boundary)?;
-        }
         Ok(isolated)
     }
 
@@ -2412,6 +2461,9 @@ pub enum CleanUpdateError {
     Conflicts {
         commit: String,
     },
+    NoMergeBase {
+        commit: String,
+    },
     /// The walk passed this many clean updates without reaching a reviewed commit.
     TooLong {
         limit: usize,
@@ -2462,6 +2514,11 @@ impl fmt::Display for CleanUpdateError {
             CleanUpdateError::Conflicts { commit } => write!(
                 f,
                 "{} resolved merge conflicts; it needs its own review",
+                short(commit)
+            ),
+            CleanUpdateError::NoMergeBase { commit } => write!(
+                f,
+                "{}'s parents have no merge base in the history the checkout holds, so it is neither a clean update nor a conflict resolution; it needs its own review, or a checkout deep enough to hold their merge base",
                 short(commit)
             ),
             CleanUpdateError::TooLong { limit } => write!(f, "more than {limit} updates"),
@@ -2539,6 +2596,20 @@ fn merge_from_base(
             parent: second.to_owned(),
             base: shown(base).to_owned(),
         });
+    }
+    // Without a merge base git merges the parents as if from an empty tree, so neither remerge diff
+    // says what either side changed.
+    let bases = isolated
+        .output(&["merge-base", "--all", first, second])
+        .map_err(|why| isolated.failed(commit, why))?;
+    match bases.status.code() {
+        Some(0) => {}
+        Some(1) if bases.stdout.is_empty() => {
+            return Err(CleanUpdateError::NoMergeBase {
+                commit: commit.to_owned(),
+            });
+        }
+        _ => return Err(isolated.failed(commit, failure(&bases))),
     }
     let empty = |reader| remerge_diff(reader, commit).map(|diff| diff.trim_ascii().is_empty());
     // Empty in the checkout, as the waiver always asked, and where no local merge setting reaches.
@@ -3153,7 +3224,6 @@ mod tests {
         let borrowed = Borrowed {
             objects: objects.to_vec(),
             format: "sha1".to_owned(),
-            shallow: None,
         };
         let isolated = Isolated::under(
             vec![missing.clone(), parent.path().to_path_buf()],
@@ -3179,6 +3249,51 @@ mod tests {
                 missing.display(),
                 missing.join("deeper").display()
             )
+        );
+    }
+
+    #[test]
+    fn a_sha256_checkouts_shallow_entry_with_a_missing_parent_bounds_its_scratch_repository() {
+        let temp = tempfile::tempdir().unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=cm", "-c", "user.email=cm@example.com"])
+                .args(args)
+                .env("HOME", temp.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let origin = temp.path().join("origin");
+        let clone = temp.path().join("clone");
+        git(
+            temp.path(),
+            &[
+                "init",
+                "-q",
+                "--object-format=sha256",
+                origin.to_str().unwrap(),
+            ],
+        );
+        for message in ["one", "two"] {
+            git(&origin, &["commit", "-q", "--allow-empty", "-m", message]);
+        }
+        let url = format!("file://{}", origin.display());
+        git(
+            temp.path(),
+            &["clone", "-q", "--depth", "1", &url, clone.to_str().unwrap()],
+        );
+        let head = git(&clone, &["rev-parse", "HEAD"]);
+        assert_eq!(head.len(), 64);
+        let isolated = Isolated::over(&clone, &head).unwrap();
+        assert_eq!(
+            fs::read_to_string(isolated.dir.join("shallow")).unwrap(),
+            format!("{head}\n")
         );
     }
 

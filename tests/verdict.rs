@@ -9079,15 +9079,42 @@ fn shallow_clone(s: &Scratch, name: &str, feature_depth: &str, main_depth: &str)
     clone
 }
 
+// Main's first change merged and reviewed, then a second merged; the clone holds both merges,
+// their parents and the first merge base, and lists h1 and main's first commit, whose parent it
+// lacks.
+fn shallow_history(host: &Fake, second: Option<&str>) -> (Scratch, String, PathBuf) {
+    let s = Scratch::new(host);
+    s.on_main("m.txt", "one\n");
+    let reviewed = s.merge_main(None);
+    s.astra(host, &reviewed, "reviewed", "ACCEPT");
+    claude_accept(host, &s.c, &reviewed);
+    match second {
+        None => s.on_main("m.txt", "two\n"),
+        Some(_) => s.on_main("shared.txt", "main\n"),
+    }
+    let merge = s.merge_main(second);
+    let shallow = shallow_clone(&s, "shallow", "3", "2");
+    let first = s.git(&["rev-parse", &format!("{}^", s.h1)]);
+    let mut boundary: Vec<String> = fs::read_to_string(shallow.join(".git/shallow"))
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    boundary.sort();
+    let mut want = vec![
+        s.h1.clone(),
+        s.git(&["rev-parse", &format!("{reviewed}^2")]),
+    ];
+    want.sort();
+    assert_eq!(boundary, want);
+    assert!(!present(&shallow, &s.home, &first));
+    (s, merge, shallow)
+}
+
 #[test]
 fn a_shallow_checkout_is_read_in_the_scratch_repository_within_its_boundary() {
     let host = at("2026-11-25T06:00:00Z");
-    let s = Scratch::new(&host);
-    s.on_main("m.txt", "one\n");
-    s.merge_main(None);
-    s.on_main("m.txt", "two\n");
-    let clean = s.merge_main(None);
-    let shallow = shallow_clone(&s, "shallow", "3", "2");
+    let (s, clean, shallow) = shallow_history(&host, None);
     let shown = scratch_git(
         &s.home,
         &shallow,
@@ -9100,10 +9127,7 @@ fn a_shallow_checkout_is_read_in_the_scratch_repository_within_its_boundary() {
     let waived = offline_merge(&s, &clean, &shallow);
     assert!(waived.status.success(), "{waived:?}");
 
-    let s = Scratch::new(&host);
-    s.on_main("shared.txt", "main\n");
-    let merge = s.merge_main(Some("feature and main\n"));
-    let shallow = shallow_clone(&s, "shallow", "3", "2");
+    let (s, merge, shallow) = shallow_history(&host, Some("feature and main\n"));
     for reviewer in ["claude", "astra"] {
         let recorded = record_env(&s, None, &[], shallow.as_os_str(), reviewer, &merge);
         assert!(recorded.status.success(), "{reviewer}: {recorded:?}");
@@ -9111,16 +9135,283 @@ fn a_shallow_checkout_is_read_in_the_scratch_repository_within_its_boundary() {
     let merged = offline_merge(&s, &merge, &shallow);
     assert!(merged.status.success(), "{merged:?}");
 
+    let (s, clean, shallow) = shallow_history(&host, None);
+    faulty_git(&s, &s.home, Fault::Boundary);
+    let refused = offline_merge(&s, &clean, &shallow);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let said = String::from_utf8_lossy(&refused.stdout);
+    assert!(
+        said.contains(&format!(
+            "reading {}'s merge in the scratch repository {}/cm-gate-",
+            &clean[..12],
+            s.home.display()
+        )) && said.contains("failed: fatal: injected rev-list"),
+        "{refused:?}"
+    );
+}
+
+fn present(repo: &Path, home: &Path, commit: &str) -> bool {
+    scratch_git(
+        home,
+        repo,
+        &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+    )
+    .status
+    .success()
+}
+
+#[test]
+fn the_scratch_repository_stops_at_a_shallow_entry_with_a_missing_parent_and_reads_past_one_whose_parents_are_all_there()
+ {
+    let host = at("2026-11-25T06:00:00Z");
+    let s = Scratch::new(&host);
+    s.on_main("m.txt", "one\n");
+    let cut = s.merge_main(None);
+    s.on_main("m.txt", "two\n");
+    let reviewed = s.merge_main(None);
+    s.astra(&host, &reviewed, "reviewed", "ACCEPT");
+    claude_accept(&host, &s.c, &reviewed);
+    s.on_main("m.txt", "three\n");
+    let clean = s.merge_main(None);
+    // The feature clone's depth cuts `cut` from h1; main's deeper fetch brings its main parent.
+    let shallow = shallow_clone(&s, "kept", "3", "4");
+    let boundary = fs::read_to_string(shallow.join(".git/shallow")).unwrap();
+    assert!(boundary.lines().any(|entry| entry == cut), "{boundary}");
+    let main_parent = s.git(&["rev-parse", &format!("{cut}^2")]);
+    assert!(present(&shallow, &s.home, &main_parent));
+    assert!(!present(&shallow, &s.home, &s.h1));
+    let waived = offline_merge(&s, &clean, &shallow);
+    assert!(waived.status.success(), "{waived:?}");
+
+    let s = Scratch::new(&host);
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    // Main's deeper fetch brings h1's parent, and h1 stays listed.
+    let shallow = shallow_clone(&s, "past", "2", "3");
+    let boundary = fs::read_to_string(shallow.join(".git/shallow")).unwrap();
+    assert_eq!(boundary, format!("{}\n", s.h1));
+    let first = s.git(&["rev-parse", &format!("{}^", s.h1)]);
+    assert!(present(&shallow, &s.home, &first));
+    let main = s.git(&["rev-parse", &s.base]);
+    let in_checkout = scratch_git(&s.home, &shallow, &["merge-base", "--all", &s.h1, &main]);
+    assert!(
+        in_checkout.status.code() == Some(1) && in_checkout.stdout.is_empty(),
+        "{in_checkout:?}"
+    );
+    let waived = offline_merge(&s, &clean, &shallow);
+    assert!(waived.status.success(), "{waived:?}");
+}
+
+fn no_merge_base(merge: &str) -> String {
+    format!(
+        "{}'s parents have no merge base in the history the checkout holds, so it is neither a clean update nor a conflict resolution",
+        &merge[..12]
+    )
+}
+
+#[test]
+fn a_merge_whose_parents_have_no_merge_base_in_the_scratch_repository_is_no_clean_update_and_no_resolution()
+ {
+    let host = at("2026-11-25T06:00:00Z");
+    let refused = |out: &std::process::Output, merge: &str| {
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(&no_merge_base(merge)),
+            "{out:?}"
+        );
+    };
+    let s = Scratch::new(&host);
+    s.on_main("other.txt", "main\n");
+    let clean = s.merge_main(None);
+    let cut = shallow_clone(&s, "cut", "2", "1");
+    let shown = scratch_git(
+        &s.home,
+        &cut,
+        &["show", "--remerge-diff", "--format=", &clean],
+    );
+    assert!(
+        shown.status.success() && shown.stdout.is_empty(),
+        "{shown:?}"
+    );
+    refused(&offline_merge(&s, &clean, &cut), &clean);
+
     let s = Scratch::new(&host);
     s.on_main("shared.txt", "main\n");
     let merge = s.merge_main(Some("feature and main\n"));
     let cut = shallow_clone(&s, "cut", "2", "1");
-    let recorded = record_env(&s, None, &[], cut.as_os_str(), "claude", &merge);
-    assert_eq!(recorded.status.code(), Some(1), "{recorded:?}");
+    refused(
+        &record_env(&s, None, &[], cut.as_os_str(), "claude", &merge),
+        &merge,
+    );
+    hand_written_resolutions(&s, &merge);
+    refused(&offline_merge(&s, &merge, &cut), &merge);
+}
+
+// Main changes x.txt and changes it back, then merges a side branch from before the change. The
+// feature branch, reviewed at its merge of the change, merges main again keeping the change,
+// reverting main's revert. A shallow entry at main's revert, whose parent the checkout holds,
+// leaves the side branch's start, from before the change, as the merge base there.
+fn reverting_merge(host: &Fake, conflicted: bool) -> (Scratch, String) {
+    let s = Scratch::new(host);
+    s.on_main("x.txt", "before\n");
+    let before = s.git(&["rev-parse", &s.base]);
+    s.on_main("x.txt", "changed\n");
+    let taken = s.merge_main(None);
+    s.astra(host, &taken, "taken", "ACCEPT");
+    claude_accept(host, &s.c, &taken);
+    s.on_main("x.txt", "before\n");
+    let revert = s.git(&["rev-parse", &s.base]);
+    s.git(&["checkout", "-q", "-b", "side", &before]);
+    s.commit("h.txt", "side\n");
+    if conflicted {
+        s.commit("shared.txt", "main\n");
+    }
+    s.git(&["checkout", "-q", &s.base]);
+    s.git(&["merge", "-q", "--no-edit", "side"]);
+    s.git(&["push", "-q", "origin", &s.base]);
+    s.git(&["checkout", "-q", "feature"]);
+    let main = format!("origin/{}", s.base);
+    let merged = scratch_git(&s.home, &s.c.repo, &["merge", "-q", "--no-commit", &main]);
+    assert_eq!(merged.status.success(), !conflicted, "{merged:?}");
+    fs::write(s.c.repo.join("x.txt"), "changed\n").unwrap();
+    if conflicted {
+        fs::write(s.c.repo.join("shared.txt"), "feature and main\n").unwrap();
+    }
+    s.git(&["add", "x.txt", "shared.txt"]);
+    s.git(&["commit", "-q", "--no-edit"]);
+    let merge = s.head();
+    fs::write(s.c.repo.join(".git/shallow"), format!("{revert}\n")).unwrap();
+    let shown = scratch_git(
+        &s.home,
+        &s.c.repo,
+        &["show", "--remerge-diff", "--format=", &merge, "--", "x.txt"],
+    );
     assert!(
-        String::from_utf8_lossy(&recorded.stdout).contains("refusing to merge unrelated histories"),
+        shown.status.success() && shown.stdout.is_empty(),
+        "the checkout's own read takes the older merge base: {shown:?}"
+    );
+    (s, merge)
+}
+
+#[test]
+fn a_shallow_entry_over_parents_the_checkout_holds_moves_no_merge_base_of_the_waiver_record_or_walk()
+ {
+    let host = at("2026-11-25T06:00:00Z");
+    let (s, merge) = reverting_merge(&host, false);
+    let waived = offline_merge(&s, &merge, &s.c.repo);
+    assert_eq!(waived.status.code(), Some(1), "{waived:?}");
+    assert!(
+        String::from_utf8_lossy(&waived.stdout).contains(&format!(
+            "{} resolved merge conflicts; it needs its own review",
+            &merge[..12]
+        )),
+        "{waived:?}"
+    );
+
+    let (s, merge) = reverting_merge(&host, true);
+    let recorded = record_claude_resolution(&s, &merge);
+    assert_eq!(recorded.status.code(), Some(1), "{recorded:?}");
+    let said = String::from_utf8_lossy(&recorded.stdout);
+    assert!(
+        said.contains("is no conflict resolution a resolution review can cover")
+            && said.contains("x.txt"),
         "{recorded:?}"
     );
+    hand_written_resolutions(&s, &merge);
+    let walked = offline_merge(&s, &merge, &s.c.repo);
+    assert_eq!(walked.status.code(), Some(1), "{walked:?}");
+    let said = String::from_utf8_lossy(&walked.stdout);
+    assert!(
+        said.contains(&format!(
+            "{}'s resolution reviews do not clear it",
+            &merge[..12]
+        )) && said.contains("x.txt"),
+        "{walked:?}"
+    );
+}
+
+#[test]
+fn a_shallow_file_the_gate_cannot_read_or_whose_line_is_not_exactly_an_object_id_stops_it_as_unreadable()
+ {
+    let host = at("2026-11-25T06:00:00Z");
+    for listed in ["a directory", "an id and a digit"] {
+        let s = Scratch::new(&host);
+        s.on_main("other.txt", "main\n");
+        let clean = s.merge_main(None);
+        let shallow = s.c.repo.join(".git/shallow");
+        match listed {
+            "a directory" => fs::create_dir(&shallow).unwrap(),
+            _ => fs::write(&shallow, format!("{}0\n", s.h1)).unwrap(),
+        }
+        // git reads a directory as no boundary, and a line as the id it starts with.
+        let shown = scratch_git(
+            &s.home,
+            &s.c.repo,
+            &["show", "--remerge-diff", "--format=", &clean],
+        );
+        assert!(
+            shown.status.success() && shown.stdout.is_empty(),
+            "{listed}: {shown:?}"
+        );
+        let waived = offline_merge(&s, &clean, &s.c.repo);
+        assert_eq!(waived.status.code(), Some(1), "{listed}: {waived:?}");
+        assert!(
+            String::from_utf8_lossy(&waived.stdout).contains(&format!(
+                "cannot read {} in {}",
+                &clean[..12],
+                s.c.repo.display()
+            )),
+            "{listed}: {waived:?}"
+        );
+    }
+}
+
+#[test]
+fn an_error_git_prints_about_the_checkouts_own_objects_stops_a_clean_update_in_the_scratch_repository()
+ {
+    let host = at("2026-11-25T06:00:00Z");
+    for fault in ["alternate", "pack index"] {
+        let s = Scratch::new(&host);
+        s.on_main("other.txt", "main\n");
+        let clean = s.merge_main(None);
+        let objects = s.c.repo.join(".git/objects");
+        if fault == "alternate" {
+            let gone = s.home.join("gone").join("objects");
+            fs::write(
+                objects.join("info").join("alternates"),
+                format!("{}\n", gone.display()),
+            )
+            .unwrap();
+        } else {
+            let pack = objects
+                .join("pack")
+                .join(format!("pack-{}", "0".repeat(40)));
+            for extension in ["idx", "pack"] {
+                fs::write(pack.with_extension(extension), "garbage").unwrap();
+            }
+        }
+        let shown = scratch_git(
+            &s.home,
+            &s.c.repo,
+            &["show", "--remerge-diff", "--format=", &clean],
+        );
+        assert!(
+            shown.status.success()
+                && shown.stdout.is_empty()
+                && String::from_utf8_lossy(&shown.stderr).starts_with("error: "),
+            "{fault}: {shown:?}"
+        );
+        let waived = offline_merge(&s, &clean, &s.c.repo);
+        assert_eq!(waived.status.code(), Some(1), "{fault}: {waived:?}");
+        let said = String::from_utf8_lossy(&waived.stdout);
+        assert!(
+            said.contains(&format!(
+                "reading {}'s merge in the scratch repository ",
+                &clean[..12]
+            )) && said.contains(" failed: error: "),
+            "{fault}: {waived:?}"
+        );
+    }
 }
 
 fn real_git() -> PathBuf {
@@ -9142,6 +9433,9 @@ enum Fault {
     EveryInit,
     MergeTree,
     TreeDiff,
+    Bases,
+    SilentBases,
+    Boundary,
     WaiverRead,
     QuietTreeDiff,
     QuietWaiverRead,
@@ -9171,6 +9465,9 @@ fn faulty_git(s: &Scratch, temp: &Path, fault: Fault) {
         Fault::EveryInit => ("*/cm-gate-*'|init'".to_owned(), fail("init")),
         Fault::MergeTree => ("*/cm-gate-*'|merge-tree'".to_owned(), fail("merge-tree")),
         Fault::TreeDiff => ("*/cm-gate-*'|diff-tree'".to_owned(), fail("diff-tree")),
+        Fault::Bases => ("*/cm-gate-*'|merge-base'".to_owned(), fail("merge-base")),
+        Fault::SilentBases => ("*/cm-gate-*'|merge-base'".to_owned(), "exit 3".to_owned()),
+        Fault::Boundary => ("*/cm-gate-*'|rev-list'".to_owned(), fail("rev-list")),
         Fault::WaiverRead => ("*/cm-gate-*'|show'".to_owned(), fail("show")),
         Fault::QuietTreeDiff => (
             "*/cm-gate-*'|diff-tree'".to_owned(),
@@ -9229,6 +9526,9 @@ fn each_step_of_the_scratch_repository_fails_its_parent_or_names_the_scratch_rep
         EveryInit,
         MergeTree,
         TreeDiff,
+        Bases,
+        SilentBases,
+        Boundary,
         WaiverRead,
         QuietTreeDiff,
         QuietWaiverRead,
@@ -9250,6 +9550,11 @@ fn each_step_of_the_scratch_repository_fails_its_parent_or_names_the_scratch_rep
                 format!("failed: fatal: injected {step}"),
             ]
         };
+        let silent = |merge: &str| {
+            let mut says = in_scratch("merge-base", merge);
+            says[1] = "failed: git exit status: 3".to_owned();
+            says
+        };
         let refused_with = |out: &std::process::Output, why: &[String]| {
             assert_eq!(out.status.code(), Some(1), "{fault:?}: {out:?}");
             let text = String::from_utf8_lossy(&out.stdout);
@@ -9261,13 +9566,16 @@ fn each_step_of_the_scratch_repository_fails_its_parent_or_names_the_scratch_rep
 
         s.on_main("shared.txt", "main\n");
         let merge = s.merge_main(Some("feature and main\n"));
+        // A full checkout lists no shallow entry, so no boundary is read.
         let at_record_and_walk = match fault {
             TempIsAFile | TempInit | TempAlternates | WaiverRead | QuietWaiverRead
-            | WarnedWaiverRead => None,
+            | WarnedWaiverRead | Boundary => None,
             EveryInit => Some(vec![no_scratch.clone()]),
             MergeTree => Some(in_scratch("merge-tree", &merge)),
             TreeDiff | QuietTreeDiff => Some(in_scratch("diff-tree", &merge)),
             UnreadTree | OddTreeDiff | TrailingRecord | UnknownRecord => unreachable!(),
+            Bases => Some(in_scratch("merge-base", &merge)),
+            SilentBases => Some(silent(&merge)),
         };
         match &at_record_and_walk {
             None => {
@@ -9294,22 +9602,25 @@ fn each_step_of_the_scratch_repository_fails_its_parent_or_names_the_scratch_rep
         let (s, other) = gate(fault);
         let env = [("TMPDIR", other.to_str().unwrap())];
         let no_scratch = no_scratch.replace(temp.to_str().unwrap(), other.to_str().unwrap());
-        let in_scratch = |step: &str, merge: &str| {
-            in_scratch(step, merge)
+        let moved = |parts: Vec<String>| {
+            parts
                 .into_iter()
                 .map(|part| part.replace(temp.to_str().unwrap(), other.to_str().unwrap()))
                 .collect::<Vec<_>>()
         };
+        let in_scratch = |step: &str, merge: &str| moved(in_scratch(step, merge));
         s.on_main("other.txt", "main\n");
         let clean = s.merge_main(None);
         let waived = offline_merge_env(&s, None, &env, &clean, s.c.repo.as_os_str());
         match fault {
             TempIsAFile | TempInit | TempAlternates | MergeTree | TreeDiff | QuietTreeDiff
-            | WarnedWaiverRead => {
+            | WarnedWaiverRead | Boundary => {
                 assert!(waived.status.success(), "{fault:?}: {waived:?}");
             }
             UnreadTree | OddTreeDiff | TrailingRecord | UnknownRecord => unreachable!(),
             EveryInit => refused_with(&waived, std::slice::from_ref(&no_scratch)),
+            Bases => refused_with(&waived, &in_scratch("merge-base", &clean)),
+            SilentBases => refused_with(&waived, &moved(silent(&clean))),
             WaiverRead => refused_with(&waived, &in_scratch("show", &clean)),
             QuietWaiverRead => {
                 let mut says = in_scratch("show", &clean);
@@ -9631,15 +9942,10 @@ fn the_scratch_repository_and_its_files_are_private_and_gone_whatever_the_umask(
             }
             let [umasks, modes, alternates] =
                 logs.map(|log| fs::read_to_string(log).unwrap_or_default());
-            // An unreviewed resolution is refused on the checkout's remerge diff, after the init.
-            let read_after_init = history != "unreviewed resolution";
-            for (log, want, ran) in [
-                (&umasks, "0077", true),
-                (&modes, "700", true),
-                (&alternates, "600", read_after_init),
-            ] {
+            // Every history reads its merge base there after the init.
+            for (log, want) in [(&umasks, "0077"), (&modes, "700"), (&alternates, "600")] {
                 assert!(
-                    log.is_empty() != ran && log.lines().all(|line| line == want),
+                    !log.is_empty() && log.lines().all(|line| line == want),
                     "{umask} {history}: {want} in {log}"
                 );
             }
