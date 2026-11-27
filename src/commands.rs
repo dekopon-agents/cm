@@ -1197,7 +1197,7 @@ fn evidence_taken(
     track: &Track,
     full: &str,
 ) -> (&'static [Flag], &'static [Flag]) {
-    if matches!(track.state, Phase::Blocked(_)) && track.resting() == to {
+    if resumes(to, track) {
         (&[], &[])
     } else if tag_only(to, track, full) {
         (&[Flag::Tag, Flag::Sha], &[Flag::Digest])
@@ -1310,12 +1310,7 @@ pub fn advance_state(
         .copied()
         .filter(|flag| !required.contains(flag) && !optional.contains(flag))
         .collect();
-    let gated = to == Phase::Merged
-        && !(track.state == Phase::Merged
-            && asked.part.is_none()
-            && Release::of_target(&step).is_some())
-        && !(matches!(track.state, Phase::Blocked(_)) && track.resting() == &to)
-        && declared.is_some_and(|declared| merge_gated(&step, declared));
+    let gated = gate_applies(&to, track, asked.part, &step, declared);
     let gate_dropped: &[(&str, &str)] = if gated { &[] } else { asked.gate };
     let carries = |flag: Flag| {
         required.contains(&flag) || (asked.given.contains(&flag) && !dropped.contains(&flag))
@@ -2032,16 +2027,53 @@ pub struct MergeGate<'a> {
 }
 
 impl MergeGate<'_> {
-    fn given(&self) -> Vec<&'static str> {
+    /// The gate flags given, by name and clap id.
+    pub fn flags(&self) -> Vec<(&'static str, &'static str)> {
         [
-            (self.head.is_some(), "--head"),
-            (self.ci_verified.is_some(), "--ci-verified"),
-            (self.waiver.is_some(), "--override"),
+            (self.head.is_some(), "--head", "head"),
+            (self.ci_verified.is_some(), "--ci-verified", "ci_verified"),
+            (self.waiver.is_some(), "--override", "waiver"),
         ]
         .into_iter()
-        .filter_map(|(given, flag)| given.then_some(flag))
+        .filter_map(|(given, name, id)| given.then_some((name, id)))
         .collect()
     }
+
+    fn given(&self) -> Vec<&'static str> {
+        self.flags().into_iter().map(|(name, _)| name).collect()
+    }
+}
+
+fn remerges(
+    to: &Phase,
+    track: &Track,
+    part: Option<&str>,
+    step_full: &str,
+    declared: bool,
+) -> bool {
+    *to == Phase::Merged
+        && track.state == Phase::Merged
+        && part.is_none()
+        && declared
+        && Release::of_target(step_full).is_some()
+}
+
+fn resumes(to: &Phase, track: &Track) -> bool {
+    matches!(track.state, Phase::Blocked(_)) && track.resting() == to
+}
+
+/// Whether a move to `to` runs the merge gate, the only move that takes the gate flags.
+fn gate_applies(
+    to: &Phase,
+    track: &Track,
+    part: Option<&str>,
+    step_full: &str,
+    declared: Option<&Step>,
+) -> bool {
+    *to == Phase::Merged
+        && !remerges(to, track, part, step_full, declared.is_some())
+        && !resumes(to, track)
+        && declared.is_some_and(|step| merge_gated(step_full, step))
 }
 
 /// What GitHub says of a PR for its merge gate, read before cm takes the lock.
@@ -2471,7 +2503,7 @@ pub(crate) fn advance_held(
                 }
                 let tag = step.release_tag(&release);
                 let track = &step.track;
-                let resuming = matches!(track.state, Phase::Blocked(_)) && track.resting() == to;
+                let resuming = resumes(to, track);
                 let tag_only = matches!(track.resting(), Phase::Drafted | Phase::Launched);
                 let sha = if tag_only {
                     given.sha.as_deref()
@@ -2699,11 +2731,7 @@ pub(crate) fn advance_held(
         )
     };
     let tag_only = tag_only(to, &track, &full);
-    let remerge = *to == Phase::Merged
-        && track.state == Phase::Merged
-        && part.is_none()
-        && declared.is_some()
-        && Release::of_target(&step_full).is_some();
+    let remerge = remerges(to, &track, part, &step_full, declared.is_some());
     match track.check(to, finish) {
         Err(_) if remerge => {}
         Err(_) if tag_only && !track.state.is_final() => {}
@@ -2720,7 +2748,7 @@ pub(crate) fn advance_held(
         let units = plan::load_units(root)?;
         violations.extend(plan::unmet(&full, &plan::gates(root, &units, step)));
     }
-    let resuming = matches!(track.state, Phase::Blocked(_)) && track.resting() == to;
+    let resuming = resumes(to, &track);
     let (required, optional) = evidence_taken(to, finish, &track, &full);
     for flag in required {
         if !flag.given(given, file) {
@@ -3047,12 +3075,7 @@ pub(crate) fn advance_held(
             )),
         }
     }
-    let gated = *to == Phase::Merged
-        && !remerge
-        && !resuming
-        && declared
-            .as_ref()
-            .is_some_and(|step| merge_gated(&step_full, step));
+    let gated = gate_applies(to, &track, part, &step_full, declared.as_ref());
     let mut gate_lines = Vec::new();
     let mut waived = Vec::new();
     if gated {

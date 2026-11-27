@@ -2054,6 +2054,107 @@ fn each_suggested_state_names_the_evidence_its_advance_requires() {
 }
 
 #[test]
+fn a_suggested_move_keeps_a_gate_flag_exactly_when_the_advance_takes_it() {
+    use cm::state::Phase;
+    let temp = chart_campaign();
+    let root = temp.path();
+    let cx = "09-daemon/chart-termination/cx";
+    let release = "00-release/dekopon/0.100.0";
+    for step in [cx, release] {
+        let declared = cm(root, &["init", step, "--lane", "codex"]);
+        assert!(declared.status.success(), "{declared:?}");
+    }
+    fs::write(root.join("ev.md"), "Synced.\n").unwrap();
+    let repo = root.join("repo");
+    fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-q"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "x"]);
+    let rev = git(&["rev-parse", "HEAD"]);
+    let pr = "https://github.com/dekopon-agents/cm/pull/1";
+    let fill = |word: &str| -> Value {
+        Value::from(match word {
+            "<pr>" => pr,
+            "<revision>" => rev.as_str(),
+            "<tag>" => "v0.100.0",
+            "<digest>" => "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "<evidence-file>" => "ev.md",
+            "<checkout>" => repo.to_str().unwrap(),
+            word => word,
+        })
+    };
+    let mut starts: Vec<(Phase, Option<Phase>)> = cm::state::ORDER
+        .iter()
+        .map(|phase| (phase.clone(), None))
+        .collect();
+    starts.push((Phase::Superseded, None));
+    for resting in [Phase::Launched, Phase::PrOpen, Phase::Merged] {
+        starts.push((Phase::Blocked("waiting".into()), Some(resting)));
+    }
+    let mut checked = Vec::new();
+    for step in [cx, release] {
+        let (unit, name) = step.rsplit_once('/').unwrap();
+        for (phase, resting) in &starts {
+            let mut at = cm::store::load_unit(&root.join(unit)).unwrap();
+            let each = at.steps.get_mut(name).unwrap();
+            each.track.state = phase.clone();
+            each.track.blocked_from = resting.clone();
+            each.track.evidence.pr = Some(pr.to_owned());
+            each.track.evidence.sha = Some(rev.clone());
+            cm::commands::write_unit(&root.join(unit), &at).unwrap();
+            let report = json(&cm(
+                root,
+                &["--json", "advance", step, "mergd", "--head", &rev],
+            ));
+            let Some(argv) = argvs(&report).into_iter().find(Value::is_array) else {
+                continue;
+            };
+            let words: Vec<&str> = argv
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|word| word.as_str().unwrap())
+                .collect();
+            if words[1] != "advance" {
+                continue;
+            }
+            let mut run = vec![Value::from("cm"), Value::from("--json")];
+            run.extend(words[1..].iter().map(|word| fill(word)));
+            if !words.contains(&"--head") {
+                run.extend([Value::from("--head"), Value::from(rev.as_str())]);
+            }
+            let ran = json(&run_argv(root, &Value::Array(run)));
+            let unexpected = ran["violations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|each| each["rule"] == "evidence-unexpected");
+            assert_eq!(
+                unexpected,
+                !words.contains(&"--head"),
+                "{step} at {phase} ({resting:?}): {words:?} -> {ran}"
+            );
+            checked.push((step, phase.to_string(), words.contains(&"--head")));
+        }
+    }
+    assert!(checked.iter().any(|(_, _, kept)| *kept), "{checked:?}");
+    assert!(
+        checked.iter().filter(|(_, _, kept)| !kept).count() >= 5,
+        "{checked:?}"
+    );
+}
+
+#[test]
 fn a_suggested_done_or_launch_takes_the_evidence_file_or_checkout_cm_already_has() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

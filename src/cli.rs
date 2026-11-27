@@ -1215,18 +1215,18 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             .into_iter()
             .filter_map(|(flag, given)| given.then_some(flag))
             .collect();
-            let gate: Vec<(&'static str, &'static str)> = [
-                ("--head", "head", head.is_some()),
-                ("--ci-verified", "ci_verified", ci_verified.is_some()),
-                ("--override", "waiver", waiver.is_some()),
-            ]
-            .into_iter()
-            .filter_map(|(name, id, given)| given.then_some((name, id)))
-            .collect();
+            let forge = crate::forge::Gh::default();
+            let gate = commands::MergeGate {
+                forge: Some(&forge),
+                head: head.clone(),
+                ci_verified: ci_verified.as_deref().map(|file| under_root(cli, file)),
+                waiver: waiver.as_deref().map(|file| under_root(cli, file)),
+            };
+            let flags = gate.flags();
             let asked = commands::Asked {
                 part: part.as_deref(),
                 given: &given,
-                gate: &gate,
+                gate: &flags,
                 repo: repo.as_deref(),
                 by: !by.is_empty(),
             };
@@ -1247,13 +1247,6 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                 ..Evidence::default()
             };
             let file = file.as_deref().map(|file| under_root(cli, file));
-            let forge = crate::forge::Gh::default();
-            let gate = commands::MergeGate {
-                forge: Some(&forge),
-                head: head.clone(),
-                ci_verified: ci_verified.as_deref().map(|file| under_root(cli, file)),
-                waiver: waiver.as_deref().map(|file| under_root(cli, file)),
-            };
             commands::advance_gated(
                 host,
                 &root,
