@@ -43,10 +43,15 @@ cargo install --locked --git https://github.com/dekopon-agents/cm
 
 ## Commands
 
-Every command takes `--json` (one JSON object on stdout with `ok` and `violations`) and `-C DIR`
-(the campaign folder; found by walking up from the current directory otherwise). Exit 0 is
-success, 1 is a refusal or violations (every one listed, never only the first), 2 is a usage
-error. `review wait` additionally uses 3 for its deadline and 4 for unreadable campaign/unit/review state in that command.
+Every command takes `--json` (one JSON object on stdout with `ok` and `violations`, whatever the
+exit) and `-C DIR` (the campaign folder; found by walking up from the current directory
+otherwise). Exit 0 is success. 1 is a refusal or violations (every one listed, never only the
+first), each with its `rule` and `next`: among them a value cm reads against the campaign (a step
+or unit id, the `advance` state with its `blocked:until:` condition, an `--after`, `--drop-after`
+or `known-red --until` gate, a `--lane`, a `cm epoch` move) and an I/O error. 2 is a usage error,
+rule `usage`: an unknown subcommand or flag, a missing argument, or a value clap reads by its
+shape (a commit SHA, a reviewer name, `owner/name`, a pin, a number). `--help` and `--version`
+exit 0. `review wait` additionally uses 3 for its deadline and 4 for unreadable campaign/unit/review state in that command, and refuses with 2.
 
 A refusal prints `path[:line]: rule: cause` as its first line, then its next move(s), indented: the
 exact command with cm's real values filled in (step, claim, item number), and a quoted
@@ -66,9 +71,34 @@ Under `--json`, each `violations[]` object has `path`, `line` (when known), `rul
 | `missing-command` | `what`, `recorded` (the FEEDBACK.md id, or null), `argv`, `inputs`, `command` (the adopt when recorded, else the `cm feedback` recipe) |
 | `settled` | `why` |
 
-`jq '.violations[].next[] | select(.kind == "missing-command")'` lists the gaps that bite. A usage
-error (exit 2) still prints clap's message on stderr, and an I/O or other internal error prints
-`{"ok": false, "violations": [], "error": …}` with exit 1.
+`jq '.violations[].next[] | select(.kind == "missing-command")'` lists the gaps that bite.
+
+A refusal the arguments themselves draw is read after the campaign is found, so its moves carry
+the campaign's values, and it writes nothing:
+
+| Rule | When | `next` |
+|---|---|---|
+| `step-unknown` | a step or unit id that is not `<NN-name>/<unit>[/<step>]`, or, for `cm advance`, one its unit does not declare (`unit-missing` when the unit is absent) | the same command with each declared id within two edits of it, else with the steps of the unit it names (five at most); then `cm next`, or for `cm advance` the `cm init … --lane '<lane>'` that declares it |
+| `block-condition` | a `blocked:` reason that is not one word, or a `blocked:until:` condition cm cannot read, `owner-queue:<word>` and `owner-queue:0` among them | `cm owner-queue add … --block <step>`, and `cm advance <step> blocked:until:owner-queue:<N>` for each open numbered item; for a step condition, the nearest declared steps; for a reason, the reason as one word |
+| `advance-refused` | an `advance` state that is no state | the same command with the track's next legal state, the one `advance-refused` names when a move is out of order; `cm launch <step>` from drafted; `nothing` when the track is final |
+| `after-parse` | a gate cm cannot read | the same command with the nearest declared step as the gate, or without the gate (`known-red --until`, which it requires: the step's own merge when no step is near) |
+| `lane-unknown` | a `--lane` that names no lane | the same command with the nearest lane, or with `'<lane>'` |
+| `epoch-status` | a `cm epoch` word that is no move | `cm epoch` with the move EPOCH.md is ready for, or each move under the status it follows when EPOCH.md has none |
+
+A usage error's one move is the verb's usage line as clap renders it (`cm advance [OPTIONS]
+<TARGET> <STATE>`): its `<…>` and `[…]` words are clap's own placeholders, so it never runs as is.
+Its path is the verbs it reached (`cm owner-queue strike`), and without `--json` it prints on
+stderr, where clap printed it.
+
+An error that has no refusal of its own is rule `io`, its path the file it failed on, and its JSON
+object keeps the error text as `error`. Without `--json` it prints on stderr:
+
+| Cause | `next` |
+|---|---|
+| a `.cm/*.json` cm cannot read or parse | `git checkout HEAD -- <path>`, as `git -C <campaign> …` when cm runs from elsewhere |
+| `.cm/lock` cm cannot take | the same command again |
+| no campaign at or above the folder | in a campaign-trail checkout, the same command as `cm -C store/epochs/<slug> …` for its one PLANNING or WORKING epoch (one move per epoch when there are several), the path relative to the current folder; anywhere else `cm init <dir>` |
+| anything else | the same command again |
 
 | Command | Contract |
 |---|---|

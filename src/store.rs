@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -68,6 +68,54 @@ pub fn absolute(path: &Path) -> PathBuf {
     out
 }
 
+// The failures a refusal can name a repair for: `cli::main` reads them out of the error chain.
+#[derive(Debug)]
+pub struct NoCampaign {
+    pub start: PathBuf,
+}
+
+impl std::fmt::Display for NoCampaign {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no campaign folder at or above {}", self.start.display())
+    }
+}
+
+impl std::error::Error for NoCampaign {}
+
+#[derive(Debug)]
+pub struct Unreadable {
+    pub path: PathBuf,
+    message: String,
+}
+
+impl Unreadable {
+    fn new(path: &Path, message: String) -> Self {
+        Unreadable {
+            path: path.to_path_buf(),
+            message,
+        }
+    }
+}
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Unreadable {}
+
+#[derive(Debug)]
+pub struct Locking {
+    pub path: PathBuf,
+}
+
+impl std::fmt::Display for Locking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "locking {CM_DIR}/{LOCK}")
+    }
+}
+
 pub fn root_or_cwd(root: Option<&Path>) -> Result<PathBuf> {
     let start = match root {
         Some(root) => root.to_path_buf(),
@@ -75,16 +123,30 @@ pub fn root_or_cwd(root: Option<&Path>) -> Result<PathBuf> {
     };
     match find_root(&start) {
         Some(found) => Ok(found),
-        None => bail!(
-            "no campaign folder at or above {}; run `cm init`",
-            start.display()
-        ),
+        None => Err(broken_state(&start).unwrap_or_else(|| NoCampaign { start }.into())),
     }
 }
 
+// The walk passes a state file it cannot read as no campaign; naming it beats `cm init`.
+fn broken_state(start: &Path) -> Option<anyhow::Error> {
+    absolute(start).ancestors().find_map(|dir| {
+        let path = state_path(dir);
+        fs::symlink_metadata(&path).ok()?;
+        match read_json::<serde_json::Value>(&path) {
+            Err(error) => Some(error),
+            Ok(value) if serde_json::from_value::<Kind>(value["kind"].clone()).is_ok() => None,
+            Ok(_) => {
+                Some(Unreadable::new(&path, format!("{} is not a cm state", path.display())).into())
+            }
+        }
+    })
+}
+
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    let text = fs::read_to_string(path)
+        .with_context(|| Unreadable::new(path, format!("reading {}", path.display())))?;
+    serde_json::from_str(&text)
+        .with_context(|| Unreadable::new(path, format!("parsing {}", path.display())))
 }
 
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -130,17 +192,21 @@ fn read_state<T: DeserializeOwned>(path: &Path) -> Result<T> {
 }
 
 pub fn load_campaign(root: &Path) -> Result<CampaignState> {
-    let state: CampaignState = read_state(&state_path(root))?;
+    let path = state_path(root);
+    let state: CampaignState = read_state(&path)?;
     if state.kind != Kind::Campaign {
-        bail!("{} is not a campaign state", state_path(root).display());
+        let message = format!("{} is not a campaign state", path.display());
+        return Err(Unreadable::new(&path, message).into());
     }
     Ok(state)
 }
 
 pub fn load_unit(dir: &Path) -> Result<UnitState> {
-    let state: UnitState = read_state(&state_path(dir))?;
+    let path = state_path(dir);
+    let state: UnitState = read_state(&path)?;
     if state.kind != Kind::Unit {
-        bail!("{} is not a unit state", state_path(dir).display());
+        let message = format!("{} is not a unit state", path.display());
+        return Err(Unreadable::new(&path, message).into());
     }
     Ok(state)
 }
@@ -217,19 +283,23 @@ pub struct Lock {
 
 pub fn lock(root: &Path) -> Result<Lock> {
     let dir = root.join(CM_DIR);
-    fs::create_dir_all(&dir)?;
-    create_new(
-        &dir.join(".gitignore"),
-        format!("{LOCK}\n{LEGACY_JOURNAL_COPY}\n").as_bytes(),
-    )?;
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join(LOCK))?;
-    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
-        .context("locking .cm/lock")?;
-    Ok(Lock { _file: file })
+    let locked = || -> io::Result<Lock> {
+        fs::create_dir_all(&dir)?;
+        create_new(
+            &dir.join(".gitignore"),
+            format!("{LOCK}\n{LEGACY_JOURNAL_COPY}\n").as_bytes(),
+        )?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(LOCK))?;
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)?;
+        Ok(Lock { _file: file })
+    };
+    locked().with_context(|| Locking {
+        path: dir.join(LOCK),
+    })
 }
 
 // An flock on the `.cm` directory itself: it adds no file to the campaign, and `cm attempt` and

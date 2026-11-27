@@ -326,21 +326,25 @@ fn usage_errors_exit_2_and_refusals_exit_1() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     assert_eq!(cm(root, &["frobnicate"]).status.code(), Some(2));
-    assert_eq!(
-        cm(root, &["launch", "not-a-target", "--worktree", "."])
-            .status
-            .code(),
-        Some(2)
-    );
-    assert_eq!(
-        cm(root, &["advance", "01-a/u", "open"]).status.code(),
-        Some(2)
-    );
     let outside = cm(root, &["--json", "journal", "x"]);
     assert_eq!(outside.status.code(), Some(1));
     assert_eq!(json(&outside)["ok"], false);
-    assert_eq!(json(&outside)["violations"], serde_json::json!([]));
+    assert_eq!(json(&outside)["violations"][0]["rule"], "io");
     assert!(cm(root, &["init"]).status.success());
+    for (args, rule) in [
+        (
+            &["--json", "launch", "not-a-target", "--worktree", "."][..],
+            "step-unknown",
+        ),
+        (
+            &["--json", "advance", "01-a/u", "open"][..],
+            "advance-refused",
+        ),
+    ] {
+        let refused = cm(root, args);
+        assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+        assert_eq!(json(&refused)["violations"][0]["rule"], rule);
+    }
     let refused = cm(
         root,
         &["--json", "advance", "01-a/u", "merged", "--sha", "abc1234"],
@@ -542,4 +546,540 @@ fn init_part_and_launch_no_parts_flags_reach_the_commands() {
             .lines()
             .any(|line| line == "- no-parts: alternatives only")
     );
+}
+
+const STEP: &str = "09-daemon/chart-termination/build";
+
+fn files(root: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut found = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                let name = path.strip_prefix(root).unwrap().display().to_string();
+                found.push((name, fs::read(&path).unwrap()));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+fn chart_campaign() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    assert!(cm(temp.path(), &["init"]).status.success());
+    for step in [STEP, "09-daemon/chart-termination/probe"] {
+        let declared = cm(temp.path(), &["init", step, "--lane", "claude-cloud"]);
+        assert!(declared.status.success(), "{declared:?}");
+    }
+    temp
+}
+
+fn argvs(report: &Value) -> Vec<Value> {
+    report["violations"][0]["next"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|each| each["argv"].clone())
+        .collect()
+}
+
+fn add_block() -> Value {
+    serde_json::json!([
+        "cm",
+        "owner-queue",
+        "add",
+        "<title>",
+        "--context",
+        "<context>",
+        "--question",
+        "<question>",
+        "--recommendation",
+        "<recommendation>",
+        "--block",
+        STEP
+    ])
+}
+
+#[test]
+fn a_block_on_no_owner_queue_item_names_the_add_and_each_open_item_and_writes_nothing() {
+    let temp = chart_campaign();
+    let root = temp.path();
+    let queue = root.join("OWNER-QUEUE.md");
+    let mut text = fs::read_to_string(&queue).unwrap();
+    text.push_str("\n## Capability cuts: confirm M01 cut, P02 kept\n\nContext: x\nQuestion?\nRecommendation: y\nAnswer: confirmed\n");
+    fs::write(&queue, text).unwrap();
+    let incident = "blocked:until:owner-queue:chart-termination-secret-leak";
+    for state in [incident, "blocked:until:owner-queue:0"] {
+        let before = files(root);
+        let refused = cm(root, &["--json", "advance", STEP, state]);
+        assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+        let report = json(&refused);
+        assert_eq!(report["violations"][0]["rule"], "block-condition");
+        assert_eq!(report["violations"][0]["path"], STEP);
+        assert_eq!(argvs(&report), [add_block()]);
+        assert_eq!(files(root), before, "{state}");
+    }
+    let text = cm(root, &["advance", STEP, incident]);
+    assert_eq!(text.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(text.stdout)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+        format!(
+            "{STEP}: block-condition: `owner-queue:chart-termination-secret-leak` is not an item number, and OWNER-QUEUE.md has no open numbered item"
+        )
+    );
+
+    for title in ["Chart termination secret leak", "Probe budget"] {
+        let added = cm(
+            root,
+            &[
+                "owner-queue",
+                "add",
+                title,
+                "--context",
+                "c",
+                "--question",
+                "q?",
+                "--recommendation",
+                "r",
+            ],
+        );
+        assert!(added.status.success(), "{added:?}");
+    }
+    let before = files(root);
+    let refused = cm(root, &["--json", "advance", STEP, incident]);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let report = json(&refused);
+    assert_eq!(report["violations"][0]["rule"], "block-condition");
+    assert_eq!(
+        argvs(&report),
+        [
+            add_block(),
+            serde_json::json!(["cm", "advance", STEP, "blocked:until:owner-queue:1"]),
+            serde_json::json!(["cm", "advance", STEP, "blocked:until:owner-queue:2"]),
+        ]
+    );
+    assert_eq!(
+        report["violations"][0]["next"][1]["when"],
+        "when the step waits on item 1, `Chart termination secret leak`"
+    );
+    assert_eq!(files(root), before);
+}
+
+#[test]
+fn a_typod_step_id_names_the_nearest_declared_step_and_writes_nothing() {
+    let temp = chart_campaign();
+    let root = temp.path();
+    let before = files(root);
+    for typo in [
+        "09-daemon/chart-termination/biuld",
+        "9-daemon/chart-termination/build",
+        "09-daemon/chart-terminaton/build",
+    ] {
+        let refused = cm(root, &["--json", "advance", typo, "blocked:waiting"]);
+        assert_eq!(refused.status.code(), Some(1), "{typo}: {refused:?}");
+        let report = json(&refused);
+        let violation = &report["violations"][0];
+        assert_eq!(violation["path"], typo);
+        assert!(
+            ["step-unknown", "unit-missing"].contains(&violation["rule"].as_str().unwrap()),
+            "{report}"
+        );
+        assert!(
+            violation["message"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("the nearest declared ids are {STEP}")),
+            "{report}"
+        );
+        assert_eq!(
+            argvs(&report)[0],
+            serde_json::json!(["cm", "advance", STEP, "blocked:waiting"])
+        );
+        assert_eq!(
+            violation["next"][0]["when"],
+            format!("when you meant `{STEP}`")
+        );
+    }
+    assert_eq!(files(root), before);
+    let undeclared = json(&cm(root, &["--json", "launch", "01-x/y/z"]));
+    let rules: Vec<&Value> = undeclared["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|violation| &violation["rule"])
+        .collect();
+    assert!(
+        !rules.contains(&&Value::from("step-unknown")),
+        "{undeclared}"
+    );
+}
+
+#[test]
+fn a_usage_error_is_one_object_of_rule_usage_naming_the_verbs_usage_line_and_exits_2() {
+    let temp = chart_campaign();
+    let root = temp.path();
+    for args in [
+        &["--json", "advance", "--bogus"][..],
+        &["advance", "--bogus", "--json"][..],
+    ] {
+        let usage = cm(root, args);
+        assert_eq!(usage.status.code(), Some(2), "{usage:?}");
+        assert!(usage.stderr.is_empty(), "{usage:?}");
+        let report: Value = serde_json::from_slice(&usage.stdout).unwrap();
+        assert_eq!(report["command"], "advance");
+        assert_eq!(report["ok"], false);
+        let violation = &report["violations"][0];
+        assert_eq!(violation["rule"], "usage");
+        assert_eq!(violation["path"], "cm advance");
+        assert!(
+            violation["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("unexpected argument '--bogus' found"),
+            "{report}"
+        );
+        assert_eq!(
+            argvs(&report),
+            [serde_json::json!([
+                "cm",
+                "advance",
+                "[OPTIONS]",
+                "<TARGET>",
+                "<STATE>"
+            ])]
+        );
+    }
+    let text = cm(root, &["advance", "--bogus"]);
+    assert_eq!(text.status.code(), Some(2));
+    assert!(text.stdout.is_empty());
+    let stderr = String::from_utf8(text.stderr).unwrap();
+    assert!(
+        stderr.starts_with("cm advance: usage: unexpected argument '--bogus' found"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("\n  next: cm advance '[OPTIONS]' '<TARGET>' '<STATE>'"),
+        "{stderr}"
+    );
+
+    let strike = json(&cm(root, &["--json", "owner-queue", "strike", "7"]));
+    assert_eq!(strike["violations"][0]["path"], "cm owner-queue strike");
+    assert_eq!(
+        argvs(&strike),
+        [serde_json::json!([
+            "cm",
+            "owner-queue",
+            "strike",
+            "[OPTIONS]",
+            "--reason",
+            "<REASON>",
+            "<NUMBER>"
+        ])]
+    );
+    let bare = cm(root, &["--json", "idea"]);
+    assert_eq!(bare.status.code(), Some(2));
+    assert!(
+        json(&bare)["violations"][0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("cm idea takes a subcommand: admit, move, outcome"),
+        "{bare:?}"
+    );
+    let unknown = cm(root, &["--json", "frobnicate"]);
+    assert_eq!(unknown.status.code(), Some(2));
+    assert_eq!(json(&unknown)["violations"][0]["path"], "cm");
+    let sha = cm(
+        root,
+        &[
+            "--json",
+            "review",
+            "wait",
+            STEP,
+            "--head",
+            "zz",
+            "--reviewer",
+            "a",
+            "--deadline",
+            "2026-01-01T00:00Z",
+        ],
+    );
+    assert_eq!(sha.status.code(), Some(2));
+    assert_eq!(json(&sha)["violations"][0]["rule"], "usage");
+
+    for args in [
+        &["--help"][..],
+        &["--json", "advance", "--help"][..],
+        &["--version"][..],
+    ] {
+        let shown = cm(root, args);
+        assert_eq!(shown.status.code(), Some(0), "{args:?}");
+        assert!(
+            serde_json::from_slice::<Value>(&shown.stdout).is_err(),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn a_bad_state_word_names_the_legal_next_state_as_a_full_command() {
+    let temp = chart_campaign();
+    let root = temp.path();
+    let before = files(root);
+    let drafted = json(&cm(root, &["--json", "advance", STEP, "open"]));
+    assert_eq!(drafted["violations"][0]["rule"], "advance-refused");
+    assert_eq!(argvs(&drafted), [serde_json::json!(["cm", "launch", STEP])]);
+    assert_eq!(files(root), before);
+
+    let unit = root.join("09-daemon/chart-termination");
+    let mut state = cm::store::load_unit(&unit).unwrap();
+    state.steps.get_mut("build").unwrap().track.state = cm::state::Phase::Launched;
+    cm::commands::write_unit(&unit, &state).unwrap();
+    let launched = json(&cm(
+        root,
+        &[
+            "--json",
+            "advance",
+            STEP,
+            "in-review",
+            "--pr",
+            "https://github.com/o/r/pull/1",
+        ],
+    ));
+    assert_eq!(
+        argvs(&launched),
+        [serde_json::json!([
+            "cm",
+            "advance",
+            STEP,
+            "pr-open",
+            "--pr",
+            "https://github.com/o/r/pull/1"
+        ])]
+    );
+
+    let reason = json(&cm(root, &["--json", "advance", STEP, "blocked:on CI"]));
+    assert_eq!(reason["violations"][0]["rule"], "block-condition");
+    assert_eq!(
+        argvs(&reason)[0],
+        serde_json::json!(["cm", "advance", STEP, "blocked:on-CI"])
+    );
+}
+
+#[test]
+fn a_bad_lane_gate_or_epoch_move_names_the_values_the_campaign_holds() {
+    let temp = chart_campaign();
+    let root = temp.path();
+    let before = files(root);
+    let lane = json(&cm(
+        root,
+        &[
+            "--json",
+            "init",
+            "09-daemon/chart-termination/x",
+            "--lane",
+            "claud-cloud",
+        ],
+    ));
+    assert_eq!(lane["violations"][0]["rule"], "lane-unknown");
+    assert_eq!(
+        argvs(&lane),
+        [
+            serde_json::json!([
+                "cm",
+                "init",
+                "09-daemon/chart-termination/x",
+                "--lane",
+                "claude-cloud"
+            ]),
+            serde_json::json!([
+                "cm",
+                "init",
+                "09-daemon/chart-termination/x",
+                "--lane",
+                "<lane>"
+            ]),
+        ]
+    );
+    let gate = json(&cm(
+        root,
+        &[
+            "--json",
+            "init",
+            "09-daemon/chart-termination/x",
+            "--lane",
+            "codex",
+            "--after",
+            "pr-open:9-daemon/chart-termination/probe",
+        ],
+    ));
+    assert_eq!(gate["violations"][0]["rule"], "after-parse", "{gate}");
+    assert_eq!(
+        argvs(&gate)[0],
+        serde_json::json!([
+            "cm",
+            "init",
+            "09-daemon/chart-termination/x",
+            "--lane",
+            "codex",
+            "--after",
+            "pr-open:09-daemon/chart-termination/probe"
+        ])
+    );
+    assert_eq!(
+        argvs(&gate).last().unwrap(),
+        &serde_json::json!([
+            "cm",
+            "init",
+            "09-daemon/chart-termination/x",
+            "--lane",
+            "codex"
+        ])
+    );
+    fs::write(
+        root.join("EPOCH.md"),
+        "---\nstatus: PLANNING\nskill_revision: abc\n---\n",
+    )
+    .unwrap();
+    let before_epoch = files(root);
+    let epoch = json(&cm(root, &["--json", "epoch", "work"]));
+    assert_eq!(epoch["violations"][0]["rule"], "epoch-status");
+    assert_eq!(
+        argvs(&epoch),
+        [serde_json::json!(["cm", "epoch", "working"])]
+    );
+    assert_eq!(files(root), before_epoch);
+    fs::remove_file(root.join("EPOCH.md")).unwrap();
+    assert_eq!(files(root), before);
+}
+
+#[test]
+fn an_unreadable_campaign_state_names_the_git_checkout_that_restores_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("campaign");
+    fs::create_dir(&root).unwrap();
+    assert!(cm(&root, &["init"]).status.success());
+    fs::write(root.join(".cm/state.json"), "not JSON").unwrap();
+    let broken = cm(&root, &["--json", "journal", "x"]);
+    assert_eq!(broken.status.code(), Some(1), "{broken:?}");
+    let report = json(&broken);
+    assert_eq!(report["violations"][0]["rule"], "io");
+    assert_eq!(report["violations"][0]["path"], ".cm/state.json");
+    assert_eq!(
+        argvs(&report),
+        [serde_json::json!([
+            "git",
+            "checkout",
+            "HEAD",
+            "--",
+            ".cm/state.json"
+        ])]
+    );
+    assert!(
+        report["error"].as_str().unwrap().contains("parsing"),
+        "{report}"
+    );
+
+    let elsewhere = cm(
+        temp.path(),
+        &["--json", "-C", root.to_str().unwrap(), "journal", "x"],
+    );
+    let dir = cm::store::absolute(&root);
+    assert_eq!(
+        argvs(&json(&elsewhere)),
+        [serde_json::json!([
+            "git",
+            "-C",
+            dir,
+            "checkout",
+            "HEAD",
+            "--",
+            ".cm/state.json"
+        ])]
+    );
+}
+
+#[test]
+fn a_lock_cm_cannot_take_names_the_same_command_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    assert!(cm(root, &["init"]).status.success());
+    let lock = root.join(".cm/lock");
+    let _ = fs::remove_file(&lock);
+    fs::create_dir(&lock).unwrap();
+    let refused = cm(root, &["--json", "journal", "a title"]);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let report = json(&refused);
+    assert_eq!(report["violations"][0]["rule"], "io");
+    assert_eq!(report["violations"][0]["path"], ".cm/lock");
+    assert_eq!(
+        argvs(&report),
+        [serde_json::json!(["cm", "journal", "a title"])]
+    );
+}
+
+#[test]
+fn outside_any_campaign_the_move_names_the_live_epoch_in_campaign_trail_or_cm_init() {
+    let temp = tempfile::tempdir().unwrap();
+    let checkout = temp.path().join("campaign-trail");
+    for (epoch, status) in [("a", "WORKING"), ("b", "CLOSED")] {
+        let dir = checkout.join("store/epochs").join(epoch);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("EPOCH.md"),
+            format!("---\nstatus: {status}\n---\n"),
+        )
+        .unwrap();
+    }
+    fs::create_dir(checkout.join("tools")).unwrap();
+    for (dir, epoch) in [
+        (checkout.clone(), "store/epochs/a"),
+        (checkout.join("tools"), "../store/epochs/a"),
+    ] {
+        let refused = cm(&dir, &["--json", "journal", "a title"]);
+        assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+        let report = json(&refused);
+        assert_eq!(report["violations"][0]["rule"], "io");
+        assert_eq!(
+            argvs(&report),
+            [serde_json::json!(["cm", "-C", epoch, "journal", "a title"])]
+        );
+    }
+    let plain = temp.path().join("plain");
+    fs::create_dir(&plain).unwrap();
+    let report = json(&cm(&plain, &["--json", "journal", "a title"]));
+    assert_eq!(argvs(&report), [serde_json::json!(["cm", "init", "."])]);
+}
+
+#[test]
+fn next_act_keeps_exit_0_with_nothing_to_act_on_and_1_with_an_action() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    assert!(cm(root, &["init"]).status.success());
+    let idle = cm(root, &["--json", "next", "--act"]);
+    assert_eq!(idle.status.code(), Some(0), "{idle:?}");
+    assert_eq!(json(&idle)["ok"], true);
+    fs::write(root.join("kickoff.md"), "Go.\n").unwrap();
+    let declared = cm(
+        root,
+        &[
+            "init",
+            "01-a/u/s",
+            "--lane",
+            "codex",
+            "--kickoff-file",
+            "kickoff.md",
+        ],
+    );
+    assert!(declared.status.success(), "{declared:?}");
+    let act = cm(root, &["--json", "next", "--act"]);
+    assert_eq!(act.status.code(), Some(1), "{act:?}");
+    assert_eq!(json(&act)["ok"], true);
 }

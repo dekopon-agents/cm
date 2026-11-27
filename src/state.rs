@@ -273,7 +273,11 @@ impl Track {
         }
     }
 
-    fn successor(&self, finish: Finish) -> Option<Phase> {
+    // The state `check` names as next, so a refusal and the move it prints agree.
+    pub fn next_state(&self, finish: Finish) -> Option<Phase> {
+        if self.state.is_final() {
+            return None;
+        }
         match (self.resting(), finish) {
             (Phase::Merged, Finish::Rollout) => Some(Phase::Deployed),
             (phase, _) => phase.successor(),
@@ -325,7 +329,7 @@ impl Track {
         if blocked && to == resting {
             return Ok(());
         }
-        let next = self.successor(finish);
+        let next = self.next_state(finish);
         if next.as_ref() == Some(to) {
             return Ok(());
         }
@@ -1317,7 +1321,7 @@ impl Step {
     ) -> Option<(Phase, Phase)> {
         let reach = self.parts_reach()?;
         let from = self.track.state.clone();
-        let next = self.track.successor(self.finish(release));
+        let next = self.track.next_state(self.finish(release));
         if next.as_ref() != Some(&reach)
             || self.track.blocked_from.is_some()
             || self.track.check(&reach, self.finish(release)).is_err()

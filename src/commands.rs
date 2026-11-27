@@ -523,7 +523,14 @@ fn init_step(
     let mut parsed = Vec::new();
     for text in &declaration.after {
         match After::parse(text, unit_name) {
-            Err(message) => violations.push(Violation::new(&full, "after-parse", message)),
+            Err(message) => violations.push(after_refusal(
+                host,
+                root,
+                &full,
+                unit_name,
+                ("--after", text),
+                message,
+            )),
             Ok(after) if after.target() == full => violations.push(Violation::new(
                 &full,
                 "after-unknown",
@@ -843,18 +850,85 @@ pub(crate) fn packet_kickoff(host: &dyn Host, step_dir: &str, step: &str) -> Vio
     )
 }
 
-// A block holds a whole step or a unit, never a part, and `--block` takes only a step.
-fn owner_queue_not_open(
-    host: &dyn Host,
-    root: &Path,
-    target: &Target,
-    part: Option<&str>,
-    number: u32,
-) -> Violation {
-    let step = match &target.step {
+fn whole(target: &Target) -> String {
+    match &target.step {
         Some(step) => format!("{}/{step}", target.unit),
         None => target.unit.clone(),
+    }
+}
+
+fn with_part(target: &Target, part: Option<&str>) -> String {
+    match part {
+        Some(part) => format!("{}#{part}", whole(target)),
+        None => whole(target),
+    }
+}
+
+// `Next::either` takes two moves or more; a lone move needs no condition.
+pub(crate) fn choice(moves: Vec<(String, outcome::Move)>) -> Option<Next> {
+    match moves.len() {
+        0 => None,
+        1 => moves.into_iter().next().map(|(_, only)| only.into()),
+        _ => Some(Next::either(moves)),
+    }
+}
+
+pub(crate) fn again_with(host: &dyn Host, from: &str, to: &str) -> Option<outcome::Move> {
+    let mut argv = host.argv()?;
+    if let Some(at) = argv.iter().skip(1).position(|word| word == from) {
+        argv[at + 1] = to.to_owned();
+    } else {
+        let at = argv
+            .iter()
+            .position(|word| word.split_once('=').is_some_and(|(_, value)| value == from))?;
+        let flag = argv[at].split_once('=').map(|(flag, _)| flag.to_owned())?;
+        argv[at] = format!("{flag}={to}");
+    }
+    Some(outcome::Move::again(argv))
+}
+
+fn again_without(host: &dyn Host, flag: &str, value: &str) -> Option<outcome::Move> {
+    let mut argv = host.argv()?;
+    let inline = format!("{flag}={value}");
+    if let Some(at) = argv.iter().position(|word| *word == inline) {
+        argv.remove(at);
+    } else {
+        let at = argv
+            .windows(2)
+            .position(|pair| pair[0] == flag && pair[1] == value)?;
+        argv.drain(at..at + 2);
+    }
+    Some(outcome::Move::again(argv))
+}
+
+// The invocation's moves need its argv; without one (an argument that is not UTF-8) the
+// refusal says so rather than print a command that would differ from it.
+pub(crate) fn refuse_moves(
+    path: impl Into<String>,
+    rule: &'static str,
+    cause: impl Into<String>,
+    moves: Vec<(String, outcome::Move)>,
+) -> Violation {
+    match choice(moves) {
+        Some(next) => Violation::refuse(path, rule, cause, next),
+        None => Violation::refuse(
+            path,
+            rule,
+            format!(
+                "{}; no next move is printed: the invocation is not UTF-8",
+                cause.into()
+            ),
+            Next::Run(Vec::new()),
+        ),
+    }
+}
+
+// A block holds a whole step or a unit, never a part, and `--block` takes only a step.
+fn owner_moves(host: &dyn Host, root: &Path, target: &Target) -> Vec<(String, outcome::Move)> {
+    let Some(prefix) = host.prefix() else {
+        return Vec::new();
     };
+    let step = whole(target);
     let mut add = vec![
         "owner-queue".into(),
         "add".into(),
@@ -869,54 +943,311 @@ fn owner_queue_not_open(
     if target.step.is_some() {
         add.extend(["--block".into(), step.as_str().into()]);
     }
+    let mut moves = vec![(
+        "to file a new question for the owner".to_owned(),
+        outcome::Move::new(outcome::cm(prefix.clone(), add)),
+    )];
+    for (open, title) in crate::ledger::open_titles(root) {
+        let argv = outcome::cm(
+            prefix.clone(),
+            [
+                "advance".into(),
+                step.as_str().into(),
+                format!("blocked:until:owner-queue:{open}").into(),
+            ],
+        );
+        moves.push((
+            format!("when the step waits on item {open}, `{title}`"),
+            outcome::Move::new(argv),
+        ));
+    }
+    moves
+}
+
+fn open_listed(root: &Path) -> Option<String> {
     let open = crate::ledger::open_titles(root);
-    let full = match part {
-        Some(part) => format!("{step}#{part}"),
-        None => step.clone(),
+    (!open.is_empty()).then(|| {
+        open.iter()
+            .map(|(open, title)| format!("{open}. {title}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
+fn owner_queue_not_open(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    part: Option<&str>,
+    number: u32,
+) -> Violation {
+    let cause = match open_listed(root) {
+        None => format!("OWNER-QUEUE.md has no open item {number}, and no item is open"),
+        Some(listed) => {
+            format!("OWNER-QUEUE.md has no open item {number}; the open items are {listed}")
+        }
     };
+    Violation::refuse_printed(
+        with_part(target, part),
+        "owner-queue-not-open",
+        cause,
+        choice(owner_moves(host, root, target)),
+    )
+}
+
+const BLOCK_FORMS: &str = "a block waits on <step>, pr-open:<step>, tag:<repo>@<version>, deployed:<repo>@<version>, owner-queue:<N> or epoch:WORKING";
+
+const GATE_FORMS: &str = "a gate is <step>, <NN-name>/<unit>/<step>, pr-open:<step>, pin:<step>@<sha>, tag:<repo>@<version> or deployed:<repo>@<version>";
+
+// The step a gate or block condition names, as declared ids would spell it, and the text it
+// keeps around that step.
+fn gate_step(text: &str, unit: &str) -> Option<(String, &'static str, String)> {
+    if text.starts_with("tag:") || text.starts_with("deployed:") {
+        return None;
+    }
+    let (prefix, rest) = match text.strip_prefix("pr-open:") {
+        Some(rest) => ("pr-open:", rest),
+        None => ("", text),
+    };
+    let rest = rest.trim_matches('/');
+    let (prefix, rest, suffix) = match rest.strip_prefix("pin:") {
+        Some(pin) => match pin.rsplit_once('@') {
+            Some((step, sha)) => ("pin:", step.trim_matches('/'), format!("@{sha}")),
+            None => ("pin:", pin.trim_matches('/'), String::new()),
+        },
+        None => (prefix, rest, String::new()),
+    };
+    let step = if rest.contains('/') {
+        rest.to_owned()
+    } else {
+        format!("{unit}/{rest}")
+    };
+    Some((step, prefix, suffix))
+}
+
+pub(crate) fn block_refusal(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    part: Option<&str>,
+    reason: &str,
+) -> Violation {
+    let path = with_part(target, part);
+    let step = whole(target);
     let prefix = host.prefix();
-    let add = prefix
-        .clone()
-        .map(|prefix| outcome::Move::new(outcome::cm(prefix, add)));
-    if open.is_empty() {
+    let advance = |state: String| {
+        prefix.clone().map(|prefix| {
+            outcome::Move::new(outcome::cm(
+                prefix,
+                ["advance".into(), step.as_str().into(), state.into()],
+            ))
+        })
+    };
+    let Some(condition) = reason.strip_prefix("until:") else {
+        let mut slug = String::new();
+        for c in reason.chars() {
+            if c.is_ascii_alphanumeric() || "._".contains(c) {
+                slug.push(c);
+            } else if !slug.is_empty() && !slug.ends_with('-') {
+                slug.push('-');
+            }
+        }
+        let slug = slug.trim_end_matches('-');
+        let mut moves: Vec<(String, outcome::Move)> = (!slug.is_empty())
+            .then(|| advance(format!("blocked:{slug}")))
+            .flatten()
+            .map(|only| ("to block on that reason as one word".to_owned(), only))
+            .into_iter()
+            .collect();
+        moves.extend(owner_moves(host, root, target));
         return Violation::refuse_printed(
-            full,
-            "owner-queue-not-open",
-            format!("OWNER-QUEUE.md has no open item {number}, and no item is open"),
-            add.map(Into::into),
+            path,
+            "block-condition",
+            format!(
+                "`blocked:{reason}`: a blocked reason is one word of letters, digits, `.`, `_` or `-`"
+            ),
+            choice(moves),
+        );
+    };
+    if condition.starts_with("owner-queue:") {
+        let cause = match open_listed(root) {
+            None => format!(
+                "`{condition}` is not an item number, and OWNER-QUEUE.md has no open numbered item"
+            ),
+            Some(listed) => {
+                format!("`{condition}` is not an item number; the open items are {listed}")
+            }
+        };
+        return Violation::refuse_printed(
+            path,
+            "block-condition",
+            cause,
+            choice(owner_moves(host, root, target)),
         );
     }
-    let listed: Vec<String> = open
-        .iter()
-        .map(|(open, title)| format!("{open}. {title}"))
-        .collect();
-    let next = prefix.zip(add).map(|(prefix, add)| {
-        let mut moves = vec![("to file a new question for the owner".to_owned(), add)];
-        for (open, title) in &open {
-            let argv = outcome::cm(
-                prefix.clone(),
-                [
-                    "advance".into(),
-                    step.as_str().into(),
-                    format!("blocked:until:owner-queue:{open}").into(),
-                ],
-            );
-            moves.push((
-                format!("when the step waits on item {open}, `{title}`"),
-                outcome::Move::new(argv),
-            ));
+    // The step parser's own message lists gate forms, pin among them, which a block does not take.
+    let cause = match plan::block_condition(condition, &target.unit) {
+        Err(message) if !message.contains("pr-open:<step>") => format!("{message}; {BLOCK_FORMS}"),
+        _ => format!("`{condition}` names no block condition; {BLOCK_FORMS}"),
+    };
+    let mut moves = Vec::new();
+    if let Some((query, keep, _)) = gate_step(condition, &target.unit) {
+        let keep = if keep == "pr-open:" { keep } else { "" };
+        let units = plan::load_units(root).unwrap_or_default();
+        for near in plan::nearest(&units, &query, true) {
+            if let Some(each) = advance(format!("blocked:until:{keep}{near}")) {
+                moves.push((format!("when the step waits on `{keep}{near}`"), each));
+            }
         }
-        Next::either(moves)
+    }
+    moves.extend(owner_moves(host, root, target));
+    Violation::refuse_printed(path, "block-condition", cause, choice(moves))
+}
+
+// The state argument of `cm advance`, read against the campaign so a refusal can name the move.
+pub fn advance_state(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    part: Option<&str>,
+    text: &str,
+) -> std::result::Result<Phase, Violation> {
+    let message = match text.parse::<Phase>() {
+        Ok(phase) => return Ok(phase),
+        Err(message) => message,
+    };
+    if let Some(reason) = text.strip_prefix("blocked:") {
+        return Err(block_refusal(host, root, target, part, reason));
+    }
+    let path = with_part(target, part);
+    let step = whole(target);
+    let unit = store::load_unit(&root.join(&target.unit)).ok();
+    let declared = unit
+        .as_ref()
+        .and_then(|unit| unit.steps.get(target.step.as_deref()?));
+    let track = match (&target.step, declared, part) {
+        (None, _, _) => unit.as_ref().map(|unit| &unit.track),
+        (Some(_), Some(step), Some(part)) => step.parts.get(part),
+        (Some(_), Some(step), None) => Some(&step.track),
+        (Some(_), None, _) => None,
+    };
+    let finish = declared.map_or(Finish::Shipped, |declared| {
+        declared.finish(Release::of_target(&step).is_some())
     });
-    Violation::refuse_printed(
-        full,
-        "owner-queue-not-open",
+    let Some(track) = track else {
+        let next = host
+            .prefix()
+            .map(|prefix| Next::run(outcome::cm(prefix, ["next".into()])));
+        return Err(Violation::refuse_printed(
+            path,
+            "advance-refused",
+            message,
+            next,
+        ));
+    };
+    let Some(next) = track.next_state(finish) else {
+        return Err(Violation::refuse(
+            path.clone(),
+            "advance-refused",
+            message,
+            Next::settled(format!("{path} is {}, which is final", track.state)),
+        ));
+    };
+    let cause = format!(
+        "{message}; {path} is {}, and its next state is {next}",
+        track.state
+    );
+    if next == Phase::Launched {
+        // Only `cm launch` enters launched, and it launches steps; a drafted unit waits on them.
+        let verb = match target.step {
+            Some(_) => vec!["launch".into(), step.into()],
+            None => vec!["next".into()],
+        };
+        let next = host
+            .prefix()
+            .map(|prefix| Next::run(outcome::cm(prefix, verb)));
+        return Err(Violation::refuse_printed(
+            path,
+            "advance-refused",
+            cause,
+            next,
+        ));
+    }
+    let moves = again_with(host, text, &next.to_string())
+        .map(|again| (format!("to move {path} to {next}"), again))
+        .into_iter()
+        .collect();
+    Err(refuse_moves(path, "advance-refused", cause, moves))
+}
+
+pub(crate) fn after_refusal(
+    host: &dyn Host,
+    root: &Path,
+    path: &str,
+    unit: &str,
+    (flag, text): (&str, &str),
+    message: String,
+) -> Violation {
+    let cause = if message.contains("pr-open:<step>") {
+        message
+    } else {
+        format!("{message}; {GATE_FORMS}")
+    };
+    let mut moves = Vec::new();
+    if let Some((query, keep, suffix)) = gate_step(text, unit) {
+        // `--until` takes no pin gate, so its nearest gate is the merge of that step.
+        let (keep, suffix) = match (flag, keep) {
+            ("--until", "pin:") => ("", String::new()),
+            _ => (keep, suffix),
+        };
+        let units = plan::load_units(root).unwrap_or_default();
+        for near in plan::nearest(&units, &query, true) {
+            let gate = format!("{keep}{near}{suffix}");
+            if let Some(each) = again_with(host, text, &gate) {
+                moves.push((format!("when you meant `{gate}`"), each));
+            }
+        }
+    }
+    if flag != "--until" {
+        moves.extend(
+            again_without(host, flag, text)
+                .map(|without| (format!("to go on without `{text}`"), without)),
+        );
+    } else if moves.is_empty() {
+        moves.extend(
+            again_with(host, text, path)
+                .map(|each| (format!("to close it once `{path}` merges"), each)),
+        );
+    }
+    refuse_moves(path, "after-parse", cause, moves)
+}
+
+pub(crate) fn nearest_refusal(
+    host: &dyn Host,
+    root: &Path,
+    rule: &'static str,
+    (text, with_step): (&str, bool),
+    cause: String,
+    otherwise: Vec<(String, outcome::Move)>,
+) -> Violation {
+    let units = plan::load_units(root).unwrap_or_default();
+    let nearest = plan::nearest(&units, text, with_step);
+    let cause = if nearest.is_empty() {
+        cause
+    } else {
         format!(
-            "OWNER-QUEUE.md has no open item {number}; the open items are {}",
-            listed.join("; ")
-        ),
-        next,
-    )
+            "{cause}; the nearest declared ids are {}",
+            nearest.join(", ")
+        )
+    };
+    let mut moves: Vec<(String, outcome::Move)> = nearest
+        .iter()
+        .filter_map(|near| {
+            again_with(host, text, near).map(|each| (format!("when you meant `{near}`"), each))
+        })
+        .collect();
+    moves.extend(otherwise);
+    refuse_moves(text, rule, cause, moves)
 }
 
 pub(crate) fn shell_word(text: &str) -> String {
@@ -1953,11 +2284,27 @@ pub(crate) fn advance_held(
     }
     let unit_dir = root.join(&target.unit);
     if !store::is_unit(&unit_dir) {
-        violations.push(Violation::new(
-            &target.unit,
-            "unit-missing",
-            format!("no unit state; run `cm init {}`", target.unit),
-        ));
+        violations.push(match host.prefix() {
+            Some(prefix) if target.step.is_some() => nearest_refusal(
+                host,
+                root,
+                "unit-missing",
+                (&step_full, true),
+                format!("{} has no unit state", target.unit),
+                vec![(
+                    format!("to create {}", target.unit),
+                    outcome::Move::new(outcome::cm(
+                        prefix,
+                        ["init".into(), target.unit.as_str().into()],
+                    )),
+                )],
+            ),
+            _ => Violation::new(
+                &target.unit,
+                "unit-missing",
+                format!("no unit state; run `cm init {}`", target.unit),
+            ),
+        });
         return Ok(Outcome::refused(violations));
     }
     let mut unit = store::load_unit(&unit_dir)?;
@@ -1984,10 +2331,25 @@ pub(crate) fn advance_held(
                 },
             },
             None => {
-                violations.push(Violation::new(
-                    &full,
+                let declare = host.prefix().map(|prefix| {
+                    let argv = outcome::cm(
+                        prefix,
+                        [
+                            "init".into(),
+                            step_full.as_str().into(),
+                            "--lane".into(),
+                            Input::Lane.into(),
+                        ],
+                    );
+                    (format!("to declare {step_full}"), outcome::Move::new(argv))
+                });
+                violations.push(nearest_refusal(
+                    host,
+                    root,
                     "step-unknown",
-                    "the step has not launched; `cm launch` it first",
+                    (&step_full, true),
+                    format!("{} declares no step `{step}`", target.unit),
+                    declare.into_iter().collect(),
                 ));
                 return Ok(Outcome::refused(violations));
             }
@@ -3132,7 +3494,14 @@ pub fn amend(
     }
     for text in &amendment.drop_after {
         match After::parse(text, &target.unit) {
-            Err(message) => violations.push(Violation::new(&full, "after-parse", message)),
+            Err(message) => violations.push(after_refusal(
+                host,
+                root,
+                &full,
+                &target.unit,
+                ("--drop-after", text),
+                message,
+            )),
             Ok(after) => {
                 if next.after.contains(&after) {
                     next.after.retain(|gate| gate != &after);
@@ -3149,7 +3518,14 @@ pub fn amend(
     }
     for text in &amendment.after {
         match After::parse(text, &target.unit) {
-            Err(message) => violations.push(Violation::new(&full, "after-parse", message)),
+            Err(message) => violations.push(after_refusal(
+                host,
+                root,
+                &full,
+                &target.unit,
+                ("--after", text),
+                message,
+            )),
             Ok(after) if next.after.contains(&after) => {}
             Ok(after) => {
                 changes.push(format!("- after: + {after}"));

@@ -46,6 +46,74 @@ pub fn track<'a>(units: &'a Units, target: &str) -> Option<&'a Track> {
     }
 }
 
+const NEAREST: usize = 5;
+
+pub(crate) fn nearest(units: &Units, text: &str, with_step: bool) -> Vec<String> {
+    let text = text.trim_matches('/');
+    let ranked = |ids: Vec<String>| {
+        let mut ids: Vec<(usize, String)> = ids
+            .into_iter()
+            .map(|id| (distance(&id, text), id))
+            .collect();
+        ids.sort();
+        ids
+    };
+    let declared = units
+        .iter()
+        .flat_map(|(unit, state)| {
+            (!with_step)
+                .then(|| unit.clone())
+                .into_iter()
+                .chain(state.steps.keys().map(move |step| format!("{unit}/{step}")))
+        })
+        .collect();
+    let close: Vec<String> = ranked(declared)
+        .into_iter()
+        .take_while(|(edits, _)| *edits <= 2)
+        .map(|(_, id)| id)
+        .take(NEAREST)
+        .collect();
+    if !close.is_empty() {
+        return close;
+    }
+    let mut parts = text.split('/');
+    let (Some(area), Some(unit)) = (parts.next(), parts.next()) else {
+        return Vec::new();
+    };
+    let unit = format!("{area}/{unit}");
+    let Some(state) = units.get(&unit) else {
+        return Vec::new();
+    };
+    ranked(
+        state
+            .steps
+            .keys()
+            .map(|step| format!("{unit}/{step}"))
+            .collect(),
+    )
+    .into_iter()
+    .map(|(_, id)| id)
+    .take(NEAREST)
+    .collect()
+}
+
+pub(crate) fn distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, x) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, y) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (above + 1)
+                .min(row[j] + 1)
+                .min(diagonal + usize::from(x != *y));
+            diagonal = above;
+        }
+    }
+    row[b.len()]
+}
+
 pub struct Gate {
     pub after: After,
     pub track: Option<Track>,

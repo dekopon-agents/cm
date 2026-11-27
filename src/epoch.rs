@@ -8,7 +8,7 @@ use anyhow::Result;
 use crate::commands::closed;
 use crate::host::Host;
 use crate::journal;
-use crate::outcome::{Outcome, Violation};
+use crate::outcome::{Next, Outcome, Violation};
 use crate::store::{self, lock, write_atomic};
 
 pub const EPOCH: &str = "EPOCH.md";
@@ -79,6 +79,34 @@ impl std::str::FromStr for Status {
             )),
         }
     }
+}
+
+pub(crate) fn move_refusal(host: &dyn Host, root: &Path, text: &str, message: String) -> Violation {
+    const MOVES: [(Status, Status); 3] = [
+        (Status::Open, Status::Planning),
+        (Status::Planning, Status::Working),
+        (Status::Working, Status::Closed),
+    ];
+    let at = fs::read_to_string(root.join(EPOCH))
+        .ok()
+        .and_then(|epoch| status(&epoch));
+    if at == Some(Status::Closed) {
+        return Violation::refuse(
+            EPOCH,
+            "epoch-status",
+            message,
+            Next::settled("EPOCH.md is CLOSED, and nothing follows it"),
+        );
+    }
+    let moves = MOVES
+        .into_iter()
+        .filter(|(from, _)| at.is_none_or(|at| at == *from))
+        .filter_map(|(from, to)| {
+            crate::commands::again_with(host, text, &to.to_string())
+                .map(|each| (format!("when EPOCH.md is {}", from.label()), each))
+        })
+        .collect();
+    crate::commands::refuse_moves(EPOCH, "epoch-status", message, moves)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
