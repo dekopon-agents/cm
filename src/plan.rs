@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

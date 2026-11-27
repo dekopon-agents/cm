@@ -1,6 +1,7 @@
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use jiff::Timestamp;
@@ -12,9 +13,83 @@ pub trait Host {
     fn github_rate_limit(&self) -> Option<String> {
         None
     }
+    // The invocation as `cm …`, without `--json`, for a refusal that re-issues it; None when it
+    // is not UTF-8.
+    fn argv(&self) -> Option<Vec<String>> {
+        None
+    }
+    // What every printed move starts with: `cm`, or `cm -C <root>` when a campaign was selected;
+    // None when that root is not UTF-8, since no printed word can name it.
+    fn prefix(&self) -> Option<Vec<String>> {
+        Some(vec!["cm".to_owned()])
+    }
 }
 
 pub struct System;
+
+pub struct Invoked {
+    pub argv: Option<Vec<String>>,
+    pub root: Option<PathBuf>,
+}
+
+impl Invoked {
+    // Drops `--json` only where it is an option: not after `--`, nor as the value of -C/--root.
+    pub fn record(args: impl IntoIterator<Item: Into<OsString>>) -> Self {
+        let mut argv = Some(vec!["cm".to_owned()]);
+        let (mut ended, mut value) = (false, false);
+        for arg in args.into_iter().skip(1).map(Into::into) {
+            let option = !ended && !value;
+            value = option && (arg == "-C" || arg == "--root");
+            if option && arg == "--json" {
+                continue;
+            }
+            ended |= option && arg == "--";
+            argv = argv.and_then(|mut argv| {
+                argv.push(arg.into_string().ok()?);
+                Some(argv)
+            });
+        }
+        Invoked { argv, root: None }
+    }
+
+    pub fn in_campaign(mut self, root: &Path) -> Self {
+        self.root = Some(std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()));
+        self
+    }
+}
+
+impl Host for Invoked {
+    fn now(&self) -> Timestamp {
+        System.now()
+    }
+
+    fn free_bytes(&self, volume: &Path) -> io::Result<u64> {
+        System.free_bytes(volume)
+    }
+
+    fn heavy_builds(&self) -> io::Result<u32> {
+        System.heavy_builds()
+    }
+
+    fn github_rate_limit(&self) -> Option<String> {
+        System.github_rate_limit()
+    }
+
+    fn argv(&self) -> Option<Vec<String>> {
+        self.argv.clone()
+    }
+
+    fn prefix(&self) -> Option<Vec<String>> {
+        match &self.root {
+            None => Some(vec!["cm".to_owned()]),
+            Some(root) => Some(vec![
+                "cm".to_owned(),
+                "-C".to_owned(),
+                root.to_str()?.to_owned(),
+            ]),
+        }
+    }
+}
 
 impl Host for System {
     fn github_rate_limit(&self) -> Option<String> {

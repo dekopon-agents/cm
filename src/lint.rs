@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 #[cfg(unix)]
