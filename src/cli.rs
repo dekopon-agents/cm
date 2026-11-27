@@ -1218,6 +1218,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
             let asked = commands::Asked {
                 part: part.as_deref(),
                 given: &given,
+                repo: repo.is_some(),
                 by: !by.is_empty(),
             };
             let state =
@@ -1788,7 +1789,6 @@ enum Held {
     Missing,
 }
 
-// Where the nth occurrence of an option is and how it holds its value.
 fn option_at(roles: &[Role], id: &str, nth: usize) -> Option<(usize, Held)> {
     roles
         .iter()
@@ -1857,7 +1857,7 @@ pub(crate) fn amends_nothing(argv: &[String]) -> bool {
         })
 }
 
-fn without(argv: &[String], id: &str) -> Vec<String> {
+pub(crate) fn without(argv: &[String], id: &str) -> Vec<String> {
     let mut argv = argv.to_vec();
     while let Some(fewer) = dropped(&argv, id, 0) {
         argv = fewer;

@@ -1173,8 +1173,9 @@ fn blocks_on_itself(target: &Target, reason: &str) -> bool {
 
 pub struct Asked<'a> {
     pub part: Option<&'a str>,
-    // The evidence flags the caller gave, kept by a suggested move as given.
+    // The evidence flags the caller gave: a suggested move keeps those its state takes.
     pub given: &'a [Flag],
+    pub repo: bool,
     pub by: bool,
 }
 
@@ -1194,7 +1195,33 @@ fn admits(track: &Track, to: &Phase, finish: Finish, target: &Target, part: Opti
             && finish != Finish::Evidence
             && track.state == Phase::Drafted;
     }
+    if tag_only(to, track, &with_part(target, part)) {
+        return !track.state.is_final();
+    }
     track.check(to, finish).is_ok()
+}
+
+// A release step not yet at pr-open is released from its tag alone.
+fn tag_only(to: &Phase, track: &Track, full: &str) -> bool {
+    *to == Phase::Released
+        && Release::of_target(full).is_some()
+        && matches!(track.resting(), Phase::Drafted | Phase::Launched)
+}
+
+// The evidence flags a move to `to` requires and allows, as `advance_held` checks them.
+fn evidence_taken(
+    to: &Phase,
+    finish: Finish,
+    track: &Track,
+    full: &str,
+) -> (&'static [Flag], &'static [Flag]) {
+    if matches!(track.state, Phase::Blocked(_)) && track.resting() == to {
+        (&[], &[])
+    } else if tag_only(to, track, full) {
+        (&[Flag::Tag, Flag::Sha], &[Flag::Digest])
+    } else {
+        evidence_for(to, finish)
+    }
 }
 
 pub fn advance_state(
@@ -1293,19 +1320,67 @@ pub fn advance_state(
             next,
         ));
     }
-    let resuming = matches!(track.state, Phase::Blocked(_)) && *track.resting() == to;
-    let required = match resuming {
-        true => &[][..],
-        false => evidence_for(&to, finish).0,
+    let (required, optional) = evidence_taken(&to, finish, track, &path);
+    let dropped: Vec<Flag> = asked
+        .given
+        .iter()
+        .copied()
+        .filter(|flag| !required.contains(flag) && !optional.contains(flag))
+        .collect();
+    let carries = |flag: Flag| {
+        required.contains(&flag) || (asked.given.contains(&flag) && !dropped.contains(&flag))
     };
-    let moves = again(host, Slot::Positional("state"), &to.to_string())
+    // `advance_held` resolves --sha and --tag in --repo, else the recorded worktree, else (for
+    // released) the PR's or the declared GitHub repo; with none of them the move names a checkout.
+    let checkout = !asked.repo
+        && (carries(Flag::Sha) || carries(Flag::Tag))
+        && !unit.as_ref().is_some_and(|unit| {
+            evidence_repos(None, unit, target)
+                .iter()
+                .any(|repo| repo.exists())
+        })
+        && !(to == Phase::Released
+            && (track
+                .evidence
+                .pr
+                .as_deref()
+                .and_then(GithubRepo::of_pr)
+                .is_some()
+                || declared.is_some_and(|declared| declared.github.is_some())));
+    let tag = Release::of_target(&path)
+        .zip(declared)
+        .map(|(release, declared)| declared.release_tag(&release));
+    let cause = match dropped.as_slice() {
+        [] => cause,
+        dropped => format!(
+            "{cause}, which takes no {}, so the move drops it",
+            dropped
+                .iter()
+                .map(|flag| flag.name())
+                .collect::<Vec<_>>()
+                .join(" or ")
+        ),
+    };
+    let moves = host
+        .argv()
+        .and_then(|argv| crate::cli::replaced(&argv, Slot::Positional("state"), &to.to_string()))
+        .map(|argv| {
+            dropped.iter().fold(argv, |argv, flag| {
+                crate::cli::without(&argv, flag.name().trim_start_matches('-'))
+            })
+        })
+        .map(outcome::Move::again)
         .map(|again| {
             required
                 .iter()
                 .filter(|flag| !asked.given.contains(flag))
                 .fold(again, |again, flag| {
-                    again.set(flag.name(), evidence_value(*flag, &to, track))
+                    again.set(flag.name(), evidence_value(*flag, &to, track, tag.as_ref()))
                 })
+        })
+        .map(|again| match checkout {
+            true => again.set("--repo", Input::Checkout),
+            false => again,
         })
         .map(|again| (format!("to move {path} to {to}"), again))
         .into_iter()
@@ -1313,11 +1388,13 @@ pub fn advance_state(
     Err(refuse_moves(path, "advance-refused", cause, moves))
 }
 
-// What a suggested state's required evidence flag takes: the value cm recorded where it is the
+// What a suggested state's required evidence flag takes: the value cm holds where it is the
 // one the move needs, else an input only the caller has.
-fn evidence_value(flag: Flag, to: &Phase, track: &Track) -> outcome::Arg {
+fn evidence_value(flag: Flag, to: &Phase, track: &Track, tag: Option<&TagName>) -> outcome::Arg {
     let recorded = match (flag, to) {
         (Flag::Pr, _) => track.evidence.pr.as_deref(),
+        // A release step's tag is declared at `cm init`, and `advance_held` takes no other.
+        (Flag::Tag, _) => tag.map(TagName::as_str),
         // A rollout deploys the merge it recorded; the merge itself is a new revision.
         (Flag::Sha, Phase::Deployed) => track.evidence.sha.as_deref(),
         _ => None,
@@ -2626,9 +2703,7 @@ pub(crate) fn advance_held(
             ),
         )
     };
-    let tag_only = *to == Phase::Released
-        && Release::of_target(&full).is_some()
-        && matches!(track.resting(), Phase::Drafted | Phase::Launched);
+    let tag_only = tag_only(to, &track, &full);
     let remerge = *to == Phase::Merged
         && track.state == Phase::Merged
         && part.is_none()
@@ -2651,13 +2726,7 @@ pub(crate) fn advance_held(
         violations.extend(plan::unmet(&full, &plan::gates(root, &units, step)));
     }
     let resuming = matches!(track.state, Phase::Blocked(_)) && track.resting() == to;
-    let (required, optional) = if resuming {
-        (&[][..], &[][..])
-    } else if tag_only {
-        (&[Flag::Tag, Flag::Sha][..], &[Flag::Digest][..])
-    } else {
-        evidence_for(to, finish)
-    };
+    let (required, optional) = evidence_taken(to, finish, &track, &full);
     for flag in required {
         if !flag.given(given, file) {
             violations.push(Violation::new(

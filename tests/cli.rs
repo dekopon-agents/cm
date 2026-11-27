@@ -863,7 +863,9 @@ fn a_bad_state_word_names_the_legal_next_state_as_a_full_command() {
             "--pr",
             "https://github.com/o/r/pull/1",
             "--sha",
-            "<revision>"
+            "<revision>",
+            "--repo",
+            "<checkout>"
         ])]
     );
 
@@ -1151,7 +1153,9 @@ fn a_repair_edits_the_argument_it_names_whatever_text_the_other_arguments_hold()
             "--pr",
             "<pr>",
             "--sha",
-            "<revision>"
+            "<revision>",
+            "--repo",
+            "<checkout>"
         ])]
     );
     let lane = json(&cm(root, &["--json", "next", "--lane", "next"]));
@@ -1761,84 +1765,149 @@ fn each_suggested_state_names_the_evidence_its_advance_requires() {
     use cm::state::Phase;
     let temp = chart_campaign();
     let root = temp.path();
-    let rollout = "09-daemon/chart-termination/roll";
-    let declared = cm(
-        root,
-        &["init", rollout, "--lane", "codex", "--kind", "rollout"],
-    );
-    assert!(declared.status.success(), "{declared:?}");
+    for (step, kind) in [("roll", &["--kind", "rollout"][..]), ("cx", &[])] {
+        let full = format!("09-daemon/chart-termination/{step}");
+        let mut argv = vec!["init", &full, "--lane", "codex"];
+        argv.extend(kind);
+        let declared = cm(root, &argv);
+        assert!(declared.status.success(), "{declared:?}");
+    }
     fs::write(root.join("ev.md"), "Synced.\n").unwrap();
+    let repo = root.join("repo");
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    fs::create_dir(&repo).unwrap();
+    git(&["init", "-q"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "x"]);
+    git(&["tag", "v1.0.0"]);
+    let rev = git(&["rev-parse", "HEAD"]);
+    let rev = rev.as_str();
+    let checkout = repo.to_str().unwrap();
     let pr = "https://github.com/dekopon-agents/cm/pull/1";
     let samples = [
         ("<pr>", pr),
-        ("<revision>", "abcdef1234567"),
+        ("<revision>", rev),
         ("<tag>", "v1.0.0"),
         (
             "<digest>",
             "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         ),
         ("<evidence-file>", "ev.md"),
+        ("<checkout>", checkout),
     ];
-    let at = |step: &str, phase: Phase, sha: Option<&str>| {
+    let at = |step: &str, phase: Phase, recorded: bool| {
         set_state(root, step, |each| {
             each.track.state = phase;
-            each.track.evidence.pr = sha.map(|_| pr.to_owned());
-            each.track.evidence.sha = sha.map(str::to_owned);
+            each.track.evidence.pr = recorded.then(|| pr.to_owned());
+            each.track.evidence.sha = recorded.then(|| rev.to_owned());
         })
     };
     type Case<'a> = (
         &'a str,
         Phase,
-        Option<&'a str>,
+        bool,
         &'a [&'a str],
         &'a [&'a str],
         &'a [&'a str],
     );
-    let cases: [Case; 7] = [
+    let pr_open: &[&str] = &[
+        "pr-open",
+        "--pr",
+        "<pr>",
+        "--sha",
+        "<revision>",
+        "--repo",
+        "<checkout>",
+    ];
+    let merged: &[&str] = &["merged", "--sha", "<revision>", "--repo", "<checkout>"];
+    let cases: [Case; 11] = [
         (
-            STEP,
+            "build",
             Phase::Launched,
-            None,
+            false,
             &["pr-opn"],
-            &["pr-open", "--pr", "<pr>", "--sha", "<revision>"],
-            &["pr", "revision"],
+            pr_open,
+            &["pr", "revision", "checkout"],
         ),
         (
-            STEP,
+            "build",
             Phase::Launched,
-            None,
+            false,
             &["mergd"],
-            &["pr-open", "--pr", "<pr>", "--sha", "<revision>"],
-            &["pr", "revision"],
+            pr_open,
+            &["pr", "revision", "checkout"],
         ),
         (
-            STEP,
+            "build",
             Phase::Launched,
-            None,
+            false,
             &["pr-opn", "--pr", pr],
-            &["pr-open", "--pr", pr, "--sha", "<revision>"],
-            &["revision"],
+            &[
+                "pr-open",
+                "--pr",
+                pr,
+                "--sha",
+                "<revision>",
+                "--repo",
+                "<checkout>",
+            ],
+            &["revision", "checkout"],
         ),
         (
-            STEP,
+            "cx",
+            Phase::Launched,
+            false,
+            &["pr-opn"],
+            pr_open,
+            &["pr", "revision", "checkout"],
+        ),
+        (
+            "build",
             Phase::PrOpen,
-            Some("abcdef1234567"),
+            true,
             &["mergd"],
-            &["merged", "--sha", "<revision>"],
-            &["revision"],
+            merged,
+            &["revision", "checkout"],
+        ),
+        // A given flag the suggested state takes no is dropped, and the cause says so.
+        (
+            "build",
+            Phase::PrOpen,
+            true,
+            &["relesed", "--tag", "v1.0.0"],
+            merged,
+            &["revision", "checkout"],
         ),
         (
-            STEP,
+            "cx",
+            Phase::PrOpen,
+            true,
+            &["mergd"],
+            merged,
+            &["revision", "checkout"],
+        ),
+        // A merged step's PR names the repo its tag is read from.
+        (
+            "build",
             Phase::Merged,
-            Some("abcdef1234567"),
+            true,
             &["relased"],
             &["released", "--tag", "<tag>"],
             &["tag"],
         ),
         (
-            STEP,
+            "build",
             Phase::Released,
-            Some("abcdef1234567"),
+            true,
             &["deplyed"],
             &["deployed", "--digest", "<digest>"],
             &["digest"],
@@ -1846,25 +1915,31 @@ fn each_suggested_state_names_the_evidence_its_advance_requires() {
         (
             "roll",
             Phase::Merged,
-            Some("abcdef1234567"),
+            true,
             &["deplyed"],
             &[
                 "deployed",
                 "--sha",
-                "abcdef1234567",
+                rev,
                 "--evidence",
                 "<evidence-file>",
+                "--repo",
+                "<checkout>",
             ],
-            &["evidence-file"],
+            &["evidence-file", "checkout"],
+        ),
+        (
+            "roll",
+            Phase::Launched,
+            false,
+            &["pr-opn"],
+            pr_open,
+            &["pr", "revision", "checkout"],
         ),
     ];
-    for (name, phase, sha, typed, suggested, inputs) in cases {
-        let step = if name == STEP {
-            STEP.to_owned()
-        } else {
-            format!("09-daemon/chart-termination/{name}")
-        };
-        at(if name == STEP { "build" } else { name }, phase, sha);
+    for (name, phase, recorded, typed, suggested, inputs) in cases {
+        let step = format!("09-daemon/chart-termination/{name}");
+        at(name, phase, recorded);
         let mut argv = vec!["--json", "advance", &step];
         argv.extend(typed);
         let report = json(&cm(root, &argv));
@@ -1872,17 +1947,24 @@ fn each_suggested_state_names_the_evidence_its_advance_requires() {
             report["violations"][0]["rule"], "advance-refused",
             "{typed:?}: {report}"
         );
+        if typed.contains(&"--tag") {
+            let cause = report["violations"][0]["message"].as_str().unwrap();
+            assert!(
+                cause.ends_with("takes no --tag, so the move drops it"),
+                "{cause}"
+            );
+        }
         let mut wanted = vec!["cm", "advance", &step];
         wanted.extend(suggested);
         assert_eq!(
             argvs(&report),
             [serde_json::json!(wanted)],
-            "{typed:?}: {report}"
+            "{name} {typed:?}: {report}"
         );
         assert_eq!(
             report["violations"][0]["next"][0]["inputs"],
             serde_json::json!(inputs),
-            "{typed:?}"
+            "{name} {typed:?}"
         );
         let filled: Vec<Value> = wanted
             .iter()
@@ -1893,13 +1975,126 @@ fn each_suggested_state_names_the_evidence_its_advance_requires() {
             .collect();
         let mut run = vec![Value::from("cm"), Value::from("--json")];
         run.extend(filled[1..].iter().cloned());
-        let ran = run_argv(root, &Value::Array(run));
-        let ran = json(&ran);
-        assert!(
-            ran["violations"]
-                .as_array()
-                .is_none_or(|all| all.iter().all(|each| each["rule"] != "evidence-missing")),
-            "{typed:?}: {ran}"
+        let ran = json(&run_argv(root, &Value::Array(run)));
+        for each in ran["violations"].as_array().into_iter().flatten() {
+            assert!(
+                !["evidence-missing", "evidence-repo", "evidence-unexpected"]
+                    .contains(&each["rule"].as_str().unwrap()),
+                "{name} {typed:?}: {ran}"
+            );
+        }
+        // Only the merge gate, which reads GitHub, may refuse a filled move.
+        if !suggested.contains(&"merged") && !suggested.contains(&"released") {
+            assert_eq!(ran["ok"], true, "{name} {typed:?}: {ran}");
+        }
+    }
+    // A recorded worktree that exists resolves --sha, so the move names no checkout.
+    at("build", Phase::Launched, false);
+    set_state(root, "build", |each| each.worktree = checkout.to_owned());
+    let report = json(&cm(root, &["--json", "advance", STEP, "pr-opn"]));
+    assert_eq!(
+        argvs(&report),
+        [serde_json::json!([
+            "cm",
+            "advance",
+            STEP,
+            "pr-open",
+            "--pr",
+            "<pr>",
+            "--sha",
+            "<revision>"
+        ])]
+    );
+}
+
+#[test]
+fn a_release_steps_suggested_released_carries_its_declared_tag() {
+    use cm::state::Phase;
+    let temp = chart_campaign();
+    let root = temp.path();
+    let release = "00-release/dekopon/0.100.0";
+    assert!(
+        cm(root, &["init", release, "--lane", "claude-cloud"])
+            .status
+            .success()
+    );
+    let repo = root.join("repo");
+    fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-q"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "x"]);
+    git(&["tag", "v0.100.0"]);
+    let rev = git(&["rev-parse", "HEAD"]);
+    let checkout = repo.to_str().unwrap();
+    let set = |phase: Phase, recorded: bool| {
+        let unit = root.join("00-release/dekopon");
+        let mut state = cm::store::load_unit(&unit).unwrap();
+        let step = state.steps.get_mut("0.100.0").unwrap();
+        step.track.state = phase;
+        step.track.evidence.sha = recorded.then(|| rev.clone());
+        cm::commands::write_unit(&unit, &state).unwrap();
+    };
+    let fill =
+        |argv: &Value| -> Value {
+            let mut run = vec![Value::from("cm"), Value::from("--json")];
+            run.extend(argv.as_array().unwrap()[1..].iter().map(
+                |word| match word.as_str().unwrap() {
+                    "<revision>" => Value::from(rev.as_str()),
+                    "<checkout>" => Value::from(checkout),
+                    _ => word.clone(),
+                },
+            ));
+            json(&run_argv(root, &Value::Array(run)))
+        };
+    // From merged the tag is the one declared at `cm init`, the only one the advance takes.
+    set(Phase::Merged, true);
+    let merged = json(&cm(root, &["--json", "advance", release, "relased"]));
+    assert_eq!(
+        argvs(&merged),
+        [serde_json::json!([
+            "cm",
+            "advance",
+            release,
+            "released",
+            "--tag",
+            "v0.100.0",
+            "--repo",
+            "<checkout>"
+        ])]
+    );
+    let ran = fill(&argvs(&merged)[0]);
+    assert_eq!(ran["ok"], true, "{ran}");
+    // From drafted or launched the release step is released from its tag alone.
+    for phase in [Phase::Drafted, Phase::Launched] {
+        set(phase.clone(), false);
+        let early = json(&cm(root, &["--json", "advance", release, "relased"]));
+        assert_eq!(
+            argvs(&early),
+            [serde_json::json!([
+                "cm",
+                "advance",
+                release,
+                "released",
+                "--tag",
+                "v0.100.0",
+                "--sha",
+                "<revision>",
+                "--repo",
+                "<checkout>"
+            ])],
+            "{phase}"
         );
+        let ran = fill(&argvs(&early)[0]);
+        assert_eq!(ran["ok"], true, "{phase}: {ran}");
     }
 }
