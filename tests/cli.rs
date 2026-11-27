@@ -2226,6 +2226,62 @@ fn a_suggested_done_or_launch_takes_the_evidence_file_or_checkout_cm_already_has
 }
 
 #[test]
+fn a_suggested_launch_keeps_the_checkout_as_given_or_prints_none() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let pi = "09-daemon/x/pi";
+    assert!(cm(root, &["init"]).status.success());
+    assert!(cm(root, &["init", pi, "--lane", "pi"]).status.success());
+    fs::write(root.join("k.md"), "Do it.\n").unwrap();
+    assert!(
+        cm(root, &["amend", pi, "--kickoff-file", "k.md"])
+            .status
+            .success()
+    );
+
+    let raw = OsStr::from_bytes(b"wt-\xff");
+    fs::create_dir_all(root.join(raw).join(".git")).unwrap();
+    let mut repo = std::ffi::OsString::from("--repo=");
+    repo.push(raw);
+    let gh = support::FakeGh::new("exit 1\n");
+    let unprintable = Command::new(env!("CARGO_BIN_EXE_cm"))
+        .current_dir(root)
+        .args(["--json", "advance", pi, "lanched"])
+        .arg(&repo)
+        .env("PATH", gh.path())
+        .output()
+        .unwrap();
+    assert_eq!(unprintable.status.code(), Some(1), "{unprintable:?}");
+    assert_eq!(
+        unprintable.stdout.iter().filter(|b| **b == b'\n').count(),
+        1
+    );
+    let unprintable = json(&unprintable);
+    assert_eq!(
+        unprintable["violations"][0]["next"],
+        serde_json::json!([]),
+        "{unprintable}"
+    );
+
+    fs::create_dir_all(root.join("-wt/.git")).unwrap();
+    let dashed = cm(root, &["--json", "advance", pi, "lanched", "--repo=-wt"]);
+    assert_eq!(dashed.status.code(), Some(1), "{dashed:?}");
+    let dashed = json(&dashed);
+    let launch = serde_json::json!(["cm", "launch", pi, "--worktree=-wt"]);
+    assert_eq!(argvs(&dashed), std::slice::from_ref(&launch));
+    assert_eq!(
+        dashed["violations"][0]["next"][0]["inputs"],
+        serde_json::json!([])
+    );
+    let mut run = vec![Value::from("cm"), Value::from("--json")];
+    run.extend(launch.as_array().unwrap()[1..].iter().cloned());
+    let ran = json(&run_argv(root, &Value::Array(run)));
+    assert_eq!(ran["ok"], true, "{ran}");
+}
+
+#[test]
 fn a_release_steps_suggested_released_carries_its_declared_tag() {
     use cm::state::Phase;
     let temp = chart_campaign();

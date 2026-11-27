@@ -1252,7 +1252,6 @@ pub fn advance_state(
         near.sort_by_key(|(edits, _)| *edits);
         near.into_iter().map(|(_, phase)| phase).collect()
     };
-    // An evidence-finished step ends with done from any state; a part ends at deployed.
     let legal = match (asked.part, finish) {
         (None, Finish::Evidence) if !track.state.is_final() => Some(Phase::Done),
         _ => track.next_state(finish),
@@ -1285,16 +1284,15 @@ pub fn advance_state(
         let local = declared
             .and_then(|declared| declared.lane)
             .is_some_and(Lane::is_local);
-        let next = host.prefix().map(|prefix| {
+        let next = host.prefix().and_then(|prefix| {
             let mut launch = vec!["launch".into(), step.as_str().into()];
             if local {
-                let worktree = match asked.repo {
-                    Some(repo) => repo.display().to_string().into(),
-                    None => Input::Checkout.into(),
-                };
-                launch.extend(["--worktree".into(), worktree]);
+                match asked.repo {
+                    Some(repo) => launch.extend(outcome::option("--worktree", repo.to_str()?)),
+                    None => launch.extend(["--worktree".into(), Input::Checkout.into()]),
+                }
             }
-            Next::run(outcome::cm(prefix, launch))
+            Some(Next::run(outcome::cm(prefix, launch)))
         });
         return Err(Violation::refuse_printed(
             path,
@@ -1422,7 +1420,6 @@ pub(crate) fn after_refusal(
     let until = gate.id == "until";
     let units = plan::load_units(root).unwrap_or_default();
     let candidates: Vec<String> = match existing {
-        // Only a gate the step has can be dropped.
         Some(gates) => {
             let mut ranked: Vec<(usize, String)> = gates
                 .iter()

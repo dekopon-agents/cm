@@ -81,8 +81,6 @@ impl std::str::FromStr for Status {
     }
 }
 
-// Each move is one `epoch` would take: its pins named when EPOCH.md holds them null, and closing
-// only once the campaign has.
 pub(crate) fn move_refusal(
     host: &dyn Host,
     root: &Path,

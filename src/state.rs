@@ -273,7 +273,6 @@ impl Track {
         }
     }
 
-    // The state `check` names as next, so a refusal and the move it prints agree.
     pub fn next_state(&self, finish: Finish) -> Option<Phase> {
         if self.state.is_final() {
             return None;

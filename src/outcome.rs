@@ -220,6 +220,21 @@ impl Move {
             Arg::Lit(text) => text == flag || text.starts_with(&inline),
             Arg::Input(_) => false,
         });
+        if let Arg::Lit(text) = &value
+            && text.starts_with('-')
+        {
+            let attached = Arg::Lit(format!("{inline}{text}"));
+            match at {
+                Some(at) => {
+                    let pair = matches!(&self.argv[at], Arg::Lit(text) if text == flag);
+                    let gone = if pair && at + 1 < end { 2 } else { 1 };
+                    self.argv.splice(at..at + gone, [attached]);
+                }
+                None => self.argv.insert(end, attached),
+            }
+            self.check();
+            return self;
+        }
         match at {
             Some(at) if matches!(&self.argv[at], Arg::Lit(text) if text == flag) => {
                 if at + 1 < end {
@@ -556,5 +571,34 @@ impl Outcome {
             object.insert(key.clone(), value.clone());
         }
         Value::Object(object)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn advance(rest: &[&str]) -> Move {
+        let head = ["cm", "advance", "09-daemon/x/pi", "launched"];
+        Move::again(
+            head.iter()
+                .chain(rest)
+                .map(|word| (*word).to_owned())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_dash_led_value_is_set_attached_to_its_flag() {
+        for given in [&["--repo", "old"][..], &["--repo=old"], &[]] {
+            let words = advance(given).set("--repo", "-wt").words();
+            assert_eq!(
+                words,
+                ["cm", "advance", "09-daemon/x/pi", "launched", "--repo=-wt"],
+                "from {given:?}"
+            );
+        }
+        let words = advance(&["--repo=-old"]).set("--repo", "wt").words();
+        assert_eq!(words[4..], ["--repo", "wt"]);
     }
 }
