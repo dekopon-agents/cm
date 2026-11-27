@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -229,6 +230,24 @@ pub fn lock(root: &Path) -> Result<Lock> {
     rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
         .context("locking .cm/lock")?;
     Ok(Lock { _file: file })
+}
+
+// An flock on the `.cm` directory itself: it adds no file to the campaign, and `cm attempt` and
+// `cm advance`, which wait on `.cm/lock` alone, never wait on it. A wait the deadline ends leaves
+// its thread to release the lock the moment it is granted.
+pub(crate) fn context_lock(root: &Path, deadline: Instant) -> Result<Option<Lock>> {
+    let dir = File::open(root.join(CM_DIR))?;
+    let (sent, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let locked = rustix::fs::flock(&dir, rustix::fs::FlockOperation::LockExclusive);
+        let _ = sent.send(locked.map(|()| dir));
+    });
+    match received.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(locked) => Ok(Some(Lock {
+            _file: locked.context("locking .cm for context reads")?,
+        })),
+        Err(_) => Ok(None),
+    }
 }
 
 pub fn ignore(root: &Path, name: &str) -> Result<()> {

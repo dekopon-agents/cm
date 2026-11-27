@@ -2818,6 +2818,13 @@ fn the_built_cm_tick_stops_writing_a_stdout_file_at_the_file_size_limit() {
         ]),
         PICK_OK,
     );
+    // The real gitsync's git calls would grow a logging fake's log past the limit, which would
+    // then kill the fake, so these fakes write nothing, as in the next test.
+    script(
+        &harness.bin.join("cm"),
+        "if [ \"$1 $2\" = '--json next' ]; then cat \"${0%/*}/../next.json\"; exit 1; fi\n",
+    );
+    harness.unlogged();
     let all = harness
         .command("cse_01abc")
         .args(["tick", "--cm", "cm"])
@@ -3220,6 +3227,12 @@ fn main_repository(dir: &Path) -> PathBuf {
         os("origin.git"),
     ]);
     git(&[os("init"), os("-q"), os("-b"), os("main"), os("repo")]);
+    for (key, value) in [
+        ("user.name", "cm tick test"),
+        ("user.email", "tick@example.invalid"),
+    ] {
+        git(&[os("-C"), os("repo"), os("config"), os(key), os(value)]);
+    }
     git(&[
         os("-C"),
         os("repo"),
@@ -3254,8 +3267,7 @@ fn main_repository(dir: &Path) -> PathBuf {
 fn the_built_cm_tick_leaves_a_bare_cm_to_the_default_search_path_when_path_is_unset() {
     let harness = Harness::new(1, &act(lines()), PICK_OK);
     // With PATH unset the tick's git is the system one, which reads only this repository, so the
-    // tick is bound and reaches the act loop. Only the fake handoff-pick.sh logs: once for
-    // `--check-bound`, and twice a tick, at the frame's check and its re-check.
+    // tick is bound and reaches the act loop.
     let git_dir = main_repository(&harness.ct.path().join("git"));
     script(
         &harness.ct.path().join(beat::HANDOFF_PICK),
@@ -3285,7 +3297,7 @@ fn the_built_cm_tick_leaves_a_bare_cm_to_the_default_search_path_when_path_is_un
             .collect();
         let could_not_run = format!("heartbeat: cm --json next --act could not run: {cm}: ");
         if ran {
-            assert_eq!(lines, Vec::<&str>::new(), "{json}");
+            assert!(lines.is_empty(), "{json}");
         } else {
             assert!(
                 matches!(lines.as_slice(), [line] if line.starts_with(&could_not_run)),
@@ -3293,7 +3305,7 @@ fn the_built_cm_tick_leaves_a_bare_cm_to_the_default_search_path_when_path_is_un
             );
         }
     }
-    assert_eq!(harness.log(), [FRAME[1]; 5], "{:?}", harness.log());
+    assert_eq!(harness.log(), [FRAME[1]; 7], "{:?}", harness.log());
 }
 
 #[test]
@@ -4455,8 +4467,8 @@ fn the_built_cm_tick_acts_in_the_bound_coordinator() {
     origin.acts(Some("cse_01abc"));
     assert_eq!(
         origin.log("pick.log"),
-        [local_pick("session_01abc"), local_pick("session_01abc")],
-        "the check and the re-check after gitsync, from the checkout"
+        vec![local_pick("session_01abc"); 3],
+        "the check, gitsync's still_bound after its pull, and the re-check after gitsync, from the checkout"
     );
     assert_eq!(
         origin.log("cm.log"),
@@ -4703,11 +4715,39 @@ fn the_built_cm_tick_binds_a_stale_head_at_any_age() {
 #[test]
 fn the_built_cm_tick_counts_a_failed_fetch_as_bound() {
     let origin = Origin::new();
+    // gitsync's pull runs its fetch from git's exec path, not PATH, so only the check's fails.
+    let bin = origin.path("fetch-fails");
+    script(
+        &bin.join("git"),
+        "[ \"$1\" = fetch ] && exit 1\nexec /usr/bin/git \"$@\"\n",
+    );
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    for check in [false, true] {
+        let mut command = origin.command(env!("CARGO_BIN_EXE_cm"));
+        command
+            .env("PATH", &path)
+            .env("CLAUDE_CODE_REMOTE_SESSION_ID", "cse_01abc")
+            .args(["tick", "--cm"])
+            .arg(origin.cm())
+            .arg("--checkout")
+            .arg(origin.ct());
+        if check {
+            command.arg("--check-bound");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let printed = if check {
+            String::new()
+        } else {
+            format!("{}\n", PRINTED.join("\n"))
+        };
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), printed);
+    }
     origin.git(
         &origin.ct(),
         &["remote", "set-url", "origin", "../no-such-origin.git"],
     );
-    origin.acts(Some("cse_01abc"));
     assert_eq!(origin.check_bound(Some("cse_01abc")), Some(0));
 }
 

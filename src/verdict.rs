@@ -497,6 +497,28 @@ pub fn parse_report(text: &str) -> Result<Block, Vec<BlockError>> {
 pub struct Verdicts {
     #[serde(default)]
     pub reviews: Vec<Recorded>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_raises: Vec<CapRaise>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapRaise {
+    pub step: String,
+    pub by: u32,
+    pub ruling: CampaignFile,
+    pub at: String,
+}
+
+const BASE_CAP: usize = 10;
+
+fn review_cap(verdicts: &Verdicts, step: &str) -> usize {
+    BASE_CAP
+        + verdicts
+            .cap_raises
+            .iter()
+            .filter(|raise| raise.step == step)
+            .map(|raise| raise.by as usize)
+            .sum::<usize>()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -698,6 +720,7 @@ pub fn record(
     part: Option<&str>,
 ) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
+    let journal_sound = violations.is_empty();
     let full = full_name(target);
     let mut non_convergence_block = false;
     if !declared(root, target)? {
@@ -755,6 +778,9 @@ pub fn record(
         },
     };
     let mut verdicts = load(root)?;
+    if journal_sound {
+        journal_raises(root, &verdicts)?;
+    }
     let pr = step_pr(root, target, part)?;
     let heads = fix_heads(
         verdicts
@@ -767,12 +793,17 @@ pub fn record(
             && !heads.iter().any(|head| same_commit(head, &block.head))
     });
     let passes = heads.len() + usize::from(new_pass);
-    if new_pass && passes > 10 {
-        violations.push(Violation::new(
-            &full,
-            "review-cap",
-            "session cap of 10 passes; an 11th fix pass on the current PR is refused",
-        ));
+    let cap = review_cap(&verdicts, &full);
+    if new_pass && passes > cap {
+        let message = if cap == BASE_CAP {
+            "session cap of 10 passes; an 11th fix pass on the current PR is refused; an owner ruling raises it: `cm review cap-raise <step> --by <1-3> --ruling <file>`".to_owned()
+        } else {
+            format!(
+                "session cap of {cap} passes (10 plus {} raised by owner ruling); fix pass {passes} on the current PR is refused; a further ruling raises it: `cm review cap-raise <step> --by <1-3> --ruling <file>`",
+                cap - BASE_CAP
+            )
+        };
+        violations.push(Violation::new(&full, "review-cap", message));
     }
     let number = verdicts
         .reviews
@@ -1017,6 +1048,173 @@ pub fn record(
     outcome.field("blocked", blocked.is_some());
     outcome.field("journal", journal);
     Ok(outcome)
+}
+
+pub fn cap_raise(
+    host: &dyn Host,
+    root: &Path,
+    target: &Target,
+    by: u32,
+    ruling: &Path,
+) -> Result<Outcome> {
+    let (_lock, mut violations) = guard(root)?;
+    let mut verdicts = load(root)?;
+    let repaired = if violations.is_empty() {
+        journal_raises(root, &verdicts)?
+    } else {
+        Vec::new()
+    };
+    let full = full_name(target);
+    if !declared(root, target)? {
+        violations.push(Violation::new(
+            &full,
+            "step-unknown",
+            "the step is not declared",
+        ));
+    }
+    let file = match CampaignFile::resolve(root, ruling) {
+        Err(error) => {
+            violations.push(Violation::new(&full, "cap-ruling", error.to_string()));
+            None
+        }
+        Ok(file) if file.as_str().contains(['\n', '\r']) => {
+            violations.push(Violation::new(
+                &full,
+                "cap-ruling",
+                format!(
+                    "`{}` holds a line break, which the journal cannot name; rename the ruling",
+                    file.as_str().escape_default()
+                ),
+            ));
+            None
+        }
+        Ok(file) => {
+            if !committed_as_it_stands(root, &file) {
+                violations.push(Violation::new(
+                    &full,
+                    "cap-ruling",
+                    format!("`{file}` is not committed as it stands; commit the ruling, then raise the cap"),
+                ));
+            }
+            if let Some(earlier) = verdicts
+                .cap_raises
+                .iter()
+                .find(|raise| raise.ruling == file)
+            {
+                violations.push(Violation::new(
+                    &full,
+                    "cap-raise-done",
+                    format!(
+                        "`{file}` already raised the cap of {} by {} at {}",
+                        earlier.step, earlier.by, earlier.at
+                    ),
+                ));
+            }
+            Some(file)
+        }
+    };
+    let mut outcome = Outcome::default();
+    for heading in &repaired {
+        outcome.line(format!("journaled an earlier raise: {heading}"));
+    }
+    let Some(file) = file.filter(|_| violations.is_empty()) else {
+        outcome.violations = violations;
+        return Ok(outcome);
+    };
+    let at = stamp(host.now());
+    verdicts.cap_raises.push(CapRaise {
+        step: full.clone(),
+        by,
+        ruling: file.clone(),
+        at: at.clone(),
+    });
+    save(root, &verdicts)?;
+    let (title, body, cap) = raise_entry(&verdicts.cap_raises, verdicts.cap_raises.len() - 1);
+    let journal = journal_line(root, &at, &title, &body)?;
+    outcome.line(format!(
+        "{full}: review cap raised by {by} to {cap} passes by {file}"
+    ));
+    outcome.field("cap", cap);
+    outcome.field("ruling", file.as_str());
+    outcome.field("journal", journal);
+    Ok(outcome)
+}
+
+// The ruling's HEAD entry is a regular-file blob whose bytes are the working file's.
+fn committed_as_it_stands(root: &Path, file: &CampaignFile) -> bool {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .arg("--literal-pathspecs")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| output.stdout)
+    };
+    let Some(listed) = git(&["ls-tree", "-z", "HEAD", "--", file.as_str()]) else {
+        return false;
+    };
+    let entries: Vec<&[u8]> = listed
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    let [entry] = entries[..] else {
+        return false;
+    };
+    let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+        return false;
+    };
+    if &entry[tab + 1..] != file.as_str().as_bytes() {
+        return false;
+    }
+    let fields: Vec<&[u8]> = entry[..tab].split(|byte| *byte == b' ').collect();
+    let [mode, b"blob", id] = fields[..] else {
+        return false;
+    };
+    if !matches!(mode, b"100644" | b"100755") {
+        return false;
+    }
+    let Ok(id) = std::str::from_utf8(id) else {
+        return false;
+    };
+    git(&["cat-file", "blob", id])
+        .is_some_and(|recorded| fs::read(root.join(file.as_str())).is_ok_and(|now| now == recorded))
+}
+
+// Appends the journal entry of every saved raise that JOURNAL.md does not hold, oldest first,
+// so a raise saved before a failed journal write is journaled before anything counts on it.
+fn journal_raises(root: &Path, verdicts: &Verdicts) -> Result<Vec<String>> {
+    let raises = &verdicts.cap_raises;
+    if raises.is_empty() {
+        return Ok(Vec::new());
+    }
+    let journal = fs::read_to_string(root.join(store::JOURNAL))?;
+    let mut written = Vec::new();
+    for (index, raise) in raises.iter().enumerate() {
+        let (title, body, _) = raise_entry(raises, index);
+        if !journal.contains(&crate::journal::entry(&raise.at, &title, Some(&body))) {
+            written.push(journal_line(root, &raise.at, &title, &body)?);
+        }
+    }
+    Ok(written)
+}
+
+// The journal title and body of `raises[index]`, and the step's cap once it was saved.
+fn raise_entry(raises: &[CapRaise], index: usize) -> (String, String, usize) {
+    let raise = &raises[index];
+    let cap = BASE_CAP
+        + raises[..=index]
+            .iter()
+            .filter(|earlier| earlier.step == raise.step)
+            .map(|earlier| earlier.by as usize)
+            .sum::<usize>();
+    (
+        format!("review cap-raise {} +{}", raise.step, raise.by),
+        format!("- ruling: {}\n- cap: {cap} passes\n", raise.ruling),
+        cap,
+    )
 }
 
 /// What `--by` names: a ruling file inside the campaign, else a commit SHA.
@@ -2181,7 +2379,10 @@ mod tests {
                 findings: Vec::new(),
             });
         }
-        let verdicts = Verdicts { reviews };
+        let verdicts = Verdicts {
+            reviews,
+            ..Verdicts::default()
+        };
         HASHES.with(|hashes| hashes.set(0));
         assert!(astra_gap(root, &target, &verdicts, None, SHA, None).is_empty());
         assert_eq!(HASHES.with(Cell::get), 2);
