@@ -557,6 +557,7 @@ are the state gates from `--after` (`<step>`, `pr-open:<step>`, `tag:<line>@<ver
 `deployed:<line>@<version>`), plus `epoch:WORKING`, `owner-queue:<n>` (item
 heading removed from OWNER-QUEUE.md), and `mac-lane:<n>` (a unique item in
 MAC-LANE.md stamped `DONE YYYY-MM-DD` or `DONE YYYY-MM-DD:` with a valid date).
+A second trailing colon leaves the wait blocked.
 `<n>` is a positive item number within `u32`. Owner-queue headings, conditions,
 checks and lint share one number parser. A block on `owner-queue:<n>` refuses unless item n is open
 now (`owner-queue-not-open`); file the question and block in one command with
