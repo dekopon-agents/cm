@@ -19,7 +19,8 @@
     "iss": {
       "type": "string",
       "format": "uri",
-      "description": "Must exactly match a configured trusted issuer; never selected by the token."
+      "description": "Must exactly match a configured trusted issuer; never selected by the token.",
+      "maxLength": 2048
     },
     "aud": {
       "const": "campaign-trail-api"
@@ -27,12 +28,14 @@
     "sub": {
       "type": "string",
       "minLength": 1,
-      "description": "Opaque principal identifier for attribution and command deduplication, never a permission grant."
+      "description": "Opaque principal identifier for attribution and command deduplication, never a permission grant.",
+      "maxLength": 128
     },
     "jti": {
       "type": "string",
       "minLength": 1,
-      "description": "Unique credential identifier for revocation and audit."
+      "description": "Unique credential identifier for revocation and audit.",
+      "maxLength": 128
     },
     "iat": {
       "type": "integer",
@@ -49,17 +52,32 @@
     "client_id": {
       "type": "string",
       "minLength": 1,
-      "description": "Opaque placement identifier, not environmental attestation or authority."
+      "description": "Opaque placement identifier, not environmental attestation or authority.",
+      "maxLength": 128
     },
     "scope": {
       "type": "string",
       "pattern": "^(?:[A-Za-z0-9:_-]+(?: [A-Za-z0-9:_-]+)*)?$",
-      "description": "Space-delimited, case-sensitive action scope words. Empty or unknown words grant no action. No implicit grants or wildcard expansion."
+      "description": "Space-delimited, case-sensitive action scope words. Empty or unknown words grant no action. No implicit grants or wildcard expansion.",
+      "maxLength": 4096
     },
     "campaign_id": {
       "type": "string",
       "minLength": 1,
-      "description": "Optional exact campaign restriction, applied uniformly to every action scope. If absent, scopes cover this API instance; no resource restriction is inferred from identity."
+      "description": "Optional exact campaign restriction: authorize against every server-loaded resource. Tokens carrying it are refused on instance operations, including whole-database backup, credential revocation and recovery, even in a single-active-campaign deployment.",
+      "maxLength": 128
+    },
+    "parent_jti": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Signed registered parent edge for a delegated token; parent/ancestor revocation, bounds, key trust and cutoff must also be validated. Never embed a parent bearer token."
+    },
+    "assignment_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Optional exact assignment restriction. Every resource must be proven within that assignment; unsupported operations refuse. Delegation cannot remove or widen it."
     }
   }
 }

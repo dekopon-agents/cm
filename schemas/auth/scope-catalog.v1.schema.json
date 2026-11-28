@@ -50,13 +50,12 @@
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "public",
-          "all_of"
+          "authentication",
+          "resource",
+          "all_of",
+          "assignment_bound"
         ],
         "properties": {
-          "public": {
-            "type": "boolean"
-          },
           "all_of": {
             "type": "array",
             "uniqueItems": true,
@@ -64,28 +63,102 @@
               "type": "string",
               "pattern": "^cm:[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$"
             }
+          },
+          "authentication": {
+            "enum": [
+              "jwt",
+              "public",
+              "github_hmac"
+            ]
+          },
+          "resource": {
+            "enum": [
+              "campaign",
+              "instance",
+              "public"
+            ]
+          },
+          "assignment_bound": {
+            "type": "boolean",
+            "description": "Explicit per-assignment projection/closure required. False means any assignment-restricted credential is refused."
           }
         },
         "allOf": [
           {
             "if": {
               "properties": {
-                "public": {
+                "authentication": {
+                  "const": "jwt"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "resource": {
+                  "enum": [
+                    "campaign",
+                    "instance"
+                  ]
+                },
+                "all_of": {
+                  "minItems": 1
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "authentication": {
+                  "const": "public"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "resource": {
+                  "const": "public"
+                },
+                "all_of": {
+                  "maxItems": 0
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "authentication": {
+                  "const": "github_hmac"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "resource": {
+                  "const": "instance"
+                },
+                "all_of": {
+                  "maxItems": 0
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "assignment_bound": {
                   "const": true
                 }
               }
             },
             "then": {
               "properties": {
-                "all_of": {
-                  "maxItems": 0
-                }
-              }
-            },
-            "else": {
-              "properties": {
-                "all_of": {
-                  "minItems": 1
+                "authentication": {
+                  "const": "jwt"
+                },
+                "resource": {
+                  "const": "campaign"
                 }
               }
             }

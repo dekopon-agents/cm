@@ -61,18 +61,20 @@ class ContractTests(unittest.TestCase):
             with self.subTest(operation=operation):
                 required = set(rule["all_of"])
                 self.assertTrue(required <= declared)
-                if rule["public"]:
+                if rule["authentication"] == "public":
                     self.assertFalse(required)
                     public.add(operation)
-                else:
+                elif rule["authentication"] == "jwt":
                     self.assertTrue(required)
+                else:
+                    self.assertFalse(required)
                 used.update(required)
         self.assertEqual(used, declared)
-        self.assertEqual(public, {"getJwtSchema", "getScopeCatalog", "getLineage"})
+        self.assertEqual(public, {"getJwtSchema", "getScopeCatalog", "getLineage", "getLiveness", "getReadinessProbe", "getTutorial", "getTutorialAsset"})
 
     def test_private_action_cannot_have_empty_requirements(self):
         catalog = json.loads(json.dumps(self.catalog))
-        catalog["operations"]["newAction"] = {"public": False, "all_of": []}
+        catalog["operations"]["newAction"] = {"authentication": "jwt", "resource": "campaign", "assignment_bound": False, "all_of": []}
         self.assertFalse(Draft202012Validator(self.catalog_schema).is_valid(catalog))
 
     def test_public_action_cannot_claim_scoped_access(self):
@@ -89,7 +91,46 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(requirements("reclassifyCard"), queue | {"cm:tracks:write"})
         self.assertEqual(requirements("setTrackRouting"), {"cm:tracks:route"})
         self.assertEqual(requirements("configureExecutor"), {"cm:executors:configure"})
-        self.assertEqual(requirements("recordExecutorObservation"), {"cm:observations:record"})
+        self.assertNotIn("recordExecutorObservation", self.catalog["operations"])
+
+    def test_ingress_inventory_is_complete_and_not_an_auth_bypass(self):
+        routes = load("ingress-routes.v1.json")["routes"]
+        ids = [r["operation_id"] for r in routes]
+        expected = {k for k, v in self.catalog["operations"].items()
+                    if v["authentication"] != "jwt"}
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(set(ids), expected)
+        self.assertEqual(self.catalog["operations"]["receiveGitHubWebhook"],
+                         {"authentication": "github_hmac", "resource": "instance", "assignment_bound": False, "all_of": []})
+        for change in [{"authentication": "public"}, {"resource": "campaign"},
+                       {"all_of": ["cm:observations:record"]}]:
+            broken = dict(self.catalog["operations"]["receiveGitHubWebhook"], **change)
+            catalog = json.loads(json.dumps(self.catalog))
+            catalog["operations"]["receiveGitHubWebhook"] = broken
+            self.assertFalse(Draft202012Validator(self.catalog_schema).is_valid(catalog))
+
+    def test_instance_operations_cannot_be_campaign_resources(self):
+        for op in ["createBackup", "downloadBackup", "revokeCredential", "inspectRecovery",
+                   "reconcileRecovery", "acceptExposure", "createCampaign"]:
+            self.assertEqual(self.catalog["operations"][op]["resource"], "instance")
+        for op in ["changeTrackLimits", "changeLaneLimits", "createTrack", "createLane"]:
+            self.assertIn("cm:campaigns:approve", self.catalog["operations"][op]["all_of"])
+
+    def test_nested_reads_do_not_gain_implied_permissions(self):
+        for op, required in {"getBrief": {"cm:reviews:read", "cm:evidence:read", "cm:journal:read"},
+                             "listDrivers": {"cm:sessions:read"},
+                             "getMacTask": {"cm:sessions:read", "cm:evidence:read"}}.items():
+            self.assertTrue(required <= set(self.catalog["operations"][op]["all_of"]))
+
+    def test_delegation_is_explicit_and_claims_do_not_embed_parent_secrets(self):
+        self.claims.validate(dict(self.valid, parent_jti="credential-01", assignment_id="assignment-04"))
+        for change in [dict(parent_jti=""), dict(parent_token="a-secret-bearer"), dict(assignment_id=[]),
+                       dict(parent_jti="x" * 129)]:
+            self.assertFalse(self.claims.is_valid(dict(self.valid, **change)))
+        for name in ["delegateCampaignCredential", "delegateInstanceCredential"]:
+            self.assertEqual(self.catalog["operations"][name]["all_of"], ["cm:credentials:delegate"])
+        bound = {name for name, rule in self.catalog["operations"].items() if rule["assignment_bound"]}
+        self.assertEqual(bound, {"getBrief", "getSession", "getEvidence"})
 
     def test_duplicate_keys(self):
         with self.assertRaisesRegex(ValueError, "duplicate JSON key"):

@@ -46,459 +46,614 @@
     "cm:drivers:write": "Register, replace or remove a driver within an accepted assignment.",
     "cm:watches:write": "Create or change a watch; expiry is not successful completion.",
     "cm:exceptions:approve": "Approve a specifically bounded exception; no blanket bypass of other checks.",
-    "cm:observations:record": "Collect source-bound observations without replacing a judgement.",
+    "cm:observations:record": "Append attributed feedback/operational reports; cannot set authoritative health, meter, evidence or native outcomes.",
     "cm:campaigns:reconcile": "Request collection/reconciliation of existing campaign operations; never redispatch an unknown effect.",
     "cm:ideas:write": "Admit or update idea records and outcomes under campaign phase/evidence guards.",
     "cm:reviews:raise-cap": "Explicitly increase a review card round cap with a linked escalation disposition; never reset round history.",
     "cm:lanes:read": "Read lane inventory, health projections, queue order and history; nested resources require their read scopes.",
-    "cm:lanes:write": "Create, pause, resume or retire a lane; immutable bindings and outstanding-work guards still apply.",
+    "cm:lanes:write": "Create, pause, resume or retire lanes; setting limits also requires campaign approval, and immutable bindings/flight guards apply.",
     "cm:lanes:edit-queue": "Attach, detach, move or reorder non-flight cards; never override claims, unknown effects or accepted work.",
     "cm:tracks:read": "Read work-track definitions, footprints, limits and routing.",
-    "cm:tracks:write": "Create or edit work-track definitions and explicitly reclassify card tracks within accepted constraints.",
+    "cm:tracks:write": "Create work tracks or edit metadata; limit changes also require campaign approval, routing uses its separate scope.",
     "cm:tracks:route": "Change the ordered primary and fallback lanes and automatic-fallback policy for a track.",
     "cm:executors:read": "Read executor configuration, source-bound health and meter freshness.",
-    "cm:executors:configure": "Configure or pause an executor; cannot assert healthy observations or erase admission holds.",
+    "cm:executors:configure": "Pause or resume an executor; cannot set capabilities, probe policy, health or meter state.",
     "cm:executors:probe": "Request a qualified capability probe; paid canaries need the ordinary test and session scopes.",
     "cm:artifacts:read": "Read native artifact bindings, observed state and attention reasons.",
     "cm:artifacts:write": "Bind or rebind artifacts to durable cards and tracks without rewriting native evidence.",
-    "cm:handoffs:acknowledge": "Acknowledge a consistent handoff snapshot; acknowledgement grants no execution authority."
+    "cm:handoffs:acknowledge": "Acknowledge a consistent handoff snapshot; acknowledgement grants no execution authority.",
+    "cm:credentials:delegate": "Authorize trusted-issuer minting of an explicitly narrower child JWT; never sign with bearer bytes, widen scopes/resources/lifetime, or inherit redelegation automatically."
   },
   "operations": {
     "getCampaign": {
-      "public": false,
       "all_of": [
         "cm:campaigns:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "createCampaign": {
-      "public": false,
       "all_of": [
         "cm:campaigns:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "instance",
+      "assignment_bound": false
     },
     "updateCampaignDraft": {
-      "public": false,
       "all_of": [
         "cm:campaigns:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "approveCampaign": {
-      "public": false,
       "all_of": [
         "cm:campaigns:approve"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "closeCampaign": {
-      "public": false,
       "all_of": [
         "cm:campaigns:close"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getCard": {
-      "public": false,
       "all_of": [
         "cm:cards:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "listCards": {
-      "public": false,
       "all_of": [
         "cm:cards:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getReadiness": {
-      "public": false,
       "all_of": [
         "cm:cards:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getBrief": {
-      "public": false,
       "all_of": [
-        "cm:cards:read"
-      ]
+        "cm:cards:read",
+        "cm:evidence:read",
+        "cm:reviews:read",
+        "cm:journal:read"
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": true
     },
     "createCard": {
-      "public": false,
       "all_of": [
         "cm:cards:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "updateCardDraft": {
-      "public": false,
       "all_of": [
         "cm:cards:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "approveCard": {
-      "public": false,
       "all_of": [
         "cm:cards:approve"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "advanceCard": {
-      "public": false,
       "all_of": [
         "cm:cards:advance"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getReviewCard": {
-      "public": false,
       "all_of": [
         "cm:reviews:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getRound": {
-      "public": false,
       "all_of": [
         "cm:reviews:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "startReviewRound": {
-      "public": false,
       "all_of": [
         "cm:reviews:start"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "recordReviewRound": {
-      "public": false,
       "all_of": [
         "cm:reviews:record"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "adjudicateFinding": {
-      "public": false,
       "all_of": [
         "cm:reviews:adjudicate"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getSession": {
-      "public": false,
       "all_of": [
         "cm:sessions:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": true
     },
     "startSession": {
-      "public": false,
       "all_of": [
         "cm:sessions:start"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "stopSession": {
-      "public": false,
       "all_of": [
         "cm:sessions:stop"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getSpend": {
-      "public": false,
       "all_of": [
         "cm:spend:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "recordUsage": {
-      "public": false,
       "all_of": [
         "cm:spend:record"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getJournalEntry": {
-      "public": false,
       "all_of": [
         "cm:journal:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "appendJournalEntry": {
-      "public": false,
       "all_of": [
         "cm:journal:append"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getEscalation": {
-      "public": false,
       "all_of": [
         "cm:escalations:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "openEscalation": {
-      "public": false,
       "all_of": [
         "cm:escalations:open"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "updateEscalation": {
-      "public": false,
       "all_of": [
         "cm:escalations:open"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "resolveEscalation": {
-      "public": false,
       "all_of": [
         "cm:escalations:resolve"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getEvidence": {
-      "public": false,
       "all_of": [
         "cm:evidence:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": true
     },
     "submitEvidence": {
-      "public": false,
       "all_of": [
         "cm:evidence:submit"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "collectEvidence": {
-      "public": false,
       "all_of": [
         "cm:evidence:collect"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "createBackup": {
-      "public": false,
       "all_of": [
         "cm:backups:create"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "instance",
+      "assignment_bound": false
     },
     "downloadBackup": {
-      "public": false,
       "all_of": [
         "cm:backups:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "instance",
+      "assignment_bound": false
     },
     "inspectRecovery": {
-      "public": false,
       "all_of": [
         "cm:recovery:inspect"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "instance",
+      "assignment_bound": false
     },
     "reconcileRecovery": {
-      "public": false,
       "all_of": [
         "cm:recovery:reconcile"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "instance",
+      "assignment_bound": false
     },
     "acceptExposure": {
-      "public": false,
       "all_of": [
         "cm:recovery:accept-exposure"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "instance",
+      "assignment_bound": false
     },
     "prepareRelease": {
-      "public": false,
       "all_of": [
         "cm:releases:prepare"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "approveRelease": {
-      "public": false,
       "all_of": [
         "cm:releases:approve"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "publishRelease": {
-      "public": false,
       "all_of": [
         "cm:releases:publish"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "applyDeployment": {
-      "public": false,
       "all_of": [
         "cm:deployments:apply"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "rollbackDeployment": {
-      "public": false,
       "all_of": [
         "cm:deployments:rollback"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "runTest": {
-      "public": false,
       "all_of": [
         "cm:tests:run"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "runExperiment": {
-      "public": false,
       "all_of": [
         "cm:experiments:run"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "revokeCredential": {
-      "public": false,
       "all_of": [
         "cm:credentials:revoke"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "instance",
+      "assignment_bound": false
     },
     "registerDriver": {
-      "public": false,
       "all_of": [
         "cm:drivers:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "removeDriver": {
-      "public": false,
       "all_of": [
         "cm:drivers:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "updateWatch": {
-      "public": false,
       "all_of": [
         "cm:watches:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "approveException": {
-      "public": false,
       "all_of": [
         "cm:exceptions:approve"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "recordObservation": {
-      "public": false,
       "all_of": [
         "cm:observations:record"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getJwtSchema": {
-      "public": true,
-      "all_of": []
+      "all_of": [],
+      "authentication": "public",
+      "resource": "public",
+      "assignment_bound": false
     },
     "getScopeCatalog": {
-      "public": true,
-      "all_of": []
+      "all_of": [],
+      "authentication": "public",
+      "resource": "public",
+      "assignment_bound": false
     },
     "getLineage": {
-      "public": true,
-      "all_of": []
+      "all_of": [],
+      "authentication": "public",
+      "resource": "public",
+      "assignment_bound": false
     },
     "getAttention": {
-      "public": false,
       "all_of": [
-        "cm:cards:read"
-      ]
+        "cm:cards:read",
+        "cm:sessions:read",
+        "cm:reviews:read",
+        "cm:escalations:read"
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "recordAttention": {
-      "public": false,
       "all_of": [
         "cm:observations:record"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "requestReconciliation": {
-      "public": false,
       "all_of": [
         "cm:campaigns:reconcile"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "admitIdea": {
-      "public": false,
       "all_of": [
         "cm:ideas:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "updateIdea": {
-      "public": false,
       "all_of": [
         "cm:ideas:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "recordIdeaOutcome": {
-      "public": false,
       "all_of": [
         "cm:ideas:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getAttempt": {
-      "public": false,
       "all_of": [
         "cm:sessions:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "recordAttempt": {
-      "public": false,
       "all_of": [
         "cm:observations:record"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "requestAttemptRepair": {
-      "public": false,
       "all_of": [
         "cm:recovery:reconcile"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "listDrivers": {
-      "public": false,
       "all_of": [
-        "cm:cards:read"
-      ]
+        "cm:cards:read",
+        "cm:sessions:read"
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getWatch": {
-      "public": false,
       "all_of": [
         "cm:cards:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getMacTask": {
-      "public": false,
       "all_of": [
-        "cm:cards:read"
-      ]
+        "cm:cards:read",
+        "cm:sessions:read",
+        "cm:evidence:read"
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "createMacTask": {
-      "public": false,
       "all_of": [
         "cm:cards:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "recordMacTask": {
-      "public": false,
       "all_of": [
         "cm:evidence:collect"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "appendFeedback": {
-      "public": false,
       "all_of": [
         "cm:observations:record"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "listFollowups": {
-      "public": false,
       "all_of": [
         "cm:reviews:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "resolveFollowup": {
-      "public": false,
       "all_of": [
         "cm:reviews:adjudicate"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "lintCampaign": {
-      "public": false,
       "all_of": [
         "cm:campaigns:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "requestUnblock": {
-      "public": false,
       "all_of": [
         "cm:cards:advance"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "raiseReviewCap": {
-      "public": false,
       "all_of": [
         "cm:reviews:raise-cap",
         "cm:escalations:resolve"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "listLanes": {
-      "public": false,
       "all_of": [
         "cm:lanes:read",
         "cm:tracks:read",
@@ -506,10 +661,12 @@
         "cm:executors:read",
         "cm:artifacts:read",
         "cm:spend:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getLane": {
-      "public": false,
       "all_of": [
         "cm:lanes:read",
         "cm:tracks:read",
@@ -517,10 +674,12 @@
         "cm:executors:read",
         "cm:artifacts:read",
         "cm:spend:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getLaneHistory": {
-      "public": false,
       "all_of": [
         "cm:lanes:read",
         "cm:tracks:read",
@@ -528,132 +687,166 @@
         "cm:executors:read",
         "cm:artifacts:read",
         "cm:spend:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "createLane": {
-      "public": false,
       "all_of": [
-        "cm:lanes:write"
-      ]
+        "cm:lanes:write",
+        "cm:campaigns:approve"
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "updateLane": {
-      "public": false,
       "all_of": [
         "cm:lanes:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "retireLane": {
-      "public": false,
       "all_of": [
         "cm:lanes:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "placeCard": {
-      "public": false,
       "all_of": [
         "cm:lanes:edit-queue",
         "cm:cards:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "reorderLane": {
-      "public": false,
       "all_of": [
         "cm:lanes:edit-queue",
         "cm:cards:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "reclassifyCard": {
-      "public": false,
       "all_of": [
         "cm:lanes:edit-queue",
         "cm:cards:write",
         "cm:tracks:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "drainLane": {
-      "public": false,
       "all_of": [
         "cm:lanes:write",
         "cm:lanes:edit-queue",
         "cm:cards:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "createTrack": {
-      "public": false,
       "all_of": [
-        "cm:tracks:write"
-      ]
+        "cm:tracks:write",
+        "cm:campaigns:approve"
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "updateTrack": {
-      "public": false,
       "all_of": [
         "cm:tracks:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "retireTrack": {
-      "public": false,
       "all_of": [
         "cm:tracks:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getTrack": {
-      "public": false,
       "all_of": [
         "cm:tracks:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "setTrackRouting": {
-      "public": false,
       "all_of": [
         "cm:tracks:route"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getExecutor": {
-      "public": false,
       "all_of": [
         "cm:executors:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "configureExecutor": {
-      "public": false,
       "all_of": [
         "cm:executors:configure"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "probeExecutor": {
-      "public": false,
       "all_of": [
         "cm:executors:probe"
-      ]
-    },
-    "recordExecutorObservation": {
-      "public": false,
-      "all_of": [
-        "cm:observations:record"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "listArtifacts": {
-      "public": false,
       "all_of": [
         "cm:artifacts:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "bindArtifact": {
-      "public": false,
       "all_of": [
         "cm:artifacts:write",
         "cm:cards:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "rebindArtifact": {
-      "public": false,
       "all_of": [
         "cm:artifacts:write",
         "cm:cards:write"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "getHandoff": {
-      "public": false,
       "all_of": [
         "cm:lanes:read",
         "cm:tracks:read",
@@ -663,13 +856,90 @@
         "cm:spend:read",
         "cm:sessions:read",
         "cm:campaigns:read"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
     },
     "acknowledgeHandoff": {
-      "public": false,
       "all_of": [
         "cm:handoffs:acknowledge"
-      ]
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
+    },
+    "getLiveness": {
+      "authentication": "public",
+      "resource": "public",
+      "all_of": [],
+      "assignment_bound": false
+    },
+    "getReadinessProbe": {
+      "authentication": "public",
+      "resource": "public",
+      "all_of": [],
+      "assignment_bound": false
+    },
+    "getTutorial": {
+      "authentication": "public",
+      "resource": "public",
+      "all_of": [],
+      "assignment_bound": false
+    },
+    "getTutorialAsset": {
+      "authentication": "public",
+      "resource": "public",
+      "all_of": [],
+      "assignment_bound": false
+    },
+    "receiveGitHubWebhook": {
+      "authentication": "github_hmac",
+      "resource": "instance",
+      "all_of": [],
+      "assignment_bound": false
+    },
+    "changeTrackLimits": {
+      "authentication": "jwt",
+      "resource": "campaign",
+      "all_of": [
+        "cm:tracks:write",
+        "cm:campaigns:approve"
+      ],
+      "assignment_bound": false
+    },
+    "changeLaneLimits": {
+      "authentication": "jwt",
+      "resource": "campaign",
+      "all_of": [
+        "cm:lanes:write",
+        "cm:campaigns:approve"
+      ],
+      "assignment_bound": false
+    },
+    "delegateCampaignCredential": {
+      "authentication": "jwt",
+      "resource": "campaign",
+      "all_of": [
+        "cm:credentials:delegate"
+      ],
+      "assignment_bound": false
+    },
+    "delegateInstanceCredential": {
+      "authentication": "jwt",
+      "resource": "instance",
+      "all_of": [
+        "cm:credentials:delegate"
+      ],
+      "assignment_bound": false
+    },
+    "revokeCampaignDelegation": {
+      "authentication": "jwt",
+      "resource": "campaign",
+      "all_of": [
+        "cm:credentials:revoke"
+      ],
+      "assignment_bound": false
     }
   }
 }

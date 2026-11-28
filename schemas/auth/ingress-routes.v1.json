@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "routes": [
+    {
+      "operation_id": "getJwtSchema",
+      "method": "GET",
+      "path": "/auth/jwt.schema.json"
+    },
+    {
+      "operation_id": "getScopeCatalog",
+      "method": "GET",
+      "path": "/auth/scopes.json"
+    },
+    {
+      "operation_id": "getLineage",
+      "method": "GET",
+      "path": "/health/lineage"
+    },
+    {
+      "operation_id": "getLiveness",
+      "method": "GET",
+      "path": "/health/live"
+    },
+    {
+      "operation_id": "getReadinessProbe",
+      "method": "GET",
+      "path": "/health/ready"
+    },
+    {
+      "operation_id": "getTutorial",
+      "method": "GET",
+      "path": "/"
+    },
+    {
+      "operation_id": "getTutorialAsset",
+      "method": "GET",
+      "path": "/tutorial-assets/{asset}"
+    },
+    {
+      "operation_id": "receiveGitHubWebhook",
+      "method": "POST",
+      "path": "/events/github"
+    }
+  ]
+}
