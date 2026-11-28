@@ -17,7 +17,7 @@ use crate::host::{Host, stamp};
 use crate::ledger::{
     QueueItem, add_queue_item, declared, evidence_dir, guard, journal_line, one_line, read_existing,
 };
-use crate::outcome::{Outcome, Violation};
+use crate::outcome::{Next, Outcome, Violation};
 use crate::state::Evidence;
 use crate::state::same_commit;
 use crate::store::{
@@ -496,7 +496,6 @@ pub fn parse_report(text: &str) -> Result<Block, Vec<BlockError>> {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Verdicts {
-    #[serde(default)]
     pub reviews: Vec<Recorded>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cap_raises: Vec<CapRaise>,
@@ -511,6 +510,7 @@ pub struct CapRaise {
 }
 
 const BASE_CAP: usize = 10;
+const REVIEW_ROUND_CAP: usize = 3;
 
 fn review_cap(verdicts: &Verdicts, step: &str) -> usize {
     BASE_CAP
@@ -605,13 +605,40 @@ fn verdicts_path(root: &Path) -> PathBuf {
     root.join(CM_DIR).join(VERDICTS)
 }
 
-pub fn load(root: &Path) -> Result<Verdicts> {
+fn read_ledger(root: &Path) -> Result<Option<Verdicts>> {
     let path = verdicts_path(root);
-    if path.exists() {
-        read_json(&path)
-    } else {
-        Ok(Verdicts::default())
+    match fs::symlink_metadata(&path) {
+        Ok(_) => read_json(&path).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
     }
+}
+
+pub fn load(root: &Path) -> Result<Verdicts> {
+    Ok(read_ledger(root)?.unwrap_or_default())
+}
+
+fn load_for_record(root: &Path, target: &Target) -> Result<Verdicts> {
+    if let Some(verdicts) = read_ledger(root)? {
+        return Ok(verdicts);
+    }
+
+    let journal = fs::read_to_string(root.join(store::JOURNAL))?;
+    let journaled = journal.lines().any(|line| {
+        crate::journal::is_stamped(line)
+            && line
+                .split_once(" — ")
+                .is_some_and(|(_, title)| title.starts_with("review record "))
+    });
+    let copied = match fs::read_dir(evidence_dir(root, target).join("reviews")) {
+        Ok(mut copies) => copies.next().transpose()?.is_some(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if journaled || copied {
+        anyhow::bail!("the ledger is missing and review history already exists");
+    }
+    Ok(Verdicts::default())
 }
 
 fn save(root: &Path, verdicts: &Verdicts) -> Result<()> {
@@ -697,6 +724,47 @@ fn escalation_pending(root: &Path, step: &str) -> Result<bool> {
     )
 }
 
+fn capped_reviewer(reviewer: Option<&str>) -> bool {
+    reviewer.is_some_and(|name| {
+        let name = name.to_ascii_lowercase();
+        name == ASTRA_REVIEWER
+            || Family::reviewer(Some(&name)) == Some(Family::Claude)
+            || name.starts_with("claude-")
+            || name.starts_with("opus-")
+    })
+}
+
+fn queue_names_step(root: &Path, step: &str) -> Result<bool> {
+    let Some(queue) = read_existing(&root.join(crate::templates::QUEUE_FILE))? else {
+        return Ok(false);
+    };
+    let lines: Vec<_> = queue.lines().collect();
+    let mut headings = crate::markdown::headings(&queue)
+        .into_iter()
+        .filter(|heading| heading.level <= 2)
+        .peekable();
+    while let Some(heading) = headings.next() {
+        let end = headings.peek().map_or(lines.len(), |next| next.line - 1);
+        if heading.level == 2
+            && heading
+                .text
+                .split_once(". ")
+                .is_some_and(|(number, title)| {
+                    crate::ledger::queue_item_number(number).is_some() && !title.trim().is_empty()
+                })
+            && lines[heading.line - 1..end].iter().any(|line| {
+                line.split(|c: char| {
+                    !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+                })
+                .any(|word| word == step)
+            })
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn step_pr(root: &Path, target: &Target, part: Option<&str>) -> Result<Option<String>> {
     let dir = root.join(&target.unit);
     if !store::is_unit(&dir) {
@@ -778,10 +846,21 @@ pub fn record(
             }
         },
     };
-    let mut verdicts = load(root)?;
-    if journal_sound {
-        journal_raises(root, &verdicts)?;
-    }
+    let mut verdicts = match load_for_record(root, target) {
+        Ok(verdicts) => verdicts,
+        Err(error) => {
+            let path = format!("{CM_DIR}/{VERDICTS}");
+            violations.push(Violation::refuse(
+                &path,
+                "review-history-unreadable",
+                format!("cannot count review rounds for {full} from {path}: {error:#}"),
+                Next::settled(format!(
+                    "restore readable review history in {path} before retrying"
+                )),
+            ));
+            return Ok(Outcome::refused(violations));
+        }
+    };
     let pr = step_pr(root, target, part)?;
     let heads = fix_heads(
         verdicts
@@ -794,18 +873,6 @@ pub fn record(
             && !heads.iter().any(|head| same_commit(head, &block.head))
     });
     let passes = heads.len() + usize::from(new_pass);
-    let cap = review_cap(&verdicts, &full);
-    if new_pass && passes > cap {
-        let message = if cap == BASE_CAP {
-            "session cap of 10 passes; an 11th fix pass on the current PR is refused; an owner ruling raises it: `cm review cap-raise <step> --by <1-3> --ruling <file>`".to_owned()
-        } else {
-            format!(
-                "session cap of {cap} passes (10 plus {} raised by owner ruling); fix pass {passes} on the current PR is refused; a further ruling raises it: `cm review cap-raise <step> --by <1-3> --ruling <file>`",
-                cap - BASE_CAP
-            )
-        };
-        violations.push(Violation::new(&full, "review-cap", message));
-    }
     let number = verdicts
         .reviews
         .iter()
@@ -851,6 +918,40 @@ pub fn record(
                 again.report
             ),
         ));
+    }
+    if block.is_some() && violations.is_empty() && capped_reviewer(reviewer) {
+        let round = verdicts
+            .reviews
+            .iter()
+            .filter(|review| review.step == full && capped_reviewer(review.reviewer.as_deref()))
+            .count()
+            + 1;
+        if round > REVIEW_ROUND_CAP {
+            let queue = queue_names_step(root, &full);
+            if !matches!(queue, Ok(true)) {
+                return Ok(Outcome::refused(vec![Violation::review_round_cap(
+                    host.prefix(),
+                    &full,
+                    round,
+                    queue.err(),
+                )]));
+            }
+        }
+    }
+    if journal_sound {
+        journal_raises(root, &verdicts)?;
+    }
+    let cap = review_cap(&verdicts, &full);
+    if new_pass && passes > cap {
+        let message = if cap == BASE_CAP {
+            "session cap of 10 passes; an 11th fix pass on the current PR is refused; an owner ruling raises it: `cm review cap-raise <step> --by <1-3> --ruling <file>`".to_owned()
+        } else {
+            format!(
+                "session cap of {cap} passes (10 plus {} raised by owner ruling); fix pass {passes} on the current PR is refused; a further ruling raises it: `cm review cap-raise <step> --by <1-3> --ruling <file>`",
+                cap - BASE_CAP
+            )
+        };
+        violations.push(Violation::new(&full, "review-cap", message));
     }
     let Some((block, text)) = block.filter(|_| violations.is_empty()) else {
         return Ok(Outcome::refused(violations));
