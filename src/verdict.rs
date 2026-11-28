@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -15,7 +15,8 @@ use crate::evidence::CampaignFile;
 use crate::forge::GithubRepo;
 use crate::host::{Host, stamp};
 use crate::ledger::{
-    QueueItem, add_queue_item, declared, evidence_dir, guard, journal_line, one_line, read_existing,
+    QueueItem, add_queue_item, declared, evidence_dir, guard, item_heading, journal_line, one_line,
+    read_existing,
 };
 use crate::outcome::{Next, Outcome, Violation};
 use crate::state::Evidence;
@@ -618,9 +619,19 @@ pub fn load(root: &Path) -> Result<Verdicts> {
     Ok(read_ledger(root)?.unwrap_or_default())
 }
 
-fn load_for_record(root: &Path, target: &Target) -> Result<Verdicts> {
+fn load_for_record(root: &Path, target: &Target) -> Result<(Verdicts, usize)> {
     if let Some(verdicts) = read_ledger(root)? {
-        return Ok(verdicts);
+        let step = full_name(target);
+        let rounds = verdicts
+            .reviews
+            .iter()
+            .filter(|review| review.step == step)
+            .try_fold(0, |rounds, review| {
+                capped_reviewer(review.reviewer.as_deref())
+                    .with_context(|| format!("cannot classify {}", review.id()))
+                    .map(|capped| rounds + usize::from(capped))
+            })?;
+        return Ok((verdicts, rounds));
     }
 
     let journal = fs::read_to_string(root.join(store::JOURNAL))?;
@@ -638,7 +649,7 @@ fn load_for_record(root: &Path, target: &Target) -> Result<Verdicts> {
     if journaled || copied {
         anyhow::bail!("the ledger is missing and review history already exists");
     }
-    Ok(Verdicts::default())
+    Ok((Verdicts::default(), 0))
 }
 
 fn save(root: &Path, verdicts: &Verdicts) -> Result<()> {
@@ -724,14 +735,45 @@ fn escalation_pending(root: &Path, step: &str) -> Result<bool> {
     )
 }
 
-fn capped_reviewer(reviewer: Option<&str>) -> bool {
-    reviewer.is_some_and(|name| {
-        let name = name.to_ascii_lowercase();
-        name == ASTRA_REVIEWER
-            || Family::reviewer(Some(&name)) == Some(Family::Claude)
-            || name.starts_with("claude-")
-            || name.starts_with("opus-")
-    })
+fn capped_reviewer(reviewer: Option<&str>) -> Result<bool> {
+    let name = reviewer.ok_or_else(|| anyhow::anyhow!("reviewer identity is missing"))?;
+    if !store::is_name(name) {
+        anyhow::bail!("reviewer `{name}` is not a valid reviewer name");
+    }
+    let name = name.to_ascii_lowercase();
+    if name.starts_with("claude-") || name.starts_with("opus-") {
+        return Ok(true);
+    }
+    match Family::reviewer(Some(&name)) {
+        Some(Family::Claude) => Ok(true),
+        Some(Family::Gpt) => Ok(name == ASTRA_REVIEWER),
+        None => anyhow::bail!("reviewer `{name}` has no known model family"),
+    }
+}
+
+fn names_step(text: &str, step: &str) -> bool {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/')))
+        .any(|word| {
+            let mut reference = word;
+            loop {
+                if store::parse_target(reference, true)
+                    .is_ok_and(|target| full_name(&target) == step)
+                {
+                    return true;
+                }
+                let prose = reference.trim_end_matches('.');
+                if prose != reference {
+                    reference = prose;
+                } else if let Some(inner) = reference
+                    .strip_prefix('_')
+                    .and_then(|inner| inner.strip_suffix('_'))
+                {
+                    reference = inner;
+                } else {
+                    return false;
+                }
+            }
+        })
 }
 
 fn queue_names_step(root: &Path, step: &str) -> Result<bool> {
@@ -746,18 +788,10 @@ fn queue_names_step(root: &Path, step: &str) -> Result<bool> {
     while let Some(heading) = headings.next() {
         let end = headings.peek().map_or(lines.len(), |next| next.line - 1);
         if heading.level == 2
-            && heading
-                .text
-                .split_once(". ")
-                .is_some_and(|(number, title)| {
-                    crate::ledger::queue_item_number(number).is_some() && !title.trim().is_empty()
-                })
-            && lines[heading.line - 1..end].iter().any(|line| {
-                line.split(|c: char| {
-                    !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
-                })
-                .any(|word| word == step)
-            })
+            && item_heading(heading.text).is_some()
+            && lines[heading.line - 1..end]
+                .iter()
+                .any(|line| names_step(line, step))
         {
             return Ok(true);
         }
@@ -846,8 +880,8 @@ pub fn record(
             }
         },
     };
-    let mut verdicts = match load_for_record(root, target) {
-        Ok(verdicts) => verdicts,
+    let (mut verdicts, rounds) = match load_for_record(root, target) {
+        Ok(history) => history,
         Err(error) => {
             let path = format!("{CM_DIR}/{VERDICTS}");
             violations.push(Violation::refuse(
@@ -919,14 +953,21 @@ pub fn record(
             ),
         ));
     }
-    if block.is_some() && violations.is_empty() && capped_reviewer(reviewer) {
-        let round = verdicts
-            .reviews
-            .iter()
-            .filter(|review| review.step == full && capped_reviewer(review.reviewer.as_deref()))
-            .count()
-            + 1;
-        if round > REVIEW_ROUND_CAP {
+    if block.is_some() && violations.is_empty() {
+        let capped = match capped_reviewer(reviewer) {
+            Ok(capped) => capped,
+            Err(error) => {
+                return Ok(Outcome::refused(vec![Violation::new(
+                    &full,
+                    "review-reviewer",
+                    format!(
+                        "cannot count review rounds: {error}; supply --reviewer with a known model identity"
+                    ),
+                )]));
+            }
+        };
+        let round = rounds + 1;
+        if capped && round > REVIEW_ROUND_CAP {
             let queue = queue_names_step(root, &full);
             if !matches!(queue, Ok(true)) {
                 return Ok(Outcome::refused(vec![Violation::review_round_cap(
@@ -2301,6 +2342,57 @@ mod tests {
 
     fn report(block: &str, tail: &str) -> String {
         format!("# Review\n\nFindings follow.\n\n```{BLOCK}\n{block}```\n{tail}")
+    }
+
+    #[test]
+    fn step_references_survive_prose_formatting_without_matching_longer_identifiers() {
+        let step = "01-review/unit/build";
+        for (form, expected) in [
+            ("{step}", true),
+            ("Another review for {step}.", true),
+            ("{step},", true),
+            ("({step});", true),
+            ("\"{step}\"!", true),
+            ("[{step}](https://example.com)", true),
+            ("*{step}*", true),
+            ("**{step}**.", true),
+            ("_{step}_", true),
+            ("__{step}__.", true),
+            ("___{step}.___", true),
+            ("`{step}`", true),
+            ("``{step}``.", true),
+            ("**`/{step}/`**.", true),
+            ("/{step}", true),
+            ("{step}/", true),
+            ("//{step}//.", true),
+            ("_/{step}/_.", true),
+            ("_{step}/._", true),
+            ("{step}-other", false),
+            ("_{step}-other_", false),
+            ("{step}_other", false),
+            ("{step}.other.", false),
+            ("{step}other", false),
+            ("{step}_", false),
+            ("prefix-{step}", false),
+            ("prefix/{step}", false),
+            ("{step}/child", false),
+            ("01-review/other/build", false),
+            ("build", false),
+            ("No step reference.", false),
+        ] {
+            let text = form.replace("{step}", step);
+            assert_eq!(names_step(&text, step), expected, "{text}");
+        }
+        // Identifier punctuation stays intact when it belongs to the target itself.
+        for step in [
+            "01-review/unit_name/build_test",
+            "01-review/unit.v2/_build_.",
+        ] {
+            for form in ["{step}", "__`/{step}/`__.", "_{step}_"] {
+                let text = form.replace("{step}", step);
+                assert!(names_step(&text, step), "{text}");
+            }
+        }
     }
 
     #[test]

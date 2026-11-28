@@ -1187,7 +1187,7 @@ fn fresh_read_baselines_use_the_head_maximum_in_either_recording_order() {
                     &review_fixture::BLOCKING,
                     "FIX REQUIRED",
                 );
-                assert!(record(&host, &c, &older, "other").ok());
+                assert!(record(&host, &c, &older, "gpt-other").ok());
                 if pending {
                     for (reviewer, head) in [("sol", "aaaaaaa0"), ("terra", "bbbbbbb0")] {
                         let report = c.report(&format!("initial-{reviewer}"), head, &[], "ACCEPT");
@@ -4882,6 +4882,101 @@ fn the_fourth_claude_or_astra_review_needs_a_queue_item_naming_the_step() {
     let report = c.report("fifth", "abcdef05", &[], "ACCEPT");
     let fifth = record(&host, &c, &report, "claude");
     assert!(fifth.ok(), "{:?}", fifth.violations);
+}
+
+#[test]
+fn reviewer_classification_is_required_for_history_and_incoming_records() {
+    let host = at("2026-10-25T06:00:00Z");
+    for (reviewer, capped) in [
+        (Some("astra"), Some(true)),
+        (Some("ASTRA"), Some(true)),
+        (Some("claude"), Some(true)),
+        (Some("claude-opus-5-5-xhigh"), Some(true)),
+        (Some("opus"), Some(true)),
+        (Some("opus-r12"), Some(true)),
+        (Some("fresh-opus"), Some(true)),
+        (Some("fable"), Some(true)),
+        (Some("sonnet"), Some(true)),
+        (Some("haiku"), Some(true)),
+        (Some("sol"), Some(false)),
+        (Some("terra"), Some(false)),
+        (Some("gpt-6-astra"), Some(false)),
+        (None, None),
+        (Some(""), None),
+        (Some("other"), None),
+        (Some("astral"), None),
+        (Some("claudette"), None),
+    ] {
+        for history in [false, true] {
+            let c = campaign(&host, true);
+            for round in 1..=3 {
+                let report = c.report(
+                    &format!("round-{round}"),
+                    &format!("{round:08x}"),
+                    &[],
+                    "ACCEPT",
+                );
+                assert!(record(&host, &c, &report, "astra").ok());
+            }
+            let path = c.root.join(".cm/verdicts.json");
+            if history {
+                let mut verdicts = verdict::load(&c.root).unwrap();
+                verdicts.reviews[2].reviewer = reviewer.map(str::to_owned);
+                store::write_json(&path, &verdicts).unwrap();
+            }
+            // A queue item cannot make an unknown classification countable.
+            if capped.is_none() {
+                file_review_question(&host, &c, STEP);
+            }
+            let report = c.report("fourth", "abcdef04", &[], "ACCEPT");
+            let before = fs::read(&path).unwrap();
+            let journal_before = journal(&c);
+            let incoming = if history { Some("astra") } else { reviewer };
+            let outcome =
+                verdict::record(&host, &c.root, &target(), &report, incoming, None).unwrap();
+            let expected = match capped {
+                Some(true) => vec!["review-round-cap"],
+                Some(false) => Vec::new(),
+                None if history => vec!["review-history-unreadable"],
+                None => vec!["review-reviewer"],
+            };
+            assert_eq!(
+                rules(&outcome),
+                expected,
+                "reviewer={reviewer:?}, history={history}: {:?}",
+                outcome.violations
+            );
+            if outcome.ok() {
+                assert_eq!(outcome.fields["id"], "R4");
+            } else {
+                assert_eq!(fs::read(&path).unwrap(), before);
+                assert_eq!(journal(&c), journal_before);
+                assert_eq!(
+                    fs::read_dir(c.root.join(STEP).join("evidence/reviews"))
+                        .unwrap()
+                        .count(),
+                    3
+                );
+                if capped.is_none() {
+                    let cause = match reviewer {
+                        None => "reviewer identity is missing".to_owned(),
+                        Some("") => "not a".to_owned(),
+                        Some(name) => format!("reviewer `{name}`"),
+                    };
+                    assert!(outcome.violations[0].message.contains(&cause));
+                    if history {
+                        // Uncapped incoming reviewers also require countable history.
+                        let outcome =
+                            verdict::record(&host, &c.root, &target(), &report, Some("sol"), None)
+                                .unwrap();
+                        assert_eq!(rules(&outcome), ["review-history-unreadable"]);
+                        assert_eq!(fs::read(&path).unwrap(), before);
+                        assert_eq!(journal(&c), journal_before);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]

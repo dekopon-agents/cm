@@ -416,7 +416,7 @@ pub(crate) fn queue_item_number(text: &str) -> Option<u32> {
 }
 
 /// A second-level OWNER-QUEUE.md heading in cm's `N. <title>` form.
-fn item_heading(text: &str) -> Option<u32> {
+pub(crate) fn item_heading(text: &str) -> Option<u32> {
     let (number, title) = text.split_once(". ")?;
     queue_item_number(number).filter(|_| !title.trim().is_empty())
 }
