@@ -633,8 +633,8 @@ enum ReviewAct {
         /// The review report, ending with its `cm-review` block.
         report: PathBuf,
         /// Who reviewed: astra, claude, …
-        #[arg(long, value_name = "KIND")]
-        reviewer: Option<String>,
+        #[arg(long, value_name = "KIND", value_parser = reviewer_name)]
+        reviewer: String,
         /// The declared part reviewed by this report.
         #[arg(long, value_name = "NAME")]
         part: Option<String>,
@@ -1469,7 +1469,7 @@ fn run(cli: &Cli, host: &dyn Host) -> Result<(Outcome, ExitCode)> {
                 &root,
                 &step_target(host, &root, target)?,
                 &under_root(cli, report),
-                reviewer.as_deref(),
+                Some(reviewer.as_str()),
                 part.as_deref(),
             )
         }

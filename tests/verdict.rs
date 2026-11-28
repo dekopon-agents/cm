@@ -1702,7 +1702,7 @@ fn merge_gate_repair_commands_select_the_part_in_advance_and_sync() {
     let missing = advance();
     assert!(missing.violations.iter().any(|violation| violation.message
         == format!(
-            "no review of {head} is recorded; `cm review record {STEP} <report> --part=-one`"
+            "no review of {head} is recorded; `cm review record {STEP} <report> --reviewer <astra|claude> --part=-one`"
         )));
     let report = c.report("astra-review-7-part", &head, &[], "ACCEPT");
     c.receipt("astra-review-7-part", &head, "gpt-6-astra", "xhigh");
@@ -4733,18 +4733,22 @@ fn reviews_recorded_before_parts_can_be_recorded_again_for_a_part() {
     assert!(!gaps().is_empty());
     let astra = c.root.join(STEP).join("evidence/astra-review-7/report.md");
     let claude = c.root.join(format!("drafts/claude-{head}.md"));
-    file_review_question(&host, &c, STEP);
-    for (report, reviewer) in [(&astra, "astra"), (&claude, "claude")] {
-        let again = verdict::record(
-            &host,
-            &c.root,
-            &target(),
-            report,
-            Some(reviewer),
-            Some("one"),
-        )
-        .unwrap();
-        assert!(again.ok(), "{:?}", again.violations);
+    // A re-record of a report already recorded for the step is not a new review round, so no
+    // owner-queue item is needed before the part's receipt binds.
+    {
+        let part = "one";
+        for (report, reviewer) in [(&astra, "astra"), (&claude, "claude")] {
+            let again = verdict::record(
+                &host,
+                &c.root,
+                &target(),
+                report,
+                Some(reviewer),
+                Some(part),
+            )
+            .unwrap();
+            assert!(again.ok(), "{part} {reviewer}: {:?}", again.violations);
+        }
     }
     assert!(gaps().is_empty(), "{:?}", gaps());
     // Within one PR and part a report is still recorded once.
@@ -4894,6 +4898,9 @@ fn reviewer_classification_is_required_for_history_and_incoming_records() {
         (Some("gpt-6.2-astra"), Some(true)),
         (Some("GPT-6.2-ASTRA"), Some(true)),
         (Some("reviewer-astra"), Some(true)),
+        (Some("gpt-6.2-astra-xhigh"), Some(true)),
+        (Some("astra-xhigh"), Some(true)),
+        (Some("gpt-6-astra-high"), Some(true)),
         (Some("claude"), Some(true)),
         (Some("claude-opus-5-5-xhigh"), Some(true)),
         (Some("opus"), Some(true)),
@@ -4978,7 +4985,16 @@ fn reviewer_classification_is_required_for_history_and_incoming_records() {
                         Some(name) => format!("reviewer `{name}`"),
                     };
                     assert!(outcome.violations[0].message.contains(&cause));
+                    if !history {
+                        let next = format!("{:?}", outcome.violations[0].next);
+                        assert!(next.contains("--reviewer"), "{next}");
+                    }
                     if history {
+                        let remedy = format!("{:?}", outcome.violations[0].next);
+                        assert!(remedy.contains("R3"), "{remedy}");
+                        if let Some(name) = reviewer.filter(|name| !name.is_empty()) {
+                            assert!(remedy.contains(name), "{remedy}");
+                        }
                         let outcome =
                             verdict::record(&host, &c.root, &target(), &report, Some("sol"), None)
                                 .unwrap();
@@ -4990,6 +5006,23 @@ fn reviewer_classification_is_required_for_history_and_incoming_records() {
             }
         }
     }
+}
+
+#[test]
+fn an_empty_ledger_object_is_uncountable_for_record_only() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let initial = c.report("initial", "abcdef01", &[], "ACCEPT");
+    assert!(record(&host, &c, &initial, "astra").ok());
+    let path = c.root.join(".cm/verdicts.json");
+    fs::write(&path, "{}").unwrap();
+    // Every other reader still treats a ledger without `reviews` as empty.
+    assert!(verdict::load(&c.root).unwrap().reviews.is_empty());
+    let report = c.report("next", "abcdef02", &[], "ACCEPT");
+    assert_eq!(
+        rules(&record(&host, &c, &report, "claude")),
+        ["review-history-unreadable"]
+    );
 }
 
 #[test]
