@@ -4771,6 +4771,38 @@ fn blocked_until_epoch_and_removed_owner_heading_use_current_files() {
 }
 
 #[test]
+fn mac_lane_fixture_only_unblocks_dated_done_items() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    fs::write(
+        c.root.join("MAC-LANE.md"),
+        include_str!("fixtures/mac-lane/MAC-LANE.md"),
+    )
+    .unwrap();
+    for number in 1..=7 {
+        let target = format!("01-a/u/item-{number}");
+        assert!(declare(&host, &c, &target, Lane::Codex, &[]).ok());
+        assert!(
+            advance(
+                &host,
+                &c,
+                &target,
+                &format!("blocked:until:mac-lane:{number}"),
+                Evidence::default(),
+            )
+            .ok()
+        );
+        let target = parse_target(&target, true).unwrap();
+        let outcome = commands::unblock(&host, &c.root, &target, None).unwrap();
+        assert_eq!(
+            outcome.ok(),
+            matches!(number, 1 | 3),
+            "Mac lane item {number}"
+        );
+    }
+}
+
+#[test]
 fn mac_lane_completion_releases_every_matching_wait_after_reload() {
     let host = at("2026-10-17T08:00:00Z");
     let c = campaign(&host);
@@ -4810,6 +4842,8 @@ fn mac_lane_completion_releases_every_matching_wait_after_reload() {
         pending,
         "44. **HELD 2026-10-17** **Run Rust tests**\n",
         "44. **DONE yesterday** **Run Rust tests**\n",
+        "44. **DONE 2026-02-30:** **Run Rust tests**\n",
+        "44. **DONE 2026-10-17::** **Run Rust tests**\n",
         "44. **DONE 2026-10-17** **Run Rust tests**\n44. **Duplicate**\n",
     ] {
         fs::write(&mac_lane, ledger).unwrap();

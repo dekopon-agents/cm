@@ -1225,7 +1225,8 @@ pub(crate) fn mac_lane_complete(root: &Path, number: u32) -> bool {
         && text[item.head..]
             .strip_prefix("**DONE ")
             .and_then(|status| status.split_once("**"))
-            .is_some_and(|(date, _)| date.parse::<jiff::civil::Date>().is_ok())
+            .map(|(date, _)| date.strip_suffix(':').unwrap_or(date))
+            .is_some_and(|date| date.parse::<jiff::civil::Date>().is_ok())
 }
 
 pub fn lint_mac_lane(root: &Path) -> Vec<Violation> {

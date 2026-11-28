@@ -556,8 +556,9 @@ the tag it was declared with (`release-tag`), and its `pr-open --pr` must be in 
 are the state gates from `--after` (`<step>`, `pr-open:<step>`, `tag:<line>@<version>`,
 `deployed:<line>@<version>`), plus `epoch:WORKING`, `owner-queue:<n>` (item
 heading removed from OWNER-QUEUE.md), and `mac-lane:<n>` (a unique item in
-MAC-LANE.md stamped DONE with a valid date). `<n>` is a positive item number within `u32`, parsed by one parser for
-headings, conditions, checks and lint. A block on `owner-queue:<n>` refuses unless item n is open
+MAC-LANE.md stamped `DONE YYYY-MM-DD` or `DONE YYYY-MM-DD:` with a valid date).
+`<n>` is a positive item number within `u32`. Owner-queue headings, conditions,
+checks and lint share one number parser. A block on `owner-queue:<n>` refuses unless item n is open
 now (`owner-queue-not-open`); file the question and block in one command with
 `cm owner-queue add … --block <step>`. `cm next` lists satisfied blocks under
 `unblock now` (`unblock_now` in JSON), with a numbered
