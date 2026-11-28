@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -107,6 +108,25 @@ fn printed(stdout: &[u8]) -> (Vec<String>, Vec<String>) {
     (lines, walls)
 }
 
+// Every file and folder under `dir`, each file with its bytes.
+fn tree(dir: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let mut tree = BTreeMap::new();
+    let mut folders = vec![dir.to_owned()];
+    while let Some(folder) = folders.pop() {
+        for entry in fs::read_dir(folder).unwrap() {
+            let path = entry.unwrap().path();
+            if fs::symlink_metadata(&path).unwrap().is_dir() {
+                folders.push(path.clone());
+                tree.insert(path, None);
+            } else {
+                let bytes = fs::read(&path).unwrap();
+                tree.insert(path, Some(bytes));
+            }
+        }
+    }
+    tree
+}
+
 fn names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .unwrap()
@@ -116,8 +136,10 @@ fn names(dir: &Path) -> Vec<String> {
     names
 }
 
-// Every write stays under the scratch root, children included: HOME, GIT_CONFIG_GLOBAL and
-// TMPDIR point into it, whatever the runner's own are, and fixture scripts find it as
+// Every write stays under the scratch root, children included: they get none of the runner's
+// variables, whose GIT_DIR, GIT_WORK_TREE or GIT_INDEX_FILE would aim their git at another
+// repository. PATH is /usr/bin:/bin (the built ticks put the root's `bin` first), HOME,
+// GIT_CONFIG_GLOBAL and TMPDIR point into the root, and fixture scripts find it as
 // $TICK_FIXTURE. Its name holds an apostrophe and a space, so every run checks that no path is
 // quoted into a script or a command line. Its campaign binds this session, `cse_01abc`: the
 // first commit holds this lineage's handoff and the fake handoff-pick.sh.
@@ -174,6 +196,7 @@ impl Scratch {
     fn child_env(&self) -> Vec<(OsString, OsString)> {
         let root = self.path();
         [
+            ("PATH", "/usr/bin:/bin".into()),
             ("HOME", root.join("home").into_os_string()),
             ("GIT_CONFIG_GLOBAL", root.join("gitconfig").into_os_string()),
             ("GIT_CONFIG_NOSYSTEM", "1".into()),
@@ -189,6 +212,7 @@ impl Scratch {
         let output = Command::new("git")
             .args(args)
             .current_dir(dir)
+            .env_clear()
             .envs(self.child_env())
             .output()
             .unwrap();
@@ -219,15 +243,17 @@ impl Scratch {
         self.git(&other, &["push", "-q", "origin", "main"]);
     }
 
-    // The real runner with this scratch root's environment under what the command sets itself;
-    // pauses are recorded, not slept.
+    // The real runner with the runner's variables removed, as tests/tick_beat.rs's `Isolated`
+    // does, and this scratch root's environment under what the command sets itself; pauses are
+    // recorded, not slept.
     fn proc(&self) -> FakeProc {
         let env = self.child_env();
         FakeProc::new(move |cmd| {
-            let cmd = env
-                .iter()
-                .filter(|(key, _)| !cmd.env.iter().any(|(set, _)| set == key))
-                .fold(cmd.clone(), |cmd, (key, value)| cmd.env(key, value));
+            let mut cmd = cmd.clone();
+            cmd.env_remove
+                .extend(std::env::vars_os().map(|(name, _)| name));
+            let own = std::mem::take(&mut cmd.env);
+            cmd.env = env.iter().cloned().chain(own).collect();
             spawn(&cmd)
         })
     }
@@ -674,6 +700,58 @@ fn a_pull_that_lands_a_successor_s_handoff_pushes_nothing_and_says_nothing_where
             "the commit stays on top of the pulled handoff"
         );
         assert_eq!(scratch.status(), "");
+    }
+}
+
+// Tests whose fixture git and in-process gitsync commit, rebase, abort and push.
+const DECOYED: [&str; 3] = [
+    "a_dirty_tree_is_committed_under_the_slug_tail_and_pushed_to_origin",
+    "a_commit_another_writer_pushed_first_is_pulled_under_ours",
+    "a_rebase_that_conflicts_is_aborted_each_try_and_leaves_the_checkout_as_it_was",
+];
+
+// A runner can hold another repository's GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE: git exports
+// them, absolute, to `git rebase -x` and to a linked worktree's hooks. This test binary is run
+// again with the three naming a decoy repository and started in its tree; the decoy and its
+// origin keep every file and folder, byte for byte.
+#[test]
+fn a_decoy_named_by_the_runner_s_git_dir_work_tree_and_index_file_gets_no_commit_and_no_push() {
+    let scratch = Scratch::new();
+    let root = scratch.path();
+    let (decoy, origin) = (root.join("decoy"), root.join("decoy.git"));
+    scratch.git(root, &["init", "-q", "--bare", "decoy.git"]);
+    scratch.git(root, &["clone", "-q", "decoy.git", "decoy"]);
+    write(&decoy.join("decoy.md"), "decoy\n");
+    scratch.git(&decoy, &["add", "-A"]);
+    scratch.git(&decoy, &["commit", "-qm", "decoy"]);
+    scratch.git(&decoy, &["push", "-q", "origin", "main"]);
+    let snapshot = || {
+        let mut both = tree(&decoy);
+        both.extend(tree(&origin));
+        both
+    };
+    let before = snapshot();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "--color=never"])
+        .args(DECOYED)
+        .env("GIT_DIR", decoy.join(".git"))
+        .env("GIT_WORK_TREE", &decoy)
+        .env("GIT_INDEX_FILE", decoy.join(".git/index"))
+        .current_dir(&decoy)
+        .output()
+        .unwrap();
+    let after = snapshot();
+    let changed: BTreeSet<&PathBuf> = (before.keys().chain(after.keys()))
+        .filter(|path| before.get(*path) != after.get(*path))
+        .collect();
+    assert!(changed.is_empty(), "{changed:?} changed: {output:?}");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for name in DECOYED {
+        assert!(
+            stdout.contains(&format!("test {name} ... ok\n")),
+            "{stdout}"
+        );
     }
 }
 
