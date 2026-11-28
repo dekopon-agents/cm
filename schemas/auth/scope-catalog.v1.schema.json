@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cm:auth:scope-catalog:v1",
+  "title": "cm API action scope catalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "audience",
+    "matching",
+    "scope_implication",
+    "unknown_scopes",
+    "scopes",
+    "operations"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "audience": {
+      "const": "campaign-trail-api"
+    },
+    "matching": {
+      "const": "exact-case-sensitive"
+    },
+    "scope_implication": {
+      "const": "none"
+    },
+    "unknown_scopes": {
+      "const": "grant-nothing"
+    },
+    "scopes": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^cm:[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "operations": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^[a-z][A-Za-z0-9]*$"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "authentication",
+          "resource",
+          "all_of",
+          "assignment_bound"
+        ],
+        "properties": {
+          "all_of": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "pattern": "^cm:[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$"
+            }
+          },
+          "authentication": {
+            "enum": [
+              "jwt",
+              "public",
+              "github_hmac"
+            ]
+          },
+          "resource": {
+            "enum": [
+              "campaign",
+              "instance",
+              "public"
+            ]
+          },
+          "assignment_bound": {
+            "type": "boolean",
+            "description": "Explicit per-assignment projection/closure required. False means any assignment-restricted credential is refused."
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "authentication": {
+                  "const": "jwt"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "resource": {
+                  "enum": [
+                    "campaign",
+                    "instance"
+                  ]
+                },
+                "all_of": {
+                  "minItems": 1
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "authentication": {
+                  "const": "public"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "resource": {
+                  "const": "public"
+                },
+                "all_of": {
+                  "maxItems": 0
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "authentication": {
+                  "const": "github_hmac"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "resource": {
+                  "const": "instance"
+                },
+                "all_of": {
+                  "maxItems": 0
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "assignment_bound": {
+                  "const": true
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "authentication": {
+                  "const": "jwt"
+                },
+                "resource": {
+                  "const": "campaign"
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
