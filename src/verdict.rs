@@ -741,12 +741,16 @@ fn capped_reviewer(reviewer: Option<&str>) -> Result<bool> {
         anyhow::bail!("reviewer `{name}` is not a valid reviewer name");
     }
     let name = name.to_ascii_lowercase();
-    if name.starts_with("claude-") || name.starts_with("opus-") {
+    if name == ASTRA_REVIEWER
+        || name.ends_with("-astra")
+        || name.starts_with("claude-")
+        || name.starts_with("opus-")
+    {
         return Ok(true);
     }
     match Family::reviewer(Some(&name)) {
         Some(Family::Claude) => Ok(true),
-        Some(Family::Gpt) => Ok(name == ASTRA_REVIEWER),
+        Some(Family::Gpt) => Ok(false),
         None => anyhow::bail!("reviewer `{name}` has no known model family"),
     }
 }
@@ -761,8 +765,7 @@ fn names_step(text: &str, step: &str) -> bool {
                 {
                     return true;
                 }
-                let prose = reference.trim_end_matches('.');
-                if prose != reference {
+                if let Some(prose) = reference.strip_suffix('.') {
                     reference = prose;
                 } else if let Some(inner) = reference
                     .strip_prefix('_')
@@ -2383,12 +2386,19 @@ mod tests {
             let text = form.replace("{step}", step);
             assert_eq!(names_step(&text, step), expected, "{text}");
         }
-        // Identifier punctuation stays intact when it belongs to the target itself.
         for step in [
+            "01-review/unit/build.",
             "01-review/unit_name/build_test",
             "01-review/unit.v2/_build_.",
         ] {
-            for form in ["{step}", "__`/{step}/`__.", "_{step}_"] {
+            for form in [
+                "{step}",
+                "Another review for {step}.",
+                "Another review for {step}...",
+                "__`/{step}/`__.",
+                "_{step}_",
+                "__{step}.__.",
+            ] {
                 let text = form.replace("{step}", step);
                 assert!(names_step(&text, step), "{text}");
             }

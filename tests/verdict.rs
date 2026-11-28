@@ -4890,6 +4890,10 @@ fn reviewer_classification_is_required_for_history_and_incoming_records() {
     for (reviewer, capped) in [
         (Some("astra"), Some(true)),
         (Some("ASTRA"), Some(true)),
+        (Some("gpt-6-astra"), Some(true)),
+        (Some("gpt-6.2-astra"), Some(true)),
+        (Some("GPT-6.2-ASTRA"), Some(true)),
+        (Some("reviewer-astra"), Some(true)),
         (Some("claude"), Some(true)),
         (Some("claude-opus-5-5-xhigh"), Some(true)),
         (Some("opus"), Some(true)),
@@ -4900,7 +4904,7 @@ fn reviewer_classification_is_required_for_history_and_incoming_records() {
         (Some("haiku"), Some(true)),
         (Some("sol"), Some(false)),
         (Some("terra"), Some(false)),
-        (Some("gpt-6-astra"), Some(false)),
+        (Some("gpt-6-sol"), Some(false)),
         (None, None),
         (Some(""), None),
         (Some("other"), None),
@@ -4909,14 +4913,17 @@ fn reviewer_classification_is_required_for_history_and_incoming_records() {
     ] {
         for history in [false, true] {
             let c = campaign(&host, true);
-            for round in 1..=3 {
+            for (index, identity) in ["astra", "gpt-6-astra", "gpt-6.2-astra"]
+                .into_iter()
+                .enumerate()
+            {
                 let report = c.report(
-                    &format!("round-{round}"),
-                    &format!("{round:08x}"),
+                    &format!("round-{index}"),
+                    &format!("{index:08x}"),
                     &[],
                     "ACCEPT",
                 );
-                assert!(record(&host, &c, &report, "astra").ok());
+                assert!(record(&host, &c, &report, identity).ok());
             }
             let path = c.root.join(".cm/verdicts.json");
             if history {
@@ -4924,7 +4931,6 @@ fn reviewer_classification_is_required_for_history_and_incoming_records() {
                 verdicts.reviews[2].reviewer = reviewer.map(str::to_owned);
                 store::write_json(&path, &verdicts).unwrap();
             }
-            // A queue item cannot make an unknown classification countable.
             if capped.is_none() {
                 file_review_question(&host, &c, STEP);
             }
@@ -4957,6 +4963,14 @@ fn reviewer_classification_is_required_for_history_and_incoming_records() {
                         .count(),
                     3
                 );
+                if capped == Some(true) {
+                    file_review_question(&host, &c, STEP);
+                    let recorded =
+                        verdict::record(&host, &c.root, &target(), &report, incoming, None)
+                            .unwrap();
+                    assert!(recorded.ok(), "{:?}", recorded.violations);
+                    assert_eq!(recorded.fields["id"], "R4");
+                }
                 if capped.is_none() {
                     let cause = match reviewer {
                         None => "reviewer identity is missing".to_owned(),
@@ -4965,7 +4979,6 @@ fn reviewer_classification_is_required_for_history_and_incoming_records() {
                     };
                     assert!(outcome.violations[0].message.contains(&cause));
                     if history {
-                        // Uncapped incoming reviewers also require countable history.
                         let outcome =
                             verdict::record(&host, &c.root, &target(), &report, Some("sol"), None)
                                 .unwrap();
