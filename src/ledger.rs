@@ -1209,6 +1209,26 @@ pub fn mac_lane_open(root: &Path) -> Result<Vec<MacItem>> {
     Ok(items.into_iter().filter(|item| item.state.open()).collect())
 }
 
+pub(crate) fn mac_lane_complete(root: &Path, number: u32) -> bool {
+    let Ok(Some(text)) = read_existing(&root.join(MAC_LANE_FILE)) else {
+        return false;
+    };
+    let Ok(items) = mac_lane_items(&text) else {
+        return false;
+    };
+    let mut matches = items.iter().filter(|item| item.number == number);
+    let Some(item) = matches.next() else {
+        return false;
+    };
+    matches.next().is_none()
+        && item.state == MacState::Done
+        && text[item.head..]
+            .strip_prefix("**DONE ")
+            .and_then(|status| status.split_once("**"))
+            .map(|(date, _)| date.strip_suffix(':').unwrap_or(date))
+            .is_some_and(|date| date.parse::<jiff::civil::Date>().is_ok())
+}
+
 pub fn lint_mac_lane(root: &Path) -> Vec<Violation> {
     let text = match read_existing(&root.join(MAC_LANE_FILE)) {
         Ok(Some(text)) => text,
