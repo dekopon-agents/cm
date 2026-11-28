@@ -401,6 +401,44 @@ impl Violation {
         }
     }
 
+    pub(crate) fn review_round_cap(
+        prefix: Option<Vec<String>>,
+        step: &str,
+        round: usize,
+        queue_error: Option<anyhow::Error>,
+    ) -> Self {
+        let reason = match queue_error {
+            Some(error) => {
+                format!("cannot check OWNER-QUEUE.md for an item that names the step: {error:#}")
+            }
+            None => "OWNER-QUEUE.md has no item that names the step".to_owned(),
+        };
+        let next = prefix.map(|prefix| {
+            Next::run(cm(
+                prefix,
+                [
+                    "owner-queue".into(),
+                    "add".into(),
+                    format!("Review round {round} for {step}").into(),
+                    "--context".into(),
+                    Input::Context.into(),
+                    "--question".into(),
+                    Input::Question.into(),
+                    "--recommendation".into(),
+                    Input::Recommendation.into(),
+                ],
+            ))
+        });
+        Self::refuse_printed(
+            step,
+            "review-round-cap",
+            format!(
+                "cannot record review round {round} for {step}: {reason}. File an item with `cm owner-queue add`"
+            ),
+            next,
+        )
+    }
+
     pub fn at(mut self, line: usize) -> Self {
         self.line = Some(line);
         self

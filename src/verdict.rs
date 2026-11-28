@@ -1,5 +1,5 @@
 #![allow(deprecated)]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -15,9 +15,10 @@ use crate::evidence::CampaignFile;
 use crate::forge::GithubRepo;
 use crate::host::{Host, stamp};
 use crate::ledger::{
-    QueueItem, add_queue_item, declared, evidence_dir, guard, journal_line, one_line, read_existing,
+    QueueItem, add_queue_item, declared, evidence_dir, guard, item_heading, journal_line, one_line,
+    read_existing,
 };
-use crate::outcome::{Outcome, Violation};
+use crate::outcome::{Next, Outcome, Violation};
 use crate::state::Evidence;
 use crate::state::same_commit;
 use crate::store::{
@@ -496,7 +497,6 @@ pub fn parse_report(text: &str) -> Result<Block, Vec<BlockError>> {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Verdicts {
-    #[serde(default)]
     pub reviews: Vec<Recorded>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cap_raises: Vec<CapRaise>,
@@ -511,6 +511,7 @@ pub struct CapRaise {
 }
 
 const BASE_CAP: usize = 10;
+const REVIEW_ROUND_CAP: usize = 3;
 
 fn review_cap(verdicts: &Verdicts, step: &str) -> usize {
     BASE_CAP
@@ -605,12 +606,179 @@ fn verdicts_path(root: &Path) -> PathBuf {
     root.join(CM_DIR).join(VERDICTS)
 }
 
-pub fn load(root: &Path) -> Result<Verdicts> {
+fn read_ledger(root: &Path) -> Result<Option<Verdicts>> {
     let path = verdicts_path(root);
-    if path.exists() {
-        read_json(&path)
-    } else {
-        Ok(Verdicts::default())
+    match fs::symlink_metadata(&path) {
+        Ok(_) => read_json(&path).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn load(root: &Path) -> Result<Verdicts> {
+    Ok(read_ledger(root)?.unwrap_or_default())
+}
+
+#[derive(Debug)]
+struct Unclassified {
+    id: String,
+    reviewer: Option<String>,
+    cause: String,
+}
+
+impl fmt::Display for Unclassified {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "cannot classify {}: {}", self.id, self.cause)
+    }
+}
+
+impl std::error::Error for Unclassified {}
+
+#[derive(Debug)]
+struct Unreadable {
+    id: String,
+    path: String,
+    cause: io::Error,
+}
+
+impl fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "cannot read the report recorded as {} at {}: {}",
+            self.id, self.path, self.cause
+        )
+    }
+}
+
+impl std::error::Error for Unreadable {}
+
+fn recorded_text(root: &Path, review: &Recorded) -> Result<String> {
+    fs::read_to_string(root.join(review.report.as_str())).map_err(|cause| {
+        Unreadable {
+            id: review.id(),
+            path: review.report.to_string(),
+            cause,
+        }
+        .into()
+    })
+}
+
+// A report recorded before the step had parts may be recorded again for a part: that copy is the
+// same report, not another review.
+#[derive(Default)]
+struct PartLess<'a> {
+    unread: Vec<&'a Recorded>,
+    digests: HashSet<[u8; 32]>,
+}
+
+impl<'a> PartLess<'a> {
+    fn contains(&mut self, root: &Path, text: &str) -> Result<bool> {
+        for review in std::mem::take(&mut self.unread) {
+            self.digests
+                .insert(Sha256::digest(recorded_text(root, review)?).into());
+        }
+        Ok(self
+            .digests
+            .contains::<[u8; 32]>(&Sha256::digest(text).into()))
+    }
+}
+
+fn history_refusal(full: &str, error: &anyhow::Error) -> Violation {
+    let path = format!("{CM_DIR}/{VERDICTS}");
+    let remedy = match (
+        error.downcast_ref::<Unclassified>(),
+        error.downcast_ref::<Unreadable>(),
+    ) {
+        (_, Some(copy)) => format!(
+            "restore the report copy {} (recorded as {}) before retrying",
+            copy.path, copy.id
+        ),
+        (Some(unclassified), None) => format!(
+            "{} in {path} names {}, which cm cannot classify; correct that row's reviewer by hand to the model that wrote the report before retrying",
+            unclassified.id,
+            unclassified
+                .reviewer
+                .as_ref()
+                .map_or("no reviewer".to_owned(), |name| format!(
+                    "reviewer `{name}`"
+                )),
+        ),
+        (None, None) => format!("restore readable review history in {path} before retrying"),
+    };
+    Violation::refuse(
+        &path,
+        "review-history-unreadable",
+        format!("cannot read the review history for {full} from {path}: {error:#}"),
+        Next::settled(remedy),
+    )
+}
+
+fn load_for_record(root: &Path, target: &Target) -> Result<(Verdicts, usize)> {
+    let path = verdicts_path(root);
+    let present = match fs::symlink_metadata(&path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if present {
+        let verdicts: Verdicts = read_json(&path)?;
+        let step = full_name(target);
+        let mut partless = PartLess::default();
+        let mut rounds = 0;
+        for review in verdicts.reviews.iter().filter(|review| review.step == step) {
+            let capped =
+                capped_reviewer(review.reviewer.as_deref()).map_err(|cause| Unclassified {
+                    id: review.id(),
+                    reviewer: review.reviewer.clone(),
+                    cause: format!("{cause:#}"),
+                })?;
+            if !capped {
+                continue;
+            }
+            if review.part.is_none() {
+                partless.unread.push(review);
+                rounds += 1;
+            } else if !partless.contains(root, &recorded_text(root, review)?)? {
+                rounds += 1;
+            }
+        }
+        return Ok((verdicts, rounds));
+    }
+
+    absent_ledger_is_empty(root, Some(target))?;
+    Ok((Verdicts::default(), 0))
+}
+
+// An absent ledger is an empty history only when no review was ever recorded.
+fn absent_ledger_is_empty(root: &Path, target: Option<&Target>) -> Result<()> {
+    let journal = fs::read_to_string(root.join(store::JOURNAL))?;
+    let journaled = journal.lines().any(|line| {
+        crate::journal::is_stamped(line)
+            && line
+                .split_once(" — ")
+                .is_some_and(|(_, title)| title.starts_with("review record "))
+    });
+    let copied = match target {
+        Some(target) => match fs::read_dir(evidence_dir(root, target).join("reviews")) {
+            Ok(mut copies) => copies.next().transpose()?.is_some(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        },
+        None => false,
+    };
+    if journaled || copied {
+        anyhow::bail!("the ledger is missing and review history already exists");
+    }
+    Ok(())
+}
+
+// Every writer that saves the ledger loads it here, so none can replace history it cannot read
+// with an empty one.
+fn load_for_write(root: &Path, target: Option<&Target>) -> Result<Verdicts> {
+    match read_ledger(root)? {
+        Some(verdicts) => Ok(verdicts),
+        None => absent_ledger_is_empty(root, target).map(|()| Verdicts::default()),
     }
 }
 
@@ -697,6 +865,74 @@ fn escalation_pending(root: &Path, step: &str) -> Result<bool> {
     )
 }
 
+fn capped_reviewer(reviewer: Option<&str>) -> Result<bool> {
+    let name = reviewer.ok_or_else(|| anyhow::anyhow!("reviewer identity is missing"))?;
+    if !store::is_name(name) {
+        anyhow::bail!("reviewer `{name}` is not a valid reviewer name");
+    }
+    let name = name.to_ascii_lowercase();
+    if name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| part == ASTRA_REVIEWER)
+        || name.starts_with("claude-")
+        || name.starts_with("opus-")
+    {
+        return Ok(true);
+    }
+    match Family::reviewer(Some(&name)) {
+        Some(Family::Claude) => Ok(true),
+        Some(Family::Gpt) => Ok(false),
+        None => anyhow::bail!("reviewer `{name}` has no known model family"),
+    }
+}
+
+fn names_step(text: &str, step: &str) -> bool {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/')))
+        .any(|word| {
+            let mut reference = word;
+            loop {
+                if store::parse_target(reference, true)
+                    .is_ok_and(|target| full_name(&target) == step)
+                {
+                    return true;
+                }
+                if let Some(prose) = reference.strip_suffix('.') {
+                    reference = prose;
+                } else if let Some(inner) = reference
+                    .strip_prefix('_')
+                    .and_then(|inner| inner.strip_suffix('_'))
+                {
+                    reference = inner;
+                } else {
+                    return false;
+                }
+            }
+        })
+}
+
+fn queue_names_step(root: &Path, step: &str) -> Result<bool> {
+    let Some(queue) = read_existing(&root.join(crate::templates::QUEUE_FILE))? else {
+        return Ok(false);
+    };
+    let lines: Vec<_> = queue.lines().collect();
+    let mut headings = crate::markdown::headings(&queue)
+        .into_iter()
+        .filter(|heading| heading.level <= 2)
+        .peekable();
+    while let Some(heading) = headings.next() {
+        let end = headings.peek().map_or(lines.len(), |next| next.line - 1);
+        if heading.level == 2
+            && item_heading(heading.text).is_some()
+            && lines[heading.line - 1..end]
+                .iter()
+                .any(|line| names_step(line, step))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn step_pr(root: &Path, target: &Target, part: Option<&str>) -> Result<Option<String>> {
     let dir = root.join(&target.unit);
     if !store::is_unit(&dir) {
@@ -752,10 +988,11 @@ pub fn record(
         }
     }
     if let Some(kind) = reviewer.filter(|kind| !store::is_name(kind)) {
-        violations.push(Violation::new(
+        violations.push(Violation::refuse(
             &full,
             "review-reviewer",
             format!("`{kind}` is not a name of letters, digits, `.`, `_` and `-`"),
+            Next::settled("supply `--reviewer <astra|claude>` (or the model's own name, such as `fresh-opus`) with the report"),
         ));
     }
     let shown = report.display().to_string();
@@ -778,10 +1015,13 @@ pub fn record(
             }
         },
     };
-    let mut verdicts = load(root)?;
-    if journal_sound {
-        journal_raises(root, &verdicts)?;
-    }
+    let (mut verdicts, rounds) = match load_for_record(root, target) {
+        Ok(history) => history,
+        Err(error) => {
+            violations.push(history_refusal(&full, &error));
+            return Ok(Outcome::refused(violations));
+        }
+    };
     let pr = step_pr(root, target, part)?;
     let heads = fix_heads(
         verdicts
@@ -794,18 +1034,6 @@ pub fn record(
             && !heads.iter().any(|head| same_commit(head, &block.head))
     });
     let passes = heads.len() + usize::from(new_pass);
-    let cap = review_cap(&verdicts, &full);
-    if new_pass && passes > cap {
-        let message = if cap == BASE_CAP {
-            "session cap of 10 passes; an 11th fix pass on the current PR is refused; an owner ruling raises it: `cm review cap-raise <step> --by <1-3> --ruling <file>`".to_owned()
-        } else {
-            format!(
-                "session cap of {cap} passes (10 plus {} raised by owner ruling); fix pass {passes} on the current PR is refused; a further ruling raises it: `cm review cap-raise <step> --by <1-3> --ruling <file>`",
-                cap - BASE_CAP
-            )
-        };
-        violations.push(Violation::new(&full, "review-cap", message));
-    }
     let number = verdicts
         .reviews
         .iter()
@@ -851,6 +1079,66 @@ pub fn record(
                 again.report
             ),
         ));
+    }
+    if block.is_some() && violations.is_empty() {
+        let capped = match capped_reviewer(reviewer) {
+            Ok(capped) => capped,
+            Err(error) => {
+                return Ok(Outcome::refused(vec![Violation::refuse(
+                    &full,
+                    "review-reviewer",
+                    format!("cannot count review rounds: {error}"),
+                    Next::settled(
+                        "supply `--reviewer <astra|claude>` (or the model's own name, such as `fresh-opus`) with the report",
+                    ),
+                )]));
+            }
+        };
+        let round = rounds + 1;
+        if capped && round > REVIEW_ROUND_CAP {
+            let mut partless = PartLess::default();
+            partless
+                .unread
+                .extend(verdicts.reviews.iter().filter(|review| {
+                    review.step == full
+                        && review.part.is_none()
+                        && capped_reviewer(review.reviewer.as_deref()).is_ok_and(|capped| capped)
+                }));
+            let again = match (part, &block) {
+                (Some(_), Some((_, text))) => match partless.contains(root, text) {
+                    Ok(again) => again,
+                    Err(error) => {
+                        violations.push(history_refusal(&full, &error));
+                        return Ok(Outcome::refused(violations));
+                    }
+                },
+                _ => false,
+            };
+            let queue = queue_names_step(root, &full);
+            if !again && !matches!(queue, Ok(true)) {
+                return Ok(Outcome::refused(vec![Violation::review_round_cap(
+                    host.prefix(),
+                    &full,
+                    round,
+                    queue.err(),
+                )]));
+            }
+        }
+    }
+    if journal_sound {
+        journal_raises(root, &verdicts)?;
+    }
+    let cap = review_cap(&verdicts, &full);
+    if new_pass && passes > cap {
+        let message = if cap == BASE_CAP {
+            "session cap of 10 passes; an 11th fix pass on the current PR is refused; an owner ruling raises it: `cm review cap-raise <step> --by <1-3> --ruling <file>`".to_owned()
+        } else {
+            format!(
+                "session cap of {cap} passes (10 plus {} raised by owner ruling); fix pass {passes} on the current PR is refused; a further ruling raises it: `cm review cap-raise <step> --by <1-3> --ruling <file>`",
+                cap - BASE_CAP
+            )
+        };
+        violations.push(Violation::new(&full, "review-cap", message));
     }
     let Some((block, text)) = block.filter(|_| violations.is_empty()) else {
         return Ok(Outcome::refused(violations));
@@ -1059,7 +1347,13 @@ pub fn cap_raise(
     ruling: &Path,
 ) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
-    let mut verdicts = load(root)?;
+    let mut verdicts = match load_for_write(root, Some(target)) {
+        Ok(verdicts) => verdicts,
+        Err(error) => {
+            violations.push(history_refusal(&full_name(target), &error));
+            return Ok(Outcome::refused(violations));
+        }
+    };
     let repaired = if violations.is_empty() {
         journal_raises(root, &verdicts)?
     } else {
@@ -1269,7 +1563,13 @@ pub fn resolve(
 ) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
     let full = full_name(target);
-    let mut verdicts = load(root)?;
+    let mut verdicts = match load_for_write(root, Some(target)) {
+        Ok(verdicts) => verdicts,
+        Err(error) => {
+            violations.push(history_refusal(&full, &error));
+            return Ok(Outcome::refused(violations));
+        }
+    };
     let by = match by_of(root, by, by_path) {
         Ok(by) => Some(by),
         Err(message) => {
@@ -1441,7 +1741,13 @@ pub fn followups(root: &Path, epoch: bool) -> Result<Outcome> {
 pub fn close_followup(host: &dyn Host, root: &Path, id: &str, by: &str) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
     one_line("--by", by, &mut violations, VERDICTS);
-    let mut verdicts = load(root)?;
+    let mut verdicts = match load_for_write(root, None) {
+        Ok(verdicts) => verdicts,
+        Err(error) => {
+            violations.push(history_refusal("the campaign", &error));
+            return Ok(Outcome::refused(violations));
+        }
+    };
     let at = stamp(host.now());
     let Some((key, logged)) = id
         .contains('.')
@@ -1883,7 +2189,7 @@ fn review_gap(
         .unwrap_or_default();
     if at_head.is_empty() {
         return Some(format!(
-            "no review of {head} is recorded; `cm review record {step} <report>{part}`"
+            "no review of {head} is recorded; `cm review record {step} <report> --reviewer <astra|claude>{part}`"
         ));
     }
     let open: Vec<String> = at_head
@@ -2192,6 +2498,30 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn the_part_less_index_keeps_digests_not_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = "report body\n".repeat(100_000);
+        let mut reviews = Vec::new();
+        for (index, text) in [big.as_str(), "short"].into_iter().enumerate() {
+            fs::write(dir.path().join(format!("r{index}.md")), text).unwrap();
+            let mut review = serde_json::from_value::<Recorded>(serde_json::json!({
+                "number": index + 1, "at": "t", "step": "01-a/u/S1", "head": "abcdef0",
+                "verdict": "accept", "report": format!("r{index}.md"),
+            }))
+            .unwrap();
+            review.reviewer = Some("astra".into());
+            reviews.push(review);
+        }
+        let mut index = PartLess::default();
+        index.unread.extend(reviews.iter());
+        assert!(index.contains(dir.path(), &big).unwrap());
+        assert!(index.contains(dir.path(), "short").unwrap());
+        assert!(!index.contains(dir.path(), "other").unwrap());
+        assert_eq!(index.digests.len(), 2);
+        assert!(index.digests.iter().all(|digest| digest.len() == 32));
+    }
+
     thread_local! {
         pub(super) static HASHES: Cell<usize> = const { Cell::new(0) };
     }
@@ -2200,6 +2530,64 @@ mod tests {
 
     fn report(block: &str, tail: &str) -> String {
         format!("# Review\n\nFindings follow.\n\n```{BLOCK}\n{block}```\n{tail}")
+    }
+
+    #[test]
+    fn step_references_survive_prose_formatting_without_matching_longer_identifiers() {
+        let step = "01-review/unit/build";
+        for (form, expected) in [
+            ("{step}", true),
+            ("Another review for {step}.", true),
+            ("{step},", true),
+            ("({step});", true),
+            ("\"{step}\"!", true),
+            ("[{step}](https://example.com)", true),
+            ("*{step}*", true),
+            ("**{step}**.", true),
+            ("_{step}_", true),
+            ("__{step}__.", true),
+            ("___{step}.___", true),
+            ("`{step}`", true),
+            ("``{step}``.", true),
+            ("**`/{step}/`**.", true),
+            ("/{step}", true),
+            ("{step}/", true),
+            ("//{step}//.", true),
+            ("_/{step}/_.", true),
+            ("_{step}/._", true),
+            ("{step}-other", false),
+            ("_{step}-other_", false),
+            ("{step}_other", false),
+            ("{step}.other.", false),
+            ("{step}other", false),
+            ("{step}_", false),
+            ("prefix-{step}", false),
+            ("prefix/{step}", false),
+            ("{step}/child", false),
+            ("01-review/other/build", false),
+            ("build", false),
+            ("No step reference.", false),
+        ] {
+            let text = form.replace("{step}", step);
+            assert_eq!(names_step(&text, step), expected, "{text}");
+        }
+        for step in [
+            "01-review/unit/build.",
+            "01-review/unit_name/build_test",
+            "01-review/unit.v2/_build_.",
+        ] {
+            for form in [
+                "{step}",
+                "Another review for {step}.",
+                "Another review for {step}...",
+                "__`/{step}/`__.",
+                "_{step}_",
+                "__{step}.__.",
+            ] {
+                let text = form.replace("{step}", step);
+                assert!(names_step(&text, step), "{text}");
+            }
+        }
     }
 
     #[test]

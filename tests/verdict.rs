@@ -959,6 +959,7 @@ fn rising_counts_request_a_fresh_reader_until_one_is_recorded() {
             .len(),
         1
     );
+    file_review_question(&host, &c, STEP);
     let fresh = c.report("fresh", "ddddddd4", &[], "ACCEPT");
     assert!(record(&host, &c, &fresh, "fresh-opus").ok());
     assert_eq!(
@@ -1186,14 +1187,14 @@ fn fresh_read_baselines_use_the_head_maximum_in_either_recording_order() {
                     &review_fixture::BLOCKING,
                     "FIX REQUIRED",
                 );
-                assert!(record(&host, &c, &older, "other").ok());
+                assert!(record(&host, &c, &older, "gpt-other").ok());
                 if pending {
-                    for (reviewer, head) in [("astra", "aaaaaaa0"), ("claude", "bbbbbbb0")] {
+                    for (reviewer, head) in [("sol", "aaaaaaa0"), ("terra", "bbbbbbb0")] {
                         let report = c.report(&format!("initial-{reviewer}"), head, &[], "ACCEPT");
                         assert!(record(&host, &c, &report, reviewer).ok());
                     }
                 }
-                let mut reports = [("astra", 1), ("claude", 2)];
+                let mut reports = [("sol", 1), ("terra", 2)];
                 if reverse {
                     reports.reverse();
                 }
@@ -1278,7 +1279,7 @@ fn a_fresh_round_compares_with_its_trigger_and_each_block_queues_the_owner() {
                 &review_fixture::BLOCKING[..count],
                 "FIX REQUIRED",
             );
-            assert!(record(&host, &c, &report, "astra").ok());
+            assert!(record(&host, &c, &report, "sol").ok());
         }
         let report = c.report(
             &format!("fresh{cycle}"),
@@ -1386,6 +1387,7 @@ fn counts_compare_the_same_reviewer_and_pr_and_include_accepted_rounds() {
         record(&host, &c, &equal, "astra").fields["converging"],
         true
     );
+    file_review_question(&host, &c, STEP);
     let accepted = c.report("accepted", "ddddddd4", &[], "ACCEPT");
     assert!(record(&host, &c, &accepted, "astra").ok());
     let returned = c.report(
@@ -1476,6 +1478,7 @@ fn part_rounds_use_the_parts_pr_and_do_not_mix_counts() {
     .unwrap();
     assert_eq!(rules(&unknown), vec!["part-unknown"]);
     assert_eq!(sha256(&c.root.join(".cm/verdicts.json")), before);
+    file_review_question(&host, &c, STEP);
     for (part, count, round, converging) in [
         ("-one", 1, 1, true),
         ("two", 3, 1, true),
@@ -1561,6 +1564,7 @@ fn part_rounds_use_the_parts_pr_and_do_not_mix_counts() {
 fn the_fix_pass_cap_ignores_accepts_second_reviewers_and_earlier_prs() {
     let host = at("2026-10-25T06:00:00Z");
     let c = campaign(&host, true);
+    file_review_question(&host, &c, STEP);
     let old = c.report(
         "old",
         "aaaaaaaa",
@@ -1698,7 +1702,7 @@ fn merge_gate_repair_commands_select_the_part_in_advance_and_sync() {
     let missing = advance();
     assert!(missing.violations.iter().any(|violation| violation.message
         == format!(
-            "no review of {head} is recorded; `cm review record {STEP} <report> --part=-one`"
+            "no review of {head} is recorded; `cm review record {STEP} <report> --reviewer <astra|claude> --part=-one`"
         )));
     let report = c.report("astra-review-7-part", &head, &[], "ACCEPT");
     c.receipt("astra-review-7-part", &head, "gpt-6-astra", "xhigh");
@@ -2542,7 +2546,10 @@ fn a_merge_that_resolved_conflicts_needs_its_own_review() {
     let report = c.report("astra-review-7-merge", &merge, &[], "ACCEPT");
     c.receipt("astra-review-7-merge", &merge, "gpt-6-astra", "xhigh");
     assert!(record(&host, &c, &report, "astra").ok());
+    file_review_question(&host, &c, STEP);
     claude_accept(&host, &c, &merge);
+    let read = review_fixture::owner_read(&c.root);
+    assert!(read.status.success(), "{read:?}");
     let merged = merge_with(&host, &c, &base);
     assert!(merged.ok(), "{:?}", merged.violations);
 }
@@ -4476,6 +4483,9 @@ fn each_part_of_a_multipart_step_is_merge_ready_on_its_own_pr() {
     )
     .unwrap();
     assert!(recorded.ok(), "{:?}", recorded.violations);
+    file_review_question(&host, &c, STEP);
+    let read = review_fixture::owner_read(&c.root);
+    assert!(read.status.success(), "{read:?}");
     let claude = c.write(
         "drafts/claude-two.md",
         &format!(
@@ -4723,17 +4733,20 @@ fn reviews_recorded_before_parts_can_be_recorded_again_for_a_part() {
     assert!(!gaps().is_empty());
     let astra = c.root.join(STEP).join("evidence/astra-review-7/report.md");
     let claude = c.root.join(format!("drafts/claude-{head}.md"));
-    for (report, reviewer) in [(&astra, "astra"), (&claude, "claude")] {
-        let again = verdict::record(
-            &host,
-            &c.root,
-            &target(),
-            report,
-            Some(reviewer),
-            Some("one"),
-        )
-        .unwrap();
-        assert!(again.ok(), "{:?}", again.violations);
+    {
+        let part = "one";
+        for (report, reviewer) in [(&astra, "astra"), (&claude, "claude")] {
+            let again = verdict::record(
+                &host,
+                &c.root,
+                &target(),
+                report,
+                Some(reviewer),
+                Some(part),
+            )
+            .unwrap();
+            assert!(again.ok(), "{part} {reviewer}: {:?}", again.violations);
+        }
     }
     assert!(gaps().is_empty(), "{:?}", gaps());
     // Within one PR and part a report is still recorded once.
@@ -4778,7 +4791,461 @@ fn a_report_recorded_before_pr_open_is_not_recorded_again_as_another_family() {
     );
 }
 
+fn file_review_question(host: &Fake, c: &Campaign, step: &str) -> u32 {
+    let filed = cm::ledger::owner_queue_add(
+        host,
+        &c.root,
+        &cm::ledger::QueueItem {
+            title: "More review rounds",
+            context: &format!("Another review for `{step}`"),
+            question: "Continue reviewing?",
+            recommendation: "Continue.",
+        },
+    )
+    .unwrap();
+    assert!(filed.ok(), "{:?}", filed.violations);
+    filed.fields["item"].as_u64().unwrap().try_into().unwrap()
+}
+
+#[test]
+fn the_fourth_claude_or_astra_review_needs_a_queue_item_naming_the_step() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    for (index, reviewer) in ["astra", "claude-opus-5-5-xhigh", "opus-r12"]
+        .into_iter()
+        .enumerate()
+    {
+        let report = c.report(
+            &format!("round-{index}"),
+            &format!("{index:08x}"),
+            &[],
+            "ACCEPT",
+        );
+        let recorded = record(&host, &c, &report, reviewer);
+        assert!(recorded.ok(), "{:?}", recorded.violations);
+    }
+    let mut unit = store::load_unit(&c.root.join("01-a/u")).unwrap();
+    unit.steps.get_mut("S1").unwrap().track.evidence.pr =
+        Some("https://github.com/o/r/pull/8".into());
+    commands::write_unit(&c.root.join("01-a/u"), &unit).unwrap();
+    file_review_question(&host, &c, &format!("{STEP}-other"));
+    let report = c.report("fourth", "abcdef04", &[], "ACCEPT");
+    let verdicts = c.root.join(".cm/verdicts.json");
+    let before = fs::read(&verdicts).unwrap();
+    let journal_before = journal(&c);
+
+    let refused = record(&host, &c, &report, "astra");
+    assert_eq!(rules(&refused), ["review-round-cap"]);
+    let refusal = &refused.violations[0];
+    assert_eq!(refusal.path, STEP);
+    assert_eq!(
+        refusal.message,
+        format!(
+            "cannot record review round 4 for {STEP}: OWNER-QUEUE.md has no item that names the step. File an item with `cm owner-queue add`"
+        )
+    );
+    assert_eq!(
+        refusal.next_json()[0]["argv"],
+        serde_json::json!([
+            "cm",
+            "owner-queue",
+            "add",
+            format!("Review round 4 for {STEP}"),
+            "--context",
+            "<context>",
+            "--question",
+            "<question>",
+            "--recommendation",
+            "<recommendation>"
+        ])
+    );
+    assert_eq!(fs::read(&verdicts).unwrap(), before);
+    assert_eq!(journal(&c), journal_before);
+    assert!(
+        !c.root
+            .join(STEP)
+            .join("evidence/reviews/R4-astra.md")
+            .exists()
+    );
+
+    let item = file_review_question(&host, &c, STEP);
+    let fourth = record(&host, &c, &report, "astra");
+    assert!(fourth.ok(), "{:?}", fourth.violations);
+    assert_eq!(fourth.fields["id"], "R4");
+
+    let answered_body = format!(
+        "Context: Another review for `{STEP}`\n\nContinue reviewing?\n\nRecommendation: Continue.\n\nAnswer: Yes.\n"
+    );
+    assert!(
+        cm::ledger::owner_queue_edit(&host, &c.root, item, &answered_body)
+            .unwrap()
+            .ok()
+    );
+    let report = c.report("fifth", "abcdef05", &[], "ACCEPT");
+    let fifth = record(&host, &c, &report, "claude");
+    assert!(fifth.ok(), "{:?}", fifth.violations);
+}
+
+#[test]
+fn reviewer_classification_is_required_for_history_and_incoming_records() {
+    let host = at("2026-10-25T06:00:00Z");
+    for (reviewer, capped) in [
+        (Some("astra"), Some(true)),
+        (Some("ASTRA"), Some(true)),
+        (Some("gpt-6-astra"), Some(true)),
+        (Some("gpt-6.2-astra"), Some(true)),
+        (Some("GPT-6.2-ASTRA"), Some(true)),
+        (Some("reviewer-astra"), Some(true)),
+        (Some("gpt-6.2-astra-xhigh"), Some(true)),
+        (Some("astra-xhigh"), Some(true)),
+        (Some("gpt-6-astra-high"), Some(true)),
+        (Some("gpt-6.2-astra_xhigh"), Some(true)),
+        (Some("gpt-6.2-astra.1"), Some(true)),
+        (Some("claude"), Some(true)),
+        (Some("claude-opus-5-5-xhigh"), Some(true)),
+        (Some("opus"), Some(true)),
+        (Some("opus-r12"), Some(true)),
+        (Some("fresh-opus"), Some(true)),
+        (Some("fable"), Some(true)),
+        (Some("sonnet"), Some(true)),
+        (Some("haiku"), Some(true)),
+        (Some("sol"), Some(false)),
+        (Some("terra"), Some(false)),
+        (Some("gpt-6-sol"), Some(false)),
+        (None, None),
+        (Some(""), None),
+        (Some("other"), None),
+        (Some("astral"), None),
+        (Some("claudette"), None),
+    ] {
+        for history in [false, true] {
+            let c = campaign(&host, true);
+            for (index, identity) in ["astra", "gpt-6-astra", "gpt-6.2-astra"]
+                .into_iter()
+                .enumerate()
+            {
+                let report = c.report(
+                    &format!("round-{index}"),
+                    &format!("{index:08x}"),
+                    &[],
+                    "ACCEPT",
+                );
+                assert!(record(&host, &c, &report, identity).ok());
+            }
+            let path = c.root.join(".cm/verdicts.json");
+            if history {
+                let mut verdicts = verdict::load(&c.root).unwrap();
+                verdicts.reviews[2].reviewer = reviewer.map(str::to_owned);
+                store::write_json(&path, &verdicts).unwrap();
+            }
+            if capped.is_none() {
+                file_review_question(&host, &c, STEP);
+            }
+            let report = c.report("fourth", "abcdef04", &[], "ACCEPT");
+            let before = fs::read(&path).unwrap();
+            let journal_before = journal(&c);
+            let incoming = if history { Some("astra") } else { reviewer };
+            let outcome =
+                verdict::record(&host, &c.root, &target(), &report, incoming, None).unwrap();
+            let expected = match capped {
+                Some(true) => vec!["review-round-cap"],
+                Some(false) => Vec::new(),
+                None if history => vec!["review-history-unreadable"],
+                None => vec!["review-reviewer"],
+            };
+            assert_eq!(
+                rules(&outcome),
+                expected,
+                "reviewer={reviewer:?}, history={history}: {:?}",
+                outcome.violations
+            );
+            if outcome.ok() {
+                assert_eq!(outcome.fields["id"], "R4");
+            } else {
+                assert_eq!(fs::read(&path).unwrap(), before);
+                assert_eq!(journal(&c), journal_before);
+                assert_eq!(
+                    fs::read_dir(c.root.join(STEP).join("evidence/reviews"))
+                        .unwrap()
+                        .count(),
+                    3
+                );
+                if capped == Some(true) {
+                    file_review_question(&host, &c, STEP);
+                    let recorded =
+                        verdict::record(&host, &c.root, &target(), &report, incoming, None)
+                            .unwrap();
+                    assert!(recorded.ok(), "{:?}", recorded.violations);
+                    assert_eq!(recorded.fields["id"], "R4");
+                }
+                if capped.is_none() {
+                    let cause = match reviewer {
+                        None => "reviewer identity is missing".to_owned(),
+                        Some("") => "not a".to_owned(),
+                        Some(name) => format!("reviewer `{name}`"),
+                    };
+                    assert!(outcome.violations[0].message.contains(&cause));
+                    if !history {
+                        let next = format!("{:?}", outcome.violations[0].next);
+                        assert!(next.contains("--reviewer"), "{next}");
+                    }
+                    if history {
+                        let remedy = format!("{:?}", outcome.violations[0].next);
+                        assert!(remedy.contains("R3"), "{remedy}");
+                        if let Some(name) = reviewer.filter(|name| !name.is_empty()) {
+                            assert!(remedy.contains(name), "{remedy}");
+                        }
+                        let outcome =
+                            verdict::record(&host, &c.root, &target(), &report, Some("sol"), None)
+                                .unwrap();
+                        assert_eq!(rules(&outcome), ["review-history-unreadable"]);
+                        assert_eq!(fs::read(&path).unwrap(), before);
+                        assert_eq!(journal(&c), journal_before);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_damaged_ledger_is_refused_by_every_reader() {
+    let host = at("2026-10-25T06:00:00Z");
+    for damage in ["empty", "duplicate-reviews", "duplicate-reviewer"] {
+        let c = campaign(&host, true);
+        for index in 0..3 {
+            let report = c.report(
+                &format!("round-{index}"),
+                &format!("{index:08x}"),
+                &[],
+                "ACCEPT",
+            );
+            assert!(record(&host, &c, &report, "astra").ok());
+        }
+        let path = c.root.join(".cm/verdicts.json");
+        let text = fs::read_to_string(&path).unwrap();
+        let damaged = match damage {
+            "empty" => "{}".to_owned(),
+            "duplicate-reviews" => format!(
+                "{},\"reviews\": []}}",
+                text.trim_end().trim_end_matches('}').trim_end()
+            ),
+            _ => text.replacen(
+                "\"reviewer\": \"astra\"",
+                "\"reviewer\": \"astra\", \"reviewer\": \"sol\"",
+                1,
+            ),
+        };
+        assert_ne!(damaged, text, "{damage}");
+        fs::write(&path, &damaged).unwrap();
+        assert!(verdict::load(&c.root).is_err(), "{damage}");
+        let report = c.report("fourth", "abcdef04", &[], "ACCEPT");
+        assert_eq!(
+            rules(&record(&host, &c, &report, "astra")),
+            ["review-history-unreadable"],
+            "{damage}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), damaged, "{damage}");
+    }
+}
+
+#[test]
+fn every_ledger_writer_refuses_history_it_cannot_read() {
+    let host = at("2026-10-25T06:00:00Z");
+    for damage in ["absent", "unreadable"] {
+        for writer in ["record", "cap-raise", "resolve", "close-followup"] {
+            let c = campaign(&host, true);
+            for index in 0..3 {
+                let report = c.report(
+                    &format!("round-{index}"),
+                    &format!("{index:08x}"),
+                    &[],
+                    "ACCEPT",
+                );
+                assert!(record(&host, &c, &report, "astra").ok());
+            }
+            let ruling = commit_ruling(&c, "rulings/more.md");
+            let next = c.report("fourth", "abcdef04", &[], "ACCEPT");
+            let path = c.root.join(".cm/verdicts.json");
+            let damaged = match damage {
+                "absent" => {
+                    fs::remove_file(&path).unwrap();
+                    None
+                }
+                _ => {
+                    fs::write(&path, "not json").unwrap();
+                    Some("not json".to_owned())
+                }
+            };
+            let journal_before = journal(&c);
+            let outcome = match writer {
+                "record" => verdict::record(&host, &c.root, &target(), &next, Some("claude"), None),
+                "cap-raise" => verdict::cap_raise(&host, &c.root, &target(), 1, &ruling),
+                "resolve" => verdict::resolve(
+                    &host,
+                    &c.root,
+                    &target(),
+                    "F1",
+                    &ruling.to_string_lossy(),
+                    &ruling,
+                ),
+                _ => verdict::close_followup(&host, &c.root, "R1.F1", "abc1234"),
+            }
+            .unwrap();
+            assert_eq!(
+                rules(&outcome),
+                ["review-history-unreadable"],
+                "{writer} {damage}: {:?}",
+                outcome.violations
+            );
+            assert_eq!(fs::read_to_string(&path).ok(), damaged, "{writer} {damage}");
+            assert_eq!(journal(&c), journal_before, "{writer} {damage}");
+        }
+    }
+}
+
+#[test]
+fn the_built_cm_refuses_cap_raise_and_a_fourth_review_after_the_ledger_is_deleted() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    for index in 0..3 {
+        let report = c.report(
+            &format!("round-{index}"),
+            &format!("{index:08x}"),
+            &[],
+            "ACCEPT",
+        );
+        assert!(record(&host, &c, &report, "astra").ok());
+    }
+    let ruling = commit_ruling(&c, "rulings/more.md");
+    let next = c.report("fourth", "abcdef04", &[], "ACCEPT");
+    let path = c.root.join(".cm/verdicts.json");
+    fs::remove_file(&path).unwrap();
+    let cm = |args: &[&str], file: &Path, tail: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("-C")
+            .arg(&c.root)
+            .args(args)
+            .arg(file)
+            .args(tail)
+            .output()
+            .unwrap()
+    };
+    let raised = cm(
+        &["review", "cap-raise", STEP, "--by", "1", "--ruling"],
+        &ruling,
+        &[],
+    );
+    assert!(!raised.status.success(), "{raised:?}");
+    assert!(!path.exists());
+    let recorded = cm(
+        &["review", "record", STEP],
+        &next,
+        &["--reviewer", "claude"],
+    );
+    assert!(!recorded.status.success(), "{recorded:?}");
+    assert!(!path.exists());
+}
+
+#[test]
+fn only_a_report_copy_that_decides_the_count_must_be_readable() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let sol = c.report("sol", "00000000", &[], "ACCEPT");
+    assert!(record(&host, &c, &sol, "sol").ok());
+    fs::remove_file(c.root.join(STEP).join("evidence/reviews/R1-sol.md")).unwrap();
+    let amendment = commands::Amendment {
+        parts: vec!["one".into()],
+        ..Default::default()
+    };
+    assert!(
+        commands::amend(&host, &c.root, &target(), &amendment)
+            .unwrap()
+            .ok()
+    );
+    let report = c.report("first", "00000001", &[], "ACCEPT");
+    let outcome = verdict::record(
+        &host,
+        &c.root,
+        &target(),
+        &report,
+        Some("astra"),
+        Some("one"),
+    )
+    .unwrap();
+    assert!(outcome.ok(), "{:?}", outcome.violations);
+
+    let c = campaign(&host, true);
+    for index in 0..3 {
+        let report = c.report(
+            &format!("round-{index}"),
+            &format!("{index:08x}"),
+            &[],
+            "ACCEPT",
+        );
+        assert!(record(&host, &c, &report, "astra").ok());
+    }
+    fs::remove_file(c.root.join(STEP).join("evidence/reviews/R1-astra.md")).unwrap();
+    assert!(
+        commands::amend(&host, &c.root, &target(), &amendment)
+            .unwrap()
+            .ok()
+    );
+    let report = c.report("fourth", "abcdef04", &[], "ACCEPT");
+    let outcome = verdict::record(
+        &host,
+        &c.root,
+        &target(),
+        &report,
+        Some("astra"),
+        Some("one"),
+    )
+    .unwrap();
+    assert_eq!(rules(&outcome), ["review-history-unreadable"]);
+    let next = format!("{:?}", outcome.violations[0].next);
+    assert!(next.contains("R1-astra.md"), "{next}");
+}
+
+#[test]
+fn review_record_refuses_uncountable_verdict_history() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    let initial = c.report("initial", "abcdef01", &[], "ACCEPT");
+    let saved = record(&host, &c, &initial, "astra");
+    assert!(saved.ok(), "{:?}", saved.violations);
+    let report = c.report("next", "abcdef02", &[], "ACCEPT");
+    let path = c.root.join(".cm/verdicts.json");
+    let before = journal(&c);
+
+    fs::remove_file(&path).unwrap();
+    let absent = record(&host, &c, &report, "claude");
+    assert_eq!(rules(&absent), ["review-history-unreadable"]);
+    assert!(!path.exists());
+
+    fs::create_dir(&path).unwrap();
+    let unreadable = record(&host, &c, &report, "claude");
+    assert_eq!(rules(&unreadable), ["review-history-unreadable"]);
+    fs::remove_dir(&path).unwrap();
+
+    for invalid in ["broken JSON", "{}"] {
+        fs::write(&path, invalid).unwrap();
+        let malformed = record(&host, &c, &report, "claude");
+        assert_eq!(rules(&malformed), ["review-history-unreadable"]);
+        assert_eq!(malformed.violations[0].path, ".cm/verdicts.json");
+        assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
+    }
+    assert_eq!(journal(&c), before);
+    assert!(
+        !c.root
+            .join(STEP)
+            .join("evidence/reviews/R2-claude.md")
+            .exists()
+    );
+}
+
 fn ten_passes(host: &Fake, c: &Campaign, step: &store::Target) {
+    let full = format!("{}/{}", step.unit, step.step.as_deref().unwrap());
+    file_review_question(host, c, &full);
     for round in 1..=10 {
         let report = c.report(
             &format!("{}-p{round}", step.step.as_deref().unwrap()),
