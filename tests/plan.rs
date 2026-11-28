@@ -1267,6 +1267,7 @@ fn merged(sha: &str) -> Pull {
         merged_at: None,
         head: None,
         head_ref: None,
+        head_repo: None,
         base: None,
         mergeable_state: None,
     }
@@ -1326,6 +1327,7 @@ fn sync_moves_steps_from_github_state_and_renders_the_card() {
             merged_at: None,
             head: None,
             head_ref: None,
+            head_repo: None,
             base: None,
             mergeable_state: None,
         },
@@ -1918,7 +1920,7 @@ repos/o/r/pulls/1)
     first)
         [ "$#" = 3 ] || exit 91
         printf 'HTTP/2.0 200 OK\r\nETag: W/"old-pull"\r\n\r\n'
-        echo '{"state":"open","merged":false,"head":{"sha":"head"},"base":{"sha":"old"},"mergeable_state":"dirty"}' ;;
+        echo '{"state":"open","merged":false,"head":{"sha":"head","ref":"work","repo":{"full_name":"o/r"}},"base":{"sha":"old"},"mergeable_state":"dirty"}' ;;
     same)
         [ "$#" = 5 ] && [ "$4" = -H ] && [ "$5" = 'If-None-Match: W/"old-pull"' ] || exit 92
         printf 'HTTP/2.0 304 Not Modified\r\n\r\n\377'
@@ -1991,6 +1993,8 @@ esac
 
     let (outcome, first, args) = observe("first", "2026-10-17T08:00:00Z");
     assert!(outcome.ok(), "{:?}", outcome.violations);
+    assert_eq!(first.head_ref.as_deref(), Some("work"));
+    assert_eq!(first.head_repo, Some("o/r".parse().unwrap()));
     assert_eq!(
         validators(),
         BTreeMap::from([
@@ -3072,6 +3076,7 @@ fn open(head: &str) -> Pull {
         merged_at: None,
         head: Some(CommitSha::new(head)),
         head_ref: None,
+        head_repo: None,
         base: None,
         mergeable_state: None,
     }
@@ -7893,6 +7898,7 @@ impl Forge for GreenPulls {
             merged_at: None,
             head: self.0.get(url).map(|head| CommitSha::new(head.clone())),
             head_ref: None,
+            head_repo: None,
             base: Some(CommitSha::new("b".repeat(40))),
             mergeable_state: Some("clean".to_owned().into()),
         })
@@ -7971,6 +7977,8 @@ fn a_script_pin_is_merge_ready_on_clean_green_ci_and_owes_no_review() {
                 target: step.to_owned(),
                 at: "2026-11-25T08:00Z".into(),
                 head: Some(head),
+                head_ref: None,
+                head_repo: None,
                 mergeable_state: Some("clean".to_owned().into()),
             },
         );
@@ -8032,6 +8040,8 @@ fn a_pi_or_undeclared_lane_pr_is_merge_ready_after_one_verdict() {
                 target: step.to_owned(),
                 at: "2026-11-25T08:00Z".into(),
                 head: Some(head),
+                head_ref: None,
+                head_repo: None,
                 mergeable_state: Some("clean".to_owned().into()),
             },
         );
@@ -8530,5 +8540,273 @@ fn one_parts_merge_is_not_its_steps_deploy() {
     assert_eq!(
         moved("01-a/u/pin"),
         "Deployed in 24 h: 1 (last: 2026-11-22T15:00Z)"
+    );
+}
+
+fn review_action(host: &Fake, c: &Campaign, target: &str) -> serde_json::Value {
+    let scope = parse_target(target, true).unwrap();
+    let out = plan::next_with(&c.root, Some(&scope), None, host.now(), None).unwrap();
+    out.fields["actionable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["kind"] == "review-owed")
+        .expect("review owed")
+        .clone()
+}
+
+#[test]
+fn release_0_102_0_review_requires_its_authoritative_pr_and_observed_range() {
+    use serde_json::json;
+
+    let host = at("2026-11-28T17:50Z");
+    let c = campaign(&host);
+    let target = "00-release/dekopon/0.102.0";
+    let repo = "dekopon-agents/dekopon";
+    let pr = "https://github.com/dekopon-agents/dekopon/pull/5102";
+    let branch = "release/0.102.0";
+    let head = "a".repeat(40);
+    let base = "db60e028d1d906f77287168e435521f871871e0f";
+
+    assert!(declare_release(&host, &c, target, repo, "v{version}").ok());
+    kickoff(&c, target);
+    open_pr(&host, &c, target, pr);
+    assert_eq!(
+        review_action(&host, &c, target)["qualification"],
+        json!({"kind": "blocked", "reason": "observed-pr"})
+    );
+
+    let mut forge = FakeForge::default();
+    let pull = Pull {
+        head_ref: Some(branch.into()),
+        head_repo: Some(repo.parse().unwrap()),
+        base: Some(CommitSha::new(base)),
+        ..open(&head)
+    };
+    forge.pulls.insert(pr.into(), pull.clone());
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    let action = review_action(&host, &c, target);
+    assert_eq!(action["pr"], pr);
+    assert_eq!(action["head"], head);
+    assert_eq!(action["base"], base);
+    assert_eq!(
+        action["qualification"],
+        json!({
+            "kind": "release-prep",
+            "repo": repo,
+            "version": "0.102.0",
+            "tag": "v0.102.0",
+            "branch": branch
+        })
+    );
+
+    forge.broken.insert(pr.into());
+    assert!(rules(&sync(&host, &forge, &c.root).unwrap()).contains(&"sync-unknown"));
+    assert_eq!(
+        review_action(&host, &c, target)["qualification"],
+        json!({"kind": "blocked", "reason": "observed-head-repo"})
+    );
+    forge.broken.remove(pr);
+
+    for (changed, reason) in [
+        (
+            Pull {
+                head_ref: Some("release/0.101.0".into()),
+                ..pull.clone()
+            },
+            "release-branch",
+        ),
+        (
+            Pull {
+                head_repo: Some("fork-owner/dekopon".parse().unwrap()),
+                ..pull.clone()
+            },
+            "release-head-repo",
+        ),
+        (
+            Pull {
+                head: Some(CommitSha::new("abcdef0")),
+                ..pull.clone()
+            },
+            "observed-head",
+        ),
+        (
+            Pull {
+                base: Some(CommitSha::new(&head)),
+                ..pull.clone()
+            },
+            "distinct-head-and-base",
+        ),
+    ] {
+        forge.pulls.insert(pr.into(), changed);
+        assert!(sync(&host, &forge, &c.root).unwrap().ok());
+        assert_eq!(
+            review_action(&host, &c, target)["qualification"],
+            json!({"kind": "blocked", "reason": reason})
+        );
+    }
+
+    // Reopened state from before the release-repo check, with a PR in a different owner.
+    let unit_dir = c.root.join("00-release/dekopon");
+    let mut unit = store::load_unit(&unit_dir).unwrap();
+    unit.steps.get_mut("0.102.0").unwrap().track.evidence.pr =
+        Some("https://github.com/wrong-owner/dekopon/pull/5102".into());
+    store::write_json(&store::state_path(&unit_dir), &unit).unwrap();
+    assert_eq!(
+        review_action(&host, &c, target)["qualification"],
+        json!({"kind": "blocked", "reason": "release-repo"})
+    );
+}
+
+#[test]
+fn pr_1034_replay_compares_named_failures_and_refuses_stale_results() {
+    use serde_json::json;
+
+    let host = at("2026-11-28T17:50Z");
+    let c = campaign(&host);
+    let target = "13-rx/issuer-core/kid";
+    let repo = "dekopon-agents/dekopon";
+    let pr = "https://github.com/dekopon-agents/dekopon/pull/1034";
+    let head = "ba650e951aeab04c3d42af792f1a6246f0cdad01";
+    let base = "0be8b01455856031356880060556ef226a4e5f18";
+    let mut forge = FakeForge::default();
+    let pull = Pull {
+        head_repo: Some(repo.parse().unwrap()),
+        head_ref: Some("mnemosyne/issuer-core-kid".into()),
+        base: Some(CommitSha::new(base)),
+        ..open(head)
+    };
+
+    assert!(declare(&host, &c, target, Lane::Pi, &[]).ok());
+    kickoff(&c, target);
+    open_pr(&host, &c, target, pr);
+    forge.pulls.insert(pr.into(), pull.clone());
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    assert_eq!(
+        review_action(&host, &c, target)["qualification"],
+        json!({"kind": "ordinary"})
+    );
+
+    // Simulate a release-like branch without a release declaration for this PR.
+    forge.pulls.get_mut(pr).unwrap().head_ref = Some("release/0.102.0".into());
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    assert_eq!(
+        review_action(&host, &c, target)["qualification"],
+        json!({"kind": "ordinary"})
+    );
+
+    let dir = c.root.join(target).join("evidence");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("rust-comparison-{head}.json"));
+    let conditions = json!({
+        "rustc_commit": "c".repeat(40),
+        "cargo_commit": "d".repeat(40),
+        "target": "aarch64-apple-darwin",
+        "environment_sha256": "e".repeat(64),
+    });
+    let bash = json!({"harness": "dekopon-shell/lib", "name": "ifs::real_bash"});
+    let flaky =
+        json!({"harness": "dekopon-brokerd/lib", "name": "digests::channel_schedule_and_watch"});
+    let run = |revision, argv: &[&str], failures: &[serde_json::Value]| {
+        json!({
+            "revision": revision,
+            "conditions": conditions,
+            "argv": argv,
+            "exit": 101,
+            "completed": true,
+            "failed_tests": failures,
+        })
+    };
+    let full = [
+        "cargo",
+        "test",
+        "--workspace",
+        "--all-features",
+        "--locked",
+        "--no-fail-fast",
+    ];
+    let rerun = [
+        "cargo",
+        "test",
+        "-p",
+        "dekopon-brokerd",
+        "--locked",
+        "digests::channel_schedule_and_watch",
+    ];
+    let mut evidence = json!({
+        "schema": 1,
+        "pr": pr,
+        "primary": {
+            "base": run(base, &full, std::slice::from_ref(&bash)),
+            "head": run(head, &full, &[bash.clone(), flaky.clone()]),
+        },
+    });
+    let compare = |evidence: &serde_json::Value| {
+        store::write_json(&path, evidence).unwrap();
+        let raw = fs::read(&path).unwrap();
+        let action = review_action(&host, &c, target);
+        assert_eq!(fs::read(&path).unwrap(), raw);
+        action["rust_comparison"].clone()
+    };
+    let refused = compare(&evidence);
+    assert_eq!(refused["status"], "refused");
+    assert_eq!(refused["reason"], "head-only-failures");
+    assert_eq!(refused["tests"], json!([flaky]));
+
+    evidence["reruns"] = json!([{
+        "base": run(base, &rerun, std::slice::from_ref(&flaky)),
+        "head": run(head, &rerun, std::slice::from_ref(&flaky)),
+    }]);
+    let accepted = compare(&evidence);
+    assert_eq!(accepted["status"], "pre-existing");
+    assert_eq!(accepted["tests"], json!([flaky, bash]));
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        accepted["sha256"],
+        format!("{:x}", Sha256::digest(fs::read(&path).unwrap()))
+    );
+
+    let mut changed = evidence.clone();
+    changed["reruns"][0]["base"]["conditions"]["environment_sha256"] = json!("f".repeat(64));
+    assert_eq!(compare(&changed)["reason"], "comparison-conditions");
+
+    for side in ["base", "head"] {
+        changed = evidence.clone();
+        changed["primary"][side]["revision"] = json!("f".repeat(40));
+        assert_eq!(compare(&changed)["reason"], "comparison-range", "{side}");
+    }
+
+    changed = evidence.clone();
+    changed["pr"] = json!("https://github.com/dekopon-agents/dekopon/pull/5102");
+    assert_eq!(compare(&changed)["reason"], "comparison-pr");
+
+    assert_eq!(compare(&evidence)["status"], "pre-existing");
+    forge.pulls.insert(
+        pr.into(),
+        Pull {
+            base: Some(CommitSha::new("f".repeat(40))),
+            ..pull.clone()
+        },
+    );
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    assert_eq!(
+        review_action(&host, &c, target)["rust_comparison"]["reason"],
+        "comparison-range"
+    );
+    let moved_head = "f".repeat(40);
+    forge.pulls.insert(
+        pr.into(),
+        Pull {
+            head: Some(CommitSha::new(&moved_head)),
+            ..pull
+        },
+    );
+    assert!(sync(&host, &forge, &c.root).unwrap().ok());
+    let moved = review_action(&host, &c, target);
+    assert_eq!(moved["head"], moved_head);
+    assert_eq!(moved["base"], base);
+    assert_eq!(
+        moved["rust_comparison"]["reason"],
+        "comparison-evidence-unavailable"
     );
 }

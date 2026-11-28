@@ -74,6 +74,10 @@ struct LastRead {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     base: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    head_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    head_repo: Option<GithubRepo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     mergeable_state: Option<MergeableState>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     etags: BTreeMap<String, String>,
@@ -83,6 +87,8 @@ impl LastRead {
     fn validates(&self, seen: &plan::Observed) -> bool {
         self.head == seen.head
             && self.base == seen.base
+            && self.head_ref == seen.head_ref
+            && self.head_repo == seen.head_repo
             && self.mergeable_state == seen.mergeable_state
     }
 }
@@ -639,6 +645,9 @@ impl<'a> Run<'a> {
             .filter(|seen| {
                 Some(seen.target.as_str()) == target
                     && fresh.is_some_and(|read| read.validates(seen))
+                    // Older observations have no branch identity. A release needs a full read.
+                    && (target.and_then(Release::of_target).is_none()
+                        || seen.head_ref.is_some() && seen.head_repo.is_some())
             })
             .cloned();
         let validators = fresh
@@ -665,7 +674,8 @@ impl<'a> Run<'a> {
                     merge_commit: None,
                     merged_at: None,
                     head: seen.head.as_ref().map(CommitSha::new),
-                    head_ref: None,
+                    head_ref: seen.head_ref,
+                    head_repo: seen.head_repo,
                     base: seen.base.as_ref().map(CommitSha::new),
                     mergeable_state: seen.mergeable_state.clone(),
                 };
@@ -1292,6 +1302,8 @@ impl<'a> Run<'a> {
                 if seen.at != *at
                     || seen.head.as_deref() != pull.head.as_ref().map(CommitSha::as_str)
                     || seen.base.as_deref() != pull.base.as_ref().map(CommitSha::as_str)
+                    || seen.head_ref != pull.head_ref
+                    || seen.head_repo != pull.head_repo
                     || seen.mergeable_state != pull.mergeable_state
                 {
                     // Another sync published a full read while this read was in flight.
@@ -1357,6 +1369,8 @@ impl<'a> Run<'a> {
                 Pull {
                     state: PullState::Open,
                     head,
+                    head_ref,
+                    head_repo,
                     mergeable_state,
                     base,
                     ..
@@ -1433,6 +1447,8 @@ impl<'a> Run<'a> {
                         target: target.clone(),
                         at: cached_at.unwrap_or_else(|| self.at.clone()),
                         head: head.map(|head| head.to_string()),
+                        head_ref,
+                        head_repo,
                         mergeable_state,
                     };
                     // A read that saw no new fact keeps the stored observation and its stamp, so
@@ -1448,6 +1464,8 @@ impl<'a> Run<'a> {
                             at,
                             head: observed.head.clone(),
                             base: observed.base.clone(),
+                            head_ref: observed.head_ref.clone(),
+                            head_repo: observed.head_repo.clone(),
                             mergeable_state: observed.mergeable_state.clone(),
                             etags,
                         };
@@ -2015,9 +2033,12 @@ fn run_sync(
             track.state == Phase::PrOpen && track.evidence.pr.as_deref() == Some(url.as_str())
         });
         if failed && current {
-            // The PR went unread, so its CI is unknown now: keep the rest, never the green.
+            // Keep the last range for existing callers. Release qualification needs a branch read.
+            let release = Release::of_target(&observed.target).is_some();
             open.entry(url).or_insert(plan::Observed {
                 ci_green: None,
+                head_ref: observed.head_ref.filter(|_| !release),
+                head_repo: observed.head_repo.filter(|_| !release),
                 ..observed
             });
         }

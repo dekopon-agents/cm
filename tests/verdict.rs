@@ -138,6 +138,7 @@ impl Forge for FakeForge {
                 .then(|| CommitSha::new(self.head.clone())),
             head: Some(CommitSha::new(self.head.clone())),
             head_ref: None,
+            head_repo: None,
             base: self.base.clone().map(CommitSha::new),
             mergeable_state: Some(self.mergeable.to_owned().into()),
         })

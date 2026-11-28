@@ -248,6 +248,8 @@ pub struct Pull {
     pub head: Option<CommitSha>,
     /// The PR's head branch, when GitHub reports it.
     pub head_ref: Option<String>,
+    /// The head branch's repository, which can differ from the PR's repository for a fork.
+    pub head_repo: Option<GithubRepo>,
     /// The base branch's tip, as GitHub reports it.
     pub base: Option<CommitSha>,
     /// GitHub's `mergeable_state` (`clean`, `dirty`, `blocked`, `unknown`, …), lower case.
@@ -1112,6 +1114,11 @@ impl Gh {
             sha: String,
             #[serde(rename = "ref")]
             name: Option<String>,
+            repo: Option<Repo>,
+        }
+        #[derive(Deserialize)]
+        struct Repo {
+            full_name: String,
         }
         let path = url
             .strip_prefix("https://github.com/")
@@ -1145,6 +1152,10 @@ impl Gh {
                 .map(CommitSha::new),
             merged_at: rest.merged_at.filter(|_| state == PullState::Merged),
             head_ref: rest.head.as_ref().and_then(|head| head.name.clone()),
+            head_repo: rest
+                .head
+                .as_ref()
+                .and_then(|head| head.repo.as_ref()?.full_name.parse().ok()),
             head: rest.head.map(|head| CommitSha::new(head.sha)),
             base: rest.base.map(|base| CommitSha::new(base.sha)),
             mergeable_state: rest

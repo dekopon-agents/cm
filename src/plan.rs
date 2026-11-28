@@ -10,7 +10,8 @@ use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use crate::attempt::{Drivers, remote_turn, turn_began};
-use crate::commands::shell_word;
+use crate::commands::{check_release_pr, is_pr_url, shell_word};
+use crate::evidence::{ReviewRange, RustComparison};
 use crate::forge::{GithubRepo, MergeableState, TagName};
 use crate::limits;
 use crate::lint::unit_dirs;
@@ -827,6 +828,94 @@ impl ActionKind {
 }
 
 #[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum ReviewQualification {
+    Ordinary,
+    ReleasePrep {
+        repo: GithubRepo,
+        version: String,
+        tag: TagName,
+        branch: String,
+    },
+    Blocked {
+        reason: &'static str,
+    },
+}
+
+fn qualify_review(action: &mut Action, root: &Path, step: &Step, observed: Option<&Observed>) {
+    let qualified = || {
+        let pr = action
+            .pr
+            .as_deref()
+            .filter(|pr| is_pr_url(pr))
+            .ok_or("authoritative-pr")?;
+        let release = Release::of_target(&action.target)
+            .map(|release| {
+                if action.part.is_some() {
+                    return Err("authoritative-release-pr");
+                }
+                let repo = GithubRepo::of_pr(pr).ok_or("release-repo")?;
+                if let Some(violation) = check_release_pr(&action.target, step, &release, &repo) {
+                    return Err(violation.rule);
+                }
+                Ok((release, repo))
+            })
+            .transpose()?;
+        let observed = observed.ok_or("observed-pr")?;
+        let head = observed
+            .head
+            .as_deref()
+            .filter(|sha| crate::evidence::exact_sha(sha))
+            .ok_or("observed-head")?;
+        let base = observed
+            .base
+            .as_deref()
+            .filter(|sha| crate::evidence::exact_sha(sha))
+            .ok_or("observed-base")?;
+        if head.eq_ignore_ascii_case(base) {
+            return Err("distinct-head-and-base");
+        }
+        let qualification = match release {
+            Some((release, repo)) => {
+                let branch = format!("release/{}", release.version);
+                let head_repo = observed.head_repo.as_ref().ok_or("observed-head-repo")?;
+                if !head_repo
+                    .to_string()
+                    .eq_ignore_ascii_case(&repo.to_string())
+                {
+                    return Err("release-head-repo");
+                }
+                if observed
+                    .head_ref
+                    .as_deref()
+                    .ok_or("observed-release-branch")?
+                    != branch
+                {
+                    return Err("release-branch");
+                }
+                ReviewQualification::ReleasePrep {
+                    repo,
+                    version: release.version.to_string(),
+                    tag: step.release_tag(&release),
+                    branch,
+                }
+            }
+            None => ReviewQualification::Ordinary,
+        };
+        Ok((qualification, ReviewRange { pr, base, head }))
+    };
+    match qualified() {
+        Ok((qualification, range)) => {
+            let comparison =
+                RustComparison::read(root, &action.target, action.part.as_deref(), range);
+            action.qualification = Some(qualification);
+            action.rust_comparison = Some(comparison);
+        }
+        Err(reason) => action.qualification = Some(ReviewQualification::Blocked { reason }),
+    }
+}
+
+#[derive(serde::Serialize)]
 struct Action {
     kind: ActionKind,
     target: String,
@@ -847,6 +936,10 @@ struct Action {
     base: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ci_green: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qualification: Option<ReviewQualification>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rust_comparison: Option<RustComparison>,
     #[serde(skip_serializing_if = "Option::is_none")]
     handoff: Option<String>,
     #[serde(skip)]
@@ -875,6 +968,8 @@ impl Action {
             head: None,
             base: None,
             ci_green: None,
+            qualification: None,
+            rust_comparison: None,
             handoff: None,
             description,
         }
@@ -1761,6 +1856,9 @@ fn actionable(
             .filter(|observed| observed.ci_head.is_some() && observed.ci_head == action.head)
             .and_then(|observed| observed.ci_green);
         action.pr = Some(pr);
+        if action.kind == ActionKind::ReviewOwed {
+            qualify_review(action, root, step, observed);
+        }
     }
     actions.sort_by(|a, b| {
         (
@@ -2263,6 +2361,10 @@ pub struct Observed {
     pub at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_repo: Option<GithubRepo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mergeable_state: Option<MergeableState>,
 }

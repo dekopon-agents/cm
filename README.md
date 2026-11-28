@@ -760,6 +760,31 @@ its own checklist contradicts (an empty `files:` included) as `weight-contradict
 verdict and a FIX REQUIRED head. Plain `cm next` prints the actions it does not already list as
 a next, unblock or watch item.
 
+#### Review qualification
+
+On a `review-owed` action from `cm next --act --json`, match the top-level `pr`, `base`
+and `head` to the PR and both full revisions under review. The action's `qualification.kind`
+is `ordinary`, `release-prep`, or `blocked`. A release prep has a declared release step,
+its recorded PR in the release repository, and the observed `release/<version>` branch in
+that repository. Its qualification gives `repo`, `version`, `tag` and `branch`. A blocked
+qualification gives a machine-readable `reason` for the missing or mismatched prerequisite.
+Run `cm sync` to read the current PR observation before qualifying a range.
+
+A qualified action also reports `rust_comparison`. The comparison reads the raw test results
+from `<step>/evidence/rust-comparison-<head>.json` (append `-<part>` before `.json` for a part).
+The file has `schema: 1`, the authoritative `pr`, one `primary` pair and optional `reruns`.
+Each pair contains `base` and `head` runs. Each run includes its full `revision`, `argv`
+(the normalized, locked Cargo test invocation), raw process `exit`, `completed` (whether the
+test results are complete), and `failed_tests` (objects with a unique Cargo test `harness` and
+the exact test `name`). Its `conditions` pin `rustc_commit`, `cargo_commit`, `target` and
+`environment_sha256` (the digest of the equivalent environment, including fixtures).
+
+`rust_comparison.status: pre-existing` names every matched head failure and cites the raw
+`evidence` and its `sha256`. A rerun can supply a match if both revisions fail the same named
+test under the same invocation and pinned conditions. A `refused` comparison gives a
+`reason` and, for `head-only-failures`, the unresolved tests. Consumers must match the
+disposition to all raw failures in the Rust test check for the same PR and range.
+
 `earlier-coordinator` lists a live attempt claimed by a session other than the one running cm,
 unless a registered lane driver whose units cover the step holds it ([Lane drivers](#lane-drivers));
 `--act` prints no note for those. CARD.md's `Actionable:` count leaves out caller-relative items

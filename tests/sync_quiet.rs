@@ -151,6 +151,7 @@ fn open(head: &str) -> Pull {
         merged_at: None,
         head: Some(CommitSha::new(head)),
         head_ref: None,
+        head_repo: None,
         base: Some(CommitSha::new("b".repeat(40))),
         mergeable_state: Some("clean".to_owned().into()),
     }
@@ -163,6 +164,7 @@ fn merged(sha: &str) -> Pull {
         merged_at: Some("2026-10-17T07:30:00Z".into()),
         head: None,
         head_ref: None,
+        head_repo: None,
         base: None,
         mergeable_state: None,
     }
