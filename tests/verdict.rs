@@ -4733,8 +4733,6 @@ fn reviews_recorded_before_parts_can_be_recorded_again_for_a_part() {
     assert!(!gaps().is_empty());
     let astra = c.root.join(STEP).join("evidence/astra-review-7/report.md");
     let claude = c.root.join(format!("drafts/claude-{head}.md"));
-    // A re-record of a report already recorded for the step is not a new review round, so no
-    // owner-queue item is needed before the part's receipt binds.
     {
         let part = "one";
         for (report, reviewer) in [(&astra, "astra"), (&claude, "claude")] {
@@ -4901,6 +4899,8 @@ fn reviewer_classification_is_required_for_history_and_incoming_records() {
         (Some("gpt-6.2-astra-xhigh"), Some(true)),
         (Some("astra-xhigh"), Some(true)),
         (Some("gpt-6-astra-high"), Some(true)),
+        (Some("gpt-6.2-astra_xhigh"), Some(true)),
+        (Some("gpt-6.2-astra.1"), Some(true)),
         (Some("claude"), Some(true)),
         (Some("claude-opus-5-5-xhigh"), Some(true)),
         (Some("opus"), Some(true)),
@@ -5009,20 +5009,103 @@ fn reviewer_classification_is_required_for_history_and_incoming_records() {
 }
 
 #[test]
-fn an_empty_ledger_object_is_uncountable_for_record_only() {
+fn a_damaged_ledger_is_refused_by_every_reader() {
+    let host = at("2026-10-25T06:00:00Z");
+    for damage in ["empty", "duplicate-reviews", "duplicate-reviewer"] {
+        let c = campaign(&host, true);
+        for index in 0..3 {
+            let report = c.report(
+                &format!("round-{index}"),
+                &format!("{index:08x}"),
+                &[],
+                "ACCEPT",
+            );
+            assert!(record(&host, &c, &report, "astra").ok());
+        }
+        let path = c.root.join(".cm/verdicts.json");
+        let text = fs::read_to_string(&path).unwrap();
+        let damaged = match damage {
+            "empty" => "{}".to_owned(),
+            "duplicate-reviews" => format!(
+                "{},\"reviews\": []}}",
+                text.trim_end().trim_end_matches('}').trim_end()
+            ),
+            _ => text.replacen(
+                "\"reviewer\": \"astra\"",
+                "\"reviewer\": \"astra\", \"reviewer\": \"sol\"",
+                1,
+            ),
+        };
+        assert_ne!(damaged, text, "{damage}");
+        fs::write(&path, &damaged).unwrap();
+        assert!(verdict::load(&c.root).is_err(), "{damage}");
+        let report = c.report("fourth", "abcdef04", &[], "ACCEPT");
+        assert_eq!(
+            rules(&record(&host, &c, &report, "astra")),
+            ["review-history-unreadable"],
+            "{damage}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), damaged, "{damage}");
+    }
+}
+
+#[test]
+fn only_a_report_copy_that_decides_the_count_must_be_readable() {
     let host = at("2026-10-25T06:00:00Z");
     let c = campaign(&host, true);
-    let initial = c.report("initial", "abcdef01", &[], "ACCEPT");
-    assert!(record(&host, &c, &initial, "astra").ok());
-    let path = c.root.join(".cm/verdicts.json");
-    fs::write(&path, "{}").unwrap();
-    // Every other reader still treats a ledger without `reviews` as empty.
-    assert!(verdict::load(&c.root).unwrap().reviews.is_empty());
-    let report = c.report("next", "abcdef02", &[], "ACCEPT");
-    assert_eq!(
-        rules(&record(&host, &c, &report, "claude")),
-        ["review-history-unreadable"]
+    let sol = c.report("sol", "00000000", &[], "ACCEPT");
+    assert!(record(&host, &c, &sol, "sol").ok());
+    fs::remove_file(c.root.join(STEP).join("evidence/reviews/R1-sol.md")).unwrap();
+    let amendment = commands::Amendment {
+        parts: vec!["one".into()],
+        ..Default::default()
+    };
+    assert!(
+        commands::amend(&host, &c.root, &target(), &amendment)
+            .unwrap()
+            .ok()
     );
+    let report = c.report("first", "00000001", &[], "ACCEPT");
+    let outcome = verdict::record(
+        &host,
+        &c.root,
+        &target(),
+        &report,
+        Some("astra"),
+        Some("one"),
+    )
+    .unwrap();
+    assert!(outcome.ok(), "{:?}", outcome.violations);
+
+    let c = campaign(&host, true);
+    for index in 0..3 {
+        let report = c.report(
+            &format!("round-{index}"),
+            &format!("{index:08x}"),
+            &[],
+            "ACCEPT",
+        );
+        assert!(record(&host, &c, &report, "astra").ok());
+    }
+    fs::remove_file(c.root.join(STEP).join("evidence/reviews/R1-astra.md")).unwrap();
+    assert!(
+        commands::amend(&host, &c.root, &target(), &amendment)
+            .unwrap()
+            .ok()
+    );
+    let report = c.report("fourth", "abcdef04", &[], "ACCEPT");
+    let outcome = verdict::record(
+        &host,
+        &c.root,
+        &target(),
+        &report,
+        Some("astra"),
+        Some("one"),
+    )
+    .unwrap();
+    assert_eq!(rules(&outcome), ["review-history-unreadable"]);
+    let next = format!("{:?}", outcome.violations[0].next);
+    assert!(next.contains("R1-astra.md"), "{next}");
 }
 
 #[test]

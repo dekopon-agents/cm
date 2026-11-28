@@ -1,12 +1,12 @@
 #![allow(deprecated)]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -497,7 +497,6 @@ pub fn parse_report(text: &str) -> Result<Block, Vec<BlockError>> {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Verdicts {
-    #[serde(default)]
     pub reviews: Vec<Recorded>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cap_raises: Vec<CapRaise>,
@@ -635,26 +634,64 @@ impl fmt::Display for Unclassified {
 
 impl std::error::Error for Unclassified {}
 
+#[derive(Debug)]
+struct Unreadable {
+    id: String,
+    path: String,
+    cause: io::Error,
+}
+
+impl fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "cannot read the report recorded as {} at {}: {}",
+            self.id, self.path, self.cause
+        )
+    }
+}
+
+impl std::error::Error for Unreadable {}
+
 fn recorded_text(root: &Path, review: &Recorded) -> Result<String> {
-    fs::read_to_string(root.join(review.report.as_str()))
-        .with_context(|| format!("cannot read the report recorded as {}", review.id()))
+    fs::read_to_string(root.join(review.report.as_str())).map_err(|cause| {
+        Unreadable {
+            id: review.id(),
+            path: review.report.to_string(),
+            cause,
+        }
+        .into()
+    })
 }
 
 // A report recorded before the step had parts may be recorded again for a part: that copy is the
-// same report, not another review. Fails closed when a recorded report cannot be read.
-fn rebound(root: &Path, earlier: &[&Recorded], text: &str) -> Result<bool> {
-    for review in earlier.iter().filter(|review| review.part.is_none()) {
-        if recorded_text(root, review)? == text {
-            return Ok(true);
+// same report, not another review.
+#[derive(Default)]
+struct PartLess<'a> {
+    unread: Vec<&'a Recorded>,
+    texts: HashSet<String>,
+}
+
+impl<'a> PartLess<'a> {
+    fn contains(&mut self, root: &Path, text: &str) -> Result<bool> {
+        for review in std::mem::take(&mut self.unread) {
+            self.texts.insert(recorded_text(root, review)?);
         }
+        Ok(self.texts.contains(text))
     }
-    Ok(false)
 }
 
 fn history_refusal(full: &str, error: &anyhow::Error) -> Violation {
     let path = format!("{CM_DIR}/{VERDICTS}");
-    let remedy = match error.downcast_ref::<Unclassified>() {
-        Some(unclassified) => format!(
+    let remedy = match (
+        error.downcast_ref::<Unclassified>(),
+        error.downcast_ref::<Unreadable>(),
+    ) {
+        (_, Some(copy)) => format!(
+            "restore the report copy {} (recorded as {}) before retrying",
+            copy.path, copy.id
+        ),
+        (Some(unclassified), None) => format!(
             "{} in {path} names {}, which cm cannot classify; correct that row's reviewer by hand to the model that wrote the report before retrying",
             unclassified.id,
             unclassified
@@ -664,7 +701,7 @@ fn history_refusal(full: &str, error: &anyhow::Error) -> Violation {
                     "reviewer `{name}`"
                 )),
         ),
-        None => format!("restore readable review history in {path} before retrying"),
+        (None, None) => format!("restore readable review history in {path} before retrying"),
     };
     Violation::refuse(
         &path,
@@ -682,30 +719,24 @@ fn load_for_record(root: &Path, target: &Target) -> Result<(Verdicts, usize)> {
         Err(error) => return Err(error.into()),
     };
     if present {
-        let value: serde_json::Value = read_json(&path)?;
-        if value.get("reviews").is_none() {
-            anyhow::bail!("{} has no `reviews` list", path.display());
-        }
-        let verdicts: Verdicts =
-            serde_json::from_value(value).with_context(|| format!("parsing {}", path.display()))?;
+        let verdicts: Verdicts = read_json(&path)?;
         let step = full_name(target);
-        let rows: Vec<&Recorded> = verdicts
-            .reviews
-            .iter()
-            .filter(|review| review.step == step)
-            .collect();
+        let mut partless = PartLess::default();
         let mut rounds = 0;
-        for (index, review) in rows.iter().enumerate() {
+        for review in verdicts.reviews.iter().filter(|review| review.step == step) {
             let capped =
                 capped_reviewer(review.reviewer.as_deref()).map_err(|cause| Unclassified {
                     id: review.id(),
                     reviewer: review.reviewer.clone(),
                     cause: format!("{cause:#}"),
                 })?;
-            if capped
-                && !(review.part.is_some()
-                    && rebound(root, &rows[..index], &recorded_text(root, review)?)?)
-            {
+            if !capped {
+                continue;
+            }
+            if review.part.is_none() {
+                partless.unread.push(review);
+                rounds += 1;
+            } else if !partless.contains(root, &recorded_text(root, review)?)? {
                 rounds += 1;
             }
         }
@@ -819,7 +850,9 @@ fn capped_reviewer(reviewer: Option<&str>) -> Result<bool> {
         anyhow::bail!("reviewer `{name}` is not a valid reviewer name");
     }
     let name = name.to_ascii_lowercase();
-    if name.split('-').any(|part| part == ASTRA_REVIEWER)
+    if name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| part == ASTRA_REVIEWER)
         || name.starts_with("claude-")
         || name.starts_with("opus-")
     {
@@ -1040,29 +1073,28 @@ pub fn record(
                 )]));
             }
         };
-        let earlier: Vec<&Recorded> = verdicts
-            .reviews
-            .iter()
-            .filter(|review| review.step == full)
-            .collect();
-        let again = match part {
-            Some(_) => match block
-                .as_ref()
-                .map(|(_, text)| rebound(root, &earlier, text))
-            {
-                Some(Ok(again)) => again,
-                Some(Err(error)) => {
-                    violations.push(history_refusal(&full, &error));
-                    return Ok(Outcome::refused(violations));
-                }
-                None => false,
-            },
-            None => false,
-        };
         let round = rounds + 1;
-        if capped && !again && round > REVIEW_ROUND_CAP {
+        if capped && round > REVIEW_ROUND_CAP {
+            let mut partless = PartLess::default();
+            partless
+                .unread
+                .extend(verdicts.reviews.iter().filter(|review| {
+                    review.step == full
+                        && review.part.is_none()
+                        && capped_reviewer(review.reviewer.as_deref()).is_ok_and(|capped| capped)
+                }));
+            let again = match (part, &block) {
+                (Some(_), Some((_, text))) => match partless.contains(root, text) {
+                    Ok(again) => again,
+                    Err(error) => {
+                        violations.push(history_refusal(&full, &error));
+                        return Ok(Outcome::refused(violations));
+                    }
+                },
+                _ => false,
+            };
             let queue = queue_names_step(root, &full);
-            if !matches!(queue, Ok(true)) {
+            if !again && !matches!(queue, Ok(true)) {
                 return Ok(Outcome::refused(vec![Violation::review_round_cap(
                     host.prefix(),
                     &full,
