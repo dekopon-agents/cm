@@ -49,7 +49,19 @@
     "cm:observations:record": "Collect source-bound observations without replacing a judgement.",
     "cm:campaigns:reconcile": "Request collection/reconciliation of existing campaign operations; never redispatch an unknown effect.",
     "cm:ideas:write": "Admit or update idea records and outcomes under campaign phase/evidence guards.",
-    "cm:reviews:raise-cap": "Explicitly increase a review card round cap with a linked escalation disposition; never reset round history."
+    "cm:reviews:raise-cap": "Explicitly increase a review card round cap with a linked escalation disposition; never reset round history.",
+    "cm:lanes:read": "Read lane inventory, health projections, queue order and history; nested resources require their read scopes.",
+    "cm:lanes:write": "Create, pause, resume or retire a lane; immutable bindings and outstanding-work guards still apply.",
+    "cm:lanes:edit-queue": "Attach, detach, move or reorder non-flight cards; never override claims, unknown effects or accepted work.",
+    "cm:tracks:read": "Read work-track definitions, footprints, limits and routing.",
+    "cm:tracks:write": "Create or edit work-track definitions and explicitly reclassify card tracks within accepted constraints.",
+    "cm:tracks:route": "Change the ordered primary and fallback lanes and automatic-fallback policy for a track.",
+    "cm:executors:read": "Read executor configuration, source-bound health and meter freshness.",
+    "cm:executors:configure": "Configure or pause an executor; cannot assert healthy observations or erase admission holds.",
+    "cm:executors:probe": "Request a qualified capability probe; paid canaries need the ordinary test and session scopes.",
+    "cm:artifacts:read": "Read native artifact bindings, observed state and attention reasons.",
+    "cm:artifacts:write": "Bind or rebind artifacts to durable cards and tracks without rewriting native evidence.",
+    "cm:handoffs:acknowledge": "Acknowledge a consistent handoff snapshot; acknowledgement grants no execution authority."
   },
   "operations": {
     "getCampaign": {
@@ -483,6 +495,180 @@
       "all_of": [
         "cm:reviews:raise-cap",
         "cm:escalations:resolve"
+      ]
+    },
+    "listLanes": {
+      "public": false,
+      "all_of": [
+        "cm:lanes:read",
+        "cm:tracks:read",
+        "cm:cards:read",
+        "cm:executors:read",
+        "cm:artifacts:read",
+        "cm:spend:read"
+      ]
+    },
+    "getLane": {
+      "public": false,
+      "all_of": [
+        "cm:lanes:read",
+        "cm:tracks:read",
+        "cm:cards:read",
+        "cm:executors:read",
+        "cm:artifacts:read",
+        "cm:spend:read"
+      ]
+    },
+    "getLaneHistory": {
+      "public": false,
+      "all_of": [
+        "cm:lanes:read",
+        "cm:tracks:read",
+        "cm:cards:read",
+        "cm:executors:read",
+        "cm:artifacts:read",
+        "cm:spend:read"
+      ]
+    },
+    "createLane": {
+      "public": false,
+      "all_of": [
+        "cm:lanes:write"
+      ]
+    },
+    "updateLane": {
+      "public": false,
+      "all_of": [
+        "cm:lanes:write"
+      ]
+    },
+    "retireLane": {
+      "public": false,
+      "all_of": [
+        "cm:lanes:write"
+      ]
+    },
+    "placeCard": {
+      "public": false,
+      "all_of": [
+        "cm:lanes:edit-queue",
+        "cm:cards:write"
+      ]
+    },
+    "reorderLane": {
+      "public": false,
+      "all_of": [
+        "cm:lanes:edit-queue",
+        "cm:cards:write"
+      ]
+    },
+    "reclassifyCard": {
+      "public": false,
+      "all_of": [
+        "cm:lanes:edit-queue",
+        "cm:cards:write",
+        "cm:tracks:write"
+      ]
+    },
+    "drainLane": {
+      "public": false,
+      "all_of": [
+        "cm:lanes:write",
+        "cm:lanes:edit-queue",
+        "cm:cards:write"
+      ]
+    },
+    "createTrack": {
+      "public": false,
+      "all_of": [
+        "cm:tracks:write"
+      ]
+    },
+    "updateTrack": {
+      "public": false,
+      "all_of": [
+        "cm:tracks:write"
+      ]
+    },
+    "retireTrack": {
+      "public": false,
+      "all_of": [
+        "cm:tracks:write"
+      ]
+    },
+    "getTrack": {
+      "public": false,
+      "all_of": [
+        "cm:tracks:read"
+      ]
+    },
+    "setTrackRouting": {
+      "public": false,
+      "all_of": [
+        "cm:tracks:route"
+      ]
+    },
+    "getExecutor": {
+      "public": false,
+      "all_of": [
+        "cm:executors:read"
+      ]
+    },
+    "configureExecutor": {
+      "public": false,
+      "all_of": [
+        "cm:executors:configure"
+      ]
+    },
+    "probeExecutor": {
+      "public": false,
+      "all_of": [
+        "cm:executors:probe"
+      ]
+    },
+    "recordExecutorObservation": {
+      "public": false,
+      "all_of": [
+        "cm:observations:record"
+      ]
+    },
+    "listArtifacts": {
+      "public": false,
+      "all_of": [
+        "cm:artifacts:read"
+      ]
+    },
+    "bindArtifact": {
+      "public": false,
+      "all_of": [
+        "cm:artifacts:write",
+        "cm:cards:write"
+      ]
+    },
+    "rebindArtifact": {
+      "public": false,
+      "all_of": [
+        "cm:artifacts:write",
+        "cm:cards:write"
+      ]
+    },
+    "getHandoff": {
+      "public": false,
+      "all_of": [
+        "cm:lanes:read",
+        "cm:tracks:read",
+        "cm:cards:read",
+        "cm:executors:read",
+        "cm:artifacts:read",
+        "cm:spend:read",
+        "cm:sessions:read",
+        "cm:campaigns:read"
+      ]
+    },
+    "acknowledgeHandoff": {
+      "public": false,
+      "all_of": [
+        "cm:handoffs:acknowledge"
       ]
     }
   }

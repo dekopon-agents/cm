@@ -80,6 +80,17 @@ class ContractTests(unittest.TestCase):
         catalog["operations"]["getScopeCatalog"]["all_of"] = ["cm:cards:read"]
         self.assertFalse(Draft202012Validator(self.catalog_schema).is_valid(catalog))
 
+    def test_lane_compound_actions_keep_distinct_authority(self):
+        requirements = lambda op: set(self.catalog["operations"][op]["all_of"])
+        queue = {"cm:lanes:edit-queue", "cm:cards:write"}
+        self.assertEqual(requirements("placeCard"), queue)
+        self.assertEqual(requirements("reorderLane"), queue)
+        self.assertEqual(requirements("drainLane"), queue | {"cm:lanes:write"})
+        self.assertEqual(requirements("reclassifyCard"), queue | {"cm:tracks:write"})
+        self.assertEqual(requirements("setTrackRouting"), {"cm:tracks:route"})
+        self.assertEqual(requirements("configureExecutor"), {"cm:executors:configure"})
+        self.assertEqual(requirements("recordExecutorObservation"), {"cm:observations:record"})
+
     def test_duplicate_keys(self):
         with self.assertRaisesRegex(ValueError, "duplicate JSON key"):
             json.loads('{"scope":"first","scope":"second"}', object_pairs_hook=unique_object)

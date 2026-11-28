@@ -98,3 +98,18 @@ handlers, not a remotely supplied policy program or a role registry.
 python3 -m pip install -r tools/auth-contract-requirements.txt
 python3 tools/check_auth_contract.py
 ```
+
+## Lane, track and executor operations
+
+Tracks describe work; executors describe qualified execution adapters; lanes pair
+them. Queue edits require both lane-queue and Card-write scopes. Cross-track
+reclassification additionally requires Track-write; draining also requires
+Lane-write to pause source admissions. Active claims, uncertain sends, running
+operations and unconfirmed stops prohibit movement regardless of scopes.
+Configuration cannot manufacture healthy observations. Missing mandatory usage
+meters pause admissions rather than imply unlimited budget. Routing changes use
+the separate Track-route scope; ordinary metadata writes cannot change fallback
+policy. Nested lane/handoff views require every constituent read scope listed in
+the catalog. Artifact accountability belongs to a durable work track, not a
+Session or an authorization role. These are contract requirements for the future
+service, not claims of an installed scheduler or health loop.
