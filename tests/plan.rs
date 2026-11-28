@@ -4771,6 +4771,115 @@ fn blocked_until_epoch_and_removed_owner_heading_use_current_files() {
 }
 
 #[test]
+fn mac_lane_fixture_only_unblocks_dated_done_items() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    fs::write(
+        c.root.join("MAC-LANE.md"),
+        include_str!("fixtures/mac-lane/MAC-LANE.md"),
+    )
+    .unwrap();
+    for number in 1..=7 {
+        let target = format!("01-a/u/item-{number}");
+        assert!(declare(&host, &c, &target, Lane::Codex, &[]).ok());
+        assert!(
+            advance(
+                &host,
+                &c,
+                &target,
+                &format!("blocked:until:mac-lane:{number}"),
+                Evidence::default(),
+            )
+            .ok()
+        );
+        let target = parse_target(&target, true).unwrap();
+        let outcome = commands::unblock(&host, &c.root, &target, None).unwrap();
+        assert_eq!(
+            outcome.ok(),
+            matches!(number, 1 | 3),
+            "Mac lane item {number}"
+        );
+    }
+}
+
+#[test]
+fn mac_lane_completion_releases_every_matching_wait_after_reload() {
+    let host = at("2026-10-17T08:00:00Z");
+    let c = campaign(&host);
+    let mac_lane = c.root.join("MAC-LANE.md");
+    let same_item = ["01-a/u/first", "02-other/v/second"];
+    let unrelated = "01-a/u/unrelated";
+    let pending = "44. **PARTIAL 2026-10-17** (working). **Run Rust tests**\n45. **Other work**\n";
+    fs::write(&mac_lane, pending).unwrap();
+    for (target, number) in same_item
+        .into_iter()
+        .map(|target| (target, 44))
+        .chain([(unrelated, 45)])
+    {
+        assert!(declare(&host, &c, target, Lane::Codex, &[]).ok());
+        assert!(
+            advance(
+                &host,
+                &c,
+                target,
+                &format!("blocked:until:mac-lane:{number}"),
+                Evidence::default()
+            )
+            .ok()
+        );
+    }
+    let offered = || {
+        let result = plan::next(&c.root, None, None).unwrap();
+        result.fields["unblock_now"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["target"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    for ledger in [
+        "",
+        pending,
+        "44. **HELD 2026-10-17** **Run Rust tests**\n",
+        "44. **DONE yesterday** **Run Rust tests**\n",
+        "44. **DONE 2026-02-30:** **Run Rust tests**\n",
+        "44. **DONE 2026-10-17::** **Run Rust tests**\n",
+        "44. **DONE 2026-10-17** **Run Rust tests**\n44. **Duplicate**\n",
+    ] {
+        fs::write(&mac_lane, ledger).unwrap();
+        assert!(offered().is_empty(), "{ledger}");
+    }
+    fs::remove_file(&mac_lane).unwrap();
+    assert!(offered().is_empty());
+    fs::write(&mac_lane, pending).unwrap();
+    assert!(
+        cm::ledger::mac_lane_done(&host, &c.root, 44, "Compared head and base")
+            .unwrap()
+            .ok()
+    );
+    assert_eq!(offered(), same_item);
+    for target in same_item {
+        let parsed = parse_target(target, true).unwrap();
+        assert!(
+            cm::commands::unblock(&host, &c.root, &parsed, None)
+                .unwrap()
+                .ok()
+        );
+        assert_eq!(state(&c, target), Phase::Drafted);
+        assert!(
+            !cm::commands::unblock(&host, &c.root, &parsed, None)
+                .unwrap()
+                .ok()
+        );
+    }
+    assert!(offered().is_empty());
+    assert_eq!(
+        state(&c, unrelated),
+        Phase::Blocked("until:mac-lane:45".into())
+    );
+}
+
+#[test]
 fn blocked_until_short_step_resolves_against_its_unit() {
     let host = at("2026-10-17T08:00:00Z");
     let c = campaign(&host);
@@ -4796,6 +4905,8 @@ fn blocked_until_short_step_resolves_against_its_unit() {
         "blocked:until:pin:S1@abcdef0",
         "blocked:until:owner-queue:0",
         "blocked:until:owner-queue:+2",
+        "blocked:until:mac-lane:0",
+        "blocked:until:mac-lane:+44",
     ] {
         assert!(invalid.parse::<Phase>().is_err(), "{invalid}");
     }

@@ -982,7 +982,7 @@ fn owner_queue_not_open(
     )
 }
 
-const BLOCK_FORMS: &str = "a block waits on <step>, pr-open:<step>, tag:<repo>@<version>, deployed:<repo>@<version>, owner-queue:<N> or epoch:WORKING";
+const BLOCK_FORMS: &str = "a block waits on <step>, pr-open:<step>, tag:<repo>@<version>, deployed:<repo>@<version>, owner-queue:<N>, mac-lane:<N> or epoch:WORKING";
 
 const GATE_FORMS: &str = "a gate is <step>, <NN-name>/<unit>/<step>, pr-open:<step>, pin:<step>@<sha>, tag:<repo>@<version> or deployed:<repo>@<version>";
 
