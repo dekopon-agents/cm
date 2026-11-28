@@ -5050,6 +5050,104 @@ fn a_damaged_ledger_is_refused_by_every_reader() {
 }
 
 #[test]
+fn every_ledger_writer_refuses_history_it_cannot_read() {
+    let host = at("2026-10-25T06:00:00Z");
+    for damage in ["absent", "unreadable"] {
+        for writer in ["record", "cap-raise", "resolve", "close-followup"] {
+            let c = campaign(&host, true);
+            for index in 0..3 {
+                let report = c.report(
+                    &format!("round-{index}"),
+                    &format!("{index:08x}"),
+                    &[],
+                    "ACCEPT",
+                );
+                assert!(record(&host, &c, &report, "astra").ok());
+            }
+            let ruling = commit_ruling(&c, "rulings/more.md");
+            let next = c.report("fourth", "abcdef04", &[], "ACCEPT");
+            let path = c.root.join(".cm/verdicts.json");
+            let damaged = match damage {
+                "absent" => {
+                    fs::remove_file(&path).unwrap();
+                    None
+                }
+                _ => {
+                    fs::write(&path, "not json").unwrap();
+                    Some("not json".to_owned())
+                }
+            };
+            let journal_before = journal(&c);
+            let outcome = match writer {
+                "record" => verdict::record(&host, &c.root, &target(), &next, Some("claude"), None),
+                "cap-raise" => verdict::cap_raise(&host, &c.root, &target(), 1, &ruling),
+                "resolve" => verdict::resolve(
+                    &host,
+                    &c.root,
+                    &target(),
+                    "F1",
+                    &ruling.to_string_lossy(),
+                    &ruling,
+                ),
+                _ => verdict::close_followup(&host, &c.root, "R1.F1", "abc1234"),
+            }
+            .unwrap();
+            assert_eq!(
+                rules(&outcome),
+                ["review-history-unreadable"],
+                "{writer} {damage}: {:?}",
+                outcome.violations
+            );
+            assert_eq!(fs::read_to_string(&path).ok(), damaged, "{writer} {damage}");
+            assert_eq!(journal(&c), journal_before, "{writer} {damage}");
+        }
+    }
+}
+
+#[test]
+fn the_built_cm_refuses_cap_raise_and_a_fourth_review_after_the_ledger_is_deleted() {
+    let host = at("2026-10-25T06:00:00Z");
+    let c = campaign(&host, true);
+    for index in 0..3 {
+        let report = c.report(
+            &format!("round-{index}"),
+            &format!("{index:08x}"),
+            &[],
+            "ACCEPT",
+        );
+        assert!(record(&host, &c, &report, "astra").ok());
+    }
+    let ruling = commit_ruling(&c, "rulings/more.md");
+    let next = c.report("fourth", "abcdef04", &[], "ACCEPT");
+    let path = c.root.join(".cm/verdicts.json");
+    fs::remove_file(&path).unwrap();
+    let cm = |args: &[&str], file: &Path, tail: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_cm"))
+            .arg("-C")
+            .arg(&c.root)
+            .args(args)
+            .arg(file)
+            .args(tail)
+            .output()
+            .unwrap()
+    };
+    let raised = cm(
+        &["review", "cap-raise", STEP, "--by", "1", "--ruling"],
+        &ruling,
+        &[],
+    );
+    assert!(!raised.status.success(), "{raised:?}");
+    assert!(!path.exists());
+    let recorded = cm(
+        &["review", "record", STEP],
+        &next,
+        &["--reviewer", "claude"],
+    );
+    assert!(!recorded.status.success(), "{recorded:?}");
+    assert!(!path.exists());
+}
+
+#[test]
 fn only_a_report_copy_that_decides_the_count_must_be_readable() {
     let host = at("2026-10-25T06:00:00Z");
     let c = campaign(&host, true);

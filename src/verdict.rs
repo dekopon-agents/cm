@@ -669,15 +669,18 @@ fn recorded_text(root: &Path, review: &Recorded) -> Result<String> {
 #[derive(Default)]
 struct PartLess<'a> {
     unread: Vec<&'a Recorded>,
-    texts: HashSet<String>,
+    digests: HashSet<[u8; 32]>,
 }
 
 impl<'a> PartLess<'a> {
     fn contains(&mut self, root: &Path, text: &str) -> Result<bool> {
         for review in std::mem::take(&mut self.unread) {
-            self.texts.insert(recorded_text(root, review)?);
+            self.digests
+                .insert(Sha256::digest(recorded_text(root, review)?).into());
         }
-        Ok(self.texts.contains(text))
+        Ok(self
+            .digests
+            .contains::<[u8; 32]>(&Sha256::digest(text).into()))
     }
 }
 
@@ -706,7 +709,7 @@ fn history_refusal(full: &str, error: &anyhow::Error) -> Violation {
     Violation::refuse(
         &path,
         "review-history-unreadable",
-        format!("cannot count review rounds for {full} from {path}: {error:#}"),
+        format!("cannot read the review history for {full} from {path}: {error:#}"),
         Next::settled(remedy),
     )
 }
@@ -743,6 +746,12 @@ fn load_for_record(root: &Path, target: &Target) -> Result<(Verdicts, usize)> {
         return Ok((verdicts, rounds));
     }
 
+    absent_ledger_is_empty(root, Some(target))?;
+    Ok((Verdicts::default(), 0))
+}
+
+// An absent ledger is an empty history only when no review was ever recorded.
+fn absent_ledger_is_empty(root: &Path, target: Option<&Target>) -> Result<()> {
     let journal = fs::read_to_string(root.join(store::JOURNAL))?;
     let journaled = journal.lines().any(|line| {
         crate::journal::is_stamped(line)
@@ -750,15 +759,27 @@ fn load_for_record(root: &Path, target: &Target) -> Result<(Verdicts, usize)> {
                 .split_once(" — ")
                 .is_some_and(|(_, title)| title.starts_with("review record "))
     });
-    let copied = match fs::read_dir(evidence_dir(root, target).join("reviews")) {
-        Ok(mut copies) => copies.next().transpose()?.is_some(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error.into()),
+    let copied = match target {
+        Some(target) => match fs::read_dir(evidence_dir(root, target).join("reviews")) {
+            Ok(mut copies) => copies.next().transpose()?.is_some(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        },
+        None => false,
     };
     if journaled || copied {
         anyhow::bail!("the ledger is missing and review history already exists");
     }
-    Ok((Verdicts::default(), 0))
+    Ok(())
+}
+
+// Every writer that saves the ledger loads it here, so none can replace history it cannot read
+// with an empty one.
+fn load_for_write(root: &Path, target: Option<&Target>) -> Result<Verdicts> {
+    match read_ledger(root)? {
+        Some(verdicts) => Ok(verdicts),
+        None => absent_ledger_is_empty(root, target).map(|()| Verdicts::default()),
+    }
 }
 
 fn save(root: &Path, verdicts: &Verdicts) -> Result<()> {
@@ -1326,7 +1347,13 @@ pub fn cap_raise(
     ruling: &Path,
 ) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
-    let mut verdicts = load(root)?;
+    let mut verdicts = match load_for_write(root, Some(target)) {
+        Ok(verdicts) => verdicts,
+        Err(error) => {
+            violations.push(history_refusal(&full_name(target), &error));
+            return Ok(Outcome::refused(violations));
+        }
+    };
     let repaired = if violations.is_empty() {
         journal_raises(root, &verdicts)?
     } else {
@@ -1536,7 +1563,13 @@ pub fn resolve(
 ) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
     let full = full_name(target);
-    let mut verdicts = load(root)?;
+    let mut verdicts = match load_for_write(root, Some(target)) {
+        Ok(verdicts) => verdicts,
+        Err(error) => {
+            violations.push(history_refusal(&full, &error));
+            return Ok(Outcome::refused(violations));
+        }
+    };
     let by = match by_of(root, by, by_path) {
         Ok(by) => Some(by),
         Err(message) => {
@@ -1708,7 +1741,13 @@ pub fn followups(root: &Path, epoch: bool) -> Result<Outcome> {
 pub fn close_followup(host: &dyn Host, root: &Path, id: &str, by: &str) -> Result<Outcome> {
     let (_lock, mut violations) = guard(root)?;
     one_line("--by", by, &mut violations, VERDICTS);
-    let mut verdicts = load(root)?;
+    let mut verdicts = match load_for_write(root, None) {
+        Ok(verdicts) => verdicts,
+        Err(error) => {
+            violations.push(history_refusal("the campaign", &error));
+            return Ok(Outcome::refused(violations));
+        }
+    };
     let at = stamp(host.now());
     let Some((key, logged)) = id
         .contains('.')
@@ -2458,6 +2497,30 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn the_part_less_index_keeps_digests_not_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = "report body\n".repeat(100_000);
+        let mut reviews = Vec::new();
+        for (index, text) in [big.as_str(), "short"].into_iter().enumerate() {
+            fs::write(dir.path().join(format!("r{index}.md")), text).unwrap();
+            let mut review = serde_json::from_value::<Recorded>(serde_json::json!({
+                "number": index + 1, "at": "t", "step": "01-a/u/S1", "head": "abcdef0",
+                "verdict": "accept", "report": format!("r{index}.md"),
+            }))
+            .unwrap();
+            review.reviewer = Some("astra".into());
+            reviews.push(review);
+        }
+        let mut index = PartLess::default();
+        index.unread.extend(reviews.iter());
+        assert!(index.contains(dir.path(), &big).unwrap());
+        assert!(index.contains(dir.path(), "short").unwrap());
+        assert!(!index.contains(dir.path(), "other").unwrap());
+        assert_eq!(index.digests.len(), 2);
+        assert!(index.digests.iter().all(|digest| digest.len() == 32));
+    }
 
     thread_local! {
         pub(super) static HASHES: Cell<usize> = const { Cell::new(0) };
