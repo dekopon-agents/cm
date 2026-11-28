@@ -16,7 +16,7 @@
     "cm:reviews:read": "Read review cards, rounds and stable finding histories.",
     "cm:reviews:start": "Admit one formal review round within its declared cap.",
     "cm:reviews:record": "Collect a native review result; supplied labels do not establish reviewer identity.",
-    "cm:reviews:adjudicate": "Resolve a disputed finding or review disagreement with an attributed decision.",
+    "cm:reviews:adjudicate": "Resolve a disputed finding or append an evidence-backed correction to a review subject.",
     "cm:sessions:read": "Read managed session status, declared purpose, limits and native receipts.",
     "cm:sessions:start": "Admit a managed worker or helper under an accepted card and remaining limits.",
     "cm:sessions:stop": "Request checkpoint and termination; a request is not confirmation that a session stopped.",
@@ -43,10 +43,9 @@
     "cm:tests:run": "Start a declared integration or smoke test within its task and target bounds.",
     "cm:experiments:run": "Start a declared experiment with its protocol, limits and cleanup obligations.",
     "cm:credentials:revoke": "Revoke a credential identifier; cannot mint tokens or read signing/provider secrets.",
-    "cm:drivers:write": "Register, replace or remove a driver within an accepted assignment.",
     "cm:watches:write": "Create or change a watch; expiry is not successful completion.",
     "cm:exceptions:approve": "Approve a specifically bounded exception; no blanket bypass of other checks.",
-    "cm:observations:record": "Append attributed feedback/operational reports; cannot set authoritative health, meter, evidence or native outcomes.",
+    "cm:observations:record": "Append attributed reports. Cannot end an attempt, clear a flight hold or certify native outcomes, health or usage.",
     "cm:campaigns:reconcile": "Request collection/reconciliation of existing campaign operations; never redispatch an unknown effect.",
     "cm:ideas:write": "Admit or update idea records and outcomes under campaign phase/evidence guards.",
     "cm:reviews:raise-cap": "Explicitly increase a review card round cap with a linked escalation disposition; never reset round history.",
@@ -61,8 +60,10 @@
     "cm:executors:probe": "Request a qualified capability probe; paid canaries need the ordinary test and session scopes.",
     "cm:artifacts:read": "Read native artifact bindings, observed state and attention reasons.",
     "cm:artifacts:write": "Bind or rebind artifacts to durable cards and tracks without rewriting native evidence.",
-    "cm:handoffs:acknowledge": "Acknowledge a consistent handoff snapshot; acknowledgement grants no execution authority.",
-    "cm:credentials:delegate": "Authorize trusted-issuer minting of an explicitly narrower child JWT; never sign with bearer bytes, widen scopes/resources/lifetime, or inherit redelegation automatically."
+    "cm:credentials:delegate": "Authorize trusted-issuer minting of an explicitly narrower child JWT; never sign with bearer bytes, widen scopes/resources/lifetime, or inherit redelegation automatically.",
+    "cm:pulls:merge": "Merge the exact qualified pull request revision in an authorized repository.",
+    "cm:recovery:accept-operation-exposure": "Record an explicit disposition of one named uncertain operation within its campaign.",
+    "cm:recovery:attest-exclusion": "Record evidence of retired sender exclusion for an instance recovery."
   },
   "operations": {
     "getCampaign": {
@@ -428,22 +429,6 @@
       "resource": "instance",
       "assignment_bound": false
     },
-    "registerDriver": {
-      "all_of": [
-        "cm:drivers:write"
-      ],
-      "authentication": "jwt",
-      "resource": "campaign",
-      "assignment_bound": false
-    },
-    "removeDriver": {
-      "all_of": [
-        "cm:drivers:write"
-      ],
-      "authentication": "jwt",
-      "resource": "campaign",
-      "assignment_bound": false
-    },
     "updateWatch": {
       "all_of": [
         "cm:watches:write"
@@ -556,15 +541,6 @@
     "requestAttemptRepair": {
       "all_of": [
         "cm:recovery:reconcile"
-      ],
-      "authentication": "jwt",
-      "resource": "campaign",
-      "assignment_bound": false
-    },
-    "listDrivers": {
-      "all_of": [
-        "cm:cards:read",
-        "cm:sessions:read"
       ],
       "authentication": "jwt",
       "resource": "campaign",
@@ -861,14 +837,6 @@
       "resource": "campaign",
       "assignment_bound": false
     },
-    "acknowledgeHandoff": {
-      "all_of": [
-        "cm:handoffs:acknowledge"
-      ],
-      "authentication": "jwt",
-      "resource": "campaign",
-      "assignment_bound": false
-    },
     "getLiveness": {
       "authentication": "public",
       "resource": "public",
@@ -939,6 +907,38 @@
       "all_of": [
         "cm:credentials:revoke"
       ],
+      "assignment_bound": false
+    },
+    "correctReviewSubject": {
+      "all_of": [
+        "cm:reviews:adjudicate"
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
+    },
+    "mergePullRequest": {
+      "all_of": [
+        "cm:pulls:merge"
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
+    },
+    "acceptOperationExposure": {
+      "all_of": [
+        "cm:recovery:accept-operation-exposure"
+      ],
+      "authentication": "jwt",
+      "resource": "campaign",
+      "assignment_bound": false
+    },
+    "recordSenderExclusion": {
+      "all_of": [
+        "cm:recovery:attest-exclusion"
+      ],
+      "authentication": "jwt",
+      "resource": "instance",
       "assignment_bound": false
     }
   }

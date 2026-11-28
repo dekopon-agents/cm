@@ -111,16 +111,33 @@ class ContractTests(unittest.TestCase):
 
     def test_instance_operations_cannot_be_campaign_resources(self):
         for op in ["createBackup", "downloadBackup", "revokeCredential", "inspectRecovery",
-                   "reconcileRecovery", "acceptExposure", "createCampaign"]:
+                   "reconcileRecovery", "acceptExposure", "recordSenderExclusion", "createCampaign"]:
             self.assertEqual(self.catalog["operations"][op]["resource"], "instance")
         for op in ["changeTrackLimits", "changeLaneLimits", "createTrack", "createLane"]:
             self.assertIn("cm:campaigns:approve", self.catalog["operations"][op]["all_of"])
 
     def test_nested_reads_do_not_gain_implied_permissions(self):
         for op, required in {"getBrief": {"cm:reviews:read", "cm:evidence:read", "cm:journal:read"},
-                             "listDrivers": {"cm:sessions:read"},
                              "getMacTask": {"cm:sessions:read", "cm:evidence:read"}}.items():
             self.assertTrue(required <= set(self.catalog["operations"][op]["all_of"]))
+
+    def test_effect_and_recovery_authority_are_separate(self):
+        operations = self.catalog["operations"]
+        for operation, scope, resource in [
+            ("mergePullRequest", "cm:pulls:merge", "campaign"),
+            ("correctReviewSubject", "cm:reviews:adjudicate", "campaign"),
+            ("acceptOperationExposure", "cm:recovery:accept-operation-exposure", "campaign"),
+            ("recordSenderExclusion", "cm:recovery:attest-exclusion", "instance"),
+        ]:
+            with self.subTest(operation=operation):
+                self.assertEqual(operations[operation], {
+                    "authentication": "jwt", "resource": resource,
+                    "assignment_bound": False, "all_of": [scope],
+                })
+        for operation in ("recordAttempt", "recordAttention"):
+            self.assertEqual(operations[operation]["all_of"], ["cm:observations:record"])
+        for operation in ("acknowledgeHandoff", "registerDriver", "removeDriver", "listDrivers"):
+            self.assertNotIn(operation, operations)
 
     def test_delegation_is_explicit_and_claims_do_not_embed_parent_secrets(self):
         self.claims.validate(dict(self.valid, parent_jti="credential-01", assignment_id="assignment-04"))

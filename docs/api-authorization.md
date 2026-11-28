@@ -147,7 +147,22 @@ There is no public recordExecutorObservation operation. configureExecutor only
 changes lifecycle subject to domain guards. Track/lane limit setters (including
 creation with initial limits) require their write scope AND cm:campaigns:approve
 with accepted exact values; metadata cannot smuggle limits/routing into a patch.
-Nested briefs, task, driver and attention views require constituent read scopes.
+Nested briefs, task and attention views require constituent read scopes.
+
+## Effect and recovery decisions
+
+`mergePullRequest` authorizes only the exact server-loaded pull request subject
+with applicable checks and review. `correctReviewSubject` records an adjudicated
+binding with qualified evidence and retains the original. Observation reports,
+including `recordAttempt` and `recordAttention`, cannot terminate attempts,
+release flight holds or supply a native outcome.
+
+`acceptOperationExposure` dispositions one uncertain operation in one campaign.
+Instance restore exposure and sender-exclusion attestations have separate scopes.
+An attestation records evidence and provenance. It does not authorize an effect.
+Ordinary token retirement does not invalidate past accepted decisions. A compromise
+revocation marks affected decisions suspect and prevents dependent unsent effects
+from being claimed, including when generated under a different service credential.
 
 ## Constrained delegation (requires issuer qualification)
 
@@ -158,6 +173,7 @@ implicit delegation scope passes to the child. A root stays in a trusted non-mod
 consumer; only the narrow child is delivered to a model destination. The planned
 identity-service mint capability must be qualified; no API pod signing Secret or
 existent token endpoint is implied by these schemas.
+The issuer independently verifies the presented parent proof and its bounds.
 
 Children carry parent_jti, with a canonical nonsecret registered ancestry graph.
 Every ancestor must remain valid and unrevoked; parent revocation invalidates its
