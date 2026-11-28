@@ -2901,6 +2901,11 @@ pub(crate) fn block_condition(text: &str, unit: &str) -> Result<String, String> 
             .ok_or("owner-queue condition needs a positive item number")?;
         return Ok(format!("owner-queue:{n}"));
     }
+    if let Some(number) = text.strip_prefix("mac-lane:") {
+        let n = crate::ledger::queue_item_number(number)
+            .ok_or("mac-lane condition needs a positive item number")?;
+        return Ok(format!("mac-lane:{n}"));
+    }
     match After::parse(text, unit)? {
         After::Pin(_) => Err("pin gates are not supported in blocked:until:".into()),
         after => Ok(after.to_string()),
@@ -2919,6 +2924,10 @@ pub(crate) fn block_met(root: &Path, units: &Units, unit: &str, condition: &str)
             root.join("OWNER-QUEUE.md").is_file()
                 && !crate::ledger::open_items(root).contains(&number)
         });
+    }
+    if let Some(number) = condition.strip_prefix("mac-lane:") {
+        return crate::ledger::queue_item_number(number)
+            .is_some_and(|number| crate::ledger::mac_lane_complete(root, number));
     }
     After::parse(condition, unit).is_ok_and(|after| gate(units, &after).met())
 }
